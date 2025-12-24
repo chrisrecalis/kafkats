@@ -1,0 +1,30 @@
+# Dependencies
+node_modules
+.pnpm-store
+.pnpm-debug.log
+npm-debug.log
+yarn-error.log
+pnpm-lock.yaml.local
+
+# Build output
+dist
+coverage
+*.tsbuildinfo
+*.tsbuildinfo.*
+*.map
+
+# Editors/OS
+.DS_Store
+.idea
+.vscode
+.cache
+.eslintcache
+*.log
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# Tooling
+.claude/

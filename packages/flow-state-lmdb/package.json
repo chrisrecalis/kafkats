@@ -1,0 +1,42 @@
+{
+	"name": "@kafkats/flow-state-lmdb",
+	"private": false,
+	"version": "0.1.0",
+	"description": "LMDB state store provider for @kafkats/flow",
+	"type": "module",
+	"main": "dist/index.js",
+	"types": "dist/index.d.ts",
+	"exports": {
+		".": {
+			"import": "./dist/index.js",
+			"types": "./dist/index.d.ts"
+		}
+	},
+	"files": [
+		"dist"
+	],
+	"license": "MIT",
+	"engines": {
+		"node": ">=18"
+	},
+	"scripts": {
+		"build": "pnpm clean && tsc -p tsconfig.build.json && tsc-alias -p tsconfig.build.json",
+		"test": "vitest run tests",
+		"typecheck": "tsc -p tsconfig.json --noEmit",
+		"clean": "rm -rf dist",
+		"prepack": "pnpm build"
+	},
+	"dependencies": {
+		"lmdb": "^3.2.6"
+	},
+	"peerDependencies": {
+		"@kafkats/flow": "workspace:^"
+	},
+	"devDependencies": {
+		"@kafkats/flow": "workspace:^",
+		"@types/node": "^24.10.1",
+		"tsc-alias": "^1.8.16",
+		"typescript": "^5.9.3",
+		"vitest": "^4.0.12"
+	}
+}

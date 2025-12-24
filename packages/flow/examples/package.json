@@ -1,0 +1,19 @@
+{
+	"name": "@kafkats/flow-examples",
+	"private": true,
+	"version": "0.1.0",
+	"description": "Real-world examples for @kafkats/flow",
+	"type": "module",
+	"scripts": {
+		"clickstream": "tsx clickstream/run.ts",
+		"clickstream:produce": "tsx clickstream/producer.ts"
+	},
+	"dependencies": {
+		"@kafkats/flow": "workspace:^",
+		"@kafkats/client": "workspace:^"
+	},
+	"devDependencies": {
+		"tsx": "^4.20.6",
+		"typescript": "^5.9.3"
+	}
+}

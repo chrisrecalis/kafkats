@@ -1,0 +1,33 @@
+{
+	"name": "kafkats (Claude Code + Codex)",
+	"build": {
+		"dockerfile": "Dockerfile"
+	},
+	"remoteUser": "node",
+	"updateRemoteUserUID": true,
+	"features": {
+		"ghcr.io/anthropics/devcontainer-features/claude-code:1.0": {},
+		"ghcr.io/devcontainers/features/docker-outside-of-docker:1": {}
+	},
+	"remoteEnv": {
+		"ANTHROPIC_API_KEY": "${localEnv:ANTHROPIC_API_KEY}",
+		"OPENAI_API_KEY": "${localEnv:OPENAI_API_KEY}"
+	},
+	"mounts": [
+		"source=${localEnv:HOME}/.claude,target=/home/node/.claude,type=bind,consistency=cached",
+		"source=${localEnv:HOME}/.claude.json,target=/home/node/.claude.json,type=bind,consistency=cached",
+		"source=${localEnv:HOME}/.codex,target=/home/node/.codex,type=bind,consistency=cached",
+		"source=kafkats-node_modules,target=${containerWorkspaceFolder}/node_modules,type=volume"
+	],
+	"postCreateCommand": "bash .devcontainer/postCreate.sh",
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"anthropic.claude-code",
+				"openai.chatgpt",
+				"dbaeumer.vscode-eslint",
+				"esbenp.prettier-vscode"
+			]
+		}
+	}
+}

@@ -1,0 +1,13 @@
+{
+	"$schema": "https://unpkg.com/@changesets/config@3.1.1/schema.json",
+	"changelog": "@changesets/cli/changelog",
+	"commit": false,
+	"fixed": [
+		["@kafkats/client", "@kafkats/flow", "@kafkats/codec-zod", "@kafkats/flow-state-lmdb"]
+	],
+	"linked": [],
+	"access": "public",
+	"baseBranch": "main",
+	"updateInternalDependencies": "patch",
+	"ignore": ["@kafkats/benchmark", "@kafkats/docs"]
+}

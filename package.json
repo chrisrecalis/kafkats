@@ -1,0 +1,27 @@
+{
+	"name": "kafkats-workspace",
+	"private": true,
+	"version": "0.0.0",
+	"license": "MIT",
+	"type": "module",
+	"packageManager": "pnpm@10.11.0",
+	"scripts": {
+		"lint": "eslint \"packages/**/*.{ts,tsx}\"",
+		"lint:fix": "eslint \"packages/**/*.{ts,tsx}\" --fix",
+		"format": "prettier --write \"packages/**/*.{ts,tsx,json,md}\"",
+		"docs:dev": "pnpm -C packages/docs dev",
+		"docs:build": "pnpm -C packages/docs build",
+		"docs:preview": "pnpm -C packages/docs preview",
+		"version-packages": "changeset version",
+		"release": "changeset publish"
+	},
+	"devDependencies": {
+		"@changesets/cli": "^2.29.8",
+		"@eslint/js": "^9.39.1",
+		"eslint": "^9.39.1",
+		"eslint-plugin-prettier": "^5.5.4",
+		"globals": "^16.5.0",
+		"prettier": "^3.6.2",
+		"typescript-eslint": "^8.47.0"
+	}
+}
