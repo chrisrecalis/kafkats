@@ -3,6 +3,7 @@ import { defineConfig } from 'vitepress'
 export default defineConfig({
 	title: 'kafkats',
 	description: 'Pure-protocol Kafka client and streams library for TypeScript',
+	base: '/kafkats/',
 
 	head: [
 		['link', { rel: 'icon', href: '/favicon.ico' }],
@@ -160,7 +161,7 @@ export default defineConfig({
 			],
 		},
 
-		socialLinks: [{ icon: 'github', link: 'https://github.com/kafkats/kafkats' }],
+		socialLinks: [{ icon: 'github', link: 'https://github.com/chrisrecalis/kafkats' }],
 
 		footer: {
 			message: 'Released under the MIT License.',
@@ -172,7 +173,7 @@ export default defineConfig({
 		},
 
 		editLink: {
-			pattern: 'https://github.com/kafkats/kafkats/edit/main/packages/docs/:path',
+			pattern: 'https://github.com/chrisrecalis/kafkats/edit/main/packages/docs/:path',
 			text: 'Edit this page on GitHub',
 		},
 
