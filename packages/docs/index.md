@@ -14,7 +14,7 @@ hero:
           link: /guide/
         - theme: alt
           text: View on GitHub
-          link: https://github.com/kafkats/kafkats
+          link: https://github.com/chrisrecalis/kafkats
 
 features:
     - icon: ⚡
