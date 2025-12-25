@@ -87,8 +87,8 @@ const producer = client.producer({
 	acks: 'all',
 })
 
+consumer.subscribe('input')
 await consumer.runEach(
-	'input',
 	async (message, ctx) => {
 		// Process message
 		const result = await transform(message.value)

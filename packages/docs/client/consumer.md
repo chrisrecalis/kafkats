@@ -18,16 +18,61 @@ const consumer = client.consumer({
 })
 ```
 
-## Subscriptions
+## Subscribing to Topics
 
-`runEach()`, `runBatch()`, and `stream()` take a `subscription` argument.
+Before consuming messages, you must subscribe to topics using `subscribe()` or manually assign partitions using `assign()`.
 
-| Subscription               | What it does                       | Example                                                   |
-| -------------------------- | ---------------------------------- | --------------------------------------------------------- |
-| Topic name                 | Consume raw `Buffer` key/value     | `consumer.runEach('events', handler)`                     |
-| Multiple topics            | Consume multiple topics at once    | `consumer.runEach(['events', 'logs'], handler)`           |
-| Typed topic (`topic(...)`) | Decode with codecs and infer types | `consumer.runEach(userEvents, handler)`                   |
-| Custom subscription        | Provide explicit decoders          | `consumer.runEach({ topic: 'events', decoder }, handler)` |
+### subscribe()
+
+Use `subscribe()` for group-managed partition assignment. The group coordinator automatically assigns partitions and handles rebalancing when consumers join or leave.
+
+```typescript
+// Subscribe to a single topic
+consumer.subscribe('events')
+
+// Subscribe to multiple topics
+consumer.subscribe(['events', 'logs'])
+
+// Subscribe with a typed topic definition
+consumer.subscribe(userEvents)
+```
+
+| Subscription               | What it does                       | Example                                       |
+| -------------------------- | ---------------------------------- | --------------------------------------------- |
+| Topic name                 | Consume raw `Buffer` key/value     | `consumer.subscribe('events')`                |
+| Multiple topics            | Consume multiple topics at once    | `consumer.subscribe(['events', 'logs'])`      |
+| Typed topic (`topic(...)`) | Decode with codecs and infer types | `consumer.subscribe(userEvents)`              |
+| Custom subscription        | Provide explicit decoders          | `consumer.subscribe({ topic: 'events', decoder })` |
+
+### assign()
+
+Use `assign()` for manual partition assignment. You directly control which partitions to consume without group coordination.
+
+```typescript
+// Manually assign specific partitions
+consumer.assign([
+	{ topic: 'events', partition: 0, offset: 0n },
+	{ topic: 'events', partition: 1, offset: 0n },
+])
+
+// Use -1n to use autoOffsetReset setting
+consumer.assign([
+	{ topic: 'events', partition: 0, offset: -1n },
+])
+
+// With typed decoders
+consumer.assign(
+	[{ topic: 'events', partition: 0, offset: 0n }],
+	{ subscription: userEvents }
+)
+```
+
+| Feature | `subscribe()` | `assign()` |
+|---------|---------------|-----------|
+| Partition assignment | Automatic (group coordinator) | Manual (you specify) |
+| Rebalancing | Yes - partitions reassigned on member changes | No - static assignment |
+| Consumer group | Required | Optional |
+| Use case | Horizontal scaling, failover | Replay, testing, manual control |
 
 ## Processing Messages
 
@@ -36,7 +81,9 @@ const consumer = client.consumer({
 Process messages one at a time:
 
 ```typescript
-await consumer.runEach('events', async (message, ctx) => {
+consumer.subscribe('events')
+
+await consumer.runEach(async (message, ctx) => {
 	console.log({
 		topic: ctx.topic,
 		partition: ctx.partition,
@@ -52,8 +99,9 @@ await consumer.runEach('events', async (message, ctx) => {
 Process messages in batches for higher throughput:
 
 ```typescript
+consumer.subscribe('events')
+
 await consumer.runBatch(
-	'events',
 	async (messages, ctx) => {
 		console.log(`Received ${messages.length} messages from ${ctx.topic}[${ctx.partition}]`)
 
@@ -73,7 +121,9 @@ await consumer.runBatch(
 Consume messages via `for await ... of`:
 
 ```typescript
-for await (const { message, ctx } of consumer.stream('events')) {
+consumer.subscribe('events')
+
+for await (const { message, ctx } of consumer.stream()) {
 	console.log(ctx.topic, ctx.partition, ctx.offset, message.value)
 }
 ```
@@ -106,7 +156,9 @@ interface ConsumeContext {
 Use the signal to cancel long-running operations:
 
 ```typescript
-await consumer.runEach('events', async (message, ctx) => {
+consumer.subscribe('events')
+
+await consumer.runEach(async (message, ctx) => {
 	const response = await fetch(url, { signal: ctx.signal })
 	// ...
 })
@@ -129,7 +181,9 @@ const userEvents = topic('user-events', {
 	value: json<UserEvent>(),
 })
 
-await consumer.runEach(userEvents, async message => {
+consumer.subscribe(userEvents)
+
+await consumer.runEach(async message => {
 	// message.key: string
 	// message.value: UserEvent
 	console.log(`User ${message.value.userId}: ${message.value.action}`)
@@ -165,8 +219,10 @@ await consumer.runEach(userEvents, async message => {
 Control how many partitions are processed concurrently:
 
 ```typescript
+consumer.subscribe('events')
+
 // Process up to 4 partitions at the same time
-await consumer.runEach('events', handler, {
+await consumer.runEach(handler, {
 	partitionConcurrency: 4,
 })
 ```
@@ -179,7 +235,7 @@ Higher concurrency increases throughput but may cause out-of-order processing ac
 
 When `autoCommit: true` and `commitOffsets: true`, the consumer:
 
-- Marks offsets as “consumed” after your handler completes successfully.
+- Marks offsets as "consumed" after your handler completes successfully.
 - Commits pending offsets periodically (`autoCommitIntervalMs`) and once more during shutdown (unless the session is lost).
 
 If you set `autoCommit: false` (or `commitOffsets: false`), the consumer will not commit offsets. On restart it will resume from the last committed offsets (or apply `autoOffsetReset` if none exist).
@@ -190,7 +246,7 @@ The public consumer API currently focuses on automatic commits. If you need expl
 
 ## Backpressure: Pause and Resume
 
-Pause fetching from specific partitions while you’re overloaded:
+Pause fetching from specific partitions while you're overloaded:
 
 ```typescript
 consumer.pause([{ topic: 'events', partition: 0 }])
@@ -246,7 +302,8 @@ With static membership:
 Stop the consumer gracefully:
 
 ```typescript
-const run = consumer.runEach('events', handler)
+consumer.subscribe('events')
+const run = consumer.runEach(handler)
 
 // Later: stop consuming
 consumer.stop()
@@ -258,8 +315,10 @@ With abort signal:
 ```typescript
 const controller = new AbortController()
 
+consumer.subscribe('events')
+
 // Start consuming
-const run = consumer.runEach('events', handler, { signal: controller.signal })
+const run = consumer.runEach(handler, { signal: controller.signal })
 
 // Later: stop gracefully
 controller.abort()

@@ -39,7 +39,8 @@ Request took too long:
 import { TimeoutError } from '@kafkats/client'
 
 try {
-	await consumer.runEach('events', async () => {
+	consumer.subscribe('events')
+	await consumer.runEach(async () => {
 		// ...
 	})
 } catch (error) {
@@ -268,7 +269,8 @@ async function sendWithRetry(producer: Producer, topic: string, messages: Produc
 ### Dead Letter Queue
 
 ```typescript
-await consumer.runEach('my-topic', async (message, ctx) => {
+consumer.subscribe('my-topic')
+await consumer.runEach(async (message, ctx) => {
 	try {
 		await processMessage(message)
 	} catch (error) {

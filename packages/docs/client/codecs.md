@@ -66,7 +66,8 @@ const orders = topic('orders', {
 await producer.send(orders, [{ key: 'order-123', value: { orderId: 'order-123', status: 'created' } }])
 
 // Type-safe consumer
-await consumer.runEach(orders, async message => {
+consumer.subscribe(orders)
+await consumer.runEach(async message => {
 	// message.key: string
 	// message.value: OrderEvent
 })

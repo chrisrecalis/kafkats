@@ -74,8 +74,10 @@ const consumer = client.consumer({
 	autoOffsetReset: 'earliest',
 })
 
-// Process messages
-await consumer.runEach('my-topic', async (message, ctx) => {
+// Subscribe and process messages
+consumer.subscribe('my-topic')
+
+await consumer.runEach(async (message, ctx) => {
 	console.log(`${ctx.topic}[${ctx.partition}] @ ${ctx.offset}: ${message.value}`)
 })
 ```
@@ -109,7 +111,9 @@ await producer.send(userEvents, [
 ])
 
 // Consumer - type-inferred
-await consumer.runEach(userEvents, async message => {
+consumer.subscribe(userEvents)
+
+await consumer.runEach(async message => {
 	// message.key is string, message.value is UserEvent
 	console.log(`User ${message.value.userId} performed ${message.value.action}`)
 })

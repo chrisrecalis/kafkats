@@ -62,7 +62,8 @@ const consumer = client.consumer({
 })
 
 // Process messages one at a time
-await consumer.runEach('my-topic', async (message, ctx) => {
+consumer.subscribe('my-topic')
+await consumer.runEach(async (message, ctx) => {
 	console.log({
 		topic: ctx.topic,
 		partition: ctx.partition,
@@ -106,7 +107,8 @@ async function main() {
 	console.log('Waiting for messages...')
 
 	let seen = 0
-	await consumer.runEach('quickstart', async message => {
+	consumer.subscribe('quickstart')
+	await consumer.runEach(async message => {
 		console.log(`Received: ${message.key?.toString()} = ${message.value?.toString()}`)
 		if (++seen >= 2) consumer.stop()
 	})

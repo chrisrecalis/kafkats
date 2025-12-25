@@ -46,8 +46,8 @@ async function main() {
 		console.log('Waiting for messages...')
 
 		// Process messages
+		consumer.subscribe(userEvents)
 		await consumer.runEach(
-			userEvents,
 			async (message, ctx) => {
 				console.log(`[${ctx.topic}:${ctx.partition}] offset=${ctx.offset}`)
 				console.log(`  Key: ${message.key}`)
@@ -103,8 +103,8 @@ Consumer closed
 Process multiple messages at once:
 
 ```typescript
+consumer.subscribe(userEvents)
 await consumer.runBatch(
-	userEvents,
 	async (messages, ctx) => {
 		console.log(`Received ${messages.length} messages`)
 
@@ -124,7 +124,8 @@ await consumer.runBatch(
 Process multiple partitions concurrently:
 
 ```typescript
-await consumer.runEach(userEvents, handler, {
+consumer.subscribe(userEvents)
+await consumer.runEach(handler, {
 	partitionConcurrency: 4, // Process 4 partitions in parallel
 })
 ```
@@ -134,5 +135,6 @@ await consumer.runEach(userEvents, handler, {
 Subscribe to multiple topics:
 
 ```typescript
-await consumer.runEach(['events', 'logs', 'metrics'], handler)
+consumer.subscribe(['events', 'logs', 'metrics'])
+await consumer.runEach(handler)
 ```
