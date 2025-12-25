@@ -130,10 +130,10 @@ describe('Producer (integration) - key partitioning', () => {
 
 			const received: Array<{ key: string | null; value: string }> = []
 
+			consumer.subscribe(testTopic)
 			const run = consumer.runEach(
-				testTopic,
 				async message => {
-					received.push({ key: message.key, value: message.value })
+					received.push({ key: message.key as string | null, value: message.value as string })
 					if (received.length >= 2) {
 						consumer.stop()
 					}

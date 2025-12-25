@@ -34,8 +34,8 @@ describe('Consumer (integration) - headers', () => {
 
 			let receivedHeaders: Record<string, Buffer> | null = null
 
+			consumer.subscribe(testTopic)
 			const run = consumer.runEach(
-				testTopic,
 				async message => {
 					receivedHeaders = message.headers
 					consumer.stop()
@@ -81,8 +81,8 @@ describe('Consumer (integration) - headers', () => {
 
 			let receivedHeaders: Record<string, Buffer> | null = null
 
+			consumer.subscribe(testTopic)
 			const run = consumer.runEach(
-				testTopic,
 				async message => {
 					receivedHeaders = message.headers
 					consumer.stop()
@@ -133,8 +133,8 @@ describe('Consumer (integration) - headers', () => {
 
 			let receivedHeaders: Record<string, Buffer> | null = null
 
+			consumer.subscribe(testTopic)
 			const run = consumer.runEach(
-				testTopic,
 				async message => {
 					receivedHeaders = message.headers
 					consumer.stop()

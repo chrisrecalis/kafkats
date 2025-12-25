@@ -32,8 +32,8 @@ describe('Consumer (integration) - concurrency', () => {
 			const finished = new Set<number>()
 			const handlerSleepMs = 1200
 
+			consumer.subscribe(testTopic)
 			await consumer.runEach(
-				testTopic,
 				async message => {
 					if (!startedAt.has(message.partition)) {
 						startedAt.set(message.partition, Date.now())

@@ -102,8 +102,10 @@ async function benchmarkKafkaTsConsumer(
 	const abortController = new AbortController()
 	let startTime = 0
 
+	// Subscribe before running
+	consumer.subscribe(testTopic)
+
 	const runPromise = consumer.runEach(
-		testTopic,
 		() => {
 			const handlerStart = performance.now()
 			// Start timing from first message (after group join)

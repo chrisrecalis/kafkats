@@ -32,10 +32,10 @@ describe('Consumer (integration) - pause/resume', () => {
 				pauseResolve = resolve
 			})
 
+			consumer.subscribe(testTopic)
 			const runPromise = consumer.runEach(
-				testTopic,
 				async message => {
-					received.push(message.value)
+					received.push(message.value as string)
 
 					if (received.length === 1) {
 						consumer.pause([{ topic: message.topic, partition: message.partition }])
@@ -110,18 +110,18 @@ describe('Consumer (integration) - pause/resume', () => {
 			})
 			let pausedPartition0 = false
 
+			consumer.subscribe(testTopic)
 			const runPromise = consumer.runEach(
-				testTopic,
 				async message => {
 					if (message.partition === 0) {
-						p0.push(message.value)
+						p0.push(message.value as string)
 						if (!pausedPartition0) {
 							pausedPartition0 = true
 							consumer.pause([{ topic: message.topic, partition: 0 }])
 							pauseResolve()
 						}
 					} else if (message.partition === 1) {
-						p1.push(message.value)
+						p1.push(message.value as string)
 					}
 
 					if (p0.length >= 3 && p1.length >= 3) {

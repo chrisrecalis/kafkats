@@ -29,8 +29,8 @@ describe.concurrent('Producer (integration) - timestamps', () => {
 			const afterSend = Date.now()
 
 			let receivedTimestamp: bigint | null = null
+			consumer.subscribe(testTopic)
 			const runPromise = consumer.runEach(
-				testTopic,
 				async message => {
 					receivedTimestamp = message.timestamp
 					consumer.stop()
@@ -82,8 +82,8 @@ describe.concurrent('Producer (integration) - timestamps', () => {
 			await producer.flush()
 
 			let receivedTimestamp: bigint | null = null
+			consumer.subscribe(testTopic)
 			const runPromise = consumer.runEach(
-				testTopic,
 				async message => {
 					receivedTimestamp = message.timestamp
 					consumer.stop()

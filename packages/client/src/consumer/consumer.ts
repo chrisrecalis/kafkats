@@ -16,8 +16,6 @@ import type {
 	ConsumerEvents,
 	TopicSubscription,
 	SubscriptionInput,
-	MsgOf,
-	KeyOf,
 	Message,
 	ConsumeContext,
 	MessageHandler,
@@ -25,6 +23,7 @@ import type {
 	RunEachOptions,
 	RunBatchOptions,
 	TopicPartition,
+	TopicPartitionOffset,
 	ConsumerTraceFn,
 } from './types.js'
 import {
@@ -40,6 +39,11 @@ import { OffsetManager } from './offset-manager.js'
 import { FetchManager } from './fetch-manager.js'
 import { noopLogger, type Logger } from '@/logger.js'
 import { sleep } from '@/utils/sleep.js'
+
+/**
+ * Subscription mode: either group-managed (subscribe) or manual (assign)
+ */
+type SubscriptionMode = 'none' | 'subscribe' | 'assign'
 
 // Shared empty objects for common cases (optimization)
 const EMPTY_BUFFER = Buffer.alloc(0)
@@ -101,6 +105,11 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	private rebalanceRunner: Promise<void> | null = null
 	private rebalanceRequested = false
 
+	// Subscription state
+	private subscriptionMode: SubscriptionMode = 'none'
+	private subscriptions: TopicSubscription<unknown, unknown>[] = []
+	private manualAssignment: TopicPartitionOffset[] = []
+
 	constructor(cluster: Cluster, config: ConsumerConfig) {
 		super()
 		this.cluster = cluster
@@ -153,18 +162,79 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	}
 
 	/**
+	 * Subscribe to topics for group-managed partition assignment.
+	 *
+	 * When using subscribe, partitions are automatically assigned by the group
+	 * coordinator and rebalanced when group membership changes.
+	 *
+	 * @param subscription - Topics to subscribe to (strings, TopicSubscription, or TopicDefinition)
+	 * @throws If already subscribed or assigned
+	 */
+	subscribe<S extends SubscriptionInput>(subscription: S): void {
+		if (this.state !== 'idle') {
+			throw new Error('Cannot subscribe while consumer is running. Call stop() first.')
+		}
+		if (this.subscriptionMode === 'assign') {
+			throw new Error('Cannot subscribe after assign(). Use either subscribe() or assign(), not both.')
+		}
+
+		this.subscriptionMode = 'subscribe'
+		this.subscriptions = this.normalizeSubscription(subscription)
+		this.manualAssignment = []
+
+		this.logger.debug('subscribed to topics', { topics: this.subscriptions.map(s => s.topic) })
+	}
+
+	/**
+	 * Manually assign specific topic partitions to consume from.
+	 *
+	 * When using assign, there is no group coordination - you directly control
+	 * which partitions are consumed. No rebalancing will occur.
+	 *
+	 * @param partitions - Topic partitions to assign with optional starting offsets
+	 * @param options - Optional subscription options for decoders
+	 * @throws If already subscribed or assigned
+	 */
+	assign<S extends SubscriptionInput>(partitions: TopicPartitionOffset[], options?: { subscription?: S }): void {
+		if (this.state !== 'idle') {
+			throw new Error('Cannot assign while consumer is running. Call stop() first.')
+		}
+		if (this.subscriptionMode === 'subscribe') {
+			throw new Error('Cannot assign after subscribe(). Use either subscribe() or assign(), not both.')
+		}
+
+		this.subscriptionMode = 'assign'
+		this.manualAssignment = partitions
+
+		// If subscription options provided, use them for decoders
+		// Otherwise create basic subscriptions from partition topics
+		if (options?.subscription) {
+			this.subscriptions = this.normalizeSubscription(options.subscription)
+		} else {
+			// Create basic subscriptions from partition topics (no decoders, raw Buffer)
+			const topics = [...new Set(partitions.map(p => p.topic))]
+			this.subscriptions = topics.map(topic => toTopicSubscription(topic))
+		}
+
+		this.logger.debug('assigned partitions', {
+			partitions: partitions.map(p => `${p.topic}-${p.partition}`),
+		})
+	}
+
+	/**
 	 * Run the consumer loop processing one message at a time
+	 *
+	 * Call subscribe() or assign() before calling runEach().
 	 *
 	 * - One consumer → one run. Calling runEach() again while active throws.
 	 * - Resolves when stop() is called, options.signal aborts, or a fatal error occurs.
 	 */
-	async runEach<S extends SubscriptionInput>(
-		subscription: S,
-		handler: MessageHandler<MsgOf<S>, KeyOf<S>>,
-		options?: RunEachOptions
-	): Promise<void> {
+	async runEach<V = unknown, K = unknown>(handler: MessageHandler<V, K>, options?: RunEachOptions): Promise<void> {
 		if (this.state !== 'idle') {
 			throw new Error('Consumer is already running. Call stop() first.')
+		}
+		if (this.subscriptionMode === 'none') {
+			throw new Error('No subscription. Call subscribe() or assign() before runEach().')
 		}
 
 		this.state = 'running'
@@ -185,20 +255,20 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		}
 
 		try {
-			// Normalize subscription to array
-			const subscriptions = this.normalizeSubscription(subscription)
+			const subscriptions = this.subscriptions
 			const topics = subscriptions.map(s => s.topic)
 
-			this.logger.info('starting consumer', { topics, mode: 'each' })
+			this.logger.info('starting consumer', { topics, mode: 'each', subscriptionMode: this.subscriptionMode })
 
-			// Create components
-			this.consumerGroup = new ConsumerGroup(this.cluster, this.config, this.logger)
+			// Create offset manager (always needed for offset tracking)
 			this.offsetManager = new OffsetManager(
 				this.cluster,
 				this.config.groupId,
 				this.config.groupInstanceId,
 				this.logger
 			)
+
+			// Create fetch manager
 			this.fetchManager = new FetchManager(
 				this.cluster,
 				this.offsetManager,
@@ -214,70 +284,87 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 				this.logger
 			)
 
-			// Handle rebalance
-			this.consumerGroup.on('rebalance', () => {
-				this.logger.debug('rebalance event received')
-				this.emit('rebalance')
-				this.rebalanceRequested = true
-				if (this.rebalanceRunner) {
-					return
-				}
+			let initialAssignment: TopicPartition[]
 
-				this.rebalanceRunner = (async () => {
-					while (this.rebalanceRequested && this.state === 'running') {
-						this.rebalanceRequested = false
-						await this.handleRebalance(subscriptions)
+			if (this.subscriptionMode === 'subscribe') {
+				// Group-managed mode: create consumer group and join
+				this.consumerGroup = new ConsumerGroup(this.cluster, this.config, this.logger)
+
+				// Handle rebalance
+				this.consumerGroup.on('rebalance', () => {
+					this.logger.debug('rebalance event received')
+					this.emit('rebalance')
+					this.rebalanceRequested = true
+					if (this.rebalanceRunner) {
+						return
 					}
-				})()
-					.catch(error => {
-						const err = error instanceof Error ? error : new Error(String(error))
-						this.logger.error('rebalance handler failed', { error: err.message })
+
+					this.rebalanceRunner = (async () => {
+						while (this.rebalanceRequested && this.state === 'running') {
+							this.rebalanceRequested = false
+							await this.handleRebalance(subscriptions)
+						}
+					})()
+						.catch(error => {
+							const err = error instanceof Error ? error : new Error(String(error))
+							this.logger.error('rebalance handler failed', { error: err.message })
+							if (this.runPromiseReject) {
+								this.runPromiseReject(err)
+								this.runPromiseReject = null
+								this.runPromiseResolve = null
+							} else {
+								this.emitError(err)
+							}
+							this.stop()
+						})
+						.finally(() => {
+							this.rebalanceRunner = null
+						})
+				})
+
+				this.consumerGroup.on('sessionLost', (partitions: TopicPartition[]) => {
+					this.logger.info('session lost, partitions cannot be committed', {
+						partitionCount: partitions.length,
+					})
+					this.sessionLost = true
+					this.offsetManager?.clearPartitions(partitions)
+					this.fetchManager?.removePartitions(partitions)
+					this.emit('partitionsLost', partitions)
+				})
+
+				this.consumerGroup.on('error', (error: Error) => {
+					const err = error instanceof Error ? error : new Error(String(error))
+
+					if (err instanceof KafkaProtocolError && err.errorCode === ErrorCode.FencedInstanceId) {
+						this.emitError(err)
 						if (this.runPromiseReject) {
 							this.runPromiseReject(err)
 							this.runPromiseReject = null
 							this.runPromiseResolve = null
-						} else {
-							this.emitError(err)
 						}
 						this.stop()
-					})
-					.finally(() => {
-						this.rebalanceRunner = null
-					})
-			})
-
-			this.consumerGroup.on('sessionLost', (partitions: TopicPartition[]) => {
-				this.logger.info('session lost, partitions cannot be committed', { partitionCount: partitions.length })
-				this.sessionLost = true
-				this.offsetManager?.clearPartitions(partitions)
-				this.fetchManager?.removePartitions(partitions)
-				this.emit('partitionsLost', partitions)
-			})
-
-			this.consumerGroup.on('error', (error: Error) => {
-				const err = error instanceof Error ? error : new Error(String(error))
-
-				if (err instanceof KafkaProtocolError && err.errorCode === ErrorCode.FencedInstanceId) {
-					this.emitError(err)
-					if (this.runPromiseReject) {
-						this.runPromiseReject(err)
-						this.runPromiseReject = null
-						this.runPromiseResolve = null
+						return
 					}
-					this.stop()
-					return
-				}
 
-				this.emitError(err)
-			})
+					this.emitError(err)
+				})
 
-			this.logger.debug('joining group', { topics })
-			const joinResult = await this.consumerGroup.join(topics)
-			this.logger.info('group joined', { assignedPartitions: joinResult.assignment.length })
-			await this.setupPartitions(subscriptions, joinResult.assignment)
+				this.logger.debug('joining group', { topics })
+				const joinResult = await this.consumerGroup.join(topics)
+				this.logger.info('group joined', { assignedPartitions: joinResult.assignment.length })
+				await this.setupPartitions(subscriptions, joinResult.assignment)
+				initialAssignment = joinResult.assignment
+			} else {
+				// Manual assignment mode: use assigned partitions directly
+				this.logger.debug('using manual assignment', {
+					partitions: this.manualAssignment.map(p => `${p.topic}-${p.partition}`),
+				})
+				await this.setupManualPartitions(this.manualAssignment)
+				initialAssignment = this.manualAssignment.map(p => ({ topic: p.topic, partition: p.partition }))
+			}
 
-			if (joinResult.assignment.length > 0) {
-				this.emit('partitionsAssigned', joinResult.assignment)
+			if (initialAssignment.length > 0) {
+				this.emit('partitionsAssigned', initialAssignment)
 			}
 
 			this.emit('running')
@@ -323,17 +410,18 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	/**
 	 * Run the consumer loop processing messages in batches
 	 *
+	 * Call subscribe() or assign() before calling runBatch().
+	 *
 	 * - One consumer → one run. Calling runBatch() again while active throws.
 	 * - Resolves when stop() is called, options.signal aborts, or a fatal error occurs.
 	 * - Offsets are only marked as consumed after the batch handler completes successfully.
 	 */
-	async runBatch<S extends SubscriptionInput>(
-		subscription: S,
-		handler: BatchHandler<MsgOf<S>, KeyOf<S>>,
-		options?: RunBatchOptions
-	): Promise<void> {
+	async runBatch<V = unknown, K = unknown>(handler: BatchHandler<V, K>, options?: RunBatchOptions): Promise<void> {
 		if (this.state !== 'idle') {
 			throw new Error('Consumer is already running. Call stop() first.')
+		}
+		if (this.subscriptionMode === 'none') {
+			throw new Error('No subscription. Call subscribe() or assign() before runBatch().')
 		}
 
 		this.state = 'running'
@@ -354,20 +442,20 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		}
 
 		try {
-			// Normalize subscription to array
-			const subscriptions = this.normalizeSubscription(subscription)
+			const subscriptions = this.subscriptions
 			const topics = subscriptions.map(s => s.topic)
 
-			this.logger.info('starting consumer', { topics, mode: 'batch' })
+			this.logger.info('starting consumer', { topics, mode: 'batch', subscriptionMode: this.subscriptionMode })
 
-			// Create components
-			this.consumerGroup = new ConsumerGroup(this.cluster, this.config, this.logger)
+			// Create offset manager (always needed for offset tracking)
 			this.offsetManager = new OffsetManager(
 				this.cluster,
 				this.config.groupId,
 				this.config.groupInstanceId,
 				this.logger
 			)
+
+			// Create fetch manager
 			this.fetchManager = new FetchManager(
 				this.cluster,
 				this.offsetManager,
@@ -382,70 +470,87 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 				this.logger
 			)
 
-			// Handle rebalance
-			this.consumerGroup.on('rebalance', () => {
-				this.logger.debug('rebalance event received')
-				this.emit('rebalance')
-				this.rebalanceRequested = true
-				if (this.rebalanceRunner) {
-					return
-				}
+			let initialAssignment: TopicPartition[]
 
-				this.rebalanceRunner = (async () => {
-					while (this.rebalanceRequested && this.state === 'running') {
-						this.rebalanceRequested = false
-						await this.handleRebalance(subscriptions)
+			if (this.subscriptionMode === 'subscribe') {
+				// Group-managed mode: create consumer group and join
+				this.consumerGroup = new ConsumerGroup(this.cluster, this.config, this.logger)
+
+				// Handle rebalance
+				this.consumerGroup.on('rebalance', () => {
+					this.logger.debug('rebalance event received')
+					this.emit('rebalance')
+					this.rebalanceRequested = true
+					if (this.rebalanceRunner) {
+						return
 					}
-				})()
-					.catch(error => {
-						const err = error instanceof Error ? error : new Error(String(error))
-						this.logger.error('rebalance handler failed', { error: err.message })
+
+					this.rebalanceRunner = (async () => {
+						while (this.rebalanceRequested && this.state === 'running') {
+							this.rebalanceRequested = false
+							await this.handleRebalance(subscriptions)
+						}
+					})()
+						.catch(error => {
+							const err = error instanceof Error ? error : new Error(String(error))
+							this.logger.error('rebalance handler failed', { error: err.message })
+							if (this.runPromiseReject) {
+								this.runPromiseReject(err)
+								this.runPromiseReject = null
+								this.runPromiseResolve = null
+							} else {
+								this.emitError(err)
+							}
+							this.stop()
+						})
+						.finally(() => {
+							this.rebalanceRunner = null
+						})
+				})
+
+				this.consumerGroup.on('sessionLost', (partitions: TopicPartition[]) => {
+					this.logger.info('session lost, partitions cannot be committed', {
+						partitionCount: partitions.length,
+					})
+					this.sessionLost = true
+					this.offsetManager?.clearPartitions(partitions)
+					this.fetchManager?.removePartitions(partitions)
+					this.emit('partitionsLost', partitions)
+				})
+
+				this.consumerGroup.on('error', (error: Error) => {
+					const err = error instanceof Error ? error : new Error(String(error))
+
+					if (err instanceof KafkaProtocolError && err.errorCode === ErrorCode.FencedInstanceId) {
+						this.emitError(err)
 						if (this.runPromiseReject) {
 							this.runPromiseReject(err)
 							this.runPromiseReject = null
 							this.runPromiseResolve = null
-						} else {
-							this.emitError(err)
 						}
 						this.stop()
-					})
-					.finally(() => {
-						this.rebalanceRunner = null
-					})
-			})
-
-			this.consumerGroup.on('sessionLost', (partitions: TopicPartition[]) => {
-				this.logger.info('session lost, partitions cannot be committed', { partitionCount: partitions.length })
-				this.sessionLost = true
-				this.offsetManager?.clearPartitions(partitions)
-				this.fetchManager?.removePartitions(partitions)
-				this.emit('partitionsLost', partitions)
-			})
-
-			this.consumerGroup.on('error', (error: Error) => {
-				const err = error instanceof Error ? error : new Error(String(error))
-
-				if (err instanceof KafkaProtocolError && err.errorCode === ErrorCode.FencedInstanceId) {
-					this.emitError(err)
-					if (this.runPromiseReject) {
-						this.runPromiseReject(err)
-						this.runPromiseReject = null
-						this.runPromiseResolve = null
+						return
 					}
-					this.stop()
-					return
-				}
 
-				this.emitError(err)
-			})
+					this.emitError(err)
+				})
 
-			this.logger.debug('joining group', { topics })
-			const joinResult = await this.consumerGroup.join(topics)
-			this.logger.info('group joined', { assignedPartitions: joinResult.assignment.length })
-			await this.setupPartitions(subscriptions, joinResult.assignment)
+				this.logger.debug('joining group', { topics })
+				const joinResult = await this.consumerGroup.join(topics)
+				this.logger.info('group joined', { assignedPartitions: joinResult.assignment.length })
+				await this.setupPartitions(subscriptions, joinResult.assignment)
+				initialAssignment = joinResult.assignment
+			} else {
+				// Manual assignment mode: use assigned partitions directly
+				this.logger.debug('using manual assignment', {
+					partitions: this.manualAssignment.map(p => `${p.topic}-${p.partition}`),
+				})
+				await this.setupManualPartitions(this.manualAssignment)
+				initialAssignment = this.manualAssignment.map(p => ({ topic: p.topic, partition: p.partition }))
+			}
 
-			if (joinResult.assignment.length > 0) {
-				this.emit('partitionsAssigned', joinResult.assignment)
+			if (initialAssignment.length > 0) {
+				this.emit('partitionsAssigned', initialAssignment)
 			}
 
 			this.emit('running')
@@ -488,14 +593,17 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	/**
 	 * Async iterator mode
 	 *
+	 * Call subscribe() or assign() before calling stream().
+	 *
 	 * - Also single-run: calling stream() during run() throws.
 	 * - Returns one message at a time.
 	 */
-	async *stream<S extends SubscriptionInput>(
-		subscription: S
-	): AsyncIterable<{ message: Message<MsgOf<S>, KeyOf<S>>; ctx: ConsumeContext }> {
+	async *stream<V = unknown, K = unknown>(): AsyncIterable<{ message: Message<V, K>; ctx: ConsumeContext }> {
 		if (this.state !== 'idle') {
 			throw new Error('Consumer is already running. Call stop() first.')
+		}
+		if (this.subscriptionMode === 'none') {
+			throw new Error('No subscription. Call subscribe() or assign() before stream().')
 		}
 
 		this.state = 'running'
@@ -504,13 +612,13 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		this.sessionLost = false
 
 		try {
-			// Normalize subscription to array
-			const subscriptions = this.normalizeSubscription(subscription)
+			const subscriptions = this.subscriptions
 			const topics = subscriptions.map(s => s.topic)
 
-			// Create components
-			this.consumerGroup = new ConsumerGroup(this.cluster, this.config)
+			// Create offset manager (always needed for offset tracking)
 			this.offsetManager = new OffsetManager(this.cluster, this.config.groupId, this.config.groupInstanceId)
+
+			// Create fetch manager
 			this.fetchManager = new FetchManager(this.cluster, this.offsetManager, this.config.autoOffsetReset, {
 				maxBytesPerPartition: this.config.maxBytesPerPartition,
 				minBytes: this.config.minBytes,
@@ -519,36 +627,50 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 				isolationLevel: this.config.isolationLevel,
 			})
 
-			// Handle rebalance
+			let initialAssignment: TopicPartition[]
 			let pendingRebalance = false
-			this.consumerGroup.on('rebalance', () => {
-				pendingRebalance = true
-				this.emit('rebalance')
-			})
 
-			this.consumerGroup.on('sessionLost', (partitions: TopicPartition[]) => {
-				this.logger.info('session lost, partitions cannot be committed', { partitionCount: partitions.length })
-				this.sessionLost = true
-				this.offsetManager?.clearPartitions(partitions)
-				this.fetchManager?.removePartitions(partitions)
-				this.emit('partitionsLost', partitions)
-			})
+			if (this.subscriptionMode === 'subscribe') {
+				// Group-managed mode: create consumer group and join
+				this.consumerGroup = new ConsumerGroup(this.cluster, this.config)
 
-			this.consumerGroup.on('error', (error: Error) => {
-				const err = error instanceof Error ? error : new Error(String(error))
-				this.emitError(err)
+				// Handle rebalance
+				this.consumerGroup.on('rebalance', () => {
+					pendingRebalance = true
+					this.emit('rebalance')
+				})
 
-				if (err instanceof KafkaProtocolError && err.errorCode === ErrorCode.FencedInstanceId) {
-					this.stop()
-				}
-			})
+				this.consumerGroup.on('sessionLost', (partitions: TopicPartition[]) => {
+					this.logger.info('session lost, partitions cannot be committed', {
+						partitionCount: partitions.length,
+					})
+					this.sessionLost = true
+					this.offsetManager?.clearPartitions(partitions)
+					this.fetchManager?.removePartitions(partitions)
+					this.emit('partitionsLost', partitions)
+				})
 
-			const joinResult = await this.consumerGroup.join(topics)
-			await this.setupPartitions(subscriptions, joinResult.assignment)
+				this.consumerGroup.on('error', (error: Error) => {
+					const err = error instanceof Error ? error : new Error(String(error))
+					this.emitError(err)
 
-			// Emit partitionsAssigned for initial join
-			if (joinResult.assignment.length > 0) {
-				this.emit('partitionsAssigned', joinResult.assignment)
+					if (err instanceof KafkaProtocolError && err.errorCode === ErrorCode.FencedInstanceId) {
+						this.stop()
+					}
+				})
+
+				const joinResult = await this.consumerGroup.join(topics)
+				await this.setupPartitions(subscriptions, joinResult.assignment)
+				initialAssignment = joinResult.assignment
+			} else {
+				// Manual assignment mode: use assigned partitions directly
+				await this.setupManualPartitions(this.manualAssignment)
+				initialAssignment = this.manualAssignment.map(p => ({ topic: p.topic, partition: p.partition }))
+			}
+
+			// Emit partitionsAssigned for initial assignment
+			if (initialAssignment.length > 0) {
+				this.emit('partitionsAssigned', initialAssignment)
 			}
 
 			this.emit('running')
@@ -619,8 +741,8 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 
 			// Yield messages
 			while (this.state === 'running' && !this.abortController.signal.aborted) {
-				// Handle rebalance
-				if (pendingRebalance) {
+				// Handle rebalance (only in subscribe mode)
+				if (pendingRebalance && this.subscriptionMode === 'subscribe') {
 					pendingRebalance = false
 					await this.handleStreamRebalance(
 						subscriptions,
@@ -644,7 +766,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 				// Yield all queued messages
 				while (messageQueue.length > 0) {
 					const item = messageQueue.shift()!
-					yield item as { message: Message<MsgOf<S>, KeyOf<S>>; ctx: ConsumeContext }
+					yield item as { message: Message<V, K>; ctx: ConsumeContext }
 				}
 			}
 
@@ -726,6 +848,44 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			)
 
 			partitionsWithOffsets.push({ ...tp, offset })
+		}
+
+		// Update fetch manager
+		fetchManager.setPartitions(partitionsWithOffsets)
+	}
+
+	/**
+	 * Set up partitions for manual assignment mode (no group coordination)
+	 */
+	private async setupManualPartitions(partitions: TopicPartitionOffset[]): Promise<void> {
+		const offsetManager = this.offsetManager
+		const fetchManager = this.fetchManager
+
+		if (!offsetManager || !fetchManager) {
+			return
+		}
+
+		// For manual assignment, we don't need group state updates
+		// Offsets are either provided explicitly or resolved from autoOffsetReset
+		const partitionsWithOffsets: Array<TopicPartition & { offset: bigint }> = []
+
+		for (const tp of partitions) {
+			// If offset is provided (>= 0), use it directly
+			// Otherwise resolve based on autoOffsetReset
+			let offset: bigint
+			if (tp.offset >= 0n) {
+				offset = tp.offset
+			} else {
+				// Resolve starting offset (earliest/latest based on config)
+				offset = await offsetManager.resolveStartingOffset(
+					tp.topic,
+					tp.partition,
+					this.config.autoOffsetReset,
+					new Map() // No committed offsets in manual mode
+				)
+			}
+
+			partitionsWithOffsets.push({ topic: tp.topic, partition: tp.partition, offset })
 		}
 
 		// Update fetch manager

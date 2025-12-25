@@ -29,10 +29,10 @@ describe('Consumer (integration) - commit disabled', () => {
 			const consumer1 = client.consumer({ groupId, autoOffsetReset: 'earliest' })
 			const seen1: string[] = []
 
+			consumer1.subscribe(testTopic)
 			const run1 = consumer1.runEach(
-				testTopic,
 				async message => {
-					seen1.push(message.value)
+					seen1.push(message.value as string)
 					if (seen1.length >= 3) {
 						consumer1.stop()
 					}
@@ -54,10 +54,10 @@ describe('Consumer (integration) - commit disabled', () => {
 			const consumer2 = client.consumer({ groupId, autoOffsetReset: 'earliest' })
 			const seen2: string[] = []
 
+			consumer2.subscribe(testTopic)
 			const run2 = consumer2.runEach(
-				testTopic,
 				async message => {
-					seen2.push(message.value)
+					seen2.push(message.value as string)
 					if (seen2.length >= 3) {
 						consumer2.stop()
 					}
@@ -132,10 +132,10 @@ describe('Consumer (integration) - commit disabled', () => {
 			const consumer2 = client.consumer({ groupId, autoOffsetReset: 'earliest' })
 			const seen2: string[] = []
 
+			consumer2.subscribe(testTopic)
 			const run2 = consumer2.runEach(
-				testTopic,
 				async message => {
-					seen2.push(message.value)
+					seen2.push(message.value as string)
 					consumer2.stop()
 				},
 				{ autoCommit: false }

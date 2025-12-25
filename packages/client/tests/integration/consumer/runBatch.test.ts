@@ -29,10 +29,10 @@ describe('Consumer (integration) - runBatch', () => {
 			const consumer = client.consumer({ groupId: uniqueName('it-group'), autoOffsetReset: 'earliest' })
 
 			const batches: string[][] = []
+			consumer.subscribe(testTopic)
 			await consumer.runBatch(
-				testTopic,
 				async batch => {
-					batches.push(batch.map(m => m.value))
+					batches.push(batch.map(m => m.value as string))
 					const total = batches.reduce((sum, b) => sum + b.length, 0)
 					if (total >= 10) {
 						consumer.stop()
@@ -73,10 +73,10 @@ describe('Consumer (integration) - runBatch', () => {
 			const consumer1 = client.consumer({ groupId, autoOffsetReset: 'earliest' })
 
 			const batches1: string[][] = []
+			consumer1.subscribe(testTopic)
 			const run1 = consumer1.runBatch(
-				testTopic,
 				async batch => {
-					batches1.push(batch.map(m => m.value))
+					batches1.push(batch.map(m => m.value as string))
 					throw new Error('boom')
 				},
 				{ autoCommit: false, maxBatchSize: 3, maxBatchWaitMs: 50 }
@@ -94,10 +94,10 @@ describe('Consumer (integration) - runBatch', () => {
 			// Since the batch handler failed, offsets should not be committed and a new consumer should re-read from the start
 			const consumer2 = client.consumer({ groupId, autoOffsetReset: 'earliest' })
 			const received2: string[] = []
+			consumer2.subscribe(testTopic)
 			const run2 = consumer2.runEach(
-				testTopic,
 				async message => {
-					received2.push(message.value)
+					received2.push(message.value as string)
 					if (received2.length >= 5) {
 						consumer2.stop()
 					}

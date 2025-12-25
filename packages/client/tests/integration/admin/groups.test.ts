@@ -47,7 +47,8 @@ describe.concurrent('Admin - Consumer Groups (integration)', () => {
 			const consumer = client.consumer({ groupId })
 
 			// Start consuming in the background
-			const consumePromise = consumer.runEach(testTopic, async () => {}, { autoCommit: false })
+			consumer.subscribe(testTopic)
+			const consumePromise = consumer.runEach(async () => {}, { autoCommit: false })
 
 			// Wait for the consumer to join the group
 			await waitUntilRunning(consumer, consumePromise)
@@ -87,7 +88,8 @@ describe.concurrent('Admin - Consumer Groups (integration)', () => {
 			const consumer = client.consumer({ groupId })
 
 			// Start consuming in the background
-			const consumePromise = consumer.runEach(testTopic, async () => {}, { autoCommit: false })
+			consumer.subscribe(testTopic)
+			const consumePromise = consumer.runEach(async () => {}, { autoCommit: false })
 
 			// Wait for the consumer to be stable and describe the group
 			await waitUntilRunning(consumer, consumePromise)
@@ -137,7 +139,8 @@ describe.concurrent('Admin - Consumer Groups (integration)', () => {
 			const consumer = client.consumer({ groupId })
 
 			// Start consuming briefly to create the group
-			const consumePromise = consumer.runEach(testTopic, async () => {}, { autoCommit: false })
+			consumer.subscribe(testTopic)
+			const consumePromise = consumer.runEach(async () => {}, { autoCommit: false })
 
 			// Wait for the consumer to join the group
 			await waitUntilRunning(consumer, consumePromise)
@@ -185,7 +188,8 @@ describe.concurrent('Admin - Consumer Groups (integration)', () => {
 			const consumer = client.consumer({ groupId })
 
 			// Start consuming in the background
-			const consumePromise = consumer.runEach(testTopic, async () => {}, { autoCommit: false })
+			consumer.subscribe(testTopic)
+			const consumePromise = consumer.runEach(async () => {}, { autoCommit: false })
 
 			// Wait for the consumer to join the group
 			await waitUntilRunning(consumer, consumePromise)
