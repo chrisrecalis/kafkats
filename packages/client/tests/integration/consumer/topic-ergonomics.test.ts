@@ -23,12 +23,12 @@ describe('Consumer (integration) - topic ergonomics', () => {
 
 			let received: Buffer | null = null as Buffer | null
 
+			consumer.subscribe(topicName)
 			await consumer.runEach(
-				topicName,
 				async message => {
-					expectTypeOf(message.value).toEqualTypeOf<Buffer>()
+					expectTypeOf(message.value).toEqualTypeOf<unknown>()
 					expect(Buffer.isBuffer(message.value)).toBe(true)
-					received = message.value
+					received = message.value as Buffer
 					consumer.stop()
 				},
 				{ autoCommit: false }
@@ -61,8 +61,8 @@ describe('Consumer (integration) - topic ergonomics', () => {
 
 			const received: string[] = []
 
+			consumer.subscribe(topicName)
 			await consumer.runBatch(
-				topicName,
 				async batch => {
 					if (batch.length === 0) {
 						return
@@ -73,11 +73,11 @@ describe('Consumer (integration) - topic ergonomics', () => {
 						return
 					}
 
-					expectTypeOf(first.value).toEqualTypeOf<Buffer>()
+					expectTypeOf(first.value).toEqualTypeOf<unknown>()
 
 					for (const msg of batch) {
 						expect(Buffer.isBuffer(msg.value)).toBe(true)
-						received.push(msg.value.toString('utf-8'))
+						received.push((msg.value as Buffer).toString('utf-8'))
 					}
 
 					if (received.length >= 3) {
@@ -109,10 +109,11 @@ describe('Consumer (integration) - topic ergonomics', () => {
 			const consumer = client.consumer({ groupId: uniqueName('it-group'), autoOffsetReset: 'earliest' })
 			const received: string[] = []
 
-			for await (const { message } of consumer.stream(topicName)) {
-				expectTypeOf(message.value).toEqualTypeOf<Buffer>()
+			consumer.subscribe(topicName)
+			for await (const { message } of consumer.stream()) {
+				expectTypeOf(message.value).toEqualTypeOf<unknown>()
 				expect(Buffer.isBuffer(message.value)).toBe(true)
-				received.push(message.value.toString('utf-8'))
+				received.push((message.value as Buffer).toString('utf-8'))
 				if (received.length >= 2) {
 					break
 				}
@@ -151,10 +152,10 @@ describe('Consumer (integration) - topic ergonomics', () => {
 			let gotBuffer = false
 			let gotString = false
 
+			consumer.subscribe([bufferTopicName, stringTopic] as const)
 			await consumer.runEach(
-				[bufferTopicName, stringTopic] as const,
 				async message => {
-					expectTypeOf(message.value).toEqualTypeOf<Buffer | string>()
+					expectTypeOf(message.value).toEqualTypeOf<unknown>()
 
 					if (message.topic === bufferTopicName) {
 						expect(Buffer.isBuffer(message.value)).toBe(true)
@@ -163,7 +164,7 @@ describe('Consumer (integration) - topic ergonomics', () => {
 					}
 					if (message.topic === stringTopicName) {
 						expect(typeof message.value).toBe('string')
-						expect(message.value).toBe('str')
+						expect(message.value as string).toBe('str')
 						gotString = true
 					}
 

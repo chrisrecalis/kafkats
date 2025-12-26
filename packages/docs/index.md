@@ -81,7 +81,8 @@ await producer.send('events', [{ value: JSON.stringify({ type: 'click', page: '/
 
 // Consumer
 const consumer = client.consumer({ groupId: 'my-group' })
-await consumer.runEach('events', async message => {
+consumer.subscribe('events')
+await consumer.runEach(async message => {
 	console.log('Received:', message.value.toString())
 })
 ```

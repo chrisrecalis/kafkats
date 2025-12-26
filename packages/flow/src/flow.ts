@@ -901,25 +901,24 @@ class FlowAppImpl implements FlowApp {
 			this.workers.push(worker)
 			this.attachConsumerEvents(consumer, worker)
 
+			// Subscribe to topics before starting consumer
+			consumer.subscribe(topics)
+
 			const runPromise = consumer
-				.runEach(
-					topics,
-					async (message, ctx) => {
-						// Run within worker context for changelog writes
-						await workerContextStorage.run(worker, async () => {
-							const sources = worker.sourcesByTopic.get(message.topic)
-							if (!sources) return
-							if (!this.eosEnabled) {
-								for (const source of sources) {
-									await source.handleMessage(message, ctx)
-								}
-								return
+				.runEach(async (message, ctx) => {
+					// Run within worker context for changelog writes
+					await workerContextStorage.run(worker, async () => {
+						const sources = worker.sourcesByTopic.get(message.topic)
+						if (!sources) return
+						if (!this.eosEnabled) {
+							for (const source of sources) {
+								await source.handleMessage(message, ctx)
 							}
-							await this.processInTransaction(message, ctx, sources, worker)
-						})
-					},
-					this.buildRunEachOptions()
-				)
+							return
+						}
+						await this.processInTransaction(message, ctx, sources, worker)
+					})
+				}, this.buildRunEachOptions())
 				.catch(err => {
 					this.lastError = err as Error
 					this.currentState = 'ERROR'

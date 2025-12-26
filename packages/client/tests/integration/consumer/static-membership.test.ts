@@ -34,10 +34,10 @@ describe('Consumer (integration) - static membership', () => {
 			})
 
 			const oldSeen: string[] = []
+			oldConsumer.subscribe(testTopic)
 			const oldRun = oldConsumer.runEach(
-				testTopic,
 				async message => {
-					oldSeen.push(message.value)
+					oldSeen.push(message.value as string)
 				},
 				{ autoCommit: false }
 			)
@@ -83,11 +83,12 @@ describe('Consumer (integration) - static membership', () => {
 			})
 
 			const newSeen: string[] = []
+			newConsumer.subscribe(testTopic)
 			const newRun = newConsumer.runEach(
-				testTopic,
 				async message => {
-					newSeen.push(message.value)
-					if (message.value === 'm-1') {
+					const value = message.value as string
+					newSeen.push(value)
+					if (value === 'm-1') {
 						newConsumer.stop()
 					}
 				},
@@ -166,10 +167,10 @@ describe('Consumer (integration) - static membership', () => {
 				aError = err
 			})
 
+			consumerA.subscribe(testTopic)
 			const runA = consumerA.runEach(
-				testTopic,
 				async message => {
-					aSeen.push(message.value)
+					aSeen.push(message.value as string)
 				},
 				{ autoCommit: false }
 			)
@@ -198,11 +199,12 @@ describe('Consumer (integration) - static membership', () => {
 			})
 
 			const bSeen: string[] = []
+			consumerB.subscribe(testTopic)
 			const runB = consumerB.runEach(
-				testTopic,
 				async message => {
-					bSeen.push(message.value)
-					if (message.value === 'b-0') {
+					const value = message.value as string
+					bSeen.push(value)
+					if (value === 'b-0') {
 						consumerB.stop()
 					}
 				},

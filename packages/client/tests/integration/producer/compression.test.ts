@@ -28,10 +28,10 @@ describe.concurrent('Producer (integration) - compression', () => {
 			await producer.flush()
 
 			const received: string[] = []
+			consumer.subscribe(testTopic)
 			const runPromise = consumer.runEach(
-				testTopic,
 				async message => {
-					received.push(message.value)
+					received.push(message.value as string)
 					if (received.length >= 10) {
 						consumer.stop()
 					}
@@ -79,10 +79,10 @@ describe.concurrent('Producer (integration) - compression', () => {
 			await producer.flush()
 
 			let receivedValue: Buffer | null = null
+			consumer.subscribe(topicName)
 			const runPromise = consumer.runEach(
-				topicName,
 				async message => {
-					receivedValue = message.value
+					receivedValue = message.value as Buffer
 					consumer.stop()
 				},
 				{ autoCommit: false }
@@ -130,10 +130,10 @@ describe.concurrent('Producer (integration) - compression', () => {
 			await producer.flush()
 
 			let received: string | null = null
+			consumer.subscribe(testTopic)
 			const runPromise = consumer.runEach(
-				testTopic,
 				async message => {
-					received = message.value
+					received = message.value as string
 					consumer.stop()
 				},
 				{ autoCommit: false }

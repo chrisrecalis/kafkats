@@ -29,10 +29,10 @@ describe('Consumer (integration) - ordering', () => {
 
 			const received: string[] = []
 
+			consumer.subscribe(testTopic)
 			const run = consumer.runEach(
-				testTopic,
 				async message => {
-					received.push(message.value)
+					received.push(message.value as string)
 					if (received.length >= 100) {
 						consumer.stop()
 					}
@@ -84,14 +84,14 @@ describe('Consumer (integration) - ordering', () => {
 
 			const receivedByPartition = new Map<number, string[]>()
 
+			consumer.subscribe(testTopic)
 			const run = consumer.runEach(
-				testTopic,
 				async message => {
 					const partition = message.partition
 					if (!receivedByPartition.has(partition)) {
 						receivedByPartition.set(partition, [])
 					}
-					receivedByPartition.get(partition)!.push(message.value)
+					receivedByPartition.get(partition)!.push(message.value as string)
 
 					// Count total messages received
 					let total = 0
@@ -148,8 +148,8 @@ describe('Consumer (integration) - ordering', () => {
 
 			const offsets: bigint[] = []
 
+			consumer.subscribe(testTopic)
 			const run = consumer.runEach(
-				testTopic,
 				async message => {
 					offsets.push(message.offset)
 					if (offsets.length >= 3) {

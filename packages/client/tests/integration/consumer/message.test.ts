@@ -41,14 +41,14 @@ describe('Consumer (integration) - message shape', () => {
 
 			let received: Received | null = null as Received | null
 
+			consumer.subscribe(testTopic)
 			await consumer.runEach(
-				testTopic,
 				async message => {
 					received = {
 						key: message.key,
 						headers: message.headers,
 						timestamp: message.timestamp,
-						value: message.value,
+						value: message.value as string,
 					}
 					consumer.stop()
 				},

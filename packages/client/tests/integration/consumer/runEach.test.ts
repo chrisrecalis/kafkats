@@ -24,10 +24,10 @@ describe('Consumer (integration) - runEach', () => {
 
 			const received: string[] = []
 
+			consumer.subscribe(testTopic)
 			const runPromise = consumer.runEach(
-				testTopic,
 				async message => {
-					received.push(message.value)
+					received.push(message.value as string)
 					if (received.length >= 3) {
 						consumer.stop()
 					}
@@ -73,10 +73,10 @@ describe('Consumer (integration) - runEach', () => {
 			const consumer1 = client.consumer({ groupId, autoOffsetReset: 'earliest' })
 
 			const seen1: string[] = []
+			consumer1.subscribe(testTopic)
 			const run1 = consumer1.runEach(
-				testTopic,
 				async message => {
-					seen1.push(message.value)
+					seen1.push(message.value as string)
 					if (message.value === 'm-1') {
 						throw new Error('boom')
 					}
@@ -96,10 +96,10 @@ describe('Consumer (integration) - runEach', () => {
 			// A second consumer in the same group should resume at the failed message (at-least-once semantics)
 			const consumer2 = client.consumer({ groupId, autoOffsetReset: 'earliest' })
 			const seen2: string[] = []
+			consumer2.subscribe(testTopic)
 			const run2 = consumer2.runEach(
-				testTopic,
 				async message => {
-					seen2.push(message.value)
+					seen2.push(message.value as string)
 					if (seen2.length >= 2) {
 						consumer2.stop()
 					}

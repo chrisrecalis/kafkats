@@ -91,10 +91,10 @@ describe.concurrent('EOS (integration) - transactions', () => {
 			})
 
 			const received: string[] = []
+			consumer.subscribe(testTopic)
 			await consumer.runEach(
-				testTopic,
 				async message => {
-					received.push(message.value)
+					received.push(message.value as string)
 					consumer.stop()
 				},
 				{ autoCommit: false }
@@ -139,10 +139,10 @@ describe.concurrent('EOS (integration) - transactions', () => {
 			})
 
 			const ruReceived: string[] = []
+			ru.subscribe(testTopic)
 			await ru.runEach(
-				testTopic,
 				async message => {
-					ruReceived.push(message.value)
+					ruReceived.push(message.value as string)
 					ru.stop()
 				},
 				{ autoCommit: false }
@@ -159,10 +159,10 @@ describe.concurrent('EOS (integration) - transactions', () => {
 
 			const rcReceived: string[] = []
 			const abortController = new AbortController()
+			rc.subscribe(testTopic)
 			const rcRun = rc.runEach(
-				testTopic,
 				async message => {
-					rcReceived.push(message.value)
+					rcReceived.push(message.value as string)
 					rc.stop()
 				},
 				{ autoCommit: false, signal: abortController.signal }

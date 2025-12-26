@@ -23,8 +23,8 @@ describe('Consumer (integration) - lifecycle', () => {
 			const abortController = new AbortController()
 
 			let called = false
+			consumer.subscribe(testTopic)
 			const run = consumer.runEach(
-				testTopic,
 				async () => {
 					called = true
 				},
@@ -61,7 +61,8 @@ describe('Consumer (integration) - lifecycle', () => {
 			const consumer = client.consumer({ groupId: uniqueName('it-group'), autoOffsetReset: 'earliest' })
 			const abortController = new AbortController()
 
-			const run1 = consumer.runEach(testTopic, async () => {}, {
+			consumer.subscribe(testTopic)
+			const run1 = consumer.runEach(async () => {}, {
 				autoCommit: false,
 				signal: abortController.signal,
 			})
@@ -72,9 +73,7 @@ describe('Consumer (integration) - lifecycle', () => {
 				consumer.once('error', err => reject(err))
 			})
 
-			await expect(consumer.runEach(testTopic, async () => {}, { autoCommit: false })).rejects.toThrow(
-				/already running/i
-			)
+			await expect(consumer.runEach(async () => {}, { autoCommit: false })).rejects.toThrow(/already running/i)
 
 			abortController.abort()
 			await run1

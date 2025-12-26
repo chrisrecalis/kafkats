@@ -37,10 +37,10 @@ describe.concurrent('Producer (integration) - batching', () => {
 
 			// Verify all messages are consumable
 			const received: string[] = []
+			consumer.subscribe(testTopic)
 			const runPromise = consumer.runEach(
-				testTopic,
 				async message => {
-					received.push(message.value)
+					received.push(message.value as string)
 					if (received.length >= 100) {
 						consumer.stop()
 					}
@@ -97,10 +97,10 @@ describe.concurrent('Producer (integration) - batching', () => {
 
 			// Verify message is consumable
 			let received: string | null = null
+			consumer.subscribe(testTopic)
 			const runPromise = consumer.runEach(
-				testTopic,
 				async message => {
-					received = message.value
+					received = message.value as string
 					consumer.stop()
 				},
 				{ autoCommit: false }
@@ -151,10 +151,10 @@ describe.concurrent('Producer (integration) - batching', () => {
 
 			// Verify messages are consumable
 			const received: Buffer[] = []
+			consumer.subscribe(topicName)
 			const runPromise = consumer.runEach(
-				topicName,
 				async message => {
-					received.push(message.value)
+					received.push(message.value as Buffer)
 					if (received.length >= 2) {
 						consumer.stop()
 					}

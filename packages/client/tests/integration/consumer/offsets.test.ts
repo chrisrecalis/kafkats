@@ -30,10 +30,10 @@ describe('Consumer (integration) - offsets', () => {
 
 			const consumer1 = client.consumer({ groupId, autoOffsetReset: 'earliest' })
 			const received1: string[] = []
+			consumer1.subscribe(testTopic)
 			await consumer1.runEach(
-				testTopic,
 				async message => {
-					received1.push(message.value)
+					received1.push(message.value as string)
 					if (received1.length >= 5) {
 						consumer1.stop()
 					}
@@ -43,10 +43,10 @@ describe('Consumer (integration) - offsets', () => {
 
 			const consumer2 = client.consumer({ groupId, autoOffsetReset: 'earliest' })
 			const received2: string[] = []
+			consumer2.subscribe(testTopic)
 			const run2 = consumer2.runEach(
-				testTopic,
 				async message => {
-					received2.push(message.value)
+					received2.push(message.value as string)
 					consumer2.stop()
 				},
 				{ autoCommit: false }
@@ -90,10 +90,10 @@ describe('Consumer (integration) - offsets', () => {
 			const consumer = client.consumer({ groupId: uniqueName('it-group'), autoOffsetReset: 'latest' })
 			const received: string[] = []
 
+			consumer.subscribe(testTopic)
 			const run = consumer.runEach(
-				testTopic,
 				async message => {
-					received.push(message.value)
+					received.push(message.value as string)
 					consumer.stop()
 				},
 				{ autoCommit: false }
@@ -131,9 +131,9 @@ describe('Consumer (integration) - offsets', () => {
 
 			const consumer = client.consumer({ groupId: uniqueName('it-group'), autoOffsetReset: 'none' })
 
+			consumer.subscribe(testTopic)
 			await expect(
 				consumer.runEach(
-					testTopic,
 					async () => {
 						// Should never be called
 					},

@@ -26,8 +26,9 @@ describe('Consumer (integration) - stream', () => {
 			const consumer = client.consumer({ groupId: uniqueName('it-group'), autoOffsetReset: 'earliest' })
 			const received: string[] = []
 
-			for await (const { message } of consumer.stream(testTopic)) {
-				received.push(message.value)
+			consumer.subscribe(testTopic)
+			for await (const { message } of consumer.stream()) {
+				received.push(message.value as string)
 				if (received.length >= 3) {
 					break
 				}

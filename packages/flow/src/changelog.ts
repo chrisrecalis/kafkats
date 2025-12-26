@@ -210,8 +210,10 @@ export class ChangelogRestorer<K, V> {
 		let lastMessageTime = Date.now()
 		const idleTimeoutMs = 5000 // Stop after 5 seconds of no messages
 
+		// Subscribe before running
+		consumer.subscribe([this.topicName])
+
 		await consumer.runEach(
-			[this.topicName],
 			async message => {
 				lastMessageTime = Date.now()
 

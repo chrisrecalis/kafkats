@@ -38,7 +38,8 @@ await producer.send('events', [{ key: 'user-1', value: JSON.stringify({ action: 
 // Create a consumer
 const consumer = client.consumer({ groupId: 'my-group' })
 
-await consumer.runEach('events', async message => {
+consumer.subscribe('events')
+await consumer.runEach(async message => {
 	console.log(message.value.toString())
 })
 ```

@@ -30,11 +30,11 @@ describe('Consumer (integration) - null values', () => {
 			let receivedKey: string | null = 'not-null'
 			let receivedValue: string | null = null
 
+			consumer.subscribe(testTopic)
 			const run = consumer.runEach(
-				testTopic,
 				async message => {
-					receivedKey = message.key
-					receivedValue = message.value
+					receivedKey = message.key as string | null
+					receivedValue = message.value as string
 					consumer.stop()
 				},
 				{ autoCommit: false }
@@ -77,10 +77,10 @@ describe('Consumer (integration) - null values', () => {
 
 			let receivedValue: string | null = null
 
+			consumer.subscribe(testTopic)
 			const run = consumer.runEach(
-				testTopic,
 				async message => {
-					receivedValue = message.value
+					receivedValue = message.value as string
 					consumer.stop()
 				},
 				{ autoCommit: false }
@@ -119,10 +119,10 @@ describe('Consumer (integration) - null values', () => {
 
 			let receivedValue: Buffer | null = null
 
+			consumer.subscribe(topicName)
 			const run = consumer.runEach(
-				topicName,
 				async message => {
-					receivedValue = message.value
+					receivedValue = message.value as Buffer
 					consumer.stop()
 				},
 				{ autoCommit: false }
@@ -170,10 +170,10 @@ describe('Consumer (integration) - null values', () => {
 
 			const received: Array<{ key: string | null; value: string }> = []
 
+			consumer.subscribe(testTopic)
 			const run = consumer.runEach(
-				testTopic,
 				async message => {
-					received.push({ key: message.key, value: message.value })
+					received.push({ key: message.key as string | null, value: message.value as string })
 					if (received.length >= 3) {
 						consumer.stop()
 					}

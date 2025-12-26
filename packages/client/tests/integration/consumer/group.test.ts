@@ -70,19 +70,19 @@ describe('Consumer (integration) - groups', () => {
 			const consumed2: Array<{ partition: number; value: string }> = []
 			const seenPartitions = new Set<number>()
 
+			consumer1.subscribe(testTopic)
 			const run1 = consumer1.runEach(
-				testTopic,
 				async message => {
-					consumed1.push({ partition: message.partition, value: message.value })
+					consumed1.push({ partition: message.partition, value: message.value as string })
 					seenPartitions.add(message.partition)
 				},
 				{ autoCommit: false }
 			)
 
+			consumer2.subscribe(testTopic)
 			const run2 = consumer2.runEach(
-				testTopic,
 				async message => {
-					consumed2.push({ partition: message.partition, value: message.value })
+					consumed2.push({ partition: message.partition, value: message.value as string })
 					seenPartitions.add(message.partition)
 				},
 				{ autoCommit: false }
@@ -193,7 +193,8 @@ describe('Consumer (integration) - groups', () => {
 				for (const p of parts) assigned2.delete(p.partition)
 			})
 
-			const run1 = consumer1.runEach(testTopic, async () => {}, { autoCommit: false })
+			consumer1.subscribe(testTopic)
+			const run1 = consumer1.runEach(async () => {}, { autoCommit: false })
 			await waitUntilRunning(consumer1, run1)
 			await vi.waitFor(
 				() => {
@@ -202,7 +203,8 @@ describe('Consumer (integration) - groups', () => {
 				{ timeout: 20_000 }
 			)
 
-			const run2 = consumer2.runEach(testTopic, async () => {}, { autoCommit: false })
+			consumer2.subscribe(testTopic)
+			const run2 = consumer2.runEach(async () => {}, { autoCommit: false })
 			await waitUntilRunning(consumer2, run2)
 
 			await vi.waitFor(
@@ -295,16 +297,17 @@ describe('Consumer (integration) - groups', () => {
 				}
 			}
 
+			consumer1.subscribe(testTopic)
 			const run1 = consumer1.runEach(
-				testTopic,
 				async message => {
-					if (!message.value.startsWith('after-')) {
+					const value = message.value as string
+					if (!value.startsWith('after-')) {
 						return
 					}
 					if (afterByPartition.has(message.partition)) {
 						throw new Error(`duplicate after-message for partition ${message.partition}`)
 					}
-					afterByPartition.set(message.partition, message.value)
+					afterByPartition.set(message.partition, value)
 					stopIfDone()
 				},
 				{ autoCommit: false }
@@ -318,16 +321,17 @@ describe('Consumer (integration) - groups', () => {
 				{ timeout: 20_000 }
 			)
 
+			consumer2.subscribe(testTopic)
 			const run2 = consumer2.runEach(
-				testTopic,
 				async message => {
-					if (!message.value.startsWith('after-')) {
+					const value = message.value as string
+					if (!value.startsWith('after-')) {
 						return
 					}
 					if (afterByPartition.has(message.partition)) {
 						throw new Error(`duplicate after-message for partition ${message.partition}`)
 					}
-					afterByPartition.set(message.partition, message.value)
+					afterByPartition.set(message.partition, value)
 					stopIfDone()
 				},
 				{ autoCommit: false }
