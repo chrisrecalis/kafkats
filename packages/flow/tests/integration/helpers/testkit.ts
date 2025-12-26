@@ -2,8 +2,16 @@ import { randomUUID } from 'node:crypto'
 import { vi } from 'vitest'
 import type { FlowApp } from '@kafkats/flow'
 
-// Re-export waitFor for direct use in tests
-export const waitFor = vi.waitFor.bind(vi)
+/**
+ * Wrapper around vi.waitFor for polling conditions in tests.
+ * Retries the callback until it stops throwing or timeout is reached.
+ */
+export async function waitFor(
+	callback: () => void | Promise<void>,
+	options?: { timeout?: number; interval?: number }
+): Promise<void> {
+	await vi.waitFor(callback, options)
+}
 
 export function uniqueName(prefix: string): string {
 	return `${prefix}-${randomUUID().replace(/-/g, '').slice(0, 12)}`
@@ -76,90 +84,6 @@ export async function consumeWithTimeout<T>(
 	await consumePromise.catch(() => {
 		// Consumer stopped
 	})
-
-	return results
-}
-
-/**
- * Poll for expected output using waitFor, retrying until results appear or timeout.
- * This is more robust than sleep + consume for testing async pipelines.
- *
- * Creates a new consumer for each poll attempt to ensure fresh reads.
- */
-export async function pollForOutput<T>(
-	// eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
-	createConsumer: () => { runEach: Function; stop: () => void },
-	topic: string,
-	opts: {
-		expectedCount: number
-		timeoutMs?: number
-		pollIntervalMs?: number
-		parse?: (buf: Buffer) => T
-	}
-): Promise<T[]> {
-	const {
-		expectedCount,
-		timeoutMs = 15000,
-		pollIntervalMs = 500,
-		parse = (buf: Buffer) => JSON.parse(buf.toString()) as T,
-	} = opts
-
-	let results: T[] = []
-	let currentConsumer: { runEach: Function; stop: () => void } | null = null
-
-	try {
-		await waitFor(
-			async () => {
-				// Stop previous consumer if any
-				if (currentConsumer) {
-					currentConsumer.stop()
-				}
-
-				currentConsumer = createConsumer()
-				const pollResults: T[] = []
-				let done = false
-
-				const consumePromise = currentConsumer.runEach(
-					topic,
-					async (msg: { value: Buffer }) => {
-						pollResults.push(parse(msg.value))
-						if (pollResults.length >= expectedCount) {
-							done = true
-							currentConsumer?.stop()
-						}
-					},
-					{ autoCommit: false }
-				)
-
-				// Give this poll attempt a short window to collect messages
-				await Promise.race([
-					consumePromise.catch(() => {}),
-					new Promise<void>(resolve => setTimeout(resolve, pollIntervalMs * 2)),
-				])
-
-				if (!done) {
-					currentConsumer.stop()
-				}
-
-				results = pollResults
-
-				if (results.length < expectedCount) {
-					throw new Error(`Only ${results.length}/${expectedCount} messages received`)
-				}
-			},
-			{ timeout: timeoutMs, interval: pollIntervalMs }
-		)
-	} catch {
-		// Timeout - return what we have
-	} finally {
-		if (currentConsumer) {
-			currentConsumer.stop()
-		}
-	}
-
-	if (results.length < expectedCount) {
-		throw new Error(`Timeout waiting for ${expectedCount} messages on ${topic} after ${timeoutMs}ms`)
-	}
 
 	return results
 }
