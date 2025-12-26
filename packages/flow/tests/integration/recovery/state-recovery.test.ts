@@ -77,14 +77,14 @@ describe('Flow (integration) - recovery', () => {
 			await producer.send(inputTopic, { value: Buffer.from(JSON.stringify({ id: 'msg5', seq: 5 })) })
 			await producer.flush()
 
+			// Close app to flush all pending writes before consuming
+			await app.close()
+
 			const results = await consumeWithTimeout<{ id: string; seq: number; processed: boolean }>(
 				client.consumer({ groupId: uniqueName('it-verify-offset-recovery'), autoOffsetReset: 'earliest' }),
 				outputTopic,
 				{ expectedCount: 5, timeoutMs: 20000 }
 			)
-
-			// Close app to flush all pending writes
-			await app.close()
 
 			const counts = new Map<string, number>()
 			for (const result of results) {
@@ -140,6 +140,9 @@ describe('Flow (integration) - recovery', () => {
 				await producer.send(inputTopic, { value: Buffer.from(JSON.stringify({ id: msgId })) })
 				await producer.flush()
 
+				// Close app to flush pending writes before consuming
+				await app.close()
+
 				finalResults = await consumeWithTimeout<{ id: string; processed: boolean }>(
 					client.consumer({
 						groupId: uniqueName(`it-verify-multi-offset-cycle${cycle}`),
@@ -148,8 +151,6 @@ describe('Flow (integration) - recovery', () => {
 					outputTopic,
 					{ expectedCount: cycle, timeoutMs: 20000 }
 				)
-
-				await app.close()
 			}
 
 			const results = finalResults
@@ -235,6 +236,9 @@ describe('Flow (integration) - recovery', () => {
 			await producer.send(inputTopic, { value: Buffer.from(JSON.stringify({ id: 'e3', value: 300 })) })
 			await producer.flush()
 
+			// Close app to flush pending transactions before consuming
+			await app.close()
+
 			const results = await consumeWithTimeout<{ id: string; value: number; processed: boolean }>(
 				client.consumer({
 					groupId: uniqueName('it-verify-eos-recovery'),
@@ -244,9 +248,6 @@ describe('Flow (integration) - recovery', () => {
 				outputTopic,
 				{ expectedCount: 3, timeoutMs: 20000 }
 			)
-
-			// Close app to flush pending transactions
-			await app.close()
 
 			// All 3 messages should appear exactly once
 			expect(results).toHaveLength(3)
@@ -340,14 +341,14 @@ describe('Flow (integration) - recovery', () => {
 			})
 			await producer.flush()
 
+			// Close app to flush all pending writes before consuming
+			await app.close()
+
 			const results = await consumeWithTimeout<Output>(
 				client.consumer({ groupId: uniqueName('it-verify-memory-state'), autoOffsetReset: 'earliest' }),
 				outputTopic,
 				{ expectedCount: 3, timeoutMs: 20000 }
 			)
-
-			// Close app to flush all pending writes
-			await app.close()
 
 			const phase1Counts = results.filter(r => r.phase === 'phase1').map(r => r.count)
 			const phase2Counts = results.filter(r => r.phase === 'phase2').map(r => r.count)
