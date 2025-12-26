@@ -30,6 +30,14 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Build packages (in dependency order)
+        run: |
+          pnpm -C packages/client build
+          pnpm -C packages/codec-zod build
+          pnpm -C packages/flow build
+          pnpm -C packages/flow-state-lmdb build
+          pnpm -C packages/benchmark build
+
       - name: Run lint
         run: pnpm lint
 
