@@ -64,6 +64,6 @@ export default defineConfig([
 
 	// Repo-wide ignores
 	{
-		ignores: ['dist', 'node_modules', '**/*.tsbuildinfo'],
+		ignores: ['**/dist/**', '**/node_modules/**', '**/*.tsbuildinfo'],
 	},
 ])
