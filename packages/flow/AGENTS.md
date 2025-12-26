@@ -106,9 +106,7 @@ Changelog topics are automatically created with the same partition count as sour
 
 ```typescript
 // Source "orders" has 8 partitions → changelog gets 8 partitions
-app.stream('orders', { key: codec.string(), value: codec.json<Order>() })
-	.groupByKey()
-	.count()
+app.stream('orders', { key: codec.string(), value: codec.json<Order>() }).groupByKey().count()
 ```
 
 For merged streams, uses the maximum partition count from all sources.
