@@ -84,7 +84,6 @@ jobs:
         package:
           - client
           - flow
-          - flow-state-lmdb
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -109,12 +108,7 @@ jobs:
           pnpm -C packages/flow-state-lmdb build
 
       - name: Run unit tests (${{ matrix.package }})
-        run: |
-          if [ "${{ matrix.package }}" = "flow-state-lmdb" ]; then
-            pnpm -C packages/${{ matrix.package }} test
-          else
-            pnpm -C packages/${{ matrix.package }} test:unit
-          fi
+        run: pnpm -C packages/${{ matrix.package }} test:unit
 
   integration-tests:
     name: Integration Tests
