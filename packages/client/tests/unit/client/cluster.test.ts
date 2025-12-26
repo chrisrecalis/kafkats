@@ -195,7 +195,7 @@ describe('Cluster', () => {
 				brokers: ['bootstrap:9092'],
 			})
 
-			;(cluster as unknown as { metadata: { brokers: Map<number, unknown> } }).metadata = {
+			;(cluster as unknown as { metadata: unknown }).metadata = {
 				brokers: new Map(), // Empty - no brokers
 				topics: new Map(),
 				clusterId: 'test',

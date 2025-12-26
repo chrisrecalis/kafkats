@@ -64,7 +64,7 @@ async function benchmarkKafkaTsProducer(
 	await client.connect()
 	await createTopicWithAssignments(cluster, topicName, 3)
 
-	const testTopic = topic<string>(topicName, { value: codec.string() })
+	const testTopic = topic<string, string>(topicName, { key: codec.string(), value: codec.string() })
 
 	const producer = client.producer({
 		...aligned,

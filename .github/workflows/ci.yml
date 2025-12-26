@@ -55,8 +55,13 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Build packages
-        run: pnpm -r --filter "./packages/*" build
+      - name: Build packages (in dependency order)
+        run: |
+          pnpm -C packages/client build
+          pnpm -C packages/codec-zod build
+          pnpm -C packages/flow build
+          pnpm -C packages/flow-state-lmdb build
+          pnpm -C packages/benchmark build
 
       - name: Type check client
         run: pnpm -C packages/client typecheck
@@ -96,8 +101,12 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Build packages
-        run: pnpm -r --filter "./packages/*" build
+      - name: Build packages (in dependency order)
+        run: |
+          pnpm -C packages/client build
+          pnpm -C packages/codec-zod build
+          pnpm -C packages/flow build
+          pnpm -C packages/flow-state-lmdb build
 
       - name: Run unit tests (${{ matrix.package }})
         run: |
@@ -136,8 +145,12 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Build packages
-        run: pnpm -r --filter "./packages/*" build
+      - name: Build packages (in dependency order)
+        run: |
+          pnpm -C packages/client build
+          pnpm -C packages/codec-zod build
+          pnpm -C packages/flow build
+          pnpm -C packages/flow-state-lmdb build
 
       - name: Run integration tests (${{ matrix.package }})
         run: pnpm -C packages/${{ matrix.package }} test:integration

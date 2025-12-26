@@ -14,7 +14,7 @@ export interface BenchmarkDiagnostics {
 	gcCount?: number
 	heapDeltaBytes?: number
 	rssDeltaBytes?: number
-	elu?: { activeMs: number; totalMs: number; utilization: number }
+	elu?: { activeMs: number; idleMs: number; utilization: number }
 }
 
 export interface BenchmarkResult {
@@ -89,10 +89,11 @@ export function printResult(result: BenchmarkResult): void {
 			diag.elu &&
 			Number.isFinite(diag.elu.utilization) &&
 			Number.isFinite(diag.elu.activeMs) &&
-			Number.isFinite(diag.elu.totalMs)
+			Number.isFinite(diag.elu.idleMs)
 		) {
+			const totalMs = diag.elu.activeMs + diag.elu.idleMs
 			console.log(
-				`  ELU:                ${(diag.elu.utilization * 100).toFixed(1)}% (${diag.elu.activeMs.toFixed(1)}ms/${diag.elu.totalMs.toFixed(1)}ms)`
+				`  ELU:                ${(diag.elu.utilization * 100).toFixed(1)}% (${diag.elu.activeMs.toFixed(1)}ms/${totalMs.toFixed(1)}ms)`
 			)
 		}
 		if (diag.traceSummary) {
@@ -234,7 +235,7 @@ export function startDiagnostics(): { stop: () => BenchmarkDiagnostics } {
 				rssDeltaBytes: endMem.rss - startMem.rss,
 				elu: {
 					activeMs: endElu.active,
-					totalMs: endElu.total,
+					idleMs: endElu.idle,
 					utilization: endElu.utilization,
 				},
 			}

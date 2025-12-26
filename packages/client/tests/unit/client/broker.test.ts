@@ -6,9 +6,6 @@ import { ConnectionClosedError, NetworkError } from '@/network/errors.js'
 import { ApiKey } from '@/protocol/messages/api-keys.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import { Encoder } from '@/protocol/primitives/encoder.js'
-import { encodeApiVersionsResponse } from '@/protocol/messages/responses/api-versions.js'
-import { encodeMetadataResponse } from '@/protocol/messages/responses/metadata.js'
-import { encodeProduceResponse } from '@/protocol/messages/responses/produce.js'
 
 /**
  * Create a mock Connection that can simulate various failure scenarios

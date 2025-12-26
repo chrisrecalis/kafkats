@@ -24,12 +24,14 @@ function createConfig(overrides: Partial<ResolvedProducerConfig> = {}): Resolved
 }
 
 function createLogger(): Logger {
-	return {
+	const logger: Logger = {
 		debug: vi.fn(),
 		info: vi.fn(),
 		warn: vi.fn(),
 		error: vi.fn(),
+		child: () => logger,
 	}
+	return logger
 }
 
 function createMessage(topic: string, partition: number, value: string, key?: string): QueuedMessage {
@@ -86,9 +88,9 @@ describe('RecordAccumulator', () => {
 			accumulator.flush()
 
 			expect(batches).toHaveLength(1)
-			expect(batches[0].topic).toBe('topic')
-			expect(batches[0].partition).toBe(0)
-			expect(batches[0].messages).toHaveLength(2)
+			expect(batches[0]!.topic).toBe('topic')
+			expect(batches[0]!.partition).toBe(0)
+			expect(batches[0]!.messages).toHaveLength(2)
 		})
 
 		it('estimates message size including overhead', () => {
@@ -101,7 +103,7 @@ describe('RecordAccumulator', () => {
 			accumulator.flush()
 
 			// Size should be: value(5) + overhead(50) = 55
-			expect(batches[0].sizeBytes).toBe(55)
+			expect(batches[0]!.sizeBytes).toBe(55)
 		})
 
 		it('includes key and headers in size estimation', () => {
@@ -123,7 +125,7 @@ describe('RecordAccumulator', () => {
 			accumulator.flush()
 
 			// Size should be: key(3) + value(5) + header(6) + overhead(50) = 64
-			expect(batches[0].sizeBytes).toBe(64)
+			expect(batches[0]!.sizeBytes).toBe(64)
 		})
 	})
 
@@ -267,7 +269,7 @@ describe('RecordAccumulator', () => {
 			accumulator.append(message)
 
 			expect(message.reject).toHaveBeenCalledWith(expect.any(Error))
-			expect((message.reject as ReturnType<typeof vi.fn>).mock.calls[0][0].message).toContain('fenced')
+			expect((message.reject as ReturnType<typeof vi.fn>).mock.calls[0]![0].message).toContain('fenced')
 			expect(accumulator.batchCount).toBe(0)
 		})
 
@@ -462,7 +464,7 @@ describe('RecordAccumulator', () => {
 			accumulator.append(createMessage('topic', 0, 'value'))
 			accumulator.flush()
 
-			expect(batches[0].createdAt).toBe(now)
+			expect(batches[0]!.createdAt).toBe(now)
 		})
 
 		it('preserves message order within batch', () => {
@@ -475,7 +477,7 @@ describe('RecordAccumulator', () => {
 			accumulator.append(createMessage('topic', 0, 'third'))
 			accumulator.flush()
 
-			const values = batches[0].messages.map(m => m.value.toString())
+			const values = batches[0]!.messages.map(m => m.value.toString())
 			expect(values).toEqual(['first', 'second', 'third'])
 		})
 	})

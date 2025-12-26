@@ -169,8 +169,8 @@ describe('Consumer (integration) - ordering', () => {
 
 			// Offsets should be sequential
 			expect(offsets).toHaveLength(3)
-			expect(offsets[1]).toBe(offsets[0] + 1n)
-			expect(offsets[2]).toBe(offsets[1] + 1n)
+			expect(offsets[1]).toBe(offsets[0]! + 1n)
+			expect(offsets[2]).toBe(offsets[1]! + 1n)
 
 			await producer.disconnect()
 			await client.disconnect()
