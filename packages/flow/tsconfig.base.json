@@ -5,7 +5,9 @@
 		"moduleResolution": "NodeNext",
 		"baseUrl": ".",
 		"paths": {
-			"@/*": ["src/*"]
+			"@/*": ["src/*"],
+			"@kafkats/flow": ["src/index.ts"],
+			"@kafkats/flow/testing": ["src/testing.ts"]
 		},
 		"lib": ["ES2022"],
 		"allowJs": false,

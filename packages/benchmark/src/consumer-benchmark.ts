@@ -104,7 +104,7 @@ async function benchmarkKafkaTsConsumer(
 
 	const runPromise = consumer.runEach(
 		testTopic,
-		() => {
+		(): Promise<void> => {
 			const handlerStart = performance.now()
 			// Start timing from first message (after group join)
 			if (startTime === 0) {
@@ -123,6 +123,7 @@ async function benchmarkKafkaTsConsumer(
 			if (messagesConsumed >= messageCount) {
 				abortController.abort()
 			}
+			return Promise.resolve()
 		},
 		{
 			autoCommit: true,
@@ -224,7 +225,7 @@ async function benchmarkKafkaJsConsumer(
 	let startTime = 0
 
 	await consumer.run({
-		eachMessage: () => {
+		eachMessage: (): Promise<void> => {
 			// Start timing from first message (after group join)
 			if (startTime === 0) {
 				startTime = performance.now()
@@ -236,6 +237,7 @@ async function benchmarkKafkaJsConsumer(
 			if (messagesConsumed >= messageCount) {
 				resolveComplete()
 			}
+			return Promise.resolve()
 		},
 	})
 
@@ -300,7 +302,7 @@ async function benchmarkPlatformaticConsumer(
 		maxBytes: ALIGNED_CONSUMER_CONFIG.maxBytesPerPartition,
 		maxWaitTime: ALIGNED_CONSUMER_CONFIG.maxWaitMs,
 		autocommit: false,
-		isolationLevel: 'read_committed',
+		isolationLevel: 'READ_COMMITTED',
 	})
 
 	const stream = await consumer.consume({

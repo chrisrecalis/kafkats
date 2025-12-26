@@ -1,7 +1,5 @@
 import { describe, expect, it } from 'vitest'
 
-import { KafkaProtocolError } from '@/client/errors.js'
-import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import { string } from '@/codec.js'
 import { topic } from '@/topic.js'
 

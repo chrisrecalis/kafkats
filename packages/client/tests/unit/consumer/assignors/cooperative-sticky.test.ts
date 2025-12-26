@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { cooperativeStickyAssignor, CooperativeStickyAssignor } from '@/consumer/assignors/cooperative-sticky.js'
+import { cooperativeStickyAssignor } from '@/consumer/assignors/cooperative-sticky.js'
 import type { MemberSubscription } from '@/consumer/assignors/types.js'
 import type { TopicPartitionList } from '@/consumer/assignors/consumer-protocol.js'
 

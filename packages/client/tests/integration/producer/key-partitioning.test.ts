@@ -32,8 +32,8 @@ describe('Producer (integration) - key partitioning', () => {
 
 			// All messages with same key should go to same partition
 			expect(results).toHaveLength(3)
-			expect(results[0].partition).toBe(results[1].partition)
-			expect(results[1].partition).toBe(results[2].partition)
+			expect(results[0]!.partition).toBe(results[1]!.partition)
+			expect(results[1]!.partition).toBe(results[2]!.partition)
 		})
 	})
 

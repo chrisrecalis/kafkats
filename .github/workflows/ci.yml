@@ -1,0 +1,161 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-format:
+    name: Lint & Format
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build packages (in dependency order)
+        run: |
+          pnpm -C packages/client build
+          pnpm -C packages/codec-zod build
+          pnpm -C packages/flow build
+          pnpm -C packages/flow-state-lmdb build
+          pnpm -C packages/benchmark build
+
+      - name: Run lint
+        run: pnpm lint
+
+      - name: Check formatting
+        run: pnpm format --check
+
+  typecheck:
+    name: Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build packages (in dependency order)
+        run: |
+          pnpm -C packages/client build
+          pnpm -C packages/codec-zod build
+          pnpm -C packages/flow build
+          pnpm -C packages/flow-state-lmdb build
+          pnpm -C packages/benchmark build
+
+      - name: Type check client
+        run: pnpm -C packages/client typecheck
+
+      - name: Type check flow
+        run: pnpm -C packages/flow typecheck
+
+      - name: Type check flow-state-lmdb
+        run: pnpm -C packages/flow-state-lmdb typecheck
+
+      - name: Type check codec-zod
+        run: pnpm -C packages/codec-zod typecheck
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - client
+          - flow
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build packages (in dependency order)
+        run: |
+          pnpm -C packages/client build
+          pnpm -C packages/codec-zod build
+          pnpm -C packages/flow build
+          pnpm -C packages/flow-state-lmdb build
+
+      - name: Run unit tests (${{ matrix.package }})
+        run: pnpm -C packages/${{ matrix.package }} test:unit
+
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - client
+          - flow
+    services:
+      docker:
+        image: docker:dind
+        options: --privileged
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build packages (in dependency order)
+        run: |
+          pnpm -C packages/client build
+          pnpm -C packages/codec-zod build
+          pnpm -C packages/flow build
+          pnpm -C packages/flow-state-lmdb build
+
+      - name: Run integration tests (${{ matrix.package }})
+        run: pnpm -C packages/${{ matrix.package }} test:integration
+        env:
+          KAFKA_TS_LOG_LEVEL: warn
+          VITEST_MAX_WORKERS: 1

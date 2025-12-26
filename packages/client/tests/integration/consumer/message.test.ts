@@ -13,7 +13,8 @@ describe('Consumer (integration) - message shape', () => {
 			await client.connect()
 
 			const topicName = uniqueName('it-message-shape')
-			const testTopic = topic<string>(topicName, {
+			const testTopic = topic<string, string>(topicName, {
+				key: string(),
 				value: string(),
 			})
 
@@ -33,7 +34,7 @@ describe('Consumer (integration) - message shape', () => {
 			const consumer = client.consumer({ groupId: uniqueName('it-group'), autoOffsetReset: 'earliest' })
 
 			type Received = {
-				key: Buffer | null
+				key: string | null
 				headers: Record<string, Buffer>
 				timestamp: bigint
 				value: string
@@ -56,7 +57,7 @@ describe('Consumer (integration) - message shape', () => {
 			)
 
 			expect(received?.value).toBe('v')
-			expect(received?.key?.toString('utf-8')).toBe('k')
+			expect(received?.key).toBe('k')
 			expect(received?.headers.h1?.toString('utf-8')).toBe('v1')
 			expect(received?.headers.h2?.toString('utf-8')).toBe('v2')
 			expect(received?.timestamp).toBe(BigInt(sentAt.getTime()))

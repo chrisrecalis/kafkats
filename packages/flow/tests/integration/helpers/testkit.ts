@@ -50,6 +50,7 @@ export async function waitForAppReady(app: FlowApp, opts?: { timeoutMs?: number 
  * - timeout is reached
  */
 export async function consumeWithTimeout<T>(
+	// eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
 	consumer: { runEach: Function; stop: () => void },
 	topic: string,
 	opts: {
@@ -87,6 +88,7 @@ export async function consumeWithTimeout<T>(
  * Creates a new consumer for each poll attempt to ensure fresh reads.
  */
 export async function pollForOutput<T>(
+	// eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
 	createConsumer: () => { runEach: Function; stop: () => void },
 	topic: string,
 	opts: {

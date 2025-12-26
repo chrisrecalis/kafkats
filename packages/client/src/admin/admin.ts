@@ -22,18 +22,10 @@ import { createListGroupsRequest } from '@/protocol/messages/requests/list-group
 import { createDescribeGroupsRequest } from '@/protocol/messages/requests/describe-groups.js'
 import { createDeleteGroupsRequest } from '@/protocol/messages/requests/delete-groups.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
-import { KafkaProtocolError } from '@/client/errors.js'
 import type { Logger } from '@/logger.js'
 import { noopLogger } from '@/logger.js'
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30000
-
-/**
- * Consumer member assignment protocol
- */
-interface ConsumerProtocolAssignment {
-	topics: Map<string, number[]>
-}
 
 /**
  * Parse consumer protocol assignment from binary format
