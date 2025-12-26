@@ -865,8 +865,12 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			return
 		}
 
-		// For manual assignment, we don't need group state updates
-		// Offsets are either provided explicitly or resolved from autoOffsetReset
+		// Set up coordinator for offset commits.
+		// For simple consumers (manual assignment), we use empty memberId and generationId=-1.
+		// This allows offset commits to work without group membership.
+		const coordinator = await this.cluster.getCoordinator('GROUP', this.config.groupId)
+		offsetManager.updateGroupState('', -1, coordinator)
+
 		const partitionsWithOffsets: Array<TopicPartition & { offset: bigint }> = []
 
 		for (const tp of partitions) {

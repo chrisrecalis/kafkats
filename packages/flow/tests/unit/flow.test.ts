@@ -12,7 +12,11 @@ class TestConsumer extends EventEmitter {
 	private stopResolve: (() => void) | null = null
 	consumerGroup = { currentMemberId: 'member-1', currentGenerationId: 1 }
 
-	async runEach(_subscription: string[], handler: TestHandler): Promise<void> {
+	subscribe(_topics: string | string[]): void {
+		// Mock: just accept the subscription
+	}
+
+	async runEach(handler: TestHandler): Promise<void> {
 		this.handler = handler
 		this.emit('running')
 		return new Promise(resolve => {
