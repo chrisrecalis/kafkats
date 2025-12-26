@@ -3,7 +3,7 @@ import { codec, TimeWindows, SessionWindows, type FlowApp } from '@kafkats/flow'
 import { KafkaClient } from '@kafkats/client'
 
 import { createClient, createFlowApp } from '../helpers/kafka.js'
-import { uniqueName, sleep } from '../helpers/testkit.js'
+import { uniqueName, waitForAppReady, waitFor } from '../helpers/testkit.js'
 
 describe('Flow (integration) - windowing', () => {
 	let client: KafkaClient
@@ -40,7 +40,7 @@ describe('Flow (integration) - windowing', () => {
 			.to(outputTopic, { key: codec.string(), value: codec.json() })
 
 		await app.start()
-		await sleep(2000)
+		await waitForAppReady(app)
 
 		const baseTime = Date.now()
 		const producer = client.producer({ lingerMs: 0 })
@@ -62,8 +62,6 @@ describe('Flow (integration) - windowing', () => {
 		})
 		await producer.flush()
 
-		await sleep(3000) // Allow time for all messages to be processed
-
 		const consumer = client.consumer({ groupId: uniqueName('it-verify-timewin'), autoOffsetReset: 'earliest' })
 		const results: Array<{ key: string; windowStart: number; count: number }> = []
 
@@ -80,7 +78,17 @@ describe('Flow (integration) - windowing', () => {
 			},
 			{ autoCommit: false }
 		)
-		await Promise.race([consumePromise, sleep(10000).then(() => consumer.stop())])
+
+		await waitFor(
+			() => {
+				if (results.length < 3) {
+					throw new Error('Not enough results yet')
+				}
+			},
+			{ timeout: 15000, interval: 100 }
+		)
+		consumer.stop()
+		await consumePromise.catch(() => {})
 
 		const latestCount = results[results.length - 1]
 		expect(latestCount?.count).toBe(3)
@@ -122,7 +130,7 @@ describe('Flow (integration) - windowing', () => {
 			.to(outputTopic, { key: codec.string(), value: codec.json() })
 
 		await app.start()
-		await sleep(2000)
+		await waitForAppReady(app)
 
 		const baseTime = Date.now()
 		const producer = client.producer({ lingerMs: 0 })
@@ -138,8 +146,6 @@ describe('Flow (integration) - windowing', () => {
 			timestamp: new Date(baseTime + 6000),
 		})
 		await producer.flush()
-
-		await sleep(2000)
 
 		const consumer = client.consumer({ groupId: uniqueName('it-verify-hopping'), autoOffsetReset: 'earliest' })
 		const results: Array<{ key: string; windowStart: number; windowEnd: number; count: number }> = []
@@ -157,7 +163,17 @@ describe('Flow (integration) - windowing', () => {
 			},
 			{ autoCommit: false }
 		)
-		await Promise.race([consumePromise, sleep(5000).then(() => consumer.stop())])
+
+		await waitFor(
+			() => {
+				if (results.length === 0) {
+					throw new Error('No results yet')
+				}
+			},
+			{ timeout: 10000, interval: 100 }
+		)
+		consumer.stop()
+		await consumePromise.catch(() => {})
 
 		expect(results.length).toBeGreaterThan(0)
 		expect(results.every(r => r.key === 'sensor1')).toBe(true)
@@ -191,7 +207,7 @@ describe('Flow (integration) - windowing', () => {
 			.to(outputTopic, { key: codec.string(), value: codec.json() })
 
 		await app.start()
-		await sleep(2000)
+		await waitForAppReady(app)
 
 		const baseTime = Date.now()
 		const producer = client.producer({ lingerMs: 0 })
@@ -213,8 +229,6 @@ describe('Flow (integration) - windowing', () => {
 		})
 		await producer.flush()
 
-		await sleep(2000)
-
 		const consumer = client.consumer({ groupId: uniqueName('it-verify-session'), autoOffsetReset: 'earliest' })
 		const results: Array<{ key: string; sessionStart: number; count: number }> = []
 
@@ -227,7 +241,18 @@ describe('Flow (integration) - windowing', () => {
 			},
 			{ autoCommit: false }
 		)
-		await Promise.race([consumePromise, sleep(5000).then(() => consumer.stop())])
+
+		await waitFor(
+			() => {
+				const latest = results[results.length - 1]
+				if (latest?.count !== 3 || latest?.key !== 'user1') {
+					throw new Error('Session count not complete yet')
+				}
+			},
+			{ timeout: 10000, interval: 100 }
+		)
+		consumer.stop()
+		await consumePromise.catch(() => {})
 
 		const latestCount = results[results.length - 1]
 		expect(latestCount?.count).toBe(3)

@@ -3,7 +3,7 @@ import { codec, flow, type FlowApp } from '@kafkats/flow'
 import { KafkaClient } from '@kafkats/client'
 
 import { createClient, getBrokerAddress, getLogLevel } from '../helpers/kafka.js'
-import { uniqueName, sleep, waitForAppReady, consumeWithTimeout } from '../helpers/testkit.js'
+import { uniqueName, waitForAppReady, consumeWithTimeout } from '../helpers/testkit.js'
 
 describe('Flow (integration) - recovery', () => {
 	let client: KafkaClient
@@ -46,24 +46,21 @@ describe('Flow (integration) - recovery', () => {
 
 			await app.start()
 			await waitForAppReady(app)
-			await sleep(2000)
 
 			const producer = client.producer({ lingerMs: 0 })
 			await producer.send(inputTopic, { value: Buffer.from(JSON.stringify({ id: 'msg1', seq: 1 })) })
 			await producer.send(inputTopic, { value: Buffer.from(JSON.stringify({ id: 'msg2', seq: 2 })) })
 			await producer.send(inputTopic, { value: Buffer.from(JSON.stringify({ id: 'msg3', seq: 3 })) })
 			await producer.flush()
-			await sleep(2000)
-
-			// Close cleanly - offsets should be committed
-			await app.close()
-			await sleep(500)
 
 			await consumeWithTimeout<{ id: string; seq: number; processed: boolean }>(
 				client.consumer({ groupId: uniqueName('it-verify-offset-recovery-p1'), autoOffsetReset: 'earliest' }),
 				outputTopic,
 				{ expectedCount: 3, timeoutMs: 20000 }
 			)
+
+			// Close cleanly - offsets should be committed
+			await app.close()
 
 			// --- Phase 2: Restart and send new messages ---
 			app = createApp()
@@ -74,23 +71,20 @@ describe('Flow (integration) - recovery', () => {
 
 			await app.start()
 			await waitForAppReady(app)
-			await sleep(2000)
 
 			// Send new messages after restart
 			await producer.send(inputTopic, { value: Buffer.from(JSON.stringify({ id: 'msg4', seq: 4 })) })
 			await producer.send(inputTopic, { value: Buffer.from(JSON.stringify({ id: 'msg5', seq: 5 })) })
 			await producer.flush()
-			await sleep(3000)
-
-			// Close app to flush all pending writes
-			await app.close()
-			await sleep(500)
 
 			const results = await consumeWithTimeout<{ id: string; seq: number; processed: boolean }>(
 				client.consumer({ groupId: uniqueName('it-verify-offset-recovery'), autoOffsetReset: 'earliest' }),
 				outputTopic,
 				{ expectedCount: 5, timeoutMs: 20000 }
 			)
+
+			// Close app to flush all pending writes
+			await app.close()
 
 			const counts = new Map<string, number>()
 			for (const result of results) {
@@ -140,16 +134,11 @@ describe('Flow (integration) - recovery', () => {
 
 				await app.start()
 				await waitForAppReady(app)
-				await sleep(2000)
 
 				// Send one message per cycle
 				const msgId = `cycle${cycle}-msg`
 				await producer.send(inputTopic, { value: Buffer.from(JSON.stringify({ id: msgId })) })
 				await producer.flush()
-				await sleep(2000)
-
-				await app.close()
-				await sleep(500)
 
 				finalResults = await consumeWithTimeout<{ id: string; processed: boolean }>(
 					client.consumer({
@@ -159,6 +148,8 @@ describe('Flow (integration) - recovery', () => {
 					outputTopic,
 					{ expectedCount: cycle, timeoutMs: 20000 }
 				)
+
+				await app.close()
 			}
 
 			const results = finalResults
@@ -213,16 +204,11 @@ describe('Flow (integration) - recovery', () => {
 
 			await app.start()
 			await waitForAppReady(app)
-			await sleep(3000)
 
 			const producer = client.producer({ lingerMs: 0 })
 			await producer.send(inputTopic, { value: Buffer.from(JSON.stringify({ id: 'e1', value: 100 })) })
 			await producer.send(inputTopic, { value: Buffer.from(JSON.stringify({ id: 'e2', value: 200 })) })
 			await producer.flush()
-			await sleep(3000)
-
-			await app.close()
-			await sleep(500)
 
 			await consumeWithTimeout<{ id: string; value: number; processed: boolean }>(
 				client.consumer({
@@ -234,6 +220,8 @@ describe('Flow (integration) - recovery', () => {
 				{ expectedCount: 2, timeoutMs: 20000 }
 			)
 
+			await app.close()
+
 			// --- Phase 2: Restart and process more ---
 			app = createApp()
 
@@ -243,15 +231,9 @@ describe('Flow (integration) - recovery', () => {
 
 			await app.start()
 			await waitForAppReady(app)
-			await sleep(3000)
 
 			await producer.send(inputTopic, { value: Buffer.from(JSON.stringify({ id: 'e3', value: 300 })) })
 			await producer.flush()
-			await sleep(4000)
-
-			// Close app to flush pending transactions
-			await app.close()
-			await sleep(500)
 
 			const results = await consumeWithTimeout<{ id: string; value: number; processed: boolean }>(
 				client.consumer({
@@ -262,6 +244,9 @@ describe('Flow (integration) - recovery', () => {
 				outputTopic,
 				{ expectedCount: 3, timeoutMs: 20000 }
 			)
+
+			// Close app to flush pending transactions
+			await app.close()
 
 			// All 3 messages should appear exactly once
 			expect(results).toHaveLength(3)
@@ -322,7 +307,6 @@ describe('Flow (integration) - recovery', () => {
 
 			await app.start()
 			await waitForAppReady(app)
-			await sleep(2000)
 
 			const producer = client.producer({ lingerMs: 0 })
 			await producer.send(inputTopic, {
@@ -334,10 +318,6 @@ describe('Flow (integration) - recovery', () => {
 				value: Buffer.from(JSON.stringify({ userId: 'user1' })),
 			})
 			await producer.flush()
-			await sleep(2000)
-
-			await app.close()
-			await sleep(500)
 
 			await consumeWithTimeout<Output>(
 				client.consumer({ groupId: uniqueName('it-verify-memory-state-p1'), autoOffsetReset: 'earliest' }),
@@ -345,12 +325,13 @@ describe('Flow (integration) - recovery', () => {
 				{ expectedCount: 2, timeoutMs: 20000 }
 			)
 
+			await app.close()
+
 			// --- Phase 2: Restart - state is lost, count restarts from 0 ---
 			app = createApp('phase2')
 
 			await app.start()
 			await waitForAppReady(app)
-			await sleep(2000)
 
 			// Send one more message
 			await producer.send(inputTopic, {
@@ -358,17 +339,16 @@ describe('Flow (integration) - recovery', () => {
 				value: Buffer.from(JSON.stringify({ userId: 'user1' })),
 			})
 			await producer.flush()
-			await sleep(2000)
-
-			// Close app to flush all pending writes
-			await app.close()
-			await sleep(500)
 
 			const results = await consumeWithTimeout<Output>(
 				client.consumer({ groupId: uniqueName('it-verify-memory-state'), autoOffsetReset: 'earliest' }),
 				outputTopic,
 				{ expectedCount: 3, timeoutMs: 20000 }
 			)
+
+			// Close app to flush all pending writes
+			await app.close()
+
 			const phase1Counts = results.filter(r => r.phase === 'phase1').map(r => r.count)
 			const phase2Counts = results.filter(r => r.phase === 'phase2').map(r => r.count)
 

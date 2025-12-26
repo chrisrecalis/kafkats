@@ -3,7 +3,7 @@ import { codec, type FlowApp } from '@kafkats/flow'
 import { KafkaClient } from '@kafkats/client'
 
 import { createClient, createFlowApp } from '../helpers/kafka.js'
-import { uniqueName, sleep } from '../helpers/testkit.js'
+import { uniqueName, waitForAppReady, waitFor } from '../helpers/testkit.js'
 
 describe('Flow (integration) - aggregations', () => {
 	let client: KafkaClient
@@ -35,7 +35,7 @@ describe('Flow (integration) - aggregations', () => {
 			.to(outputTopic, { key: codec.string(), value: codec.json() })
 
 		await app.start()
-		await sleep(2000)
+		await waitForAppReady(app)
 
 		const producer = client.producer({ lingerMs: 0 })
 		await producer.send(inputTopic, {
@@ -56,8 +56,6 @@ describe('Flow (integration) - aggregations', () => {
 		})
 		await producer.flush()
 
-		await sleep(2000)
-
 		const consumer = client.consumer({ groupId: uniqueName('it-verify-count'), autoOffsetReset: 'earliest' })
 		const counts = new Map<string, number>()
 
@@ -70,7 +68,17 @@ describe('Flow (integration) - aggregations', () => {
 			},
 			{ autoCommit: false }
 		)
-		await Promise.race([consumePromise, sleep(5000).then(() => consumer.stop())])
+
+		await waitFor(
+			() => {
+				if (counts.get('user1') !== 3 || counts.get('user2') !== 1) {
+					throw new Error('Counts not yet complete')
+				}
+			},
+			{ timeout: 10000, interval: 100 }
+		)
+		consumer.stop()
+		await consumePromise.catch(() => {})
 
 		expect(counts.get('user1')).toBe(3)
 		expect(counts.get('user2')).toBe(1)
@@ -99,7 +107,7 @@ describe('Flow (integration) - aggregations', () => {
 			.to(outputTopic, { key: codec.string(), value: codec.json() })
 
 		await app.start()
-		await sleep(2000)
+		await waitForAppReady(app)
 
 		const producer = client.producer({ lingerMs: 0 })
 		await producer.send(inputTopic, {
@@ -120,8 +128,6 @@ describe('Flow (integration) - aggregations', () => {
 		})
 		await producer.flush()
 
-		await sleep(2000)
-
 		const consumer = client.consumer({ groupId: uniqueName('it-verify-reduce'), autoOffsetReset: 'earliest' })
 		const totals = new Map<string, number>()
 
@@ -134,7 +140,17 @@ describe('Flow (integration) - aggregations', () => {
 			},
 			{ autoCommit: false }
 		)
-		await Promise.race([consumePromise, sleep(5000).then(() => consumer.stop())])
+
+		await waitFor(
+			() => {
+				if (totals.get('account1') !== 175 || totals.get('account2') !== 200) {
+					throw new Error('Totals not yet complete')
+				}
+			},
+			{ timeout: 10000, interval: 100 }
+		)
+		consumer.stop()
+		await consumePromise.catch(() => {})
 
 		expect(totals.get('account1')).toBe(175)
 		expect(totals.get('account2')).toBe(200)
@@ -171,7 +187,7 @@ describe('Flow (integration) - aggregations', () => {
 			.to(outputTopic, { key: codec.string(), value: codec.json() })
 
 		await app.start()
-		await sleep(2000)
+		await waitForAppReady(app)
 
 		const producer = client.producer({ lingerMs: 0 })
 		await producer.send(inputTopic, {
@@ -188,8 +204,6 @@ describe('Flow (integration) - aggregations', () => {
 		})
 		await producer.flush()
 
-		await sleep(2000)
-
 		const consumer = client.consumer({ groupId: uniqueName('it-verify-agg'), autoOffsetReset: 'earliest' })
 		const stats = new Map<string, Stats>()
 
@@ -202,7 +216,19 @@ describe('Flow (integration) - aggregations', () => {
 			},
 			{ autoCommit: false }
 		)
-		await Promise.race([consumePromise, sleep(5000).then(() => consumer.stop())])
+
+		await waitFor(
+			() => {
+				const c1 = stats.get('customer1')
+				const c2 = stats.get('customer2')
+				if (c1?.count !== 2 || c1?.totalQuantity !== 8 || c2?.count !== 1 || c2?.totalQuantity !== 10) {
+					throw new Error('Stats not yet complete')
+				}
+			},
+			{ timeout: 10000, interval: 100 }
+		)
+		consumer.stop()
+		await consumePromise.catch(() => {})
 
 		expect(stats.get('customer1')).toEqual({ count: 2, totalQuantity: 8 })
 		expect(stats.get('customer2')).toEqual({ count: 1, totalQuantity: 10 })
@@ -231,7 +257,7 @@ describe('Flow (integration) - aggregations', () => {
 			.to(outputTopic, { key: codec.string(), value: codec.json() })
 
 		await app.start()
-		await sleep(2000)
+		await waitForAppReady(app)
 
 		const producer = client.producer({ lingerMs: 0 })
 		await producer.send(inputTopic, {
@@ -248,8 +274,6 @@ describe('Flow (integration) - aggregations', () => {
 		})
 		await producer.flush()
 
-		await sleep(2000)
-
 		const consumer = client.consumer({ groupId: uniqueName('it-verify-groupby'), autoOffsetReset: 'earliest' })
 		const counts = new Map<string, number>()
 
@@ -262,7 +286,17 @@ describe('Flow (integration) - aggregations', () => {
 			},
 			{ autoCommit: false }
 		)
-		await Promise.race([consumePromise, sleep(5000).then(() => consumer.stop())])
+
+		await waitFor(
+			() => {
+				if (counts.get('sports') !== 2 || counts.get('music') !== 1) {
+					throw new Error('Counts not yet complete')
+				}
+			},
+			{ timeout: 10000, interval: 100 }
+		)
+		consumer.stop()
+		await consumePromise.catch(() => {})
 
 		expect(counts.get('sports')).toBe(2)
 		expect(counts.get('music')).toBe(1)

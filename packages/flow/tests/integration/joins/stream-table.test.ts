@@ -3,7 +3,7 @@ import { codec, type FlowApp } from '@kafkats/flow'
 import { KafkaClient } from '@kafkats/client'
 
 import { createClient, createFlowApp } from '../helpers/kafka.js'
-import { uniqueName, sleep, consumeWithTimeout } from '../helpers/testkit.js'
+import { uniqueName, waitForAppReady, consumeWithTimeout } from '../helpers/testkit.js'
 
 describe('Flow (integration) - stream-table joins', () => {
 	let client: KafkaClient
@@ -43,7 +43,7 @@ describe('Flow (integration) - stream-table joins', () => {
 			.to(outputTopic, { key: codec.string(), value: codec.json() })
 
 		await app.start()
-		await sleep(2000)
+		await waitForAppReady(app)
 
 		const producer = client.producer({ lingerMs: 0 })
 
@@ -58,8 +58,6 @@ describe('Flow (integration) - stream-table joins', () => {
 		})
 		await producer.flush()
 
-		await sleep(2000)
-
 		// Send events that should join with the table
 		await producer.send(eventsTopic, {
 			key: Buffer.from('user1'),
@@ -70,8 +68,6 @@ describe('Flow (integration) - stream-table joins', () => {
 			value: Buffer.from(JSON.stringify({ action: 'purchase' })),
 		})
 		await producer.flush()
-
-		await sleep(2000)
 
 		const consumer = client.consumer({ groupId: uniqueName('it-verify-stj'), autoOffsetReset: 'earliest' })
 		const results = await consumeWithTimeout<EnrichedEvent>(consumer, outputTopic, { expectedCount: 2 })
@@ -112,7 +108,7 @@ describe('Flow (integration) - stream-table joins', () => {
 			.to(outputTopic, { key: codec.string(), value: codec.json() })
 
 		await app.start()
-		await sleep(2000)
+		await waitForAppReady(app)
 
 		const producer = client.producer({ lingerMs: 0 })
 
@@ -122,8 +118,6 @@ describe('Flow (integration) - stream-table joins', () => {
 			value: Buffer.from(JSON.stringify({ name: 'Alice' })),
 		})
 		await producer.flush()
-
-		await sleep(2000)
 
 		// Send events - one with matching user, one without
 		await producer.send(eventsTopic, {
@@ -135,8 +129,6 @@ describe('Flow (integration) - stream-table joins', () => {
 			value: Buffer.from(JSON.stringify({ action: 'view' })),
 		})
 		await producer.flush()
-
-		await sleep(2000)
 
 		const consumer = client.consumer({ groupId: uniqueName('it-verify-stlj'), autoOffsetReset: 'earliest' })
 		const results = await consumeWithTimeout<EnrichedEvent>(consumer, outputTopic, { expectedCount: 2 })
@@ -177,7 +169,7 @@ describe('Flow (integration) - stream-table joins', () => {
 			.to(outputTopic, { key: codec.string(), value: codec.json() })
 
 		await app.start()
-		await sleep(2000)
+		await waitForAppReady(app)
 
 		const producer = client.producer({ lingerMs: 0 })
 
@@ -187,7 +179,6 @@ describe('Flow (integration) - stream-table joins', () => {
 			value: Buffer.from(JSON.stringify({ name: 'OldName' })),
 		})
 		await producer.flush()
-		await sleep(2000)
 
 		// First event with old name
 		await producer.send(eventsTopic, {
@@ -195,7 +186,6 @@ describe('Flow (integration) - stream-table joins', () => {
 			value: Buffer.from(JSON.stringify({ eventId: 'e1' })),
 		})
 		await producer.flush()
-		await sleep(1000)
 
 		// Update user name
 		await producer.send(usersTopic, {
@@ -203,7 +193,6 @@ describe('Flow (integration) - stream-table joins', () => {
 			value: Buffer.from(JSON.stringify({ name: 'NewName' })),
 		})
 		await producer.flush()
-		await sleep(2000)
 
 		// Second event should use new name
 		await producer.send(eventsTopic, {
@@ -211,8 +200,6 @@ describe('Flow (integration) - stream-table joins', () => {
 			value: Buffer.from(JSON.stringify({ eventId: 'e2' })),
 		})
 		await producer.flush()
-
-		await sleep(2000)
 
 		const consumer = client.consumer({ groupId: uniqueName('it-verify-upd'), autoOffsetReset: 'earliest' })
 		const results = await consumeWithTimeout<Result>(consumer, outputTopic, { expectedCount: 2 })

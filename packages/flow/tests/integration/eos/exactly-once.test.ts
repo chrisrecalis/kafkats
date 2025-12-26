@@ -3,7 +3,7 @@ import { codec, type FlowApp } from '@kafkats/flow'
 import { KafkaClient } from '@kafkats/client'
 
 import { createClient, createFlowApp } from '../helpers/kafka.js'
-import { uniqueName, sleep, consumeWithTimeout } from '../helpers/testkit.js'
+import { uniqueName, waitForAppReady, consumeWithTimeout } from '../helpers/testkit.js'
 
 describe('Flow (integration) - exactly-once semantics', () => {
 	let client: KafkaClient
@@ -37,14 +37,12 @@ describe('Flow (integration) - exactly-once semantics', () => {
 			.to(outputTopic, { value: codec.json() })
 
 		await app.start()
-		await sleep(2000)
+		await waitForAppReady(app)
 
 		const producer = client.producer({ lingerMs: 0 })
 		await producer.send(inputTopic, { value: Buffer.from(JSON.stringify({ id: 'e1', value: 100 })) })
 		await producer.send(inputTopic, { value: Buffer.from(JSON.stringify({ id: 'e2', value: 200 })) })
 		await producer.flush()
-
-		await sleep(2000)
 
 		const consumer = client.consumer({
 			groupId: uniqueName('it-verify-eos'),
@@ -87,15 +85,13 @@ describe('Flow (integration) - exactly-once semantics', () => {
 			.to(outputTopic, { value: codec.json() })
 
 		await app.start()
-		await sleep(2000)
+		await waitForAppReady(app)
 
 		const producer = client.producer({ lingerMs: 0 })
 		await producer.send(inputTopic, { value: Buffer.from(JSON.stringify({ seq: 1 })) })
 		await producer.send(inputTopic, { value: Buffer.from(JSON.stringify({ seq: 2 })) })
 		await producer.send(inputTopic, { value: Buffer.from(JSON.stringify({ seq: 3 })) })
 		await producer.flush()
-
-		await sleep(2000)
 
 		const consumer = client.consumer({
 			groupId: uniqueName('it-verify-eos-commit'),
@@ -135,14 +131,12 @@ describe('Flow (integration) - exactly-once semantics', () => {
 			.to(outputTopic, { value: codec.json() })
 
 		await app.start()
-		await sleep(2000)
+		await waitForAppReady(app)
 
 		const producer = client.producer({ lingerMs: 0 })
 		await producer.send(inputTopic, { value: Buffer.from(JSON.stringify({ name: 'test1' })) })
 		await producer.send(inputTopic, { value: Buffer.from(JSON.stringify({ name: 'test2' })) })
 		await producer.flush()
-
-		await sleep(2000)
 
 		const consumer = client.consumer({ groupId: uniqueName('it-verify-alo'), autoOffsetReset: 'earliest' })
 		const results = await consumeWithTimeout<{ name: string; handled: boolean }>(consumer, outputTopic, {

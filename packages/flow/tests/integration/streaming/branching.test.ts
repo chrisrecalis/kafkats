@@ -3,7 +3,7 @@ import { codec, type FlowApp } from '@kafkats/flow'
 import { KafkaClient } from '@kafkats/client'
 
 import { createClient, createFlowApp } from '../helpers/kafka.js'
-import { uniqueName, sleep, consumeWithTimeout } from '../helpers/testkit.js'
+import { uniqueName, waitForAppReady, consumeWithTimeout } from '../helpers/testkit.js'
 
 describe('Flow (integration) - branching', () => {
 	let client: KafkaClient
@@ -41,15 +41,13 @@ describe('Flow (integration) - branching', () => {
 		lowPriority!.to(lowPriorityTopic, { value: codec.json() })
 
 		await app.start()
-		await sleep(2000)
+		await waitForAppReady(app)
 
 		const producer = client.producer({ lingerMs: 0 })
 		await producer.send(inputTopic, { value: Buffer.from(JSON.stringify({ id: 't1', priority: 'high' })) })
 		await producer.send(inputTopic, { value: Buffer.from(JSON.stringify({ id: 't2', priority: 'low' })) })
 		await producer.send(inputTopic, { value: Buffer.from(JSON.stringify({ id: 't3', priority: 'high' })) })
 		await producer.flush()
-
-		await sleep(2000)
 
 		const highConsumer = client.consumer({ groupId: uniqueName('it-verify-high'), autoOffsetReset: 'earliest' })
 		const highReceived = await consumeWithTimeout<Task>(highConsumer, highPriorityTopic, { expectedCount: 2 })
@@ -88,15 +86,13 @@ describe('Flow (integration) - branching', () => {
 		stream.filter((_, v) => v.value > 50).to(filteredTopic, { value: codec.json() })
 
 		await app.start()
-		await sleep(2000)
+		await waitForAppReady(app)
 
 		const producer = client.producer({ lingerMs: 0 })
 		await producer.send(inputTopic, { value: Buffer.from(JSON.stringify({ type: 'a', value: 100 })) })
 		await producer.send(inputTopic, { value: Buffer.from(JSON.stringify({ type: 'b', value: 25 })) })
 		await producer.send(inputTopic, { value: Buffer.from(JSON.stringify({ type: 'c', value: 75 })) })
 		await producer.flush()
-
-		await sleep(2000)
 
 		const allConsumer = client.consumer({ groupId: uniqueName('it-verify-all'), autoOffsetReset: 'earliest' })
 		const allReceived = await consumeWithTimeout<Event>(allConsumer, allTopic, { expectedCount: 3 })
