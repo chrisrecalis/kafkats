@@ -27,7 +27,7 @@ function createMockConnection() {
 		send: vi
 			.fn()
 			.mockImplementation(
-				async (apiKey: ApiKey, apiVersion: number, encodePayload: (encoder: Encoder) => void) => {
+				async (apiKey: ApiKey, apiVersion: number, _encodePayload: (encoder: Encoder) => void) => {
 					if (!isConnected) {
 						throw new ConnectionClosedError('Connection closed')
 					}
@@ -62,48 +62,6 @@ function buildApiVersionsResponse(versions: Array<{ apiKey: ApiKey; minVersion: 
 		e.writeInt16(v.apiKey)
 		e.writeInt16(v.minVersion)
 		e.writeInt16(v.maxVersion)
-	})
-	return encoder.toBuffer()
-}
-
-/**
- * Build a Metadata response buffer (v0-v8)
- */
-function buildMetadataResponse(brokers: Array<{ nodeId: number; host: string; port: number }>): Buffer {
-	const encoder = new Encoder()
-	// Correlation ID
-	encoder.writeInt32(0)
-	// Brokers array - callback is (item, encoder)
-	encoder.writeArray(brokers, (b, e) => {
-		e.writeInt32(b.nodeId)
-		e.writeString(b.host)
-		e.writeInt32(b.port)
-	})
-	// Topics array (empty)
-	encoder.writeArray([], () => {})
-	return encoder.toBuffer()
-}
-
-/**
- * Build a Produce response buffer with error
- */
-function buildProduceResponse(
-	topics: Array<{
-		name: string
-		partitions: Array<{ partitionIndex: number; errorCode: ErrorCode; baseOffset: bigint }>
-	}>
-): Buffer {
-	const encoder = new Encoder()
-	// Correlation ID
-	encoder.writeInt32(0)
-	// Topics array - callback is (item, encoder)
-	encoder.writeArray(topics, (t, e) => {
-		e.writeString(t.name)
-		e.writeArray(t.partitions, (p, pe) => {
-			pe.writeInt32(p.partitionIndex)
-			pe.writeInt16(p.errorCode)
-			pe.writeInt64(p.baseOffset)
-		})
 	})
 	return encoder.toBuffer()
 }

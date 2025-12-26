@@ -3,7 +3,7 @@ import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import { Cluster } from '@/client/cluster.js'
 import { Broker } from '@/client/broker.js'
 import { BrokerNotAvailableError, LeaderNotAvailableError, CoordinatorNotAvailableError } from '@/client/errors.js'
-import { ConnectionClosedError, NetworkError } from '@/network/errors.js'
+import { ConnectionClosedError } from '@/network/errors.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
 
 /**
@@ -53,8 +53,7 @@ describe('Cluster', () => {
 			})
 
 			// Mock the Broker constructor to return our mock brokers
-			const brokerMocks: (typeof cluster)['bootstrapBrokers'] = []
-			const originalConnect = cluster.connect.bind(cluster)
+			type BrokerMocks = (typeof cluster)['bootstrapBrokers']
 
 			// Override connect to inject mock brokers
 			cluster.connect = async () => {
@@ -73,7 +72,7 @@ describe('Cluster', () => {
 					],
 					topics: [],
 				})
-				;(cluster as unknown as { bootstrapBrokers: typeof brokerMocks }).bootstrapBrokers = [
+				;(cluster as unknown as { bootstrapBrokers: BrokerMocks }).bootstrapBrokers = [
 					broker1 as unknown as Broker,
 					broker2 as unknown as Broker,
 					broker3 as unknown as Broker,
@@ -81,8 +80,7 @@ describe('Cluster', () => {
 				;(cluster as unknown as { isConnected: boolean }).isConnected = true
 
 				// Connect loop
-				for (const broker of (cluster as unknown as { bootstrapBrokers: typeof brokerMocks })
-					.bootstrapBrokers) {
+				for (const broker of (cluster as unknown as { bootstrapBrokers: BrokerMocks }).bootstrapBrokers) {
 					try {
 						await (broker as ReturnType<typeof createMockBroker>).connect()
 						// Fetch metadata

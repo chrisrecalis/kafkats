@@ -68,7 +68,9 @@ async function waitForTopicLeaders(
 		await new Promise(resolve => setTimeout(resolve, delayMs))
 	}
 
-	throw new Error(`Timed out waiting for leaders for topic ${topicName}${lastError ? `: ${String(lastError)}` : ''}`)
+	throw new Error(
+		`Timed out waiting for leaders for topic ${topicName}${lastError instanceof Error ? `: ${lastError.message}` : ''}`
+	)
 }
 
 export async function createTopicWithAssignments(

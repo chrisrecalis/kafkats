@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events'
 import type * as net from 'node:net'
 
 import { Connection } from '@/network/connection.js'
-import { ConnectionClosedError, NetworkError } from '@/network/errors.js'
+import { ConnectionClosedError } from '@/network/errors.js'
 import { ApiKey } from '@/protocol/messages/api-keys.js'
 
 /**
@@ -65,24 +65,6 @@ class MockSocket extends EventEmitter {
 		if (lastWrite.length < 12) return null
 		return lastWrite.readInt32BE(8)
 	}
-}
-
-/**
- * Create a Connection with a mock socket injected
- */
-function createMockedConnection(): { connection: Connection; mockSocket: MockSocket } {
-	const mockSocket = new MockSocket()
-
-	// We'll need to intercept the socket factory
-	const connection = new Connection({
-		host: 'localhost',
-		port: 9092,
-		clientId: 'test-client',
-		connectionTimeoutMs: 1000,
-		requestTimeoutMs: 5000,
-	})
-
-	return { connection, mockSocket }
 }
 
 describe('Connection', () => {

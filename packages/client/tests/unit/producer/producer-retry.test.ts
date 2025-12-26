@@ -102,14 +102,6 @@ function buildProduceResponse(
 	}
 }
 
-/**
- * Wait for async operations to settle
- * Uses real timers, so needs short delays
- */
-async function waitForSettle(ms = 50): Promise<void> {
-	await new Promise(resolve => setTimeout(resolve, ms))
-}
-
 describe('Producer retry behavior', () => {
 	let mockCluster: ReturnType<typeof createMockCluster>
 	let mockBroker: ReturnType<typeof createMockBroker>

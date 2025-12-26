@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { stickyAssignor, StickyAssignor } from '@/consumer/assignors/sticky.js'
+import { stickyAssignor } from '@/consumer/assignors/sticky.js'
 import type { MemberSubscription } from '@/consumer/assignors/types.js'
 import type { TopicPartitionList } from '@/consumer/assignors/consumer-protocol.js'
 
