@@ -206,15 +206,9 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		this.subscriptionMode = 'assign'
 		this.manualAssignment = partitions
 
-		// If subscription options provided, use them for decoders
-		// Otherwise create basic subscriptions from partition topics
-		if (options?.subscription) {
-			this.subscriptions = this.normalizeSubscription(options.subscription)
-		} else {
-			// Create basic subscriptions from partition topics (no decoders, raw Buffer)
-			const topics = [...new Set(partitions.map(p => p.topic))]
-			this.subscriptions = topics.map(topic => toTopicSubscription(topic))
-		}
+		// Use provided subscription for decoders, or infer topics from partitions
+		const topics = [...new Set(partitions.map(p => p.topic))]
+		this.subscriptions = this.normalizeSubscription(options?.subscription ?? topics)
 
 		this.logger.debug('assigned partitions', {
 			partitions: partitions.map(p => `${p.topic}-${p.partition}`),
