@@ -11,5 +11,8 @@ export default defineConfig({
 		globalSetup: ['./tests/integration/helpers/global-setup.ts'],
 		testTimeout: 60_000,
 		hookTimeout: 120_000,
+		// Stop on first failure and set max 5 minute total runtime
+		bail: 1,
+		globalTimeout: 300_000, // 5 minutes max for entire test suite
 	},
 })
