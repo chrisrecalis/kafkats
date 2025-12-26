@@ -10,7 +10,7 @@ import {
 import { KafkaClient } from '@kafkats/client'
 
 import { getBrokerAddress, getLogLevel, createClient } from '../helpers/kafka.js'
-import { uniqueName, sleep } from '../helpers/testkit.js'
+import { uniqueName, waitForAppReady } from '../helpers/testkit.js'
 
 function createFlowAppWithConfig(config: Omit<FlowConfig, 'client'>): FlowApp {
 	return flow({
@@ -50,9 +50,7 @@ describe('Flow (integration) - changelog partition validation', () => {
 
 		// Start the app - this should create the changelog topic
 		await app.start()
-
-		// Wait for changelog topic to be created
-		await sleep(2000)
+		await waitForAppReady(app)
 
 		// Verify changelog topic has 4 partitions
 		const metadata = await client.getMetadata([expectedChangelogTopic])
@@ -149,7 +147,7 @@ describe('Flow (integration) - changelog partition validation', () => {
 
 		// Start the app
 		await app.start()
-		await sleep(2000)
+		await waitForAppReady(app)
 
 		// Verify changelog topic has 6 partitions (max of 2 and 6)
 		const metadata = await client.getMetadata([expectedChangelogTopic])
@@ -180,7 +178,7 @@ describe('Flow (integration) - changelog partition validation', () => {
 		app.stream(inputTopic, { key: codec.string(), value: codec.json<Click>() }).groupByKey().count()
 
 		await app.start()
-		await sleep(2000)
+		await waitForAppReady(app)
 
 		// Verify changelog topic was NOT created
 		const metadata = await client.getMetadata([expectedChangelogTopic])
@@ -233,7 +231,7 @@ describe('Flow (integration) - changelog partition validation', () => {
 		app.table(inputTopic, { key: codec.string(), value: codec.json<User>() })
 
 		await app.start()
-		await sleep(2000)
+		await waitForAppReady(app)
 
 		// Get metadata for all topics matching the pattern
 		const metadata = await client.getMetadata()
@@ -272,7 +270,7 @@ describe('Flow (integration) - changelog partition validation', () => {
 
 		// Should start successfully with the configured RF
 		await app.start()
-		await sleep(2000)
+		await waitForAppReady(app)
 
 		// Verify the changelog topic was created (RF=1 works with single broker)
 		const metadata = await client.getMetadata([expectedChangelogTopic])

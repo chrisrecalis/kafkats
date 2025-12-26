@@ -3,7 +3,7 @@ import { codec, type FlowApp } from '@kafkats/flow'
 import { KafkaClient } from '@kafkats/client'
 
 import { createClient, createFlowApp } from '../helpers/kafka.js'
-import { uniqueName, sleep, consumeWithTimeout } from '../helpers/testkit.js'
+import { uniqueName, waitForAppReady, waitFor, consumeWithTimeout } from '../helpers/testkit.js'
 
 describe('Flow (integration) - basic streaming', () => {
 	let client: KafkaClient
@@ -34,14 +34,12 @@ describe('Flow (integration) - basic streaming', () => {
 			.to(outputTopic, { value: codec.json() })
 
 		await app.start()
-		await sleep(2000) // Wait for consumer group join
+		await waitForAppReady(app)
 
 		const producer = client.producer({ lingerMs: 0 })
 		await producer.send(inputTopic, { value: Buffer.from(JSON.stringify({ id: 'o1', total: 250 })) })
 		await producer.send(inputTopic, { value: Buffer.from(JSON.stringify({ id: 'o2', total: 50 })) })
 		await producer.flush()
-
-		await sleep(2000) // Wait for processing
 
 		const consumer = client.consumer({ groupId: uniqueName('it-verify'), autoOffsetReset: 'earliest' })
 		const received = await consumeWithTimeout(consumer, outputTopic, { expectedCount: 1 })
@@ -72,13 +70,11 @@ describe('Flow (integration) - basic streaming', () => {
 			.to(outputTopic, { value: codec.json() })
 
 		await app.start()
-		await sleep(2000)
+		await waitForAppReady(app)
 
 		const producer = client.producer({ lingerMs: 0 })
 		await producer.send(inputTopic, { value: Buffer.from(JSON.stringify({ type: 'click', data: 'btn1' })) })
 		await producer.flush()
-
-		await sleep(2000)
 
 		const consumer = client.consumer({ groupId: uniqueName('it-verify-mapvalues'), autoOffsetReset: 'earliest' })
 		const received = await consumeWithTimeout<Enriched>(consumer, outputTopic, { expectedCount: 1 })
@@ -107,13 +103,11 @@ describe('Flow (integration) - basic streaming', () => {
 			.to(outputTopic, { key: codec.string(), value: codec.json() })
 
 		await app.start()
-		await sleep(2000)
+		await waitForAppReady(app)
 
 		const producer = client.producer({ lingerMs: 0 })
 		await producer.send(inputTopic, { value: Buffer.from(JSON.stringify({ userId: 'user123', name: 'Alice' })) })
 		await producer.flush()
-
-		await sleep(2000)
 
 		const consumer = client.consumer({ groupId: uniqueName('it-verify-selectkey'), autoOffsetReset: 'earliest' })
 		let receivedKey: string | null = null
@@ -128,7 +122,16 @@ describe('Flow (integration) - basic streaming', () => {
 			},
 			{ autoCommit: false }
 		)
-		await Promise.race([consumePromise, sleep(5000).then(() => consumer.stop())])
+
+		await waitFor(
+			() => {
+				if (receivedValue === null) {
+					throw new Error('No message received yet')
+				}
+			},
+			{ timeout: 10000, interval: 100 }
+		)
+		await consumePromise.catch(() => {})
 
 		expect(receivedKey).toBe('user123')
 		expect(receivedValue).toEqual({ userId: 'user123', name: 'Alice' })
@@ -158,13 +161,11 @@ describe('Flow (integration) - basic streaming', () => {
 			.to(outputTopic, { value: codec.json() })
 
 		await app.start()
-		await sleep(2000)
+		await waitForAppReady(app)
 
 		const producer = client.producer({ lingerMs: 0 })
 		await producer.send(inputTopic, { value: Buffer.from(JSON.stringify({ id: 'e1' })) })
 		await producer.flush()
-
-		await sleep(3000)
 
 		// Check audit topic
 		const auditConsumer = client.consumer({ groupId: uniqueName('it-verify-audit'), autoOffsetReset: 'earliest' })
@@ -203,14 +204,21 @@ describe('Flow (integration) - basic streaming', () => {
 			.to(outputTopic, { value: codec.json() })
 
 		await app.start()
-		await sleep(2000)
+		await waitForAppReady(app)
 
 		const producer = client.producer({ lingerMs: 0 })
 		await producer.send(inputTopic, { value: Buffer.from(JSON.stringify({ name: 'item1' })) })
 		await producer.send(inputTopic, { value: Buffer.from(JSON.stringify({ name: 'item2' })) })
 		await producer.flush()
 
-		await sleep(2000)
+		await waitFor(
+			() => {
+				if (peekedValues.length < 2) {
+					throw new Error(`Only ${peekedValues.length}/2 messages peeked`)
+				}
+			},
+			{ timeout: 10000, interval: 100 }
+		)
 
 		expect(peekedValues).toHaveLength(2)
 		expect(peekedValues).toContainEqual({ name: 'item1' })

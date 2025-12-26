@@ -3,7 +3,7 @@ import { codec, TimeWindows, type FlowApp } from '@kafkats/flow'
 import { KafkaClient } from '@kafkats/client'
 
 import { createClient, createFlowApp } from '../helpers/kafka.js'
-import { uniqueName, sleep, consumeWithTimeout } from '../helpers/testkit.js'
+import { uniqueName, waitForAppReady, waitFor, consumeWithTimeout } from '../helpers/testkit.js'
 
 describe('Flow (integration) - stream-stream joins', () => {
 	let client: KafkaClient
@@ -50,7 +50,7 @@ describe('Flow (integration) - stream-stream joins', () => {
 			.to(outputTopic, { key: codec.string(), value: codec.json() })
 
 		await app.start()
-		await sleep(2000)
+		await waitForAppReady(app)
 
 		const baseTime = Date.now()
 		const producer = client.producer({ lingerMs: 0 })
@@ -66,8 +66,6 @@ describe('Flow (integration) - stream-stream joins', () => {
 			timestamp: new Date(baseTime + 1000),
 		})
 		await producer.flush()
-
-		await sleep(2000)
 
 		const consumer = client.consumer({ groupId: uniqueName('it-verify-ssj'), autoOffsetReset: 'earliest' })
 		const results = await consumeWithTimeout<CompletedOrder>(consumer, outputTopic, { expectedCount: 1 })
@@ -120,7 +118,7 @@ describe('Flow (integration) - stream-stream joins', () => {
 			.to(outputTopic, { key: codec.string(), value: codec.json() })
 
 		await app.start()
-		await sleep(2000)
+		await waitForAppReady(app)
 
 		const baseTime = Date.now()
 		const producer = client.producer({ lingerMs: 0 })
@@ -143,8 +141,6 @@ describe('Flow (integration) - stream-stream joins', () => {
 			timestamp: new Date(baseTime + 1000),
 		})
 		await producer.flush()
-
-		await sleep(2000)
 
 		const consumer = client.consumer({ groupId: uniqueName('it-verify-sslj'), autoOffsetReset: 'earliest' })
 		const results = await consumeWithTimeout<ClickWithImpression>(consumer, outputTopic, { expectedCount: 2 })
@@ -190,7 +186,7 @@ describe('Flow (integration) - stream-stream joins', () => {
 			.to(outputTopic, { key: codec.string(), value: codec.json() })
 
 		await app.start()
-		await sleep(2000)
+		await waitForAppReady(app)
 
 		const baseTime = Date.now()
 		const producer = client.producer({ lingerMs: 0 })
@@ -217,8 +213,6 @@ describe('Flow (integration) - stream-stream joins', () => {
 		})
 		await producer.flush()
 
-		await sleep(2000)
-
 		const consumer = client.consumer({ groupId: uniqueName('it-verify-ssoj'), autoOffsetReset: 'earliest' })
 		const results: Combined[] = []
 
@@ -229,7 +223,20 @@ describe('Flow (integration) - stream-stream joins', () => {
 			},
 			{ autoCommit: false }
 		)
-		await Promise.race([consumePromise, sleep(5000).then(() => consumer.stop())])
+
+		await waitFor(
+			() => {
+				const hasL1R1 = results.some(r => r.leftId === 'L1' && r.rightId === 'R1')
+				const hasL2Null = results.some(r => r.leftId === 'L2' && r.rightId === null)
+				const hasNullR3 = results.some(r => r.leftId === null && r.rightId === 'R3')
+				if (!hasL1R1 || !hasL2Null || !hasNullR3) {
+					throw new Error('Not all expected join results received yet')
+				}
+			},
+			{ timeout: 10000, interval: 100 }
+		)
+		consumer.stop()
+		await consumePromise.catch(() => {})
 
 		expect(results.length).toBeGreaterThanOrEqual(3)
 		expect(results.some(r => r.leftId === 'L1' && r.rightId === 'R1')).toBe(true)

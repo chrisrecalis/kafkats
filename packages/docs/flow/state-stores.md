@@ -227,9 +227,7 @@ The partition count is automatically inferred:
 ```typescript
 // Source topic has 8 partitions
 // → Changelog topic created with 8 partitions
-app.stream('orders', { key: codec.string(), value: codec.json<Order>() })
-	.groupByKey()
-	.count() // Changelog: my-app-count-store-0-changelog (8 partitions)
+app.stream('orders', { key: codec.string(), value: codec.json<Order>() }).groupByKey().count() // Changelog: my-app-count-store-0-changelog (8 partitions)
 ```
 
 For merged streams, the **maximum** partition count is used:
@@ -238,10 +236,7 @@ For merged streams, the **maximum** partition count is used:
 const stream1 = app.stream('topic-a') // 4 partitions
 const stream2 = app.stream('topic-b') // 8 partitions
 
-stream1
-	.merge(stream2)
-	.groupByKey()
-	.count() // Changelog created with 8 partitions (max)
+stream1.merge(stream2).groupByKey().count() // Changelog created with 8 partitions (max)
 ```
 
 ### Validation
