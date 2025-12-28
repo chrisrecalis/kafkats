@@ -7,7 +7,8 @@
 
 import { EventEmitter } from 'node:events'
 import type { Cluster } from '@/client/cluster.js'
-import { KafkaProtocolError } from '@/client/errors.js'
+import type { Broker } from '@/client/broker.js'
+import { CoordinatorNotAvailableError, KafkaProtocolError, NotCoordinatorError } from '@/client/errors.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import type { DecodedRecord, RecordHeader } from '@/protocol/records/index.js'
 import type {
@@ -25,6 +26,7 @@ import type {
 	RunEachOptions,
 	RunBatchOptions,
 	TopicPartition,
+	ManualAssignment,
 	ConsumerTraceFn,
 } from './types.js'
 import {
@@ -100,6 +102,36 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	private fetchCallback: FetchCallback | null = null
 	private rebalanceRunner: Promise<void> | null = null
 	private rebalanceRequested = false
+
+	private async getCoordinatorWithRetry(type: 'GROUP' | 'TRANSACTION', key: string): Promise<Broker> {
+		const signal = this.abortController?.signal
+		const maxAttempts = 10
+		let backoffMs = 100
+
+		for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+			try {
+				return await this.cluster.getCoordinator(type, key)
+			} catch (error) {
+				if (signal?.aborted) {
+					throw error
+				}
+				if (error instanceof CoordinatorNotAvailableError || error instanceof NotCoordinatorError) {
+					this.logger.debug('coordinator lookup failed, retrying', {
+						type,
+						key,
+						attempt,
+						error: error.message,
+					})
+					await sleep(backoffMs, { signal, resolveOnAbort: true }).catch(() => {})
+					backoffMs = Math.min(backoffMs * 2, 1_000)
+					continue
+				}
+				throw error
+			}
+		}
+
+		throw new CoordinatorNotAvailableError(type, key)
+	}
 
 	constructor(cluster: Cluster, config: ConsumerConfig) {
 		super()
@@ -188,6 +220,109 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			// Normalize subscription to array
 			const subscriptions = this.normalizeSubscription(subscription)
 			const topics = subscriptions.map(s => s.topic)
+
+			const manualAssignment = opts.assignment
+			if (manualAssignment) {
+				const normalized = this.normalizeManualAssignment(manualAssignment)
+
+				const subscriptionTopics = new Set(topics)
+				for (const tp of normalized) {
+					if (!subscriptionTopics.has(tp.topic)) {
+						throw new Error(
+							`Manual assignment includes topic "${tp.topic}" that is not in the subscription`
+						)
+					}
+				}
+
+				this.logger.info('starting consumer', {
+					topics,
+					mode: 'each',
+					assignmentMode: 'manual',
+					assignedPartitionCount: normalized.length,
+				})
+
+				// Manual assignment mode: no group join/rebalance.
+				// Use an OffsetManager without groupInstanceId since we don't have generation/member metadata.
+				this.offsetManager = new OffsetManager(this.cluster, this.config.groupId, undefined, this.logger)
+				this.fetchManager = new FetchManager(
+					this.cluster,
+					this.offsetManager,
+					this.config.autoOffsetReset,
+					{
+						maxBytesPerPartition: this.config.maxBytesPerPartition,
+						minBytes: this.config.minBytes,
+						maxWaitMs: this.config.maxWaitMs,
+						partitionConcurrency: opts.partitionConcurrency ?? 1,
+						isolationLevel: this.config.isolationLevel,
+						trace: this.trace,
+					},
+					this.logger
+				)
+
+				const assignment: TopicPartition[] = normalized.map(tp => ({
+					topic: tp.topic,
+					partition: tp.partition,
+				}))
+
+				// Coordinator is needed for offset fetch/commit (even without group membership)
+				const coordinator = await this.getCoordinatorWithRetry('GROUP', this.config.groupId)
+				this.offsetManager.updateGroupState('', -1, coordinator)
+
+				// Fetch committed offsets for the assigned partitions
+				const committedOffsets = await this.offsetManager.fetchCommittedOffsets(assignment)
+
+				// Resolve starting offsets
+				const partitionsWithOffsets: Array<TopicPartition & { offset: bigint }> = []
+				for (const tp of normalized) {
+					const offset =
+						tp.offset !== undefined
+							? tp.offset
+							: await this.offsetManager.resolveStartingOffset(
+									tp.topic,
+									tp.partition,
+									this.config.autoOffsetReset,
+									committedOffsets
+								)
+					partitionsWithOffsets.push({ topic: tp.topic, partition: tp.partition, offset })
+				}
+
+				this.fetchManager.setPartitions(partitionsWithOffsets)
+
+				if (assignment.length > 0) {
+					this.emit('partitionsAssigned', assignment)
+				}
+				this.emit('running')
+
+				await new Promise<void>((resolve, reject) => {
+					this.runPromiseResolve = resolve
+					this.runPromiseReject = reject
+
+					this.fetchLoopPromise = this.startFetchLoopEach(
+						subscriptions,
+						handler as MessageHandler<unknown, unknown>,
+						opts
+					)
+						.then(() => {
+							if (this.runPromiseResolve) {
+								this.runPromiseResolve()
+								this.runPromiseResolve = null
+								this.runPromiseReject = null
+							}
+						})
+						.catch(error => {
+							const err = error instanceof Error ? error : new Error(String(error))
+							if (this.runPromiseReject) {
+								this.runPromiseReject(err)
+								this.runPromiseReject = null
+								this.runPromiseResolve = null
+							} else {
+								this.emitError(err)
+							}
+						})
+				})
+
+				return
+			}
 
 			this.logger.info('starting consumer', { topics, mode: 'each' })
 
@@ -311,6 +446,9 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 						}
 					})
 			})
+		} catch (error) {
+			this.emitError(error)
+			throw error
 		} finally {
 			this.logger.debug('consumer run loop ended, cleaning up')
 			await this.cleanup()
@@ -357,6 +495,103 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			// Normalize subscription to array
 			const subscriptions = this.normalizeSubscription(subscription)
 			const topics = subscriptions.map(s => s.topic)
+
+			const manualAssignment = opts.assignment
+			if (manualAssignment) {
+				const normalized = this.normalizeManualAssignment(manualAssignment)
+
+				const subscriptionTopics = new Set(topics)
+				for (const tp of normalized) {
+					if (!subscriptionTopics.has(tp.topic)) {
+						throw new Error(
+							`Manual assignment includes topic "${tp.topic}" that is not in the subscription`
+						)
+					}
+				}
+
+				this.logger.info('starting consumer', {
+					topics,
+					mode: 'batch',
+					assignmentMode: 'manual',
+					assignedPartitionCount: normalized.length,
+				})
+
+				this.offsetManager = new OffsetManager(this.cluster, this.config.groupId, undefined, this.logger)
+				this.fetchManager = new FetchManager(
+					this.cluster,
+					this.offsetManager,
+					this.config.autoOffsetReset,
+					{
+						maxBytesPerPartition: this.config.maxBytesPerPartition,
+						minBytes: this.config.minBytes,
+						maxWaitMs: this.config.maxWaitMs,
+						partitionConcurrency: opts.partitionConcurrency ?? 1,
+						isolationLevel: this.config.isolationLevel,
+					},
+					this.logger
+				)
+
+				const assignment: TopicPartition[] = normalized.map(tp => ({
+					topic: tp.topic,
+					partition: tp.partition,
+				}))
+
+				const coordinator = await this.getCoordinatorWithRetry('GROUP', this.config.groupId)
+				this.offsetManager.updateGroupState('', -1, coordinator)
+
+				const committedOffsets = await this.offsetManager.fetchCommittedOffsets(assignment)
+
+				const partitionsWithOffsets: Array<TopicPartition & { offset: bigint }> = []
+				for (const tp of normalized) {
+					const offset =
+						tp.offset !== undefined
+							? tp.offset
+							: await this.offsetManager.resolveStartingOffset(
+									tp.topic,
+									tp.partition,
+									this.config.autoOffsetReset,
+									committedOffsets
+								)
+					partitionsWithOffsets.push({ topic: tp.topic, partition: tp.partition, offset })
+				}
+
+				this.fetchManager.setPartitions(partitionsWithOffsets)
+
+				if (assignment.length > 0) {
+					this.emit('partitionsAssigned', assignment)
+				}
+				this.emit('running')
+
+				await new Promise<void>((resolve, reject) => {
+					this.runPromiseResolve = resolve
+					this.runPromiseReject = reject
+
+					this.fetchLoopPromise = this.startFetchLoopBatch(
+						subscriptions,
+						handler as BatchHandler<unknown, unknown>,
+						opts as Required<Pick<RunBatchOptions, 'maxBatchSize' | 'maxBatchWaitMs'>> & RunBatchOptions
+					)
+						.then(() => {
+							if (this.runPromiseResolve) {
+								this.runPromiseResolve()
+								this.runPromiseResolve = null
+								this.runPromiseReject = null
+							}
+						})
+						.catch(error => {
+							const err = error instanceof Error ? error : new Error(String(error))
+							if (this.runPromiseReject) {
+								this.runPromiseReject(err)
+								this.runPromiseReject = null
+								this.runPromiseResolve = null
+							} else {
+								this.emitError(err)
+							}
+						})
+				})
+
+				return
+			}
 
 			this.logger.info('starting consumer', { topics, mode: 'batch' })
 
@@ -476,6 +711,9 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 						}
 					})
 			})
+		} catch (error) {
+			this.emitError(error)
+			throw error
 		} finally {
 			this.logger.debug('consumer run loop ended, cleaning up')
 			await this.cleanup()
@@ -581,7 +819,9 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 						offset: record.offset,
 						timestamp: record.timestamp,
 						key: record.key === null ? null : keyDecoder(record.key),
-						value: decoder(record.value ?? EMPTY_BUFFER),
+						// Preserve tombstones (null values) without decoding.
+						// Note: types do not currently model nullable values in Message<V, K>.
+						value: record.value === null ? null : decoder(record.value ?? EMPTY_BUFFER),
 						headers: convertHeaders(record.headers),
 					}
 
@@ -691,6 +931,15 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	private normalizeSubscription(input: SubscriptionInput): TopicSubscription<unknown, unknown>[] {
 		const items = (Array.isArray(input) ? input : [input]) as Array<string | SubscriptionLike<unknown, unknown>>
 		return items.map(item => (typeof item === 'string' ? toTopicSubscription(item) : toTopicSubscription(item)))
+	}
+
+	private normalizeManualAssignment(input: ManualAssignment[]): ManualAssignment[] {
+		const byKey = new Map<string, ManualAssignment>()
+		for (const tp of input) {
+			const key = `${tp.topic}:${tp.partition}`
+			byKey.set(key, tp)
+		}
+		return [...byKey.values()]
 	}
 
 	/**
@@ -1158,7 +1407,9 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 						offset: record.offset,
 						timestamp: record.timestamp,
 						key: record.key === null ? null : keyDecoder(record.key),
-						value: decoder(record.value ?? EMPTY_BUFFER),
+						// Preserve tombstones (null values) without decoding.
+						// Note: types do not currently model nullable values in Message<V, K>.
+						value: record.value === null ? null : decoder(record.value ?? EMPTY_BUFFER),
 						headers: convertHeaders(record.headers),
 					}
 
@@ -1254,7 +1505,9 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 						offset: record.offset,
 						timestamp: record.timestamp,
 						key: record.key === null ? null : keyDecoder(record.key),
-						value: decoder(record.value ?? EMPTY_BUFFER),
+						// Preserve tombstones (null values) without decoding.
+						// Note: types do not currently model nullable values in Message<V, K>.
+						value: record.value === null ? null : decoder(record.value ?? EMPTY_BUFFER),
 						headers: convertHeaders(record.headers),
 					}
 

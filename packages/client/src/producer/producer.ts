@@ -46,6 +46,8 @@ import type {
 	ProducerTraceFn,
 } from './types.js'
 
+const EMPTY_BUFFER = Buffer.alloc(0)
+
 /**
  * Default producer configuration values
  */
@@ -340,7 +342,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 						messages: messages.slice(reservation.reservedCount),
 						sizeBytes: messages
 							.slice(reservation.reservedCount)
-							.reduce((sum, m) => sum + m.value.length + (m.key?.length ?? 0), 0),
+							.reduce((sum, m) => sum + (m.value?.length ?? 0) + (m.key?.length ?? 0), 0),
 						createdAt: Date.now(),
 					}
 					this.pendingBatches.push(remainingBatch)
@@ -854,7 +856,8 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		const promises = msgArray.map(msg => {
 			return new Promise<SendResult>((resolve, reject) => {
 				try {
-					const valueBuffer = encodeValue(msg.value)
+					const valueBuffer = msg.value === null ? null : encodeValue(msg.value)
+					const partitionValue = valueBuffer ?? EMPTY_BUFFER
 					const keyBuffer = encodeKey(msg.key)
 
 					const headers: Record<string, Buffer> = {}
@@ -866,7 +869,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 
 					let partition = msg.partition
 					if (partition === undefined) {
-						partition = this.config.partitioner(topicDef.topic, keyBuffer, valueBuffer, partitionCount)
+						partition = this.config.partitioner(topicDef.topic, keyBuffer, partitionValue, partitionCount)
 
 						// Handle sticky partitioner for keyless messages
 						if (partition === -1) {
@@ -1075,10 +1078,11 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		for (const msg of msgArray) {
 			let partition = msg.partition
 			if (partition === undefined) {
-				const valueBuffer = encodeValue(msg.value)
+				const valueBuffer = msg.value === null ? null : encodeValue(msg.value)
+				const partitionValue = valueBuffer ?? EMPTY_BUFFER
 				const keyBuffer = encodeKey(msg.key)
 
-				partition = this.config.partitioner(topicDef.topic, keyBuffer, valueBuffer, partitionCount)
+				partition = this.config.partitioner(topicDef.topic, keyBuffer, partitionValue, partitionCount)
 				if (partition === -1) {
 					partition = this.getStickyPartition(topicDef.topic, partitionCount)
 				}

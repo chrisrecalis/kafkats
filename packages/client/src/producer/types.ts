@@ -145,7 +145,7 @@ export interface ProducerMessage<V = Buffer, K = Buffer | string> {
 	/** Message key (optional) */
 	key?: K | null
 	/** Message value */
-	value: V
+	value: V | null
 	/** Message headers (optional) */
 	headers?: Record<string, string | Buffer>
 	/** Explicit partition override - bypasses partitioner (optional) */
@@ -177,7 +177,7 @@ export interface QueuedMessage {
 	topic: string
 	partition: number
 	key: Buffer | null
-	value: Buffer
+	value: Buffer | null
 	headers: Record<string, Buffer>
 	timestamp: bigint
 	resolve: (result: SendResult) => void

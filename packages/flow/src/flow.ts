@@ -290,7 +290,7 @@ type StreamFormat<K, V> = {
 type ActiveTransaction = {
 	send(
 		topic: string,
-		messages: { key?: Buffer | null; value: Buffer; headers?: Record<string, Buffer>; partition?: number }
+		messages: { key?: Buffer | null; value: Buffer | null; headers?: Record<string, Buffer>; partition?: number }
 	): Promise<unknown>
 	sendOffsets(params: {
 		groupId?: string
@@ -313,6 +313,7 @@ type WorkerContext = {
 	activeTransaction: ActiveTransaction | null
 	groupInstanceId?: string | null
 	sourcesByTopic: Map<string, SourceNode<unknown, unknown>[]>
+	assignedPartitions: Map<TopicPartitionKey, { topic: string; partition: number }>
 	// Transaction batching state for EOS
 	pendingOffsets: Map<TopicPartitionKey, { topic: string; partition: number; offset: bigint }>
 	transactionActive: boolean
@@ -599,7 +600,10 @@ class SourceNode<K, V> extends Processor<K, V> {
 		return codec ? codec.decode(raw) : (raw as unknown as K)
 	}
 
-	private decodeValue(raw: Buffer): V {
+	private decodeValue(raw: Buffer | null): V {
+		if (raw === null) {
+			return null as unknown as V
+		}
 		const codec = this.format.valueCodec
 		return codec ? codec.decode(raw) : (raw as unknown as V)
 	}
@@ -682,6 +686,9 @@ class FlowAppImpl implements FlowApp {
 	private lastError: Error | null = null
 	private storeCounter = 0
 	private startupProducer: Producer | null = null
+	private changelogRestorationEnabled = false
+	private restorationComplete = false
+	private restorationQueue: Promise<void> = Promise.resolve()
 
 	constructor(readonly config: FlowConfig) {
 		this.eosEnabled = (config.processingGuarantee ?? 'at_least_once') === 'exactly_once'
@@ -853,15 +860,11 @@ class FlowAppImpl implements FlowApp {
 
 		// Validate and create changelog topics (returns false if skipped due to no brokers)
 		const changelogTopicsCreated = await this.validateAndCreateChangelogTopics()
+		this.changelogRestorationEnabled = changelogTopicsCreated
 
 		// Initialize all state stores
 		for (const store of this.stateStores.values()) {
 			await store.init()
-		}
-
-		// Restore state from changelog topics (skip if topic creation was skipped)
-		if (changelogTopicsCreated) {
-			await this.restoreFromChangelogs()
 		}
 
 		const topics = [...this.sourcesByTopic.keys()]
@@ -895,6 +898,7 @@ class FlowAppImpl implements FlowApp {
 				activeTransaction: null,
 				groupInstanceId: groupInstanceId ?? null,
 				sourcesByTopic: new Map(),
+				assignedPartitions: new Map(),
 				// Transaction batching state
 				pendingOffsets: new Map(),
 				transactionActive: false,
@@ -968,6 +972,56 @@ class FlowAppImpl implements FlowApp {
 		}
 
 		await Promise.all(workerReady)
+
+		// Restore only the changelog partitions that are assigned to this application instance.
+		// Workers pause their partitions in the partitionsAssigned handler to avoid processing
+		// messages before state is fully restored.
+		try {
+			if (changelogTopicsCreated) {
+				const assigned: Array<{ topic: string; partition: number }> = []
+				const seen = new Set<string>()
+				for (const worker of this.workers) {
+					for (const tp of worker.assignedPartitions.values()) {
+						const key = `${tp.topic}:${tp.partition}`
+						if (seen.has(key)) continue
+						seen.add(key)
+						assigned.push(tp)
+					}
+				}
+
+				await this.enqueueChangelogRestoration(assigned)
+			}
+		} catch (err) {
+			this.lastError = err as Error
+			this.currentState = 'ERROR'
+			await this.close().catch(() => {})
+			throw err
+		} finally {
+			for (const worker of this.workers) {
+				const partitions = [...worker.assignedPartitions.values()]
+				if (partitions.length > 0) {
+					try {
+						worker.consumer.resume(partitions)
+					} catch {
+						// Ignore - consumer may already be stopping after an error
+					}
+				}
+			}
+			this.restorationComplete = true
+		}
+	}
+
+	private enqueueChangelogRestoration(partitions: Array<{ topic: string; partition: number }>): Promise<void> {
+		if (!this.changelogRestorationEnabled || this.changelogTopics.size === 0) {
+			return Promise.resolve()
+		}
+		if (partitions.length === 0) {
+			return Promise.resolve()
+		}
+
+		const task = this.restorationQueue.then(() => this.restoreFromChangelogs(partitions))
+		this.restorationQueue = task
+		return task
 	}
 
 	async close(): Promise<void> {
@@ -1025,7 +1079,7 @@ class FlowAppImpl implements FlowApp {
 		const valueCodec = options?.value ?? format.valueCodec
 
 		const key = this.encodeKey(record.key, keyCodec)
-		const value = this.encodeValue(record.value, valueCodec)
+		const value = record.value === null ? null : this.encodeValue(record.value, valueCodec)
 
 		const partition = options?.partitioner
 			? await this.resolvePartition(topic, record.key, record.value, options.partitioner)
@@ -1196,7 +1250,9 @@ class FlowAppImpl implements FlowApp {
 	/**
 	 * Restore state from changelog topics for all stores.
 	 */
-	private async restoreFromChangelogs(): Promise<void> {
+	private async restoreFromChangelogs(
+		assignedPartitions: Array<{ topic: string; partition: number }>
+	): Promise<void> {
 		for (const [storeName, spec] of this.changelogTopics) {
 			if (spec.skipRestoration) {
 				continue
@@ -1207,13 +1263,24 @@ class FlowAppImpl implements FlowApp {
 				continue
 			}
 
+			const partitions = spec.sourceTopics.size
+				? [...new Set(assignedPartitions.filter(tp => spec.sourceTopics.has(tp.topic)).map(tp => tp.partition))]
+				: undefined
+			if (partitions?.length === 0) {
+				continue
+			}
+
 			// Get the inner store for restoration (unwrap changelog-backed store)
 			const innerStore = store instanceof ChangelogBackedKeyValueStore ? store.innerStore : store
 
 			const restorer = new ChangelogRestorer(spec.topicName, spec.keyCodec, spec.valueCodec, innerStore)
 
 			try {
-				const restoredCount = await restorer.restore(this.client, this.config.changelog?.restoration)
+				const restoredCount = await restorer.restore(
+					this.client,
+					this.config.changelog?.restoration,
+					partitions
+				)
 				if (restoredCount > 0) {
 					// Log restoration (optional - could add a logger)
 				}
@@ -1542,9 +1609,49 @@ class FlowAppImpl implements FlowApp {
 				})
 			}
 		})
-		consumer.on('partitionsAssigned', () => {
+		consumer.on('partitionsAssigned', partitions => {
+			for (const tp of partitions) {
+				worker.assignedPartitions.set(`${tp.topic}:${tp.partition}`, tp)
+			}
+
+			if (this.changelogRestorationEnabled && this.changelogTopics.size > 0) {
+				// Prevent processing messages until the app restores state for these partitions.
+				try {
+					consumer.pause(partitions)
+				} catch {
+					// Ignore - pause is best effort and may fail if the consumer is stopping
+				}
+
+				// After startup, restore newly assigned partitions before resuming them.
+				if (this.restorationComplete) {
+					void this.enqueueChangelogRestoration(partitions)
+						.then(() => {
+							try {
+								consumer.resume(partitions)
+							} catch {
+								// Ignore - consumer may have been stopped while restoring
+							}
+						})
+						.catch(err => {
+							this.lastError = err as Error
+							this.currentState = 'ERROR'
+							consumer.stop()
+						})
+				}
+			}
+
 			if (this.currentState !== 'ERROR') {
 				this.currentState = 'RUNNING'
+			}
+		})
+		consumer.on('partitionsRevoked', partitions => {
+			for (const tp of partitions) {
+				worker.assignedPartitions.delete(`${tp.topic}:${tp.partition}`)
+			}
+		})
+		consumer.on('partitionsLost', partitions => {
+			for (const tp of partitions) {
+				worker.assignedPartitions.delete(`${tp.topic}:${tp.partition}`)
 			}
 		})
 		consumer.on('error', error => {

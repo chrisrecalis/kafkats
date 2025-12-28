@@ -151,6 +151,14 @@ export interface RunEachOptions {
 	commitOffsets?: boolean
 	autoCommitIntervalMs?: number
 	signal?: AbortSignal
+	/**
+	 * Manually assign the consumer to these partitions instead of joining a group.
+	 *
+	 * - Skips JoinGroup/SyncGroup and does not emit rebalance events.
+	 * - Offsets (if commitOffsets is enabled) are still committed under `groupId`,
+	 *   but without group generation/member metadata.
+	 */
+	assignment?: ManualAssignment[]
 }
 
 /**
@@ -164,6 +172,14 @@ export interface RunBatchOptions {
 	signal?: AbortSignal
 	maxBatchSize?: number
 	maxBatchWaitMs?: number
+	/**
+	 * Manually assign the consumer to these partitions instead of joining a group.
+	 *
+	 * - Skips JoinGroup/SyncGroup and does not emit rebalance events.
+	 * - Offsets (if commitOffsets is enabled) are still committed under `groupId`,
+	 *   but without group generation/member metadata.
+	 */
+	assignment?: ManualAssignment[]
 }
 
 // ==================== Consumer Configuration ====================
@@ -311,6 +327,15 @@ export interface TopicPartition {
 
 export interface TopicPartitionOffset extends TopicPartition {
 	offset: bigint
+}
+
+export interface ManualAssignment extends TopicPartition {
+	/**
+	 * Optional starting offset for this partition.
+	 * If omitted, the consumer resolves the start offset from committed offsets (if present)
+	 * or falls back to `autoOffsetReset`.
+	 */
+	offset?: bigint
 }
 
 export enum ConsumerGroupState {

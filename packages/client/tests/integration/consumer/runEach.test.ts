@@ -120,4 +120,78 @@ describe('Consumer (integration) - runEach', () => {
 			await client.disconnect()
 		})
 	})
+
+	it('supports manual partition assignment without group coordination', async () => {
+		await withKafka(async ({ createClient }) => {
+			const client = createClient('it-runEach-manual-assign')
+			await client.connect()
+
+			const topicName = uniqueName('it-runEach-manual-assign')
+			const testTopic = topic<string>(topicName, {
+				value: string(),
+			})
+
+			await client.createTopics([{ name: topicName, numPartitions: 1, replicationFactor: 1 }])
+
+			const producer = client.producer({ lingerMs: 0 })
+			await producer.send(testTopic, [{ value: 'x' }])
+			await producer.flush()
+
+			const groupId = uniqueName('it-group')
+			const consumer1 = client.consumer({ groupId, autoOffsetReset: 'earliest' })
+			const consumer2 = client.consumer({ groupId, autoOffsetReset: 'earliest' })
+
+			const seen1: string[] = []
+			const seen2: string[] = []
+
+			const run1 = consumer1.runEach(
+				testTopic,
+				async message => {
+					seen1.push(message.value)
+					consumer1.stop()
+				},
+				{
+					autoCommit: false,
+					commitOffsets: false,
+					assignment: [{ topic: topicName, partition: 0 }],
+				}
+			)
+			void run1.catch(() => {})
+
+			const run2 = consumer2.runEach(
+				testTopic,
+				async message => {
+					seen2.push(message.value)
+					consumer2.stop()
+				},
+				{
+					autoCommit: false,
+					commitOffsets: false,
+					assignment: [{ topic: topicName, partition: 0 }],
+				}
+			)
+			void run2.catch(() => {})
+
+			await new Promise<void>((resolve, reject) => {
+				let running = 0
+				const onRunning = () => {
+					running++
+					if (running >= 2) resolve()
+				}
+				consumer1.once('running', onRunning)
+				consumer2.once('running', onRunning)
+				consumer1.once('error', err => reject(err))
+				consumer2.once('error', err => reject(err))
+			})
+
+			await run1
+			await run2
+
+			expect(seen1).toEqual(['x'])
+			expect(seen2).toEqual(['x'])
+
+			await producer.disconnect()
+			await client.disconnect()
+		})
+	})
 })

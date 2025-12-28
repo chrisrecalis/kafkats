@@ -477,7 +477,7 @@ describe('RecordAccumulator', () => {
 			accumulator.append(createMessage('topic', 0, 'third'))
 			accumulator.flush()
 
-			const values = batches[0]!.messages.map(m => m.value.toString())
+			const values = batches[0]!.messages.map(m => m.value!.toString())
 			expect(values).toEqual(['first', 'second', 'third'])
 		})
 	})

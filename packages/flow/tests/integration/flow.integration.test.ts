@@ -612,6 +612,36 @@ describe('stream-table joins', () => {
 		expect(msg.value.user).toBe('Robert')
 	})
 
+	it('table tombstones delete rows and affect joins', async () => {
+		await producer.send(usersTopic, { key: 'u3', value: userCodec.encode({ name: 'Charlie' }) })
+		await output.waitFor<string, User>(outUsers, m => m.key === 'u3' && m.value.name === 'Charlie')
+
+		await producer.send(eventsTopic, { key: 'u3', value: eventCodec.encode({ action: 'before-delete' }) })
+		await output.waitFor<string, InnerEnriched>(
+			outInner,
+			m => m.key === 'u3' && m.value.action === 'before-delete' && m.value.user === 'Charlie'
+		)
+
+		await producer.send(usersTopic, { key: 'u3', value: null })
+		const barrierKey = '__barrier_u3__'
+		await producer.send(usersTopic, { key: barrierKey, value: userCodec.encode({ name: 'barrier' }) })
+		await output.waitFor<string, User>(outUsers, m => m.key === barrierKey && m.value.name === 'barrier')
+
+		await producer.send(eventsTopic, { key: 'u3', value: eventCodec.encode({ action: 'after-delete' }) })
+		const left = await output.waitFor<string, Enriched>(
+			outLeft,
+			m => m.key === 'u3' && m.value.action === 'after-delete'
+		)
+		expect(left.value).toEqual({ action: 'after-delete', user: null })
+		await expect(
+			output.waitFor<string, InnerEnriched>(
+				outInner,
+				m => m.key === 'u3' && m.value.action === 'after-delete',
+				400
+			)
+		).rejects.toThrow('Timed out')
+	})
+
 	it('null keys are skipped by join processors', async () => {
 		await producer.send(eventsTopic, { key: null, value: eventCodec.encode({ action: 'click' }) })
 		await expect(output.waitFor(outLeft, m => m.key === null, 400)).rejects.toThrow('Timed out')
@@ -852,34 +882,189 @@ describe('changelog topics and restoration', () => {
 			groupId: `${appId}-collector-${Date.now()}`,
 			topics: [{ topic: outputTopic, keyCodec: stringCodec, valueCodec: numberCodec }],
 		})
-		await withTimeout('output collector start', out.start(), 15_000)
-
 		const app1 = buildApp(true)
-		await withTimeout('app1.start', app1.start(), 20_000)
-
-		await withTimeout('produce input (1)', producer.send(input, { key: 'a', value: numberCodec.encode(1) }), 15_000)
-		await withTimeout('produce input (2)', producer.send(input, { key: 'a', value: numberCodec.encode(1) }), 15_000)
-		await out.waitFor(outputTopic, m => m.key === 'a' && m.value === 2)
-
-		await withTimeout('app1.close', app1.close(), 20_000)
-
 		const app2 = buildApp(false)
-		await withTimeout('app2.start', app2.start(), 20_000)
 
-		await withTimeout('produce input (3)', producer.send(input, { key: 'a', value: numberCodec.encode(1) }), 15_000)
 		try {
-			await out.waitFor(outputTopic, m => m.key === 'a' && m.value === 3)
-		} catch (error) {
-			const seen = out
-				.getTopicMessages<string, number>(outputTopic)
-				.filter(m => m.key === 'a')
-				.map(m => m.value)
-			throw new Error(`Expected restored count to reach 3, but saw values: [${seen.join(', ')}]`, {
-				cause: error instanceof Error ? error : new Error(String(error)),
+			await withTimeout('output collector start', out.start(), 15_000)
+
+			await withTimeout('app1.start', app1.start(), 20_000)
+
+			await withTimeout(
+				'produce input (1)',
+				producer.send(input, { key: 'a', value: numberCodec.encode(1) }),
+				15_000
+			)
+			await withTimeout(
+				'produce input (2)',
+				producer.send(input, { key: 'a', value: numberCodec.encode(1) }),
+				15_000
+			)
+			await out.waitFor(outputTopic, m => m.key === 'a' && m.value === 2)
+
+			await withTimeout('app1.close', app1.close(), 20_000)
+
+			await withTimeout('app2.start', app2.start(), 20_000)
+
+			await withTimeout(
+				'produce input (3)',
+				producer.send(input, { key: 'a', value: numberCodec.encode(1) }),
+				15_000
+			)
+			try {
+				await out.waitFor(outputTopic, m => m.key === 'a' && m.value === 3)
+			} catch (error) {
+				const seen = out
+					.getTopicMessages<string, number>(outputTopic)
+					.filter(m => m.key === 'a')
+					.map(m => m.value)
+				throw new Error(`Expected restored count to reach 3, but saw values: [${seen.join(', ')}]`, {
+					cause: error instanceof Error ? error : new Error(String(error)),
+				})
+			}
+		} finally {
+			await withTimeout('app2.close', app2.close(), 20_000).catch(() => {})
+			await withTimeout('app1.close', app1.close(), 20_000).catch(() => {})
+			await withTimeout('output collector stop', out.stop(), 15_000).catch(() => {})
+		}
+	}, 60_000)
+
+	it('restores newly assigned partitions after another instance joins the group', async () => {
+		const input = uniqueTopicName('flow-it-restore-rebalance-src')
+		const outputTopic = uniqueTopicName('flow-it-restore-rebalance-out')
+		const appId = `flow-it-restore-rebalance-${Date.now()}`
+		const storeName = 'counts'
+
+		await createTopics(client, [{ name: input, partitions: 2 }, { name: outputTopic }])
+		const keysByPartition = new Map<number, string>([
+			[0, 'p0'],
+			[1, 'p1'],
+		])
+
+		const seedClientId = `${appId}-seed-${Date.now()}`
+		const restoreClientId = `${appId}-restore-${Date.now()}`
+
+		const buildApp = (clientId: string, skipRestoration: boolean) => {
+			const app = flow({
+				applicationId: appId,
+				client: {
+					clientId,
+					brokers: requireKafkaBrokers(),
+				},
+				numStreamThreads: 1,
+				consumer: { autoOffsetReset: 'earliest', maxWaitMs: 100 },
+				changelog: {
+					restoration: {
+						idleTimeoutMs: 2_000,
+						initialIdleTimeoutMs: 10_000,
+						checkIntervalMs: 200,
+						consumerMaxWaitMs: 200,
+					},
+				},
 			})
+			app.stream(input, { key: stringCodec, value: numberCodec })
+				.groupByKey()
+				.count({ storeName, key: stringCodec, value: numberCodec, changelog: { skipRestoration } })
+				.toStream()
+				.to(outputTopic)
+			return app
 		}
 
-		await withTimeout('app2.close', app2.close(), 20_000)
-		await withTimeout('output collector stop', out.stop(), 15_000)
+		const waitForMemberAssignment = async (params: {
+			groupId: string
+			memberClientId: string
+			topic: string
+			timeoutMs?: number
+		}): Promise<number> => {
+			const timeoutMs = params.timeoutMs ?? 20_000
+			const admin = client.admin()
+			const startedAt = Date.now()
+
+			while (Date.now() - startedAt < timeoutMs) {
+				const [desc] = await admin.describeGroups([params.groupId])
+				if (desc?.state !== 'Stable') {
+					await new Promise(resolve => setTimeout(resolve, 200))
+					continue
+				}
+
+				const member = desc.members.find(m => m.clientId === params.memberClientId)
+				const partition = member?.assignment.find(tp => tp.topic === params.topic)?.partition
+				if (partition !== undefined) {
+					return partition
+				}
+
+				await new Promise(resolve => setTimeout(resolve, 200))
+			}
+
+			throw new Error(`Timed out waiting for group assignment for ${params.memberClientId} in ${params.groupId}`)
+		}
+
+		const out = new MultiTopicCollector({
+			client,
+			groupId: `${appId}-collector-${Date.now()}`,
+			topics: [{ topic: outputTopic, keyCodec: stringCodec, valueCodec: numberCodec }],
+		})
+
+		const app1 = buildApp(seedClientId, true)
+		const app2 = buildApp(restoreClientId, false)
+
+		try {
+			await withTimeout('output collector start', out.start(), 15_000)
+
+			await withTimeout('app1.start', app1.start(), 20_000)
+
+			await withTimeout(
+				'produce input (partition 0 seed)',
+				producer.send(input, {
+					key: keysByPartition.get(0)!,
+					value: numberCodec.encode(1),
+					partition: 0,
+				}),
+				15_000
+			)
+			await withTimeout(
+				'produce input (partition 1 seed)',
+				producer.send(input, {
+					key: keysByPartition.get(1)!,
+					value: numberCodec.encode(1),
+					partition: 1,
+				}),
+				15_000
+			)
+			await out.waitFor(outputTopic, m => m.key === keysByPartition.get(0) && m.value === 1)
+			await out.waitFor(outputTopic, m => m.key === keysByPartition.get(1) && m.value === 1)
+
+			await withTimeout('app2.start', app2.start(), 20_000)
+
+			const assignedPartition = await withTimeout(
+				'wait for app2 assignment',
+				waitForMemberAssignment({
+					groupId: appId,
+					memberClientId: restoreClientId,
+					topic: input,
+				}),
+				25_000
+			)
+
+			const key = keysByPartition.get(assignedPartition)
+			if (!key) {
+				throw new Error(`Missing test key for assigned partition ${assignedPartition}`)
+			}
+
+			await withTimeout(
+				`produce input (assigned partition ${assignedPartition})`,
+				producer.send(input, {
+					key,
+					value: numberCodec.encode(1),
+					partition: assignedPartition,
+				}),
+				15_000
+			)
+			await out.waitFor(outputTopic, m => m.key === key && m.value === 2, 15_000)
+		} finally {
+			await withTimeout('app2.close', app2.close(), 20_000).catch(() => {})
+			await withTimeout('app1.close', app1.close(), 20_000).catch(() => {})
+			await withTimeout('output collector stop', out.stop(), 15_000).catch(() => {})
+		}
 	}, 60_000)
 })

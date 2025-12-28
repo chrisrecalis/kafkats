@@ -140,25 +140,27 @@ await consumer.runEach(userEvents, async message => {
 
 ### runEach Options
 
-| Option                 | Type          | Default | Description                                  |
-| ---------------------- | ------------- | ------- | -------------------------------------------- |
-| `partitionConcurrency` | `number`      | `1`     | How many partitions process concurrently     |
-| `autoCommit`           | `boolean`     | `true`  | Enable periodic commits                      |
-| `commitOffsets`        | `boolean`     | `true`  | Track consumed offsets for committing        |
-| `autoCommitIntervalMs` | `number`      | `5000`  | Commit interval when `autoCommit` is enabled |
-| `signal`               | `AbortSignal` | -       | Abort to stop the consumer                   |
+| Option                 | Type                 | Default | Description                                         |
+| ---------------------- | -------------------- | ------- | --------------------------------------------------- |
+| `partitionConcurrency` | `number`             | `1`     | How many partitions process concurrently            |
+| `autoCommit`           | `boolean`            | `true`  | Enable periodic commits                             |
+| `commitOffsets`        | `boolean`            | `true`  | Track consumed offsets for committing               |
+| `autoCommitIntervalMs` | `number`             | `5000`  | Commit interval when `autoCommit` is enabled        |
+| `signal`               | `AbortSignal`        | -       | Abort to stop the consumer                          |
+| `assignment`           | `ManualAssignment[]` | -       | Manually assign partitions instead of joining group |
 
 ### runBatch Options
 
-| Option                 | Type          | Default | Description                                  |
-| ---------------------- | ------------- | ------- | -------------------------------------------- |
-| `partitionConcurrency` | `number`      | `1`     | How many partitions process concurrently     |
-| `autoCommit`           | `boolean`     | `true`  | Enable periodic commits                      |
-| `commitOffsets`        | `boolean`     | `true`  | Track consumed offsets for committing        |
-| `autoCommitIntervalMs` | `number`      | `5000`  | Commit interval when `autoCommit` is enabled |
-| `signal`               | `AbortSignal` | -       | Abort to stop the consumer                   |
-| `maxBatchSize`         | `number`      | `100`   | Maximum messages per partition-batch         |
-| `maxBatchWaitMs`       | `number`      | `50`    | Max time to wait before flushing a batch     |
+| Option                 | Type                 | Default | Description                                         |
+| ---------------------- | -------------------- | ------- | --------------------------------------------------- |
+| `partitionConcurrency` | `number`             | `1`     | How many partitions process concurrently            |
+| `autoCommit`           | `boolean`            | `true`  | Enable periodic commits                             |
+| `commitOffsets`        | `boolean`            | `true`  | Track consumed offsets for committing               |
+| `autoCommitIntervalMs` | `number`             | `5000`  | Commit interval when `autoCommit` is enabled        |
+| `signal`               | `AbortSignal`        | -       | Abort to stop the consumer                          |
+| `maxBatchSize`         | `number`             | `100`   | Maximum messages per partition-batch                |
+| `maxBatchWaitMs`       | `number`             | `50`    | Max time to wait before flushing a batch            |
+| `assignment`           | `ManualAssignment[]` | -       | Manually assign partitions instead of joining group |
 
 ## Partition Concurrency
 
@@ -240,6 +242,69 @@ With static membership:
 
 - Consumer keeps its partition assignment on restart
 - No rebalance triggered if consumer rejoins within session timeout
+
+## Manual Topic Assignment
+
+Bypass the consumer group protocol entirely and manually assign specific partitions:
+
+```typescript
+interface ManualAssignment {
+	topic: string
+	partition: number
+	offset?: bigint // Optional starting offset
+}
+```
+
+### Basic Usage
+
+```typescript
+await consumer.runEach(
+	'events',
+	async message => {
+		console.log(message.value)
+	},
+	{
+		assignment: [
+			{ topic: 'events', partition: 0 },
+			{ topic: 'events', partition: 1 },
+		],
+	}
+)
+```
+
+### With Explicit Starting Offset
+
+```typescript
+await consumer.runEach(
+	'events',
+	async message => {
+		console.log(message.value)
+	},
+	{
+		assignment: [{ topic: 'events', partition: 0, offset: 100n }],
+	}
+)
+```
+
+### How It Works
+
+When using manual assignment:
+
+- **No group coordination** - Skips JoinGroup/SyncGroup protocol exchanges
+- **No rebalancing** - Partitions remain statically assigned
+- **Offset resolution** - If `offset` is omitted, the consumer fetches committed offsets (if present) or falls back to `autoOffsetReset`
+- **Offset commits** - Still commits offsets under `groupId` (if `commitOffsets: true`), but without group generation/member metadata
+
+### Use Cases
+
+- **Static partition mapping** - When you need deterministic partition-to-consumer mapping
+- **Multiple consumers on same partition** - Multiple consumers with the same `groupId` can consume the same partition independently
+- **Testing** - Simplified testing without rebalance complexity
+- **State restoration** - Read specific partitions for state recovery
+
+::: warning
+Manual assignment does not emit `partitionsRevoked` events since there is no rebalancing. Ensure your application handles partition ownership appropriately.
+:::
 
 ## Graceful Shutdown
 
