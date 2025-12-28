@@ -124,7 +124,10 @@ export class TopicCollector<K = Buffer, V = Buffer> extends EventEmitter {
 		this.runPromise = null
 	}
 
-	waitFor(predicate: (msg: CollectedMessage<K, V>) => boolean, timeoutMs: number = 5_000): Promise<CollectedMessage<K, V>> {
+	waitFor(
+		predicate: (msg: CollectedMessage<K, V>) => boolean,
+		timeoutMs: number = 5_000
+	): Promise<CollectedMessage<K, V>> {
 		const existing = this.messages.find(predicate)
 		if (existing) {
 			return Promise.resolve(existing)

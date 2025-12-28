@@ -89,7 +89,8 @@ describe('KStream operators', () => {
 	const mapCodec = codec.json<{ key: string; n: number; mapped: true }>()
 	const mapValuesCodec = codec.json<{ nPlus1: number; type: string }>()
 	const throughCodec = codec.json<{ n: number; type: string; through: true }>()
-	const mergedCodec = codec.json<{ source: 'a' | 'b'; n: number }>()
+	type MergedValue = { source: 'a' | 'b'; n: number }
+	const mergedCodec = codec.json<MergedValue>()
 
 	const peeked: Array<{ key: string | null; value: InputEvent }> = []
 
@@ -129,7 +130,12 @@ describe('KStream operators', () => {
 		streamA.selectKey((v, _k) => v.type).to(outSelectKey, { key: stringCodec })
 
 		// branch
-		const [branchA, branchB] = streamA.branch((_k, v) => v.type === 'a', (_k, v) => v.type === 'b')
+		const branches = streamA.branch(
+			(_k, v) => v.type === 'a',
+			(_k, v) => v.type === 'b'
+		)
+		const branchA = branches[0]!
+		const branchB = branches[1]!
 		branchA.to(outBranchA)
 		branchB.to(outBranchB)
 
@@ -141,8 +147,8 @@ describe('KStream operators', () => {
 
 		// merge
 		streamA
-			.mapValues(v => ({ source: 'a' as const, n: v.n }))
-			.merge(streamB.mapValues(v => ({ source: 'b' as const, n: v.n })))
+			.mapValues<MergedValue>(v => ({ source: 'a', n: v.n }))
+			.merge(streamB.mapValues<MergedValue>(v => ({ source: 'b', n: v.n })))
 			.to(outMerged, { value: mergedCodec })
 
 		// custom partitioner
@@ -221,7 +227,7 @@ describe('KStream operators', () => {
 
 	it('flatMapValues emits multiple records per input', async () => {
 		await producer.send(inputA, { key: 'k3', value: jsonCodec.encode({ n: 5, type: 'x' }) })
-		const msgs = await output.waitForCount(outFlat, m => m.key === 'k3', 2)
+		const msgs = await output.waitForCount<string, number>(outFlat, m => m.key === 'k3', 2)
 		const values = msgs.map(m => m.value).sort((a, b) => a - b)
 		expect(values).toEqual([5, 6])
 	})
@@ -298,84 +304,76 @@ describe('KStream operators', () => {
 })
 
 describe('offsetReset policies', () => {
-	it(
-		'offsetReset=earliest consumes messages produced before app.start()',
-			async () => {
-				const input = uniqueTopicName('flow-it-offset-earliest-input')
-				const outputTopic = uniqueTopicName('flow-it-offset-earliest-out')
-				const appId = `flow-it-offset-earliest-${Date.now()}`
+	it('offsetReset=earliest consumes messages produced before app.start()', async () => {
+		const input = uniqueTopicName('flow-it-offset-earliest-input')
+		const outputTopic = uniqueTopicName('flow-it-offset-earliest-out')
+		const appId = `flow-it-offset-earliest-${Date.now()}`
 
-				await createTopics(client, [{ name: input }, { name: outputTopic }])
+		await createTopics(client, [{ name: input }, { name: outputTopic }])
 
-				await producer.send(input, { key: 'pre', value: jsonCodec.encode({ n: 1, type: 'x' }) })
+		await producer.send(input, { key: 'pre', value: jsonCodec.encode({ n: 1, type: 'x' }) })
 
-				const app = flow({
-					applicationId: appId,
-					client,
-					numStreamThreads: 1,
-					consumer: { autoOffsetReset: 'earliest', maxWaitMs: 100 },
-				})
-				app.stream(input, { key: stringCodec, value: jsonCodec, offsetReset: 'earliest' }).to(outputTopic)
+		const app = flow({
+			applicationId: appId,
+			client,
+			numStreamThreads: 1,
+			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 100 },
+		})
+		app.stream(input, { key: stringCodec, value: jsonCodec, offsetReset: 'earliest' }).to(outputTopic)
 
-				const out = new MultiTopicCollector({
-					client,
-					groupId: `${appId}-collector`,
-					topics: [{ topic: outputTopic, keyCodec: stringCodec, valueCodec: jsonCodec }],
-				})
+		const out = new MultiTopicCollector({
+			client,
+			groupId: `${appId}-collector`,
+			topics: [{ topic: outputTopic, keyCodec: stringCodec, valueCodec: jsonCodec }],
+		})
 
-				await out.start()
-				await app.start()
+		await out.start()
+		await app.start()
 
-				await out.waitFor(outputTopic, m => m.key === 'pre')
+		await out.waitFor(outputTopic, m => m.key === 'pre')
 
-				await app.close()
-				await out.stop()
-			},
-			30_000
-		)
+		await app.close()
+		await out.stop()
+	}, 30_000)
 
-	it(
-		'offsetReset=latest ignores pre-existing messages but consumes new ones',
-			async () => {
-				const input = uniqueTopicName('flow-it-offset-latest-input')
-				const outputTopic = uniqueTopicName('flow-it-offset-latest-out')
-				const appId = `flow-it-offset-latest-${Date.now()}`
+	it('offsetReset=latest ignores pre-existing messages but consumes new ones', async () => {
+		const input = uniqueTopicName('flow-it-offset-latest-input')
+		const outputTopic = uniqueTopicName('flow-it-offset-latest-out')
+		const appId = `flow-it-offset-latest-${Date.now()}`
 
-				await createTopics(client, [{ name: input }, { name: outputTopic }])
+		await createTopics(client, [{ name: input }, { name: outputTopic }])
 
-				await producer.send(input, { key: 'pre', value: jsonCodec.encode({ n: 1, type: 'x' }) })
+		await producer.send(input, { key: 'pre', value: jsonCodec.encode({ n: 1, type: 'x' }) })
 
-				const app = flow({
-					applicationId: appId,
-					client,
-					numStreamThreads: 1,
-					consumer: { autoOffsetReset: 'earliest', maxWaitMs: 100 },
-				})
-				app.stream(input, { key: stringCodec, value: jsonCodec, offsetReset: 'latest' }).to(outputTopic)
+		const app = flow({
+			applicationId: appId,
+			client,
+			numStreamThreads: 1,
+			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 100 },
+		})
+		app.stream(input, { key: stringCodec, value: jsonCodec, offsetReset: 'latest' }).to(outputTopic)
 
-				const out = new MultiTopicCollector({
-					client,
-					groupId: `${appId}-collector`,
-					topics: [{ topic: outputTopic, keyCodec: stringCodec, valueCodec: jsonCodec }],
-				})
+		const out = new MultiTopicCollector({
+			client,
+			groupId: `${appId}-collector`,
+			topics: [{ topic: outputTopic, keyCodec: stringCodec, valueCodec: jsonCodec }],
+		})
 
-				await out.start()
-				await app.start()
+		await out.start()
+		await app.start()
 
-				// pre-existing should be ignored
-				await expect(out.waitFor(outputTopic, m => m.key === 'pre', 500)).rejects.toThrow('Timed out')
+		// pre-existing should be ignored
+		await expect(out.waitFor(outputTopic, m => m.key === 'pre', 500)).rejects.toThrow('Timed out')
 
-				// app.start() waits for the consumer to be running, so this message is guaranteed
-				// to be produced after partitions are assigned.
-				await producer.send(input, { key: 'post', value: jsonCodec.encode({ n: 1, type: 'x' }) })
-				await out.waitFor(outputTopic, m => m.key === 'post', 10_000)
+		// app.start() waits for the consumer to be running, so this message is guaranteed
+		// to be produced after partitions are assigned.
+		await producer.send(input, { key: 'post', value: jsonCodec.encode({ n: 1, type: 'x' }) })
+		await out.waitFor(outputTopic, m => m.key === 'post', 10_000)
 
-				await app.close()
-				await out.stop()
-			},
-			30_000
-		)
-	})
+		await app.close()
+		await out.stop()
+	}, 30_000)
+})
 
 describe('grouping and aggregations', () => {
 	const input = uniqueTopicName('flow-it-agg-input')
@@ -413,12 +411,16 @@ describe('grouping and aggregations', () => {
 			.to(outSum)
 
 		grouped
-			.aggregate(() => ({ sum: 0 }), (_k, v, agg) => ({ sum: agg.sum + v }), {
-				storeName: 'aggs',
-				key: stringCodec,
-				value: aggCodec,
-				changelog: false,
-			})
+			.aggregate(
+				() => ({ sum: 0 }),
+				(_k, v, agg) => ({ sum: agg.sum + v }),
+				{
+					storeName: 'aggs',
+					key: stringCodec,
+					value: aggCodec,
+					changelog: false,
+				}
+			)
 			.toStream()
 			.to(outAgg)
 
@@ -485,7 +487,7 @@ describe('grouping and aggregations', () => {
 	it('aggregate can build custom aggregate objects', async () => {
 		await producer.send(input, { key: 'x', value: numberCodec.encode(2) })
 		await producer.send(input, { key: 'x', value: numberCodec.encode(3) })
-		await output.waitFor(outAgg, m => m.key === 'x' && m.value.sum === 5)
+		await output.waitFor<string, { sum: number }>(outAgg, m => m.key === 'x' && m.value.sum === 5)
 	})
 
 	it('aggregations skip null keys', async () => {
@@ -504,10 +506,12 @@ describe('grouping and aggregations', () => {
 describe('stream-table joins', () => {
 	type User = { name: string }
 	type Event = { action: string }
+	type InnerEnriched = { action: string; user: string }
 	type Enriched = { action: string; user: string | null }
 
 	const userCodec = codec.json<User>()
 	const eventCodec = codec.json<Event>()
+	const innerEnrichedCodec = codec.json<InnerEnriched>()
 	const enrichedCodec = codec.json<Enriched>()
 
 	const usersTopic = uniqueTopicName('flow-it-join-users')
@@ -535,7 +539,7 @@ describe('stream-table joins', () => {
 
 		events
 			.join(users, (event, user) => ({ action: event.action, user: user.name }))
-			.to(outInner, { value: enrichedCodec })
+			.to(outInner, { value: innerEnrichedCodec })
 		events
 			.leftJoin(users, (event, user) => ({ action: event.action, user: user?.name ?? null }))
 			.to(outLeft, { value: enrichedCodec })
@@ -545,7 +549,7 @@ describe('stream-table joins', () => {
 			groupId: `${appId}-collector`,
 			topics: [
 				{ topic: outUsers, keyCodec: stringCodec, valueCodec: userCodec },
-				{ topic: outInner, keyCodec: stringCodec, valueCodec: enrichedCodec },
+				{ topic: outInner, keyCodec: stringCodec, valueCodec: innerEnrichedCodec },
 				{ topic: outLeft, keyCodec: stringCodec, valueCodec: enrichedCodec },
 			],
 		})
@@ -572,10 +576,13 @@ describe('stream-table joins', () => {
 
 	it('inner join emits when the table has a matching key', async () => {
 		await producer.send(usersTopic, { key: 'u1', value: userCodec.encode({ name: 'Alice' }) })
-		await output.waitFor(outUsers, m => m.key === 'u1' && m.value.name === 'Alice')
+		await output.waitFor<string, User>(outUsers, m => m.key === 'u1' && m.value.name === 'Alice')
 
 		await producer.send(eventsTopic, { key: 'u1', value: eventCodec.encode({ action: 'click' }) })
-		const msg = await output.waitFor(outInner, m => m.key === 'u1' && m.value.action === 'click')
+		const msg = await output.waitFor<string, InnerEnriched>(
+			outInner,
+			m => m.key === 'u1' && m.value.action === 'click'
+		)
 		expect(msg.value).toEqual({ action: 'click', user: 'Alice' })
 	})
 
@@ -592,13 +599,16 @@ describe('stream-table joins', () => {
 
 	it('joins observe updated table values', async () => {
 		await producer.send(usersTopic, { key: 'u2', value: userCodec.encode({ name: 'Bob' }) })
-		await output.waitFor(outUsers, m => m.key === 'u2' && m.value.name === 'Bob')
+		await output.waitFor<string, User>(outUsers, m => m.key === 'u2' && m.value.name === 'Bob')
 
 		await producer.send(usersTopic, { key: 'u2', value: userCodec.encode({ name: 'Robert' }) })
-		await output.waitFor(outUsers, m => m.key === 'u2' && m.value.name === 'Robert')
+		await output.waitFor<string, User>(outUsers, m => m.key === 'u2' && m.value.name === 'Robert')
 
 		await producer.send(eventsTopic, { key: 'u2', value: eventCodec.encode({ action: 'purchase' }) })
-		const msg = await output.waitFor(outInner, m => m.key === 'u2' && m.value.action === 'purchase')
+		const msg = await output.waitFor<string, InnerEnriched>(
+			outInner,
+			m => m.key === 'u2' && m.value.action === 'purchase'
+		)
 		expect(msg.value.user).toBe('Robert')
 	})
 
@@ -631,11 +641,9 @@ describe('stream-stream joins', () => {
 		const right = app.stream(rightTopic, { key: stringCodec, value: numberCodec })
 
 		left.join(right, (l, r) => l + r, { within: TimeWindows.of(1_000) }).to(outInner, { value: numberCodec })
-		left
-			.leftJoin(right, (l, r) => (r === null ? l : l + r), { within: TimeWindows.of(1_000) })
-			.to(outLeft, {
-				value: numberCodec,
-			})
+		left.leftJoin(right, (l, r) => (r === null ? l : l + r), { within: TimeWindows.of(1_000) }).to(outLeft, {
+			value: numberCodec,
+		})
 		left.outerJoin(right, (l, r) => (l ?? 0) + (r ?? 0), { within: TimeWindows.of(1_000) }).to(outOuter, {
 			value: numberCodec,
 		})
@@ -747,11 +755,7 @@ describe('changelog topics and restoration', () => {
 		const storeName = 'counts'
 		const changelogTopic = buildChangelogTopicName(appId, storeName)
 
-		await createTopics(client, [
-			{ name: a, partitions: 1 },
-			{ name: b, partitions: 4 },
-			{ name: outputTopic },
-		])
+		await createTopics(client, [{ name: a, partitions: 1 }, { name: b, partitions: 4 }, { name: outputTopic }])
 
 		const app = flow({ applicationId: appId, client, numStreamThreads: 1, consumer: { maxWaitMs: 100 } })
 		const s1 = app.stream(a, { key: stringCodec, value: numberCodec })
@@ -812,83 +816,70 @@ describe('changelog topics and restoration', () => {
 		await app.close()
 	})
 
-		it(
-			'restores state from changelog topics after restart',
-			async () => {
-			const input = uniqueTopicName('flow-it-restore-src')
-			const outputTopic = uniqueTopicName('flow-it-restore-out')
-			const appId = `flow-it-restore-${Date.now()}`
-			const storeName = 'counts'
+	it('restores state from changelog topics after restart', async () => {
+		const input = uniqueTopicName('flow-it-restore-src')
+		const outputTopic = uniqueTopicName('flow-it-restore-out')
+		const appId = `flow-it-restore-${Date.now()}`
+		const storeName = 'counts'
 
-				await createTopics(client, [{ name: input }, { name: outputTopic }])
+		await createTopics(client, [{ name: input }, { name: outputTopic }])
 
-				const buildApp = (skipRestoration: boolean) => {
-					const app = flow({
-						applicationId: appId,
-						client,
-						numStreamThreads: 1,
-						consumer: { maxWaitMs: 100 },
-						changelog: {
-							restoration: {
-								idleTimeoutMs: 2_000,
-								initialIdleTimeoutMs: 10_000,
-								checkIntervalMs: 200,
-								consumerMaxWaitMs: 200,
-							},
-						},
-					})
-					app.stream(input, { key: stringCodec, value: numberCodec })
-						.groupByKey()
-						.count({ storeName, key: stringCodec, value: numberCodec, changelog: { skipRestoration } })
-						.toStream()
-						.to(outputTopic)
-					return app
-				}
-
-			const out = new MultiTopicCollector({
+		const buildApp = (skipRestoration: boolean) => {
+			const app = flow({
+				applicationId: appId,
 				client,
-					groupId: `${appId}-collector-${Date.now()}`,
-					topics: [{ topic: outputTopic, keyCodec: stringCodec, valueCodec: numberCodec }],
-				})
-				await withTimeout('output collector start', out.start(), 15_000)
+				numStreamThreads: 1,
+				consumer: { maxWaitMs: 100 },
+				changelog: {
+					restoration: {
+						idleTimeoutMs: 2_000,
+						initialIdleTimeoutMs: 10_000,
+						checkIntervalMs: 200,
+						consumerMaxWaitMs: 200,
+					},
+				},
+			})
+			app.stream(input, { key: stringCodec, value: numberCodec })
+				.groupByKey()
+				.count({ storeName, key: stringCodec, value: numberCodec, changelog: { skipRestoration } })
+				.toStream()
+				.to(outputTopic)
+			return app
+		}
 
-				const app1 = buildApp(true)
-				await withTimeout('app1.start', app1.start(), 20_000)
+		const out = new MultiTopicCollector({
+			client,
+			groupId: `${appId}-collector-${Date.now()}`,
+			topics: [{ topic: outputTopic, keyCodec: stringCodec, valueCodec: numberCodec }],
+		})
+		await withTimeout('output collector start', out.start(), 15_000)
 
-				await withTimeout(
-					'produce input (1)',
-					producer.send(input, { key: 'a', value: numberCodec.encode(1) }),
-					15_000
-				)
-				await withTimeout(
-					'produce input (2)',
-					producer.send(input, { key: 'a', value: numberCodec.encode(1) }),
-					15_000
-				)
-				await out.waitFor(outputTopic, m => m.key === 'a' && m.value === 2)
+		const app1 = buildApp(true)
+		await withTimeout('app1.start', app1.start(), 20_000)
 
-				await withTimeout('app1.close', app1.close(), 20_000)
+		await withTimeout('produce input (1)', producer.send(input, { key: 'a', value: numberCodec.encode(1) }), 15_000)
+		await withTimeout('produce input (2)', producer.send(input, { key: 'a', value: numberCodec.encode(1) }), 15_000)
+		await out.waitFor(outputTopic, m => m.key === 'a' && m.value === 2)
 
-				const app2 = buildApp(false)
-				await withTimeout('app2.start', app2.start(), 20_000)
+		await withTimeout('app1.close', app1.close(), 20_000)
 
-				await withTimeout(
-					'produce input (3)',
-					producer.send(input, { key: 'a', value: numberCodec.encode(1) }),
-					15_000
-				)
-				try {
-					await out.waitFor(outputTopic, m => m.key === 'a' && m.value === 3)
-				} catch (error) {
-					const seen = out.getTopicMessages<string, number>(outputTopic).filter(m => m.key === 'a').map(m => m.value)
-					throw new Error(`Expected restored count to reach 3, but saw values: [${seen.join(', ')}]`, {
-						cause: error instanceof Error ? error : new Error(String(error)),
-					})
-				}
+		const app2 = buildApp(false)
+		await withTimeout('app2.start', app2.start(), 20_000)
 
-				await withTimeout('app2.close', app2.close(), 20_000)
-				await withTimeout('output collector stop', out.stop(), 15_000)
-			},
-			60_000
-		)
-	})
+		await withTimeout('produce input (3)', producer.send(input, { key: 'a', value: numberCodec.encode(1) }), 15_000)
+		try {
+			await out.waitFor(outputTopic, m => m.key === 'a' && m.value === 3)
+		} catch (error) {
+			const seen = out
+				.getTopicMessages<string, number>(outputTopic)
+				.filter(m => m.key === 'a')
+				.map(m => m.value)
+			throw new Error(`Expected restored count to reach 3, but saw values: [${seen.join(', ')}]`, {
+				cause: error instanceof Error ? error : new Error(String(error)),
+			})
+		}
+
+		await withTimeout('app2.close', app2.close(), 20_000)
+		await withTimeout('output collector stop', out.stop(), 15_000)
+	}, 60_000)
+})

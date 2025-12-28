@@ -277,7 +277,8 @@ export class Producer extends EventEmitter<ProducerEvents> {
 			}
 		}
 
-		const finalError = lastError instanceof Error ? lastError : new Error(`Failed to send batches: ${String(lastError)}`)
+		const finalError =
+			lastError instanceof Error ? lastError : new Error(`Failed to send batches: ${String(lastError)}`)
 
 		// We failed before we could hand the batches to sendBrokerBatches(), so reject all message promises and
 		// mark the batches as completed to unblock flush/drain.
