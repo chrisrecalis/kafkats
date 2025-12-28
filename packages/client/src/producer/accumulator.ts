@@ -186,7 +186,7 @@ export class RecordAccumulator extends EventEmitter<AccumulatorEvents> {
 	private estimateMessageSize(message: QueuedMessage): number {
 		let size = 0
 		if (message.key) size += message.key.length
-		size += message.value.length
+		if (message.value) size += message.value.length
 		for (const value of Object.values(message.headers)) {
 			size += value.length
 		}

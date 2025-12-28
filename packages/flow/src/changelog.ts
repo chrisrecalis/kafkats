@@ -222,7 +222,11 @@ export class ChangelogRestorer<K, V> {
 	 * Restore state by consuming the changelog topic from the beginning.
 	 * @returns Number of records restored
 	 */
-	async restore(client: KafkaClient, options?: ChangelogRestorationOptions): Promise<number> {
+	async restore(client: KafkaClient, options?: ChangelogRestorationOptions, partitions?: number[]): Promise<number> {
+		if (partitions && partitions.length === 0) {
+			return 0
+		}
+
 		const uniqueGroupId = `${this.topicName}-restorer-${Date.now()}-${Math.random().toString(36).slice(2)}`
 
 		const consumer = client.consumer({
@@ -271,6 +275,7 @@ export class ChangelogRestorer<K, V> {
 			},
 			{
 				commitOffsets: false,
+				assignment: partitions?.map(partition => ({ topic: this.topicName, partition })),
 				signal: (() => {
 					// Create an abort controller that will abort after idle timeout
 					const controller = new AbortController()

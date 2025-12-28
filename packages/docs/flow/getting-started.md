@@ -23,19 +23,19 @@ const app = flow({
 
 ### Configuration Options
 
-| Option                | Type                                | Default           | Description                                                                     |
-| --------------------- | ----------------------------------- | ----------------- | ------------------------------------------------------------------------------- |
-| `applicationId`       | `string`                            | -                 | Required. Also used as the consumer group id                                    |
-| `client`              | `KafkaClient \| KafkaClientConfig`  | -                 | Required. Pass an existing client or a config object                            |
-| `numStreamThreads`    | `number`                            | `1`               | Number of parallel stream threads (each has its own producer/consumer)          |
-| `processingGuarantee` | `'at_least_once' \| 'exactly_once'` | `'at_least_once'` | Enables transactional processing when `'exactly_once'`                          |
-| `commitIntervalMs`    | `number`                            | `100`             | Transaction commit interval in milliseconds (only applies to `exactly_once`)    |
-| `stateDir`            | `string`                            | -                 | State directory (used by some store providers)                                  |
-| `stateStoreProvider`  | `StateStoreProvider`                | in-memory         | State store backend (in-memory by default)                                      |
-| `changelog`           | `object`                            | -                 | Changelog topic settings: `replicationFactor`, `topicConfigs`, `autoCreate`     |
-| `consumer`            | `Omit<ConsumerConfig, 'groupId'>`   | -                 | Consumer overrides (Flow sets `groupId` to `applicationId`)                     |
-| `producer`            | `ProducerConfig`                    | -                 | Producer overrides                                                              |
-| `runEach`             | `RunEachOptions`                    | -                 | Consumer run-loop options (e.g. `partitionConcurrency`, `autoCommitIntervalMs`) |
+| Option                | Type                                | Default           | Description                                                                                   |
+| --------------------- | ----------------------------------- | ----------------- | --------------------------------------------------------------------------------------------- |
+| `applicationId`       | `string`                            | -                 | Required. Also used as the consumer group id                                                  |
+| `client`              | `KafkaClient \| KafkaClientConfig`  | -                 | Required. Pass an existing client or a config object                                          |
+| `numStreamThreads`    | `number`                            | `1`               | Number of parallel stream threads (each has its own producer/consumer)                        |
+| `processingGuarantee` | `'at_least_once' \| 'exactly_once'` | `'at_least_once'` | Enables transactional processing when `'exactly_once'`                                        |
+| `commitIntervalMs`    | `number`                            | `100`             | Transaction commit interval in milliseconds (only applies to `exactly_once`)                  |
+| `stateDir`            | `string`                            | -                 | State directory (used by some store providers)                                                |
+| `stateStoreProvider`  | `StateStoreProvider`                | in-memory         | State store backend (in-memory by default)                                                    |
+| `changelog`           | `object`                            | -                 | Changelog topic settings: `replicationFactor`, `topicConfigs`, `autoCreate`                   |
+| `consumer`            | `Omit<ConsumerConfig, 'groupId'>`   | -                 | Consumer overrides (Flow sets `groupId` to `applicationId`)                                   |
+| `producer`            | `ProducerConfig`                    | -                 | Producer overrides                                                                            |
+| `runEach`             | `RunEachOptions`                    | -                 | Consumer run-loop options (e.g. `partitionConcurrency`, `autoCommitIntervalMs`, `assignment`) |
 
 #### Client Config (KafkaClientConfig)
 
