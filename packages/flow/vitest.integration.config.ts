@@ -8,8 +8,21 @@ export default defineConfig({
 		},
 	},
 	test: {
-		globalSetup: ['./tests/integration/helpers/global-setup.ts'],
-		testTimeout: 60_000,
-		hookTimeout: 120_000,
+		include: ['tests/integration/**/*.test.ts'],
+		globalSetup: ['tests/integration/kafka.global-setup.ts'],
+		pool: 'threads',
+		maxWorkers: 1,
+		fileParallelism: false,
+		testTimeout: 15_000,
+		hookTimeout: 60_000,
+		teardownTimeout: 60_000,
+		deps: {
+			optimizer: {
+				ssr: {
+					enabled: false,
+				},
+			},
+		},
 	},
 })
+

@@ -21,6 +21,34 @@ export interface ChangelogConfig {
 	skipRestoration?: boolean
 }
 
+export interface ChangelogRestorationOptions {
+	/**
+	 * Stop restoration after this many milliseconds without consuming any messages.
+	 * Default: 5000ms.
+	 */
+	idleTimeoutMs?: number
+	/**
+	 * Stop restoration after this many milliseconds without consuming any messages
+	 * BEFORE the first message is received.
+	 *
+	 * This can be set higher than idleTimeoutMs to tolerate slow consumer startup
+	 * while still stopping quickly after reaching the end of the changelog.
+	 *
+	 * Default: idleTimeoutMs.
+	 */
+	initialIdleTimeoutMs?: number
+	/**
+	 * How often to check for the idle timeout.
+	 * Default: 1000ms.
+	 */
+	checkIntervalMs?: number
+	/**
+	 * Override the consumer's Fetch maxWaitMs during restoration to make stop() responsive.
+	 * Default: unset (uses consumer defaults).
+	 */
+	consumerMaxWaitMs?: number
+}
+
 /**
  * Error thrown when an existing changelog topic has the wrong number of partitions.
  * This indicates data corruption risk and requires manual intervention.
@@ -194,12 +222,13 @@ export class ChangelogRestorer<K, V> {
 	 * Restore state by consuming the changelog topic from the beginning.
 	 * @returns Number of records restored
 	 */
-	async restore(client: KafkaClient): Promise<number> {
+	async restore(client: KafkaClient, options?: ChangelogRestorationOptions): Promise<number> {
 		const uniqueGroupId = `${this.topicName}-restorer-${Date.now()}-${Math.random().toString(36).slice(2)}`
 
 		const consumer = client.consumer({
 			groupId: uniqueGroupId,
 			autoOffsetReset: 'earliest',
+			...(options?.consumerMaxWaitMs !== undefined ? { maxWaitMs: options.consumerMaxWaitMs } : {}),
 		})
 
 		let restoredCount = 0
@@ -208,12 +237,22 @@ export class ChangelogRestorer<K, V> {
 		// We'll use a timeout to detect when we've consumed all available messages
 		// This is a simpler approach than tracking end offsets
 		let lastMessageTime = Date.now()
-		const idleTimeoutMs = 5000 // Stop after 5 seconds of no messages
+		let isRunning = false
+		let hasConsumedMessage = false
+		const idleTimeoutMs = options?.idleTimeoutMs ?? 5000 // Stop after N ms of no messages
+		const initialIdleTimeoutMs = options?.initialIdleTimeoutMs ?? idleTimeoutMs
+		const checkIntervalMs = options?.checkIntervalMs ?? 1000
+
+		consumer.once('running', () => {
+			isRunning = true
+			lastMessageTime = Date.now()
+		})
 
 		await consumer.runEach(
 			[this.topicName],
 			async message => {
 				lastMessageTime = Date.now()
+				hasConsumedMessage = true
 
 				if (message.key === null) {
 					return
@@ -238,17 +277,19 @@ export class ChangelogRestorer<K, V> {
 
 					// Check periodically if we should stop
 					const checkIdle = setInterval(() => {
+						if (!isRunning) return
 						if (stopRequested) {
 							clearInterval(checkIdle)
 							controller.abort()
 							return
 						}
-						if (Date.now() - lastMessageTime > idleTimeoutMs) {
+						const timeoutMs = hasConsumedMessage ? idleTimeoutMs : initialIdleTimeoutMs
+						if (Date.now() - lastMessageTime > timeoutMs) {
 							stopRequested = true
 							clearInterval(checkIdle)
 							controller.abort()
 						}
-					}, 1000)
+					}, checkIntervalMs)
 
 					return controller.signal
 				})(),
