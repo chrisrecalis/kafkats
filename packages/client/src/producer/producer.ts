@@ -9,6 +9,7 @@ import type { ProduceRequest } from '@/protocol/messages/requests/produce.js'
 import { ErrorCode, isRetriableError } from '@/protocol/messages/error-codes.js'
 import {
 	shouldRefreshMetadata,
+	KafkaError,
 	ProducerFencedError,
 	InvalidTxnStateError,
 	TransactionAbortedError,
@@ -225,23 +226,68 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	 * one ProduceRequest per broker containing all partitions.
 	 */
 	private async sendBatchesGroupedByBroker(batches: PartitionBatch[]): Promise<void> {
-		// Look up leader for each batch and group by broker
-		const batchesByBroker = new Map<Broker, PartitionBatch[]>()
+		const topics = Array.from(new Set(batches.map(b => b.topic)))
 
+		const strategy = new ReconnectionStrategy({
+			maxAttempts: this.config.retries + 1,
+			initialDelayMs: this.config.retryBackoffMs,
+			maxDelayMs: this.config.maxRetryBackoffMs,
+		})
+
+		let lastError: unknown
+
+		while (strategy.shouldReconnect()) {
+			try {
+				// Look up leader for each batch and group by broker
+				const batchesByBroker = new Map<Broker, PartitionBatch[]>()
+
+				for (const batch of batches) {
+					const leader = await this.cluster.getLeaderForPartition(batch.topic, batch.partition)
+					const existing = batchesByBroker.get(leader) ?? []
+					existing.push(batch)
+					batchesByBroker.set(leader, existing)
+				}
+
+				// Send one request per broker in parallel.
+				// We use allSettled to ensure we don't emit unhandled rejections here; individual messages will be
+				// resolved/rejected by sendBrokerBatches().
+				const sendPromises: Promise<void>[] = []
+				for (const [broker, brokerBatches] of batchesByBroker) {
+					sendPromises.push(this.sendBrokerBatches(broker, brokerBatches))
+				}
+
+				await Promise.allSettled(sendPromises)
+				return
+			} catch (error) {
+				lastError = error
+				strategy.recordFailure()
+
+				if (error instanceof KafkaError && shouldRefreshMetadata(error.errorCode)) {
+					await this.cluster.refreshMetadata(topics)
+					for (const topic of topics) {
+						this.partitionCache.delete(topic)
+					}
+				}
+
+				if (!strategy.shouldReconnect()) {
+					break
+				}
+
+				await this.sleep(strategy.nextDelay())
+			}
+		}
+
+		const finalError =
+			lastError instanceof Error ? lastError : new Error(`Failed to send batches: ${String(lastError)}`)
+
+		// We failed before we could hand the batches to sendBrokerBatches(), so reject all message promises and
+		// mark the batches as completed to unblock flush/drain.
 		for (const batch of batches) {
-			const leader = await this.cluster.getLeaderForPartition(batch.topic, batch.partition)
-			const existing = batchesByBroker.get(leader) ?? []
-			existing.push(batch)
-			batchesByBroker.set(leader, existing)
+			for (const msg of batch.messages) {
+				msg.reject(finalError)
+			}
+			this.accumulator.batchCompleted()
 		}
-
-		// Send one request per broker in parallel
-		const sendPromises: Promise<void>[] = []
-		for (const [broker, brokerBatches] of batchesByBroker) {
-			sendPromises.push(this.sendBrokerBatches(broker, brokerBatches))
-		}
-
-		await Promise.all(sendPromises)
 	}
 
 	/**

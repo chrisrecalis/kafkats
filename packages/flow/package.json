@@ -26,8 +26,8 @@
 	"scripts": {
 		"build": "pnpm clean && tsc -p tsconfig.build.json && tsc-alias -p tsconfig.build.json",
 		"test": "vitest run tests",
+		"test:integration": "vitest run -c vitest.integration.config.ts",
 		"test:unit": "vitest run tests/unit",
-		"test:integration": "vitest run --config vitest.integration.config.ts tests/integration",
 		"typecheck": "tsc -p tsconfig.json --noEmit",
 		"clean": "rm -rf dist",
 		"prepack": "pnpm build"

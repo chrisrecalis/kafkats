@@ -16,6 +16,7 @@ import type { StateStoreProvider, KeyValueStore, WindowStore, SessionStore, Wind
 import { InMemoryStateStoreProvider } from '@/state/memory.js'
 import {
 	type ChangelogConfig,
+	type ChangelogRestorationOptions,
 	type ChangelogTopicSpec,
 	ChangelogWriter,
 	ChangelogRestorer,
@@ -57,6 +58,8 @@ export interface FlowConfig {
 		replicationFactor?: number
 		/** Additional topic configs applied to all changelog topics */
 		topicConfigs?: Record<string, string>
+		/** Options to control changelog restoration behavior on startup. */
+		restoration?: ChangelogRestorationOptions
 		/**
 		 * Whether to auto-create changelog topics during startup.
 		 * Default: true
@@ -872,6 +875,8 @@ class FlowAppImpl implements FlowApp {
 		this.totalWorkers = threadCount
 		this.stoppedWorkers = 0
 
+		const workerReady: Promise<void>[] = []
+
 		for (let id = 0; id < threadCount; id += 1) {
 			const producer = this.client.producer(this.buildProducerConfig(id, threadCount))
 			const groupInstanceId = this.buildGroupInstanceId(id, threadCount)
@@ -901,6 +906,40 @@ class FlowAppImpl implements FlowApp {
 			this.workers.push(worker)
 			this.attachConsumerEvents(consumer, worker)
 
+			workerReady.push(
+				new Promise<void>((resolve, reject) => {
+					const timeoutMs = 10_000
+					const timer = setTimeout(() => {
+						cleanup()
+						reject(new Error(`Consumer did not start within ${timeoutMs}ms`))
+					}, timeoutMs)
+
+					const onRunning = () => {
+						cleanup()
+						resolve()
+					}
+					const onError = (error: unknown) => {
+						cleanup()
+						reject(error instanceof Error ? error : new Error(String(error)))
+					}
+					const onStopped = () => {
+						cleanup()
+						reject(new Error('Consumer stopped before starting'))
+					}
+
+					const cleanup = () => {
+						clearTimeout(timer)
+						consumer.off('running', onRunning)
+						consumer.off('error', onError)
+						consumer.off('stopped', onStopped)
+					}
+
+					consumer.once('running', onRunning)
+					consumer.once('error', onError)
+					consumer.once('stopped', onStopped)
+				})
+			)
+
 			const runPromise = consumer
 				.runEach(
 					topics,
@@ -927,6 +966,8 @@ class FlowAppImpl implements FlowApp {
 
 			this.runPromises.push(runPromise)
 		}
+
+		await Promise.all(workerReady)
 	}
 
 	async close(): Promise<void> {
@@ -1172,7 +1213,7 @@ class FlowAppImpl implements FlowApp {
 			const restorer = new ChangelogRestorer(spec.topicName, spec.keyCodec, spec.valueCodec, innerStore)
 
 			try {
-				const restoredCount = await restorer.restore(this.client)
+				const restoredCount = await restorer.restore(this.client, this.config.changelog?.restoration)
 				if (restoredCount > 0) {
 					// Log restoration (optional - could add a logger)
 				}
