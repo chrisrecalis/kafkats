@@ -15,6 +15,7 @@ import { Encoder } from '@/protocol/primitives/index.js'
 import { encodeRequestHeader } from '@/protocol/messages/headers.js'
 import { noopLogger, type Logger } from '@/logger.js'
 import { SaslAuthenticator } from '@/auth/sasl-authenticator.js'
+import { sleep } from '@/utils/sleep.js'
 
 export interface ConnectionOptions extends ConnectionConfig {
 	host: string
@@ -363,7 +364,7 @@ export class Connection extends EventEmitter<ConnectionEvents> {
 		if (waitForPending && this.requestQueue.totalPending > 0) {
 			const startTime = Date.now()
 			while (this.requestQueue.totalPending > 0 && Date.now() - startTime < waitTimeoutMs) {
-				await new Promise(resolve => setTimeout(resolve, 50))
+				await sleep(50)
 			}
 		}
 

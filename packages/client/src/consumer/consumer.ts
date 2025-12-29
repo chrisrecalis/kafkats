@@ -42,6 +42,7 @@ import { OffsetManager } from './offset-manager.js'
 import { FetchManager } from './fetch-manager.js'
 import { noopLogger, type Logger } from '@/logger.js'
 import { sleep } from '@/utils/sleep.js'
+import { retry } from '@/utils/retry.js'
 
 // Shared empty objects for common cases (optimization)
 const EMPTY_BUFFER = Buffer.alloc(0)
@@ -105,32 +106,40 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 
 	private async getCoordinatorWithRetry(type: 'GROUP' | 'TRANSACTION', key: string): Promise<Broker> {
 		const signal = this.abortController?.signal
-		const maxAttempts = 10
-		let backoffMs = 100
-
-		for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-			try {
-				return await this.cluster.getCoordinator(type, key)
-			} catch (error) {
-				if (signal?.aborted) {
-					throw error
-				}
-				if (error instanceof CoordinatorNotAvailableError || error instanceof NotCoordinatorError) {
+		try {
+			return await retry(() => this.cluster.getCoordinator(type, key), {
+				maxAttempts: 10,
+				initialDelayMs: 100,
+				maxDelayMs: 1_000,
+				multiplier: 2,
+				jitter: 0,
+				signal,
+				resolveOnAbort: true,
+				shouldRetry: error => {
+					if (signal?.aborted) {
+						return false
+					}
+					return error instanceof CoordinatorNotAvailableError || error instanceof NotCoordinatorError
+				},
+				onRetry: ({ attempt, delayMs, error }) => {
 					this.logger.debug('coordinator lookup failed, retrying', {
 						type,
 						key,
 						attempt,
-						error: error.message,
+						delayMs,
+						error: error instanceof Error ? error.message : String(error),
 					})
-					await sleep(backoffMs, { signal, resolveOnAbort: true }).catch(() => {})
-					backoffMs = Math.min(backoffMs * 2, 1_000)
-					continue
-				}
+				},
+			})
+		} catch (error) {
+			if (signal?.aborted) {
 				throw error
 			}
+			if (error instanceof CoordinatorNotAvailableError || error instanceof NotCoordinatorError) {
+				throw new CoordinatorNotAvailableError(type, key)
+			}
+			throw error
 		}
-
-		throw new CoordinatorNotAvailableError(type, key)
 	}
 
 	constructor(cluster: Cluster, config: ConsumerConfig) {
