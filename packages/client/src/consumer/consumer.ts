@@ -163,6 +163,278 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		}
 	}
 
+	private startRun(commitOffsets: boolean, externalSignal?: AbortSignal): void {
+		if (this.state !== 'idle') {
+			throw new Error('Consumer is already running. Call stop() first.')
+		}
+
+		this.state = 'running'
+		this.abortController = new AbortController()
+		this.commitOffsets = commitOffsets
+		this.sessionLost = false
+		this.rebalanceRequested = false
+		this.rebalanceRunner = null
+
+		// Set up external abort signal
+		if (externalSignal) {
+			externalSignal.addEventListener('abort', () => {
+				this.stop()
+			})
+		}
+	}
+
+	private async finalizeRun(options?: { logCleanup?: boolean; logStop?: boolean }): Promise<void> {
+		const { logCleanup = true, logStop = true } = options ?? {}
+
+		if (logCleanup) {
+			this.logger.debug('consumer run loop ended, cleaning up')
+		}
+		await this.cleanup()
+		this.state = 'idle'
+
+		if (logStop) {
+			this.logger.info('consumer stopped')
+		}
+		this.emit('stopped')
+	}
+
+	private getSubscriptionsAndTopics(subscription: SubscriptionInput): {
+		subscriptions: TopicSubscription<unknown, unknown>[]
+		topics: string[]
+	} {
+		const subscriptions = this.normalizeSubscription(subscription)
+		return {
+			subscriptions,
+			topics: subscriptions.map(s => s.topic),
+		}
+	}
+
+	private normalizeAndValidateManualAssignment(assignment: ManualAssignment[], topics: string[]): ManualAssignment[] {
+		const normalized = this.normalizeManualAssignment(assignment)
+
+		const subscriptionTopics = new Set(topics)
+		for (const tp of normalized) {
+			if (!subscriptionTopics.has(tp.topic)) {
+				throw new Error(`Manual assignment includes topic "${tp.topic}" that is not in the subscription`)
+			}
+		}
+
+		return normalized
+	}
+
+	private initGroupComponents(partitionConcurrency: number, logger?: Logger): void {
+		this.consumerGroup = new ConsumerGroup(this.cluster, this.config, logger)
+		this.offsetManager = new OffsetManager(this.cluster, this.config.groupId, this.config.groupInstanceId, logger)
+		this.fetchManager = new FetchManager(
+			this.cluster,
+			this.offsetManager,
+			this.config.autoOffsetReset,
+			{
+				maxBytesPerPartition: this.config.maxBytesPerPartition,
+				minBytes: this.config.minBytes,
+				maxWaitMs: this.config.maxWaitMs,
+				partitionConcurrency,
+				isolationLevel: this.config.isolationLevel,
+				trace: this.trace,
+			},
+			logger
+		)
+	}
+
+	private initManualAssignmentComponents(partitionConcurrency: number, logger?: Logger): void {
+		this.offsetManager = new OffsetManager(this.cluster, this.config.groupId, undefined, logger)
+		this.fetchManager = new FetchManager(
+			this.cluster,
+			this.offsetManager,
+			this.config.autoOffsetReset,
+			{
+				maxBytesPerPartition: this.config.maxBytesPerPartition,
+				minBytes: this.config.minBytes,
+				maxWaitMs: this.config.maxWaitMs,
+				partitionConcurrency,
+				isolationLevel: this.config.isolationLevel,
+				trace: this.trace,
+			},
+			logger
+		)
+	}
+
+	private attachGroupEventHandlers(subscriptions: TopicSubscription<unknown, unknown>[]): void {
+		const consumerGroup = this.consumerGroup
+		if (!consumerGroup) {
+			return
+		}
+
+		// Handle rebalance
+		consumerGroup.on('rebalance', () => {
+			this.logger.debug('rebalance event received')
+			this.emit('rebalance')
+			this.rebalanceRequested = true
+			if (this.rebalanceRunner) {
+				return
+			}
+
+			this.rebalanceRunner = (async () => {
+				while (this.rebalanceRequested && this.state === 'running') {
+					this.rebalanceRequested = false
+					await this.handleRebalance(subscriptions)
+				}
+			})()
+				.catch(error => {
+					const err = error instanceof Error ? error : new Error(String(error))
+					this.logger.error('rebalance handler failed', { error: err.message })
+					if (this.runPromiseReject) {
+						this.runPromiseReject(err)
+						this.runPromiseReject = null
+						this.runPromiseResolve = null
+					} else {
+						this.emitError(err)
+					}
+					this.stop()
+				})
+				.finally(() => {
+					this.rebalanceRunner = null
+				})
+		})
+
+		consumerGroup.on('sessionLost', (partitions: TopicPartition[]) => {
+			this.logger.info('session lost, partitions cannot be committed', { partitionCount: partitions.length })
+			this.sessionLost = true
+			this.offsetManager?.clearPartitions(partitions)
+			this.fetchManager?.removePartitions(partitions)
+			this.emit('partitionsLost', partitions)
+		})
+
+		consumerGroup.on('error', (error: Error) => {
+			const err = error instanceof Error ? error : new Error(String(error))
+
+			if (err instanceof KafkaProtocolError && err.errorCode === ErrorCode.FencedInstanceId) {
+				this.emitError(err)
+				if (this.runPromiseReject) {
+					this.runPromiseReject(err)
+					this.runPromiseReject = null
+					this.runPromiseResolve = null
+				}
+				this.stop()
+				return
+			}
+
+			this.emitError(err)
+		})
+	}
+
+	private async startFetchLoopAndWait(startFetchLoop: () => Promise<void>): Promise<void> {
+		await new Promise<void>((resolve, reject) => {
+			this.runPromiseResolve = resolve
+			this.runPromiseReject = reject
+
+			this.fetchLoopPromise = startFetchLoop()
+				.then(() => {
+					if (this.runPromiseResolve) {
+						this.runPromiseResolve()
+						this.runPromiseResolve = null
+						this.runPromiseReject = null
+					}
+				})
+				.catch(error => {
+					const err = error instanceof Error ? error : new Error(String(error))
+					if (this.runPromiseReject) {
+						this.runPromiseReject(err)
+						this.runPromiseReject = null
+						this.runPromiseResolve = null
+					} else {
+						this.emitError(err)
+					}
+				})
+		})
+	}
+
+	private async startManualAssignmentRun(
+		mode: 'each' | 'batch',
+		subscriptions: TopicSubscription<unknown, unknown>[],
+		topics: string[],
+		manualAssignment: ManualAssignment[],
+		partitionConcurrency: number,
+		startFetchLoop: () => Promise<void>
+	): Promise<void> {
+		this.logger.info('starting consumer', {
+			topics,
+			mode,
+			assignmentMode: 'manual',
+			assignedPartitionCount: manualAssignment.length,
+		})
+
+		// Manual assignment mode: no group join/rebalance.
+		// Use an OffsetManager without groupInstanceId since we don't have generation/member metadata.
+		this.initManualAssignmentComponents(partitionConcurrency, this.logger)
+
+		const offsetManager = this.offsetManager
+		const fetchManager = this.fetchManager
+		if (!offsetManager || !fetchManager) {
+			return
+		}
+
+		const assignment: TopicPartition[] = manualAssignment.map(tp => ({ topic: tp.topic, partition: tp.partition }))
+
+		// Coordinator is needed for offset fetch/commit (even without group membership)
+		const coordinator = await this.getCoordinatorWithRetry('GROUP', this.config.groupId)
+		offsetManager.updateGroupState('', -1, coordinator)
+
+		// Fetch committed offsets for the assigned partitions
+		const committedOffsets = await offsetManager.fetchCommittedOffsets(assignment)
+
+		// Resolve starting offsets
+		const partitionsWithOffsets: Array<TopicPartition & { offset: bigint }> = []
+		for (const tp of manualAssignment) {
+			const offset =
+				tp.offset !== undefined
+					? tp.offset
+					: await offsetManager.resolveStartingOffset(
+							tp.topic,
+							tp.partition,
+							this.config.autoOffsetReset,
+							committedOffsets
+						)
+			partitionsWithOffsets.push({ topic: tp.topic, partition: tp.partition, offset })
+		}
+
+		fetchManager.setPartitions(partitionsWithOffsets)
+
+		if (assignment.length > 0) {
+			this.emit('partitionsAssigned', assignment)
+		}
+		this.emit('running')
+
+		await this.startFetchLoopAndWait(startFetchLoop)
+	}
+
+	private async startGroupRun(
+		mode: 'each' | 'batch',
+		subscriptions: TopicSubscription<unknown, unknown>[],
+		topics: string[],
+		partitionConcurrency: number,
+		startFetchLoop: () => Promise<void>
+	): Promise<void> {
+		this.logger.info('starting consumer', { topics, mode })
+
+		// Create components
+		this.initGroupComponents(partitionConcurrency, this.logger)
+		this.attachGroupEventHandlers(subscriptions)
+
+		this.logger.debug('joining group', { topics })
+		const joinResult = await this.consumerGroup!.join(topics)
+		this.logger.info('group joined', { assignedPartitions: joinResult.assignment.length })
+		await this.setupPartitions(subscriptions, joinResult.assignment)
+
+		if (joinResult.assignment.length > 0) {
+			this.emit('partitionsAssigned', joinResult.assignment)
+		}
+
+		this.emit('running')
+
+		await this.startFetchLoopAndWait(startFetchLoop)
+	}
+
 	/**
 	 * Check if consumer is running
 	 */
@@ -204,266 +476,41 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		handler: MessageHandler<MsgOf<S>, KeyOf<S>>,
 		options?: RunEachOptions
 	): Promise<void> {
-		if (this.state !== 'idle') {
-			throw new Error('Consumer is already running. Call stop() first.')
-		}
-
-		this.state = 'running'
-		this.abortController = new AbortController()
-		this.sessionLost = false
-
 		const opts = {
 			...DEFAULT_RUN_EACH_OPTIONS,
 			...options,
 		}
-		this.commitOffsets = opts.commitOffsets !== false
-
-		// Set up external abort signal
-		if (options?.signal) {
-			options.signal.addEventListener('abort', () => {
-				this.stop()
-			})
-		}
+		this.startRun(opts.commitOffsets !== false, options?.signal)
 
 		try {
-			// Normalize subscription to array
-			const subscriptions = this.normalizeSubscription(subscription)
-			const topics = subscriptions.map(s => s.topic)
-
 			const manualAssignment = opts.assignment
+			const { subscriptions, topics } = this.getSubscriptionsAndTopics(subscription)
+
 			if (manualAssignment) {
-				const normalized = this.normalizeManualAssignment(manualAssignment)
-
-				const subscriptionTopics = new Set(topics)
-				for (const tp of normalized) {
-					if (!subscriptionTopics.has(tp.topic)) {
-						throw new Error(
-							`Manual assignment includes topic "${tp.topic}" that is not in the subscription`
-						)
-					}
-				}
-
-				this.logger.info('starting consumer', {
+				const normalized = this.normalizeAndValidateManualAssignment(manualAssignment, topics)
+				await this.startManualAssignmentRun(
+					'each',
+					subscriptions,
 					topics,
-					mode: 'each',
-					assignmentMode: 'manual',
-					assignedPartitionCount: normalized.length,
-				})
-
-				// Manual assignment mode: no group join/rebalance.
-				// Use an OffsetManager without groupInstanceId since we don't have generation/member metadata.
-				this.offsetManager = new OffsetManager(this.cluster, this.config.groupId, undefined, this.logger)
-				this.fetchManager = new FetchManager(
-					this.cluster,
-					this.offsetManager,
-					this.config.autoOffsetReset,
-					{
-						maxBytesPerPartition: this.config.maxBytesPerPartition,
-						minBytes: this.config.minBytes,
-						maxWaitMs: this.config.maxWaitMs,
-						partitionConcurrency: opts.partitionConcurrency ?? 1,
-						isolationLevel: this.config.isolationLevel,
-						trace: this.trace,
-					},
-					this.logger
+					normalized,
+					opts.partitionConcurrency ?? DEFAULT_RUN_EACH_OPTIONS.partitionConcurrency,
+					() => this.startFetchLoopEach(subscriptions, handler as MessageHandler<unknown, unknown>, opts)
 				)
-
-				const assignment: TopicPartition[] = normalized.map(tp => ({
-					topic: tp.topic,
-					partition: tp.partition,
-				}))
-
-				// Coordinator is needed for offset fetch/commit (even without group membership)
-				const coordinator = await this.getCoordinatorWithRetry('GROUP', this.config.groupId)
-				this.offsetManager.updateGroupState('', -1, coordinator)
-
-				// Fetch committed offsets for the assigned partitions
-				const committedOffsets = await this.offsetManager.fetchCommittedOffsets(assignment)
-
-				// Resolve starting offsets
-				const partitionsWithOffsets: Array<TopicPartition & { offset: bigint }> = []
-				for (const tp of normalized) {
-					const offset =
-						tp.offset !== undefined
-							? tp.offset
-							: await this.offsetManager.resolveStartingOffset(
-									tp.topic,
-									tp.partition,
-									this.config.autoOffsetReset,
-									committedOffsets
-								)
-					partitionsWithOffsets.push({ topic: tp.topic, partition: tp.partition, offset })
-				}
-
-				this.fetchManager.setPartitions(partitionsWithOffsets)
-
-				if (assignment.length > 0) {
-					this.emit('partitionsAssigned', assignment)
-				}
-				this.emit('running')
-
-				await new Promise<void>((resolve, reject) => {
-					this.runPromiseResolve = resolve
-					this.runPromiseReject = reject
-
-					this.fetchLoopPromise = this.startFetchLoopEach(
-						subscriptions,
-						handler as MessageHandler<unknown, unknown>,
-						opts
-					)
-						.then(() => {
-							if (this.runPromiseResolve) {
-								this.runPromiseResolve()
-								this.runPromiseResolve = null
-								this.runPromiseReject = null
-							}
-						})
-						.catch(error => {
-							const err = error instanceof Error ? error : new Error(String(error))
-							if (this.runPromiseReject) {
-								this.runPromiseReject(err)
-								this.runPromiseReject = null
-								this.runPromiseResolve = null
-							} else {
-								this.emitError(err)
-							}
-						})
-				})
-
 				return
 			}
 
-			this.logger.info('starting consumer', { topics, mode: 'each' })
-
-			// Create components
-			this.consumerGroup = new ConsumerGroup(this.cluster, this.config, this.logger)
-			this.offsetManager = new OffsetManager(
-				this.cluster,
-				this.config.groupId,
-				this.config.groupInstanceId,
-				this.logger
+			await this.startGroupRun(
+				'each',
+				subscriptions,
+				topics,
+				opts.partitionConcurrency ?? DEFAULT_RUN_EACH_OPTIONS.partitionConcurrency,
+				() => this.startFetchLoopEach(subscriptions, handler as MessageHandler<unknown, unknown>, opts)
 			)
-			this.fetchManager = new FetchManager(
-				this.cluster,
-				this.offsetManager,
-				this.config.autoOffsetReset,
-				{
-					maxBytesPerPartition: this.config.maxBytesPerPartition,
-					minBytes: this.config.minBytes,
-					maxWaitMs: this.config.maxWaitMs,
-					partitionConcurrency: opts.partitionConcurrency ?? 1,
-					isolationLevel: this.config.isolationLevel,
-					trace: this.trace,
-				},
-				this.logger
-			)
-
-			// Handle rebalance
-			this.consumerGroup.on('rebalance', () => {
-				this.logger.debug('rebalance event received')
-				this.emit('rebalance')
-				this.rebalanceRequested = true
-				if (this.rebalanceRunner) {
-					return
-				}
-
-				this.rebalanceRunner = (async () => {
-					while (this.rebalanceRequested && this.state === 'running') {
-						this.rebalanceRequested = false
-						await this.handleRebalance(subscriptions)
-					}
-				})()
-					.catch(error => {
-						const err = error instanceof Error ? error : new Error(String(error))
-						this.logger.error('rebalance handler failed', { error: err.message })
-						if (this.runPromiseReject) {
-							this.runPromiseReject(err)
-							this.runPromiseReject = null
-							this.runPromiseResolve = null
-						} else {
-							this.emitError(err)
-						}
-						this.stop()
-					})
-					.finally(() => {
-						this.rebalanceRunner = null
-					})
-			})
-
-			this.consumerGroup.on('sessionLost', (partitions: TopicPartition[]) => {
-				this.logger.info('session lost, partitions cannot be committed', { partitionCount: partitions.length })
-				this.sessionLost = true
-				this.offsetManager?.clearPartitions(partitions)
-				this.fetchManager?.removePartitions(partitions)
-				this.emit('partitionsLost', partitions)
-			})
-
-			this.consumerGroup.on('error', (error: Error) => {
-				const err = error instanceof Error ? error : new Error(String(error))
-
-				if (err instanceof KafkaProtocolError && err.errorCode === ErrorCode.FencedInstanceId) {
-					this.emitError(err)
-					if (this.runPromiseReject) {
-						this.runPromiseReject(err)
-						this.runPromiseReject = null
-						this.runPromiseResolve = null
-					}
-					this.stop()
-					return
-				}
-
-				this.emitError(err)
-			})
-
-			this.logger.debug('joining group', { topics })
-			const joinResult = await this.consumerGroup.join(topics)
-			this.logger.info('group joined', { assignedPartitions: joinResult.assignment.length })
-			await this.setupPartitions(subscriptions, joinResult.assignment)
-
-			if (joinResult.assignment.length > 0) {
-				this.emit('partitionsAssigned', joinResult.assignment)
-			}
-
-			this.emit('running')
-
-			await new Promise<void>((resolve, reject) => {
-				this.runPromiseResolve = resolve
-				this.runPromiseReject = reject
-
-				this.fetchLoopPromise = this.startFetchLoopEach(
-					subscriptions,
-					handler as MessageHandler<unknown, unknown>,
-					opts
-				)
-					.then(() => {
-						// If the fetch loop ends, ensure the run promise resolves.
-						if (this.runPromiseResolve) {
-							this.runPromiseResolve()
-							this.runPromiseResolve = null
-							this.runPromiseReject = null
-						}
-					})
-					.catch(error => {
-						// Surface unexpected fetch loop failures to the run() caller.
-						const err = error instanceof Error ? error : new Error(String(error))
-						if (this.runPromiseReject) {
-							this.runPromiseReject(err)
-							this.runPromiseReject = null
-							this.runPromiseResolve = null
-						} else {
-							this.emitError(err)
-						}
-					})
-			})
 		} catch (error) {
 			this.emitError(error)
 			throw error
 		} finally {
-			this.logger.debug('consumer run loop ended, cleaning up')
-			await this.cleanup()
-			this.state = 'idle'
-			this.logger.info('consumer stopped')
-			this.emit('stopped')
+			await this.finalizeRun()
 		}
 	}
 
@@ -479,256 +526,46 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		handler: BatchHandler<MsgOf<S>, KeyOf<S>>,
 		options?: RunBatchOptions
 	): Promise<void> {
-		if (this.state !== 'idle') {
-			throw new Error('Consumer is already running. Call stop() first.')
-		}
-
-		this.state = 'running'
-		this.abortController = new AbortController()
-		this.sessionLost = false
-
 		const opts = {
 			...DEFAULT_RUN_BATCH_OPTIONS,
 			...options,
 		}
-		this.commitOffsets = opts.commitOffsets !== false
-
-		// Set up external abort signal
-		if (options?.signal) {
-			options.signal.addEventListener('abort', () => {
-				this.stop()
-			})
-		}
+		this.startRun(opts.commitOffsets !== false, options?.signal)
 
 		try {
-			// Normalize subscription to array
-			const subscriptions = this.normalizeSubscription(subscription)
-			const topics = subscriptions.map(s => s.topic)
-
 			const manualAssignment = opts.assignment
+			const { subscriptions, topics } = this.getSubscriptionsAndTopics(subscription)
+
 			if (manualAssignment) {
-				const normalized = this.normalizeManualAssignment(manualAssignment)
-
-				const subscriptionTopics = new Set(topics)
-				for (const tp of normalized) {
-					if (!subscriptionTopics.has(tp.topic)) {
-						throw new Error(
-							`Manual assignment includes topic "${tp.topic}" that is not in the subscription`
-						)
-					}
-				}
-
-				this.logger.info('starting consumer', {
+				const normalized = this.normalizeAndValidateManualAssignment(manualAssignment, topics)
+				await this.startManualAssignmentRun(
+					'batch',
+					subscriptions,
 					topics,
-					mode: 'batch',
-					assignmentMode: 'manual',
-					assignedPartitionCount: normalized.length,
-				})
-
-				this.offsetManager = new OffsetManager(this.cluster, this.config.groupId, undefined, this.logger)
-				this.fetchManager = new FetchManager(
-					this.cluster,
-					this.offsetManager,
-					this.config.autoOffsetReset,
-					{
-						maxBytesPerPartition: this.config.maxBytesPerPartition,
-						minBytes: this.config.minBytes,
-						maxWaitMs: this.config.maxWaitMs,
-						partitionConcurrency: opts.partitionConcurrency ?? 1,
-						isolationLevel: this.config.isolationLevel,
-					},
-					this.logger
+					normalized,
+					opts.partitionConcurrency ?? DEFAULT_RUN_BATCH_OPTIONS.partitionConcurrency,
+					() =>
+						this.startFetchLoopBatch(
+							subscriptions,
+							handler as BatchHandler<unknown, unknown>,
+							opts as Required<Pick<RunBatchOptions, 'maxBatchSize' | 'maxBatchWaitMs'>> & RunBatchOptions
+						)
 				)
-
-				const assignment: TopicPartition[] = normalized.map(tp => ({
-					topic: tp.topic,
-					partition: tp.partition,
-				}))
-
-				const coordinator = await this.getCoordinatorWithRetry('GROUP', this.config.groupId)
-				this.offsetManager.updateGroupState('', -1, coordinator)
-
-				const committedOffsets = await this.offsetManager.fetchCommittedOffsets(assignment)
-
-				const partitionsWithOffsets: Array<TopicPartition & { offset: bigint }> = []
-				for (const tp of normalized) {
-					const offset =
-						tp.offset !== undefined
-							? tp.offset
-							: await this.offsetManager.resolveStartingOffset(
-									tp.topic,
-									tp.partition,
-									this.config.autoOffsetReset,
-									committedOffsets
-								)
-					partitionsWithOffsets.push({ topic: tp.topic, partition: tp.partition, offset })
-				}
-
-				this.fetchManager.setPartitions(partitionsWithOffsets)
-
-				if (assignment.length > 0) {
-					this.emit('partitionsAssigned', assignment)
-				}
-				this.emit('running')
-
-				await new Promise<void>((resolve, reject) => {
-					this.runPromiseResolve = resolve
-					this.runPromiseReject = reject
-
-					this.fetchLoopPromise = this.startFetchLoopBatch(
-						subscriptions,
-						handler as BatchHandler<unknown, unknown>,
-						opts as Required<Pick<RunBatchOptions, 'maxBatchSize' | 'maxBatchWaitMs'>> & RunBatchOptions
-					)
-						.then(() => {
-							if (this.runPromiseResolve) {
-								this.runPromiseResolve()
-								this.runPromiseResolve = null
-								this.runPromiseReject = null
-							}
-						})
-						.catch(error => {
-							const err = error instanceof Error ? error : new Error(String(error))
-							if (this.runPromiseReject) {
-								this.runPromiseReject(err)
-								this.runPromiseReject = null
-								this.runPromiseResolve = null
-							} else {
-								this.emitError(err)
-							}
-						})
-				})
-
 				return
 			}
 
-			this.logger.info('starting consumer', { topics, mode: 'batch' })
-
-			// Create components
-			this.consumerGroup = new ConsumerGroup(this.cluster, this.config, this.logger)
-			this.offsetManager = new OffsetManager(
-				this.cluster,
-				this.config.groupId,
-				this.config.groupInstanceId,
-				this.logger
+			await this.startGroupRun(
+				'batch',
+				subscriptions,
+				topics,
+				opts.partitionConcurrency ?? DEFAULT_RUN_BATCH_OPTIONS.partitionConcurrency,
+				() => this.startFetchLoopBatch(subscriptions, handler as BatchHandler<unknown, unknown>, opts)
 			)
-			this.fetchManager = new FetchManager(
-				this.cluster,
-				this.offsetManager,
-				this.config.autoOffsetReset,
-				{
-					maxBytesPerPartition: this.config.maxBytesPerPartition,
-					minBytes: this.config.minBytes,
-					maxWaitMs: this.config.maxWaitMs,
-					partitionConcurrency: opts.partitionConcurrency ?? 1,
-					isolationLevel: this.config.isolationLevel,
-				},
-				this.logger
-			)
-
-			// Handle rebalance
-			this.consumerGroup.on('rebalance', () => {
-				this.logger.debug('rebalance event received')
-				this.emit('rebalance')
-				this.rebalanceRequested = true
-				if (this.rebalanceRunner) {
-					return
-				}
-
-				this.rebalanceRunner = (async () => {
-					while (this.rebalanceRequested && this.state === 'running') {
-						this.rebalanceRequested = false
-						await this.handleRebalance(subscriptions)
-					}
-				})()
-					.catch(error => {
-						const err = error instanceof Error ? error : new Error(String(error))
-						this.logger.error('rebalance handler failed', { error: err.message })
-						if (this.runPromiseReject) {
-							this.runPromiseReject(err)
-							this.runPromiseReject = null
-							this.runPromiseResolve = null
-						} else {
-							this.emitError(err)
-						}
-						this.stop()
-					})
-					.finally(() => {
-						this.rebalanceRunner = null
-					})
-			})
-
-			this.consumerGroup.on('sessionLost', (partitions: TopicPartition[]) => {
-				this.logger.info('session lost, partitions cannot be committed', { partitionCount: partitions.length })
-				this.sessionLost = true
-				this.offsetManager?.clearPartitions(partitions)
-				this.fetchManager?.removePartitions(partitions)
-				this.emit('partitionsLost', partitions)
-			})
-
-			this.consumerGroup.on('error', (error: Error) => {
-				const err = error instanceof Error ? error : new Error(String(error))
-
-				if (err instanceof KafkaProtocolError && err.errorCode === ErrorCode.FencedInstanceId) {
-					this.emitError(err)
-					if (this.runPromiseReject) {
-						this.runPromiseReject(err)
-						this.runPromiseReject = null
-						this.runPromiseResolve = null
-					}
-					this.stop()
-					return
-				}
-
-				this.emitError(err)
-			})
-
-			this.logger.debug('joining group', { topics })
-			const joinResult = await this.consumerGroup.join(topics)
-			this.logger.info('group joined', { assignedPartitions: joinResult.assignment.length })
-			await this.setupPartitions(subscriptions, joinResult.assignment)
-
-			if (joinResult.assignment.length > 0) {
-				this.emit('partitionsAssigned', joinResult.assignment)
-			}
-
-			this.emit('running')
-
-			await new Promise<void>((resolve, reject) => {
-				this.runPromiseResolve = resolve
-				this.runPromiseReject = reject
-				this.fetchLoopPromise = this.startFetchLoopBatch(
-					subscriptions,
-					handler as BatchHandler<unknown, unknown>,
-					opts
-				)
-					.then(() => {
-						if (this.runPromiseResolve) {
-							this.runPromiseResolve()
-							this.runPromiseResolve = null
-							this.runPromiseReject = null
-						}
-					})
-					.catch(error => {
-						const err = error instanceof Error ? error : new Error(String(error))
-						if (this.runPromiseReject) {
-							this.runPromiseReject(err)
-							this.runPromiseReject = null
-							this.runPromiseResolve = null
-						} else {
-							this.emitError(err)
-						}
-					})
-			})
 		} catch (error) {
 			this.emitError(error)
 			throw error
 		} finally {
-			this.logger.debug('consumer run loop ended, cleaning up')
-			await this.cleanup()
-			this.state = 'idle'
-			this.logger.info('consumer stopped')
-			this.emit('stopped')
+			await this.finalizeRun()
 		}
 	}
 
@@ -741,39 +578,29 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	async *stream<S extends SubscriptionInput>(
 		subscription: S
 	): AsyncIterable<{ message: Message<MsgOf<S>, KeyOf<S>>; ctx: ConsumeContext }> {
-		if (this.state !== 'idle') {
-			throw new Error('Consumer is already running. Call stop() first.')
-		}
-
-		this.state = 'running'
-		this.abortController = new AbortController()
-		this.commitOffsets = true
-		this.sessionLost = false
+		this.startRun(true)
 
 		try {
-			// Normalize subscription to array
-			const subscriptions = this.normalizeSubscription(subscription)
-			const topics = subscriptions.map(s => s.topic)
+			const { subscriptions, topics } = this.getSubscriptionsAndTopics(subscription)
 
-			// Create components
-			this.consumerGroup = new ConsumerGroup(this.cluster, this.config)
-			this.offsetManager = new OffsetManager(this.cluster, this.config.groupId, this.config.groupInstanceId)
-			this.fetchManager = new FetchManager(this.cluster, this.offsetManager, this.config.autoOffsetReset, {
-				maxBytesPerPartition: this.config.maxBytesPerPartition,
-				minBytes: this.config.minBytes,
-				maxWaitMs: this.config.maxWaitMs,
-				partitionConcurrency: 1, // Stream mode uses single concurrency
-				isolationLevel: this.config.isolationLevel,
-			})
+			// Create components (no internal component logging by default in stream mode)
+			this.initGroupComponents(1, undefined)
+			const consumerGroup = this.consumerGroup
+			const offsetManager = this.offsetManager
+			const fetchManager = this.fetchManager
+			const signal = this.abortController!.signal
+			if (!consumerGroup || !offsetManager || !fetchManager) {
+				return
+			}
 
 			// Handle rebalance
 			let pendingRebalance = false
-			this.consumerGroup.on('rebalance', () => {
+			consumerGroup.on('rebalance', () => {
 				pendingRebalance = true
 				this.emit('rebalance')
 			})
 
-			this.consumerGroup.on('sessionLost', (partitions: TopicPartition[]) => {
+			consumerGroup.on('sessionLost', (partitions: TopicPartition[]) => {
 				this.logger.info('session lost, partitions cannot be committed', { partitionCount: partitions.length })
 				this.sessionLost = true
 				this.offsetManager?.clearPartitions(partitions)
@@ -781,7 +608,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 				this.emit('partitionsLost', partitions)
 			})
 
-			this.consumerGroup.on('error', (error: Error) => {
+			consumerGroup.on('error', (error: Error) => {
 				const err = error instanceof Error ? error : new Error(String(error))
 				this.emitError(err)
 
@@ -790,7 +617,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 				}
 			})
 
-			const joinResult = await this.consumerGroup.join(topics)
+			const joinResult = await consumerGroup.join(topics)
 			await this.setupPartitions(subscriptions, joinResult.assignment)
 
 			// Emit partitionsAssigned for initial join
@@ -835,7 +662,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 					}
 
 					const ctx: ConsumeContext = {
-						signal: this.abortController!.signal,
+						signal,
 						topic,
 						partition,
 						offset: record.offset,
@@ -844,7 +671,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 					messageQueue.push({ message, ctx })
 
 					// Mark as consumed for auto-commit
-					this.offsetManager!.markConsumed(topic, partition, record.offset)
+					offsetManager.markConsumed(topic, partition, record.offset)
 
 					// Wake up iterator
 					if (resolveNext) {
@@ -859,15 +686,13 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			let currentFetchPromise: Promise<void> | null = null
 
 			// Start fetch in background
-			currentFetchPromise = this.fetchManager.start(streamFetchCallback)
+			currentFetchPromise = fetchManager.start(streamFetchCallback)
 
 			// Start auto-commit
-			if (this.offsetManager) {
-				this.offsetManager.startAutoCommit(DEFAULT_RUN_EACH_OPTIONS.autoCommitIntervalMs)
-			}
+			offsetManager.startAutoCommit(DEFAULT_RUN_EACH_OPTIONS.autoCommitIntervalMs)
 
 			// Yield messages
-			while (this.state === 'running' && !this.abortController.signal.aborted) {
+			while (this.state === 'running' && !signal.aborted) {
 				// Handle rebalance
 				if (pendingRebalance) {
 					pendingRebalance = false
@@ -898,14 +723,12 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			}
 
 			// Clean up fetch
-			this.fetchManager.stop()
+			fetchManager.stop()
 			await currentFetchPromise?.catch(err => {
 				this.logger.error('fetch error during cleanup', { error: (err as Error).message })
 			})
 		} finally {
-			await this.cleanup()
-			this.state = 'idle'
-			this.emit('stopped')
+			await this.finalizeRun({ logCleanup: false, logStop: false })
 		}
 	}
 
