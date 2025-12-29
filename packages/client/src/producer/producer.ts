@@ -19,6 +19,8 @@ import { createRecordBatch, encodeRecordBatch, encodeRecordBatchSync } from '@/p
 import { CompressionType } from '@/protocol/records/compression.js'
 import { ReconnectionStrategy } from '@/network/reconnection.js'
 import { noopLogger, type Logger } from '@/logger.js'
+import { sleep as sleepMs } from '@/utils/sleep.js'
+import { createRetryStrategyOptions, retry } from '@/utils/retry.js'
 import { RecordAccumulator } from './accumulator.js'
 import { murmur2Partitioner } from './partitioners/murmur2.js'
 import { createRoundRobinPartitioner } from './partitioners/round-robin.js'
@@ -47,6 +49,10 @@ import type {
 } from './types.js'
 
 const EMPTY_BUFFER = Buffer.alloc(0)
+
+function isCoordinatorErrorCode(errorCode: ErrorCode): boolean {
+	return errorCode === ErrorCode.NotCoordinator || errorCode === ErrorCode.CoordinatorNotAvailable
+}
 
 /**
  * Default producer configuration values
@@ -230,11 +236,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	private async sendBatchesGroupedByBroker(batches: PartitionBatch[]): Promise<void> {
 		const topics = Array.from(new Set(batches.map(b => b.topic)))
 
-		const strategy = new ReconnectionStrategy({
-			maxAttempts: this.config.retries + 1,
-			initialDelayMs: this.config.retryBackoffMs,
-			maxDelayMs: this.config.maxRetryBackoffMs,
-		})
+		const strategy = new ReconnectionStrategy(createRetryStrategyOptions(this.config))
 
 		let lastError: unknown
 
@@ -444,11 +446,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 			})),
 		}
 
-		const strategy = new ReconnectionStrategy({
-			maxAttempts: this.config.retries + 1,
-			initialDelayMs: this.config.retryBackoffMs,
-			maxDelayMs: this.config.maxRetryBackoffMs,
-		})
+		const strategy = new ReconnectionStrategy(createRetryStrategyOptions(this.config))
 
 		while (strategy.shouldReconnect()) {
 			try {
@@ -1109,59 +1107,38 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	private async addPartitionsToTransaction(topic: string, partitions: number[]): Promise<void> {
 		let coordinator = await this.cluster.getCoordinator('TRANSACTION', this.config.transactionalId!)
 
-		const strategy = new ReconnectionStrategy({
-			maxAttempts: this.config.retries + 1,
-			initialDelayMs: this.config.retryBackoffMs,
-			maxDelayMs: this.config.maxRetryBackoffMs,
-		})
+		await retry(
+			async () => {
+				const response = await coordinator.addPartitionsToTxn({
+					transactionalId: this.config.transactionalId!,
+					producerId: this.producerId,
+					producerEpoch: this.producerEpoch,
+					topics: [
+						{
+							name: topic,
+							partitions,
+						},
+					],
+				})
 
-		while (strategy.shouldReconnect()) {
-			const response = await coordinator.addPartitionsToTxn({
-				transactionalId: this.config.transactionalId!,
-				producerId: this.producerId,
-				producerEpoch: this.producerEpoch,
-				topics: [
-					{
-						name: topic,
-						partitions,
-					},
-				],
-			})
+				for (const topicResult of response.results) {
+					for (const partitionResult of topicResult.resultsByPartition) {
+						if (partitionResult.errorCode === ErrorCode.None) {
+							continue
+						}
 
-			// Check for errors in response
-			let hasError = false
-			let retriableError = false
-			let errorCode = ErrorCode.None
-			let errorMessage = ''
-
-			for (const topicResult of response.results) {
-				for (const partitionResult of topicResult.resultsByPartition) {
-					if (partitionResult.errorCode !== ErrorCode.None) {
-						hasError = true
-						errorCode = partitionResult.errorCode
-						errorMessage = `AddPartitionsToTxn failed for ${topicResult.name}-${partitionResult.partitionIndex}`
-
-						// Handle coordinator move - invalidate cache and re-fetch
-						if (
-							partitionResult.errorCode === ErrorCode.NotCoordinator ||
-							partitionResult.errorCode === ErrorCode.CoordinatorNotAvailable
-						) {
+						if (isCoordinatorErrorCode(partitionResult.errorCode)) {
 							this.cluster.invalidateCoordinator('TRANSACTION', this.config.transactionalId!)
 							coordinator = await this.cluster.getCoordinator('TRANSACTION', this.config.transactionalId!)
-							retriableError = true
-							break
 						}
 
-						if (isRetriableError(partitionResult.errorCode)) {
-							retriableError = true
-							break
-						}
+						throw new KafkaProtocolError(
+							partitionResult.errorCode,
+							`AddPartitionsToTxn failed for ${topicResult.name}-${partitionResult.partitionIndex}`
+						)
 					}
 				}
-				if (hasError) break
-			}
 
-			if (!hasError) {
 				// Success - mark partitions as part of this transaction
 				for (const partition of partitions) {
 					this.partitionsInTransaction.add(`${topic}:${partition}`)
@@ -1172,21 +1149,12 @@ export class Producer extends EventEmitter<ProducerEvents> {
 					topic,
 					partitions,
 				})
-				return
+			},
+			{
+				...createRetryStrategyOptions(this.config),
+				shouldRetry: error => error instanceof KafkaProtocolError && error.retriable,
 			}
-
-			if (retriableError) {
-				strategy.recordFailure()
-				if (strategy.shouldReconnect()) {
-					await this.sleep(strategy.nextDelay())
-					continue
-				}
-			}
-
-			throw new KafkaProtocolError(errorCode, errorMessage)
-		}
-
-		throw new Error('AddPartitionsToTxn failed after max retries')
+		)
 	}
 
 	/**
@@ -1201,49 +1169,33 @@ export class Producer extends EventEmitter<ProducerEvents> {
 
 		let coordinator = await this.cluster.getCoordinator('TRANSACTION', this.config.transactionalId!)
 
-		const strategy = new ReconnectionStrategy({
-			maxAttempts: this.config.retries + 1,
-			initialDelayMs: this.config.retryBackoffMs,
-			maxDelayMs: this.config.maxRetryBackoffMs,
-		})
+		await retry(
+			async () => {
+				// Register the group with the transaction coordinator
+				const response = await coordinator.addOffsetsToTxn({
+					transactionalId: this.config.transactionalId!,
+					producerId: this.producerId,
+					producerEpoch: this.producerEpoch,
+					groupId,
+				})
 
-		while (strategy.shouldReconnect()) {
-			// Register the group with the transaction coordinator
-			const response = await coordinator.addOffsetsToTxn({
-				transactionalId: this.config.transactionalId!,
-				producerId: this.producerId,
-				producerEpoch: this.producerEpoch,
-				groupId,
-			})
-
-			if (response.errorCode === ErrorCode.None) {
-				break
-			}
-
-			// Handle coordinator move - invalidate cache and re-fetch
-			if (
-				response.errorCode === ErrorCode.NotCoordinator ||
-				response.errorCode === ErrorCode.CoordinatorNotAvailable
-			) {
-				this.cluster.invalidateCoordinator('TRANSACTION', this.config.transactionalId!)
-				coordinator = await this.cluster.getCoordinator('TRANSACTION', this.config.transactionalId!)
-				strategy.recordFailure()
-				if (strategy.shouldReconnect()) {
-					await this.sleep(strategy.nextDelay())
-					continue
+				if (response.errorCode === ErrorCode.None) {
+					return
 				}
-			}
 
-			if (isRetriableError(response.errorCode)) {
-				strategy.recordFailure()
-				if (strategy.shouldReconnect()) {
-					await this.sleep(strategy.nextDelay())
-					continue
+				// Handle coordinator move - invalidate cache and re-fetch
+				if (isCoordinatorErrorCode(response.errorCode)) {
+					this.cluster.invalidateCoordinator('TRANSACTION', this.config.transactionalId!)
+					coordinator = await this.cluster.getCoordinator('TRANSACTION', this.config.transactionalId!)
 				}
-			}
 
-			throw new KafkaProtocolError(response.errorCode, `AddOffsetsToTxn failed for group ${groupId}`)
-		}
+				throw new KafkaProtocolError(response.errorCode, `AddOffsetsToTxn failed for group ${groupId}`)
+			},
+			{
+				...createRetryStrategyOptions(this.config),
+				shouldRetry: error => error instanceof KafkaProtocolError && error.retriable,
+			}
+		)
 
 		// Store offsets and group metadata for commit during transaction commit phase
 		const existing = this.offsetsToCommit.get(groupId)
@@ -1282,48 +1234,32 @@ export class Producer extends EventEmitter<ProducerEvents> {
 			// End transaction with commit (with retry for transient errors)
 			let coordinator = await this.cluster.getCoordinator('TRANSACTION', this.config.transactionalId!)
 
-			const strategy = new ReconnectionStrategy({
-				maxAttempts: this.config.retries + 1,
-				initialDelayMs: this.config.retryBackoffMs,
-				maxDelayMs: this.config.maxRetryBackoffMs,
-			})
+			await retry(
+				async () => {
+					const response = await coordinator.endTxn({
+						transactionalId: this.config.transactionalId!,
+						producerId: this.producerId,
+						producerEpoch: this.producerEpoch,
+						committed: true,
+					})
 
-			while (strategy.shouldReconnect()) {
-				const response = await coordinator.endTxn({
-					transactionalId: this.config.transactionalId!,
-					producerId: this.producerId,
-					producerEpoch: this.producerEpoch,
-					committed: true,
-				})
-
-				if (response.errorCode === ErrorCode.None) {
-					break
-				}
-
-				// Handle coordinator move - invalidate cache and re-fetch
-				if (
-					response.errorCode === ErrorCode.NotCoordinator ||
-					response.errorCode === ErrorCode.CoordinatorNotAvailable
-				) {
-					this.cluster.invalidateCoordinator('TRANSACTION', this.config.transactionalId!)
-					coordinator = await this.cluster.getCoordinator('TRANSACTION', this.config.transactionalId!)
-					strategy.recordFailure()
-					if (strategy.shouldReconnect()) {
-						await this.sleep(strategy.nextDelay())
-						continue
+					if (response.errorCode === ErrorCode.None) {
+						return
 					}
-				}
 
-				if (isRetriableError(response.errorCode)) {
-					strategy.recordFailure()
-					if (strategy.shouldReconnect()) {
-						await this.sleep(strategy.nextDelay())
-						continue
+					// Handle coordinator move - invalidate cache and re-fetch
+					if (isCoordinatorErrorCode(response.errorCode)) {
+						this.cluster.invalidateCoordinator('TRANSACTION', this.config.transactionalId!)
+						coordinator = await this.cluster.getCoordinator('TRANSACTION', this.config.transactionalId!)
 					}
-				}
 
-				throw new KafkaProtocolError(response.errorCode, 'EndTxn commit failed')
-			}
+					throw new KafkaProtocolError(response.errorCode, 'EndTxn commit failed')
+				},
+				{
+					...createRetryStrategyOptions(this.config),
+					shouldRetry: error => error instanceof KafkaProtocolError && error.retriable,
+				}
+			)
 
 			this.logger.info('transaction committed', {
 				transactionalId: this.config.transactionalId,
@@ -1426,11 +1362,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		// TxnOffsetCommit goes to the GROUP coordinator (not transaction coordinator)
 		let groupCoordinator = await this.cluster.getCoordinator('GROUP', groupId)
 
-		const strategy = new ReconnectionStrategy({
-			maxAttempts: this.config.retries + 1,
-			initialDelayMs: this.config.retryBackoffMs,
-			maxDelayMs: this.config.maxRetryBackoffMs,
-		})
+		const strategy = new ReconnectionStrategy(createRetryStrategyOptions(this.config))
 
 		while (strategy.shouldReconnect()) {
 			const response = await groupCoordinator.txnOffsetCommit({
@@ -1621,11 +1553,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	 * Actual initialization logic - separated for proper promise handling
 	 */
 	private async doInitializeIdempotentProducer(): Promise<void> {
-		const strategy = new ReconnectionStrategy({
-			maxAttempts: this.config.retries + 1,
-			initialDelayMs: this.config.retryBackoffMs,
-			maxDelayMs: this.config.maxRetryBackoffMs,
-		})
+		const strategy = new ReconnectionStrategy(createRetryStrategyOptions(this.config))
 
 		while (strategy.shouldReconnect()) {
 			try {
@@ -1930,6 +1858,6 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	}
 
 	private sleep(ms: number): Promise<void> {
-		return new Promise(resolve => setTimeout(resolve, ms))
+		return sleepMs(ms)
 	}
 }

@@ -16,7 +16,7 @@ import { OFFSET_TIMESTAMP } from '@/protocol/messages/requests/list-offsets.js'
 import type { TopicPartition, AutoOffsetReset } from './types.js'
 import { noopLogger, type Logger } from '@/logger.js'
 import { tpKey } from '@/utils/topic-partition.js'
-import { sleep } from '@/utils/sleep.js'
+import { retry } from '@/utils/retry.js'
 
 /**
  * Offset manager
@@ -387,11 +387,8 @@ export class OffsetManager {
 	 * List offset for a specific timestamp
 	 */
 	private async listOffset(topic: string, partition: number, timestamp: bigint): Promise<bigint> {
-		const maxAttempts = 5
-		let lastError: unknown
-
-		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-			try {
+		return retry(
+			async () => {
 				const leader = await this.cluster.getLeaderForPartition(topic, partition)
 
 				const response = await leader.listOffsets({
@@ -423,37 +420,35 @@ export class OffsetManager {
 				}
 
 				return partitionResponse.offset
-			} catch (error) {
-				lastError = error
+			},
+			{
+				maxAttempts: 5,
+				initialDelayMs: 100,
+				maxDelayMs: 2_000,
+				multiplier: 2,
+				jitter: 0,
+				shouldRetry: error => isKafkaError(error) && error.retriable,
+				onRetry: async ({ attempt, delayMs, error }) => {
+					const errorCode = isKafkaError(error) ? error.errorCode : undefined
+					if (errorCode !== undefined && shouldRefreshMetadata(errorCode)) {
+						this.logger.debug('refreshing metadata due to listOffsets error', {
+							topic,
+							partition,
+							errorCode,
+							attempt,
+						})
+						await this.cluster.refreshMetadata([topic]).catch(() => {})
+					}
 
-				const retriable = isKafkaError(error) && error.retriable
-				if (!retriable || attempt >= maxAttempts) {
-					throw error
-				}
-
-				const errorCode = isKafkaError(error) ? error.errorCode : undefined
-				if (errorCode !== undefined && shouldRefreshMetadata(errorCode)) {
-					this.logger.debug('refreshing metadata due to listOffsets error', {
+					this.logger.debug('retrying listOffsets after error', {
 						topic,
 						partition,
-						errorCode,
 						attempt,
+						delayMs,
+						error: error instanceof Error ? error.message : String(error),
 					})
-					await this.cluster.refreshMetadata([topic]).catch(() => {})
-				}
-
-				const delayMs = Math.min(100 * 2 ** (attempt - 1), 2000)
-				this.logger.debug('retrying listOffsets after error', {
-					topic,
-					partition,
-					attempt,
-					delayMs,
-					error: error instanceof Error ? error.message : String(error),
-				})
-				await sleep(delayMs)
+				},
 			}
-		}
-
-		throw lastError instanceof Error ? lastError : new Error(`ListOffsets failed for ${topic}-${partition}`)
+		)
 	}
 }

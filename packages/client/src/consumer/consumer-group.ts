@@ -33,6 +33,7 @@ import type { PartitionAssignor, MemberSubscription, RebalanceProtocol, TopicPar
 import { rangeAssignor, stickyAssignor, cooperativeStickyAssignor } from './assignors/index.js'
 import { noopLogger, type Logger } from '@/logger.js'
 import { sleep } from '@/utils/sleep.js'
+import { retry } from '@/utils/retry.js'
 
 /**
  * Result of join operation with partition change info
@@ -376,28 +377,23 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 			return
 		}
 
-		const maxRetries = 5
-		const initialDelayMs = 500
-		const maxDelayMs = 5000
-
-		for (let attempt = 0; attempt < maxRetries; attempt++) {
-			try {
-				this.coordinator = await this.cluster.getCoordinator('GROUP', this.config.groupId)
-				return
-			} catch (error) {
-				if (error instanceof CoordinatorNotAvailableError && attempt < maxRetries - 1) {
-					const delay = Math.min(initialDelayMs * Math.pow(2, attempt), maxDelayMs)
-					this.logger.debug('coordinator not available, retrying', {
-						attempt: attempt + 1,
-						maxRetries,
-						delayMs: delay,
-					})
-					await new Promise(resolve => setTimeout(resolve, delay))
-					continue
-				}
-				throw error
-			}
-		}
+		const maxAttempts = 5
+		this.coordinator = await retry(() => this.cluster.getCoordinator('GROUP', this.config.groupId), {
+			maxAttempts,
+			initialDelayMs: 500,
+			maxDelayMs: 5_000,
+			multiplier: 2,
+			jitter: 0,
+			signal: this.abortController?.signal,
+			shouldRetry: error => error instanceof CoordinatorNotAvailableError,
+			onRetry: ({ attempt, delayMs }) => {
+				this.logger.debug('coordinator not available, retrying', {
+					attempt,
+					maxAttempts,
+					delayMs,
+				})
+			},
+		})
 	}
 
 	/**
