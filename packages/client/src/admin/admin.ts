@@ -14,9 +14,11 @@ import type {
 	TopicPartition,
 	ClusterDescription,
 	BrokerDescription,
+	CreateTopicsResult,
 	DeleteTopicsResult,
 	DeleteGroupsResult,
 } from './types.js'
+import { createCreateTopicsRequest } from '@/protocol/messages/requests/create-topics.js'
 import { createDeleteTopicsRequest } from '@/protocol/messages/requests/delete-topics.js'
 import { createListGroupsRequest } from '@/protocol/messages/requests/list-groups.js'
 import { createDescribeGroupsRequest } from '@/protocol/messages/requests/describe-groups.js'
@@ -189,6 +191,57 @@ export class Admin {
 
 		this.logger.debug('described topics', { count: descriptions.length })
 		return descriptions
+	}
+
+	/**
+	 * Create topics in the cluster
+	 *
+	 * Sends the request to the controller broker.
+	 *
+	 * @param topics - Topics to create
+	 * @param options - Optional settings
+	 * @returns Results for each topic
+	 */
+	async createTopics(
+		topics: Array<{
+			name: string
+			numPartitions?: number
+			replicationFactor?: number
+			configs?: Record<string, string>
+		}>,
+		options?: { timeoutMs?: number; validateOnly?: boolean }
+	): Promise<CreateTopicsResult[]> {
+		this.logger.debug('creating topics', { topics: topics.map(t => t.name) })
+
+		const controller = await this.cluster.getControllerBroker()
+
+		const request = createCreateTopicsRequest(topics)
+		request.timeoutMs = options?.timeoutMs ?? this.config.requestTimeoutMs
+		request.validateOnly = options?.validateOnly ?? false
+
+		const response = await controller.createTopics(request)
+
+		const results: CreateTopicsResult[] = response.topics.map(t => ({
+			name: t.name,
+			topicId: t.topicId,
+			errorCode: t.errorCode,
+			errorMessage: t.errorMessage,
+			numPartitions: t.numPartitions,
+			replicationFactor: t.replicationFactor,
+		}))
+
+		for (const result of results) {
+			if (result.errorCode !== ErrorCode.None) {
+				this.logger.warn('topic creation failed', {
+					topic: result.name,
+					errorCode: result.errorCode,
+					errorMessage: result.errorMessage,
+				})
+			}
+		}
+
+		this.logger.debug('created topics', { count: results.length })
+		return results
 	}
 
 	/**

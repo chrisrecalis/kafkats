@@ -82,6 +82,41 @@ interface PartitionInfo {
 }
 ```
 
+### Creating Topics
+
+Create topics in the cluster:
+
+```typescript
+const results = await admin.createTopics([
+	{
+		name: 'orders',
+		numPartitions: 6,
+		replicationFactor: 3,
+		configs: {
+			'retention.ms': '604800000', // 7 days
+			'cleanup.policy': 'delete',
+		},
+	},
+])
+
+for (const result of results) {
+	if (result.errorCode === 0) {
+		console.log(`Created topic: ${result.name}`)
+	} else {
+		console.log(`Failed to create ${result.name}: ${result.errorMessage}`)
+	}
+}
+```
+
+Validate topic configuration without creating:
+
+```typescript
+const results = await admin.createTopics(
+	[{ name: 'test-topic', numPartitions: 3 }],
+	{ validateOnly: true }
+)
+```
+
 ### Deleting Topics
 
 Delete topics from the cluster:
@@ -294,24 +329,6 @@ const admin = client.admin({
 | Option             | Type     | Default | Description                     |
 | ------------------ | -------- | ------- | ------------------------------- |
 | `requestTimeoutMs` | `number` | `30000` | Timeout for admin requests (ms) |
-
-## Creating Topics
-
-To create topics, use the `KafkaClient.createTopics()` method:
-
-```typescript
-await client.createTopics([
-	{
-		name: 'orders',
-		numPartitions: 6,
-		replicationFactor: 3,
-		configs: {
-			'retention.ms': '604800000', // 7 days
-			'cleanup.policy': 'delete',
-		},
-	},
-])
-```
 
 ## Next Steps
 

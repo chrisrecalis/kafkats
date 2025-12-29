@@ -154,3 +154,21 @@ export interface DeleteGroupsResult {
 	/** Error code */
 	errorCode: ErrorCode
 }
+
+/**
+ * Result of a create topics operation
+ */
+export interface CreateTopicsResult {
+	/** Topic name */
+	name: string
+	/** Topic ID */
+	topicId: string
+	/** Error code */
+	errorCode: ErrorCode
+	/** Error message */
+	errorMessage: string | null
+	/** Number of partitions */
+	numPartitions: number
+	/** Replication factor */
+	replicationFactor: number
+}
