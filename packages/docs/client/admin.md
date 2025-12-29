@@ -21,6 +21,42 @@ The admin client shares the underlying cluster connection with the `KafkaClient`
 
 ## Topic Operations
 
+### Fetching Topic Offsets
+
+Get the earliest or latest offsets for a topic's partitions:
+
+```typescript
+const offsets = await admin.fetchTopicOffsets('events', [0, 1, 2], 'latest')
+
+for (const [partition, offset] of offsets) {
+	console.log(`Partition ${partition}: offset ${offset}`)
+}
+```
+
+Fetch earliest offsets:
+
+```typescript
+const earliestOffsets = await admin.fetchTopicOffsets('events', [0, 1, 2], 'earliest')
+```
+
+With isolation level for transactional topics:
+
+```typescript
+// Get the last stable offset (LSO) - only committed transactional messages
+const committedOffsets = await admin.fetchTopicOffsets('events', [0, 1, 2], 'latest', {
+	isolationLevel: 'read_committed',
+})
+```
+
+#### Options
+
+| Option           | Type                                      | Default            | Description                                   |
+| ---------------- | ----------------------------------------- | ------------------ | --------------------------------------------- |
+| `topic`          | `string`                                  | -                  | Topic name                                    |
+| `partitions`     | `number[]`                                | -                  | Partition indices to fetch offsets for        |
+| `which`          | `'earliest' \| 'latest'`                  | -                  | Which offset to fetch                         |
+| `isolationLevel` | `'read_uncommitted' \| 'read_committed'`  | `read_uncommitted` | Controls visibility of transactional messages |
+
 ### Listing Topics
 
 Get a list of all topic names in the cluster:
