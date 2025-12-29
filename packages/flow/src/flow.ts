@@ -9,10 +9,18 @@ import {
 	type Producer,
 	type ProducerConfig,
 	type RunEachOptions,
+	type SendResult,
 } from '@kafkats/client'
 import type { Codec } from '@/codec.js'
 import { buffer as bufferCodec } from '@/codec.js'
-import type { StateStoreProvider, KeyValueStore, WindowStore, SessionStore, WindowedKey } from '@/state.js'
+import type {
+	ChangelogCheckpointStore,
+	StateStoreProvider,
+	KeyValueStore,
+	WindowStore,
+	SessionStore,
+	WindowedKey,
+} from '@/state.js'
 import { InMemoryStateStoreProvider } from '@/state/memory.js'
 import {
 	type ChangelogConfig,
@@ -291,7 +299,7 @@ type ActiveTransaction = {
 	send(
 		topic: string,
 		messages: { key?: Buffer | null; value: Buffer | null; headers?: Record<string, Buffer>; partition?: number }
-	): Promise<unknown>
+	): Promise<SendResult>
 	sendOffsets(params: {
 		groupId?: string
 		consumerGroupMetadata?: {
@@ -311,11 +319,14 @@ type WorkerContext = {
 	producer: Producer
 	consumer: Consumer
 	activeTransaction: ActiveTransaction | null
+	activeTransactionPromise: Promise<void> | null
 	groupInstanceId?: string | null
 	sourcesByTopic: Map<string, SourceNode<unknown, unknown>[]>
 	assignedPartitions: Map<TopicPartitionKey, { topic: string; partition: number }>
 	// Transaction batching state for EOS
 	pendingOffsets: Map<TopicPartitionKey, { topic: string; partition: number; offset: bigint }>
+	pendingChangelogOffsets: Map<TopicPartitionKey, { topic: string; partition: number; offset: bigint }>
+	eosQueue: Promise<void>
 	transactionActive: boolean
 	commitTimer: ReturnType<typeof setTimeout> | null
 	lastCommitTime: number
@@ -675,6 +686,7 @@ class FlowAppImpl implements FlowApp {
 	private readonly eosEnabled: boolean
 	private readonly commitIntervalMs: number
 	private readonly stateStoreProvider: StateStoreProvider
+	private readonly changelogCheckpointStore: ChangelogCheckpointStore | null
 	private readonly stateStores = new Map<string, KeyValueStore<unknown, unknown>>()
 	private readonly changelogTopics = new Map<string, ChangelogTopicSpec>()
 	private readonly changelogWriters = new Map<string, ChangelogWriter<unknown, unknown>>()
@@ -701,6 +713,7 @@ class FlowAppImpl implements FlowApp {
 			this.ownsClient = true
 		}
 		this.stateStoreProvider = config.stateStoreProvider ?? new InMemoryStateStoreProvider()
+		this.changelogCheckpointStore = this.stateStoreProvider.getChangelogCheckpointStore?.() ?? null
 	}
 
 	getOrCreateStore<K, V>(
@@ -759,6 +772,29 @@ class FlowAppImpl implements FlowApp {
 							return null
 						}
 						return worker.activeTransaction
+					},
+					async result => {
+						if (!this.changelogCheckpointStore) {
+							return
+						}
+						const worker = workerContextStorage.getStore()
+						if (worker?.activeTransaction) {
+							const key: TopicPartitionKey = `${result.topic}:${result.partition}`
+							const nextOffset = result.offset + 1n
+							const existing = worker.pendingChangelogOffsets.get(key)
+							if (!existing || nextOffset > existing.offset) {
+								worker.pendingChangelogOffsets.set(key, {
+									topic: result.topic,
+									partition: result.partition,
+									offset: nextOffset,
+								})
+							}
+							return
+						}
+
+						await this.changelogCheckpointStore
+							.set(result.topic, result.partition, result.offset + 1n)
+							.catch(() => {})
 					}
 				)
 				this.changelogWriters.set(storeName, writer as ChangelogWriter<unknown, unknown>)
@@ -896,11 +932,14 @@ class FlowAppImpl implements FlowApp {
 				producer,
 				consumer,
 				activeTransaction: null,
+				activeTransactionPromise: null,
 				groupInstanceId: groupInstanceId ?? null,
 				sourcesByTopic: new Map(),
 				assignedPartitions: new Map(),
 				// Transaction batching state
 				pendingOffsets: new Map(),
+				pendingChangelogOffsets: new Map(),
+				eosQueue: Promise.resolve(),
 				transactionActive: false,
 				commitTimer: null,
 				lastCommitTime: 0,
@@ -948,8 +987,7 @@ class FlowAppImpl implements FlowApp {
 				.runEach(
 					topics,
 					async (message, ctx) => {
-						// Run within worker context for changelog writes
-						await workerContextStorage.run(worker, async () => {
+						const handler = async () => {
 							const sources = worker.sourcesByTopic.get(message.topic)
 							if (!sources) return
 							if (!this.eosEnabled) {
@@ -959,7 +997,15 @@ class FlowAppImpl implements FlowApp {
 								return
 							}
 							await this.processInTransaction(message, ctx, sources, worker)
-						})
+						}
+
+						if (!this.eosEnabled) {
+							// Run within worker context for changelog writes
+							await workerContextStorage.run(worker, handler)
+							return
+						}
+
+						await this.enqueueEosTask(worker, () => workerContextStorage.run(worker, handler))
 					},
 					this.buildRunEachOptions()
 				)
@@ -1031,7 +1077,7 @@ class FlowAppImpl implements FlowApp {
 
 		// Commit any pending transactions before stopping
 		for (const worker of this.workers) {
-			await this.commitTransactionBatch(worker).catch(() => {
+			await this.enqueueEosTask(worker, () => this.commitTransactionBatch(worker)).catch(() => {
 				// Ignore errors during shutdown - best effort commit
 			})
 		}
@@ -1279,7 +1325,8 @@ class FlowAppImpl implements FlowApp {
 				const restoredCount = await restorer.restore(
 					this.client,
 					this.config.changelog?.restoration,
-					partitions
+					partitions,
+					this.changelogCheckpointStore ?? undefined
 				)
 				if (restoredCount > 0) {
 					// Log restoration (optional - could add a logger)
@@ -1341,6 +1388,7 @@ class FlowAppImpl implements FlowApp {
 			...base,
 			transactionalId,
 			idempotent: true,
+			retries: base.retries ?? 10,
 		}
 	}
 
@@ -1391,6 +1439,15 @@ class FlowAppImpl implements FlowApp {
 		}
 	}
 
+	private enqueueEosTask<T>(worker: WorkerContext, fn: () => Promise<T>): Promise<T> {
+		const run = worker.eosQueue.then(fn, fn)
+		worker.eosQueue = run.then(
+			() => {},
+			() => {}
+		)
+		return run
+	}
+
 	/**
 	 * Process a message within a batched transaction.
 	 * Multiple messages are batched into a single transaction and committed together
@@ -1407,35 +1464,40 @@ class FlowAppImpl implements FlowApp {
 			throw new Error('Flow is not started')
 		}
 
-		// Start a new transaction if one isn't active
-		if (!worker.transactionActive) {
-			await this.beginTransaction(worker)
-		}
+		try {
+			// Start a new transaction if one isn't active
+			if (!worker.transactionActive) {
+				await this.beginTransaction(worker)
+			}
 
-		// Process the message within the current transaction
-		for (const source of sources) {
-			await source.handleMessage(message, ctx)
-		}
+			// Process the message within the current transaction
+			for (const source of sources) {
+				await source.handleMessage(message, ctx)
+			}
 
-		// Track this offset for the batch commit
-		const key: TopicPartitionKey = `${message.topic}:${message.partition}`
-		const existingOffset = worker.pendingOffsets.get(key)
-		// Only update if this offset is higher (messages may be processed out of order within a partition)
-		if (!existingOffset || message.offset >= existingOffset.offset) {
-			worker.pendingOffsets.set(key, {
-				topic: message.topic,
-				partition: message.partition,
-				offset: message.offset + 1n, // Commit the next offset
-			})
-		}
+			// Track this offset for the batch commit
+			const key: TopicPartitionKey = `${message.topic}:${message.partition}`
+			const existingOffset = worker.pendingOffsets.get(key)
+			// Only update if this offset is higher (messages may be processed out of order within a partition)
+			if (!existingOffset || message.offset >= existingOffset.offset) {
+				worker.pendingOffsets.set(key, {
+					topic: message.topic,
+					partition: message.partition,
+					offset: message.offset + 1n, // Commit the next offset
+				})
+			}
 
-		// Schedule a commit if the interval has elapsed
-		const now = Date.now()
-		if (now - worker.lastCommitTime >= this.commitIntervalMs) {
-			await this.commitTransactionBatch(worker)
-		} else if (!worker.commitTimer) {
-			// Schedule a commit for when the interval elapses
-			this.scheduleCommit(worker)
+			// Schedule a commit if the interval has elapsed
+			const now = Date.now()
+			if (now - worker.lastCommitTime >= this.commitIntervalMs) {
+				await this.commitTransactionBatch(worker)
+			} else if (!worker.commitTimer) {
+				// Schedule a commit for when the interval elapses
+				this.scheduleCommit(worker)
+			}
+		} catch (err) {
+			await this.abortTransactionBatch(worker, err)
+			throw err
 		}
 	}
 
@@ -1447,7 +1509,9 @@ class FlowAppImpl implements FlowApp {
 
 		// Begin the transaction using the producer's internal transaction start
 		// We access the producer's transaction method but don't await its completion yet
-		worker.activeTransaction = await this.startProducerTransaction(producer)
+		const started = await this.startProducerTransaction(producer)
+		worker.activeTransaction = started.tx
+		worker.activeTransactionPromise = started.completion
 		worker.transactionActive = true
 		worker.lastCommitTime = Date.now()
 	}
@@ -1455,22 +1519,30 @@ class FlowAppImpl implements FlowApp {
 	/**
 	 * Start a producer transaction and return the transaction handle
 	 */
-	private startProducerTransaction(producer: Producer): Promise<ActiveTransaction> {
+	private startProducerTransaction(
+		producer: Producer
+	): Promise<{ tx: ActiveTransaction; completion: Promise<void> }> {
 		return new Promise((resolve, reject) => {
-			// We need to call producer.transaction() but capture the tx object
-			// and not wait for the entire transaction to complete
-			const txPromise = producer.transaction(async tx => {
-				resolve(tx as ActiveTransaction)
-				// This promise will be resolved externally when we commit
-				return new Promise<void>((resolveInner, rejectInner) => {
-					// Store the resolve/reject for later use
-					;(tx as ActiveTransaction & { _resolve?: () => void; _reject?: (err: Error) => void })._resolve =
-						resolveInner
-					;(tx as ActiveTransaction & { _resolve?: () => void; _reject?: (err: Error) => void })._reject =
-						rejectInner
+			let txResolved = false
+
+			const completion = producer.transaction(async tx => {
+				const txHandle = tx as ActiveTransaction & { _resolve?: () => void; _reject?: (err: Error) => void }
+
+				const gate = new Promise<void>((resolveInner, rejectInner) => {
+					txHandle._resolve = resolveInner
+					txHandle._reject = (err: Error) => rejectInner(err)
 				})
+
+				txResolved = true
+				queueMicrotask(() => resolve({ tx: txHandle, completion }))
+				return gate
 			})
-			txPromise.catch(reject)
+
+			completion.catch(err => {
+				if (!txResolved) {
+					reject(err instanceof Error ? err : new Error(String(err)))
+				}
+			})
 		})
 	}
 
@@ -1481,37 +1553,88 @@ class FlowAppImpl implements FlowApp {
 		// Cancel any pending commit timer
 		this.cancelCommitTimer(worker)
 
-		if (!worker.transactionActive || !worker.activeTransaction) {
+		if (!worker.transactionActive || !worker.activeTransaction || !worker.activeTransactionPromise) {
 			return
 		}
 
 		const tx = worker.activeTransaction
+		const txPromise = worker.activeTransactionPromise
 		const offsets = Array.from(worker.pendingOffsets.values())
 
-		if (offsets.length > 0) {
-			const groupMetadata = this.getConsumerGroupMetadata(worker.consumer, worker.groupInstanceId)
-			if (!groupMetadata || groupMetadata.generationId < 0) {
-				throw new Error('exactly_once requires active consumer group metadata')
+		try {
+			if (offsets.length > 0) {
+				const groupMetadata = this.getConsumerGroupMetadata(worker.consumer, worker.groupInstanceId)
+				if (!groupMetadata || groupMetadata.generationId < 0) {
+					throw new Error('exactly_once requires active consumer group metadata')
+				}
+
+				// Send all accumulated offsets
+				await tx.sendOffsets({
+					consumerGroupMetadata: groupMetadata,
+					offsets,
+				})
 			}
 
-			// Send all accumulated offsets
-			await tx.sendOffsets({
-				consumerGroupMetadata: groupMetadata,
-				offsets,
-			})
+			// Complete the transaction by resolving the gate promise (commit happens inside producer.transaction()).
+			const txWithResolve = tx as ActiveTransaction & { _resolve?: () => void }
+			txWithResolve._resolve?.()
+
+			// Wait for the transaction commit to succeed before checkpointing.
+			await txPromise
+
+			await this.flushChangelogCheckpoints(worker)
+		} catch (err) {
+			const txWithReject = tx as ActiveTransaction & { _reject?: (err: Error) => void }
+			txWithReject._reject?.(err instanceof Error ? err : new Error(String(err)))
+			await txPromise.catch(() => {})
+			throw err
+		} finally {
+			// Reset state for next batch
+			worker.pendingOffsets.clear()
+			worker.pendingChangelogOffsets.clear()
+			worker.activeTransaction = null
+			worker.activeTransactionPromise = null
+			worker.transactionActive = false
+			worker.lastCommitTime = Date.now()
+		}
+	}
+
+	private async abortTransactionBatch(worker: WorkerContext, error: unknown): Promise<void> {
+		this.cancelCommitTimer(worker)
+
+		if (!worker.transactionActive || !worker.activeTransaction || !worker.activeTransactionPromise) {
+			worker.pendingOffsets.clear()
+			worker.pendingChangelogOffsets.clear()
+			worker.activeTransaction = null
+			worker.activeTransactionPromise = null
+			worker.transactionActive = false
+			worker.lastCommitTime = Date.now()
+			return
 		}
 
-		// Complete the transaction by resolving the inner promise
-		const txWithResolve = tx as ActiveTransaction & { _resolve?: () => void }
-		if (txWithResolve._resolve) {
-			txWithResolve._resolve()
-		}
+		const tx = worker.activeTransaction as ActiveTransaction & { _reject?: (err: Error) => void }
+		const txPromise = worker.activeTransactionPromise
 
-		// Reset state for next batch
+		tx._reject?.(error instanceof Error ? error : new Error(String(error)))
+		await txPromise.catch(() => {})
+
 		worker.pendingOffsets.clear()
+		worker.pendingChangelogOffsets.clear()
 		worker.activeTransaction = null
+		worker.activeTransactionPromise = null
 		worker.transactionActive = false
 		worker.lastCommitTime = Date.now()
+	}
+
+	private async flushChangelogCheckpoints(worker: WorkerContext): Promise<void> {
+		if (!this.changelogCheckpointStore) {
+			return
+		}
+
+		for (const checkpoint of worker.pendingChangelogOffsets.values()) {
+			const offset = this.eosEnabled ? checkpoint.offset + 1n : checkpoint.offset
+			await this.changelogCheckpointStore.set(checkpoint.topic, checkpoint.partition, offset).catch(() => {})
+		}
 	}
 
 	/**
@@ -1525,7 +1648,7 @@ class FlowAppImpl implements FlowApp {
 		const timeUntilCommit = Math.max(0, this.commitIntervalMs - (Date.now() - worker.lastCommitTime))
 		worker.commitTimer = setTimeout(() => {
 			worker.commitTimer = null
-			this.commitTransactionBatch(worker).catch(err => {
+			this.enqueueEosTask(worker, () => this.commitTransactionBatch(worker)).catch(err => {
 				this.lastError = err as Error
 				this.currentState = 'ERROR'
 			})
@@ -1603,7 +1726,7 @@ class FlowAppImpl implements FlowApp {
 			// This is done synchronously in the event handler to ensure
 			// offsets are committed before partitions are reassigned
 			if (this.eosEnabled && worker.transactionActive) {
-				this.commitTransactionBatch(worker).catch(err => {
+				this.enqueueEosTask(worker, () => this.commitTransactionBatch(worker)).catch(err => {
 					this.lastError = err as Error
 					this.currentState = 'ERROR'
 				})

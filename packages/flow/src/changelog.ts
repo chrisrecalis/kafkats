@@ -1,6 +1,7 @@
 import type { KafkaClient, Producer } from '@kafkats/client'
+import type { SendResult } from '@kafkats/client'
 import type { Codec } from './codec.js'
-import type { KeyValueStore, WindowedKey } from './state.js'
+import type { ChangelogCheckpointStore, KeyValueStore, WindowedKey } from './state.js'
 
 /**
  * Configuration for changelog topics backing state stores.
@@ -23,22 +24,22 @@ export interface ChangelogConfig {
 
 export interface ChangelogRestorationOptions {
 	/**
-	 * Stop restoration after this many milliseconds without consuming any messages.
+	 * Abort restoration if no progress is made for this many milliseconds while restoration is incomplete.
 	 * Default: 5000ms.
 	 */
 	idleTimeoutMs?: number
 	/**
-	 * Stop restoration after this many milliseconds without consuming any messages
-	 * BEFORE the first message is received.
+	 * Abort restoration if no progress is made for this many milliseconds BEFORE the first message is received,
+	 * while restoration is incomplete.
 	 *
 	 * This can be set higher than idleTimeoutMs to tolerate slow consumer startup
-	 * while still stopping quickly after reaching the end of the changelog.
+	 * while still aborting quickly if restoration stalls.
 	 *
 	 * Default: idleTimeoutMs.
 	 */
 	initialIdleTimeoutMs?: number
 	/**
-	 * How often to check for the idle timeout.
+	 * How often to check for the progress timeout.
 	 * Default: 1000ms.
 	 */
 	checkIntervalMs?: number
@@ -149,7 +150,7 @@ interface TransactionLike {
 	send(
 		topic: string,
 		messages: { key?: Buffer | null; value: Buffer | null; headers?: Record<string, Buffer>; partition?: number }
-	): Promise<unknown>
+	): Promise<SendResult>
 }
 
 /**
@@ -161,7 +162,8 @@ export class ChangelogWriter<K, V> {
 		private readonly keyCodec: Codec<K>,
 		private readonly valueCodec: Codec<V>,
 		private readonly getProducer: () => Producer,
-		private readonly getTransaction: () => TransactionLike | null
+		private readonly getTransaction: () => TransactionLike | null,
+		private readonly onWriteAck?: (result: SendResult) => void | Promise<void>
 	) {}
 
 	/**
@@ -173,15 +175,17 @@ export class ChangelogWriter<K, V> {
 		const transaction = this.getTransaction()
 
 		if (transaction) {
-			await transaction.send(this.topicName, {
+			const result = await transaction.send(this.topicName, {
 				key: keyBuffer,
 				value: valueBuffer,
 			})
+			await this.onWriteAck?.(result)
 		} else {
-			await this.getProducer().send(this.topicName, {
+			const result = await this.getProducer().send(this.topicName, {
 				key: keyBuffer,
 				value: valueBuffer,
 			})
+			await this.onWriteAck?.(result)
 		}
 	}
 
@@ -192,17 +196,12 @@ export class ChangelogWriter<K, V> {
 		const keyBuffer = this.keyCodec.encode(key)
 		const transaction = this.getTransaction()
 
-		// Kafka supports null values for tombstones, but types may not reflect this
-		// Use type assertion to work around the type restriction
-		const tombstoneMessage = {
-			key: keyBuffer,
-			value: null as unknown as Buffer,
-		}
-
 		if (transaction) {
-			await transaction.send(this.topicName, tombstoneMessage)
+			const result = await transaction.send(this.topicName, { key: keyBuffer, value: null })
+			await this.onWriteAck?.(result)
 		} else {
-			await this.getProducer().send(this.topicName, tombstoneMessage)
+			const result = await this.getProducer().send(this.topicName, { key: keyBuffer, value: null })
+			await this.onWriteAck?.(result)
 		}
 	}
 }
@@ -222,8 +221,21 @@ export class ChangelogRestorer<K, V> {
 	 * Restore state by consuming the changelog topic from the beginning.
 	 * @returns Number of records restored
 	 */
-	async restore(client: KafkaClient, options?: ChangelogRestorationOptions, partitions?: number[]): Promise<number> {
-		if (partitions && partitions.length === 0) {
+	async restore(
+		client: KafkaClient,
+		options?: ChangelogRestorationOptions,
+		partitions?: number[],
+		checkpointStore?: ChangelogCheckpointStore
+	): Promise<number> {
+		const admin = client.admin()
+		const [desc] = await admin.describeTopics([this.topicName])
+		if (!desc) {
+			return 0
+		}
+
+		const topicPartitions = partitions ?? desc.partitions.map(p => p.partitionIndex)
+
+		if (topicPartitions.length === 0) {
 			return 0
 		}
 
@@ -235,71 +247,166 @@ export class ChangelogRestorer<K, V> {
 			...(options?.consumerMaxWaitMs !== undefined ? { maxWaitMs: options.consumerMaxWaitMs } : {}),
 		})
 
-		let restoredCount = 0
-		let stopRequested = false
+		const [startOffsets, endOffsets] = await Promise.all([
+			admin.fetchTopicOffsets(this.topicName, topicPartitions, 'earliest', { isolationLevel: 'read_committed' }),
+			admin.fetchTopicOffsets(this.topicName, topicPartitions, 'latest', { isolationLevel: 'read_committed' }),
+		])
 
-		// We'll use a timeout to detect when we've consumed all available messages
-		// This is a simpler approach than tracking end offsets
-		let lastMessageTime = Date.now()
+		const assigned = [...new Set(topicPartitions)].sort((a, b) => a - b)
+		const checkpointOffsets = checkpointStore
+			? new Map<number, bigint>(
+					(
+						await Promise.all(
+							assigned.map(async partition => {
+								const offset = await checkpointStore.get(this.topicName, partition)
+								return offset !== undefined ? ([partition, offset] as const) : null
+							})
+						)
+					).filter((pair): pair is readonly [number, bigint] => pair !== null)
+				)
+			: new Map<number, bigint>()
+
+		const pendingPartitions = new Set<number>()
+		const assignment = assigned.flatMap(partition => {
+			const earliestOffset = startOffsets.get(partition)
+			const endOffset = endOffsets.get(partition)
+			const checkpointOffset = checkpointOffsets.get(partition)
+			const startOffset =
+				checkpointOffset !== undefined && earliestOffset !== undefined && checkpointOffset > earliestOffset
+					? checkpointOffset
+					: earliestOffset
+
+			if (startOffset === undefined || endOffset === undefined) {
+				throw new Error(`Missing offset information for ${this.topicName}-${partition}`)
+			}
+
+			if (startOffset >= endOffset) {
+				return []
+			}
+
+			pendingPartitions.add(partition)
+			return [{ topic: this.topicName, partition, offset: startOffset }]
+		})
+
+		if (pendingPartitions.size === 0) {
+			return 0
+		}
+
+		let restoredCount = 0
+
+		const abortController = new AbortController()
+
+		let lastProgressTime = Date.now()
 		let isRunning = false
 		let hasConsumedMessage = false
-		const idleTimeoutMs = options?.idleTimeoutMs ?? 5000 // Stop after N ms of no messages
+		const idleTimeoutMs = options?.idleTimeoutMs ?? 5000
 		const initialIdleTimeoutMs = options?.initialIdleTimeoutMs ?? idleTimeoutMs
 		const checkIntervalMs = options?.checkIntervalMs ?? 1000
+		const restoreCompleteReason = Symbol('changelogRestoreComplete')
 
 		consumer.once('running', () => {
 			isRunning = true
-			lastMessageTime = Date.now()
+			lastProgressTime = Date.now()
 		})
 
-		await consumer.runEach(
-			[this.topicName],
-			async message => {
-				lastMessageTime = Date.now()
-				hasConsumedMessage = true
+		const checkIdle = setInterval(() => {
+			if (!isRunning) return
+			if (abortController.signal.aborted) return
+			if (pendingPartitions.size === 0) return
 
-				if (message.key === null) {
-					return
-				}
-
-				const key = this.keyCodec.decode(message.key)
-
-				if (message.value === null) {
-					// Tombstone - delete from store
-					await this.store.delete(key)
-				} else {
-					const value = this.valueCodec.decode(message.value)
-					await this.store.put(key, value)
-					restoredCount++
-				}
-			},
-			{
-				commitOffsets: false,
-				assignment: partitions?.map(partition => ({ topic: this.topicName, partition })),
-				signal: (() => {
-					// Create an abort controller that will abort after idle timeout
-					const controller = new AbortController()
-
-					// Check periodically if we should stop
-					const checkIdle = setInterval(() => {
-						if (!isRunning) return
-						if (stopRequested) {
-							clearInterval(checkIdle)
-							controller.abort()
-							return
-						}
-						const timeoutMs = hasConsumedMessage ? idleTimeoutMs : initialIdleTimeoutMs
-						if (Date.now() - lastMessageTime > timeoutMs) {
-							stopRequested = true
-							clearInterval(checkIdle)
-							controller.abort()
-						}
-					}, checkIntervalMs)
-
-					return controller.signal
-				})(),
+			const timeoutMs = hasConsumedMessage ? idleTimeoutMs : initialIdleTimeoutMs
+			if (Date.now() - lastProgressTime > timeoutMs) {
+				abortController.abort(
+					new Error(
+						`Timed out restoring changelog "${this.topicName}" (pending partitions: ${[
+							...pendingPartitions,
+						].join(', ')})`
+					)
+				)
 			}
-		)
+		}, checkIntervalMs)
+
+		const pausedPartitions = new Set<number>()
+		try {
+			await consumer.runEach(
+				[this.topicName],
+				async message => {
+					const endOffset = endOffsets.get(message.partition)
+					if (endOffset === undefined) {
+						return
+					}
+
+					// Ignore any records that arrive beyond the captured end offset (e.g. concurrent writers).
+					if (message.offset >= endOffset) {
+						pendingPartitions.delete(message.partition)
+						if (!pausedPartitions.has(message.partition)) {
+							pausedPartitions.add(message.partition)
+							consumer.pause([{ topic: message.topic, partition: message.partition }])
+						}
+						if (pendingPartitions.size === 0) {
+							abortController.abort(restoreCompleteReason)
+						}
+						return
+					}
+
+					lastProgressTime = Date.now()
+					hasConsumedMessage = true
+
+					if (message.key !== null) {
+						const key = this.keyCodec.decode(message.key)
+
+						if (message.value === null) {
+							// Tombstone - delete from store
+							await this.store.delete(key)
+						} else {
+							const value = this.valueCodec.decode(message.value)
+							await this.store.put(key, value)
+							restoredCount++
+						}
+					}
+
+					if (message.offset + 1n >= endOffset) {
+						pendingPartitions.delete(message.partition)
+						if (!pausedPartitions.has(message.partition)) {
+							pausedPartitions.add(message.partition)
+							consumer.pause([{ topic: message.topic, partition: message.partition }])
+						}
+						if (pendingPartitions.size === 0) {
+							abortController.abort(restoreCompleteReason)
+						}
+					}
+				},
+				{
+					commitOffsets: false,
+					assignment,
+					signal: abortController.signal,
+				}
+			)
+		} finally {
+			clearInterval(checkIdle)
+		}
+
+		const abortReason: unknown = abortController.signal.reason
+		if (abortReason !== restoreCompleteReason) {
+			if (abortReason instanceof Error) {
+				throw abortReason
+			}
+			if (pendingPartitions.size > 0) {
+				throw new Error(`Aborted restoring changelog "${this.topicName}"`, { cause: abortReason })
+			}
+		}
+
+		if (checkpointStore) {
+			await Promise.all(
+				assigned.map(async partition => {
+					const endOffset = endOffsets.get(partition)
+					if (endOffset === undefined) {
+						return
+					}
+					await checkpointStore.set(this.topicName, partition, endOffset)
+				})
+			).catch(() => {})
+		}
 
 		return restoredCount
 	}

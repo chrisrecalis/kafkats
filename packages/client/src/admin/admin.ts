@@ -21,9 +21,12 @@ import { createDeleteTopicsRequest } from '@/protocol/messages/requests/delete-t
 import { createListGroupsRequest } from '@/protocol/messages/requests/list-groups.js'
 import { createDescribeGroupsRequest } from '@/protocol/messages/requests/describe-groups.js'
 import { createDeleteGroupsRequest } from '@/protocol/messages/requests/delete-groups.js'
+import { OFFSET_TIMESTAMP } from '@/protocol/messages/requests/list-offsets.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
+import { KafkaProtocolError, isKafkaError, shouldRefreshMetadata } from '@/client/errors.js'
 import type { Logger } from '@/logger.js'
 import { noopLogger } from '@/logger.js'
+import { sleep } from '@/utils/sleep.js'
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30000
 
@@ -123,6 +126,38 @@ export class Admin {
 	}
 
 	// ==================== Topic Operations ====================
+
+	/**
+	 * Fetch the earliest or latest offsets for a topic's partitions.
+	 *
+	 * Uses the ListOffsets API against each partition leader. When `isolationLevel` is `read_committed`,
+	 * the returned "latest" offsets represent the last stable offset (LSO) rather than the log end offset (LEO),
+	 * matching what a `read_committed` consumer can actually read.
+	 */
+	async fetchTopicOffsets(
+		topic: string,
+		partitions: number[],
+		which: 'earliest' | 'latest',
+		options?: { isolationLevel?: 'read_uncommitted' | 'read_committed' }
+	): Promise<Map<number, bigint>> {
+		if (partitions.length === 0) {
+			return new Map()
+		}
+
+		const uniquePartitions = [...new Set(partitions)]
+
+		const timestamp = which === 'earliest' ? OFFSET_TIMESTAMP.EARLIEST : OFFSET_TIMESTAMP.LATEST
+		const isolationLevel = options?.isolationLevel === 'read_committed' ? 1 : 0
+
+		const offsets = await Promise.all(
+			uniquePartitions.map(async partition => {
+				const offset = await this.listOffset(topic, partition, timestamp, isolationLevel)
+				return [partition, offset] as const
+			})
+		)
+
+		return new Map(offsets)
+	}
 
 	/**
 	 * List all topic names in the cluster
@@ -472,5 +507,85 @@ export class Admin {
 
 		this.logger.debug('deleted groups', { count: results.length })
 		return results
+	}
+
+	/**
+	 * List a single offset for a topic partition with retries and metadata refresh.
+	 */
+	private async listOffset(
+		topic: string,
+		partition: number,
+		timestamp: bigint,
+		isolationLevel: number
+	): Promise<bigint> {
+		const maxAttempts = 5
+		let lastError: unknown
+
+		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+			try {
+				const leader = await this.cluster.getLeaderForPartition(topic, partition)
+
+				const response = await leader.listOffsets({
+					isolationLevel,
+					topics: [
+						{
+							name: topic,
+							partitions: [
+								{
+									partitionIndex: partition,
+									timestamp,
+								},
+							],
+						},
+					],
+				})
+
+				const topicResponse = response.topics.find(t => t.name === topic)
+				const partitionResponse = topicResponse?.partitions.find(p => p.partitionIndex === partition)
+
+				if (!partitionResponse) {
+					throw new Error(`No offset response for ${topic}-${partition}`)
+				}
+
+				if (partitionResponse.errorCode !== ErrorCode.None) {
+					throw new KafkaProtocolError(
+						partitionResponse.errorCode,
+						`ListOffsets failed for ${topic}-${partition}`
+					)
+				}
+
+				return partitionResponse.offset
+			} catch (error) {
+				lastError = error
+
+				const retriable = isKafkaError(error) && error.retriable
+				if (!retriable || attempt >= maxAttempts) {
+					throw error
+				}
+
+				const errorCode = isKafkaError(error) ? error.errorCode : undefined
+				if (errorCode !== undefined && shouldRefreshMetadata(errorCode)) {
+					this.logger.debug('refreshing metadata due to listOffsets error', {
+						topic,
+						partition,
+						errorCode,
+						attempt,
+					})
+					await this.cluster.refreshMetadata([topic]).catch(() => {})
+				}
+
+				const delayMs = Math.min(100 * 2 ** (attempt - 1), 2000)
+				this.logger.debug('retrying listOffsets after error', {
+					topic,
+					partition,
+					attempt,
+					delayMs,
+					error: error instanceof Error ? error.message : String(error),
+				})
+				await sleep(delayMs)
+			}
+		}
+
+		throw lastError instanceof Error ? lastError : new Error(`ListOffsets failed for ${topic}-${partition}`)
 	}
 }

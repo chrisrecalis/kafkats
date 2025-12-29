@@ -35,24 +35,28 @@ export function decodeAddPartitionsToTxnResponse(decoder: IDecoder, version: num
 	const throttleTimeMs = decoder.readInt32()
 
 	if (version >= 4) {
+		const errorCode = decoder.readInt16() as ErrorCode
+
 		// v4+: batched response format
 		const resultsByTransaction = flexible
-			? decoder.readCompactArray(d => {
+			? (decoder.readCompactNullableArray(d => {
 					const transactionalId = d.readCompactString()
-					const topicResults = d.readCompactArray(td => {
-						const name = td.readCompactString()
-						const resultsByPartition = td.readCompactArray(pd => {
-							const partitionIndex = pd.readInt32()
-							const errorCode = pd.readInt16() as ErrorCode
-							pd.skipTaggedFields()
-							return { partitionIndex, errorCode }
-						})
-						td.skipTaggedFields()
-						return { name, resultsByPartition }
-					})
+					const topicResults =
+						d.readCompactNullableArray(td => {
+							const name = td.readCompactString()
+							const resultsByPartition =
+								td.readCompactNullableArray(pd => {
+									const partitionIndex = pd.readInt32()
+									const errorCode = pd.readInt16() as ErrorCode
+									pd.skipTaggedFields()
+									return { partitionIndex, errorCode }
+								}) ?? []
+							td.skipTaggedFields()
+							return { name, resultsByPartition }
+						}) ?? []
 					d.skipTaggedFields()
 					return { transactionalId, topicResults }
-				})
+				}) ?? [])
 			: []
 
 		if (flexible) {
@@ -63,7 +67,7 @@ export function decodeAddPartitionsToTxnResponse(decoder: IDecoder, version: num
 		const firstTxn = resultsByTransaction[0]
 		return {
 			throttleTimeMs,
-			errorCode: ErrorCode.None,
+			errorCode,
 			results: firstTxn?.topicResults ?? [],
 		}
 	}
