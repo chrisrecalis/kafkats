@@ -54,12 +54,11 @@ export function encodeAddPartitionsToTxnRequest(
 				enc.writeCompactString(txn.transactionalId)
 				enc.writeInt64(txn.producerId)
 				enc.writeInt16(txn.producerEpoch)
-				enc.writeBoolean(true) // verifyOnly = false means add partitions
+				enc.writeBoolean(false) // verifyOnly = false means add partitions
 				enc.writeCompactArray(txn.topics, (t, tenc) => {
 					tenc.writeCompactString(t.name)
 					tenc.writeCompactArray(t.partitions, (p, penc) => {
 						penc.writeInt32(p)
-						penc.writeEmptyTaggedFields()
 					})
 					tenc.writeEmptyTaggedFields()
 				})
@@ -76,7 +75,6 @@ export function encodeAddPartitionsToTxnRequest(
 			enc.writeCompactString(t.name)
 			enc.writeCompactArray(t.partitions, (p, penc) => {
 				penc.writeInt32(p)
-				penc.writeEmptyTaggedFields()
 			})
 			enc.writeEmptyTaggedFields()
 		})

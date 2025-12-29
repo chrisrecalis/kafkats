@@ -1,6 +1,7 @@
 import { open, type Database, type RootDatabase } from 'lmdb'
 import type {
 	Codec,
+	ChangelogCheckpointStore,
 	KeyValueStore,
 	KeyValueStoreOptions,
 	SessionStore,
@@ -465,6 +466,8 @@ export class LMDBStateStoreProvider implements StateStoreProvider {
 	readonly name = 'lmdb'
 	private readonly rootDb: RootDatabase<Buffer, Buffer>
 	private readonly stores = new Map<string, Database<Buffer, Buffer>>()
+	private readonly checkpointDb: Database<Buffer, Buffer>
+	private readonly checkpointStore: ChangelogCheckpointStore
 
 	constructor(options: LMDBProviderOptions) {
 		this.rootDb = open({
@@ -474,6 +477,12 @@ export class LMDBStateStoreProvider implements StateStoreProvider {
 			keyEncoding: 'binary',
 			encoding: 'binary',
 		})
+
+		this.checkpointDb = this.rootDb.openDB('__kafkats_flow_changelog_checkpoints__', {
+			keyEncoding: 'binary',
+			encoding: 'binary',
+		})
+		this.checkpointStore = new LMDBChangelogCheckpointStore(this.checkpointDb)
 	}
 
 	private getOrCreateDb(name: string): Database<Buffer, Buffer> {
@@ -503,9 +512,37 @@ export class LMDBStateStoreProvider implements StateStoreProvider {
 		return new LMDBSessionStore(name, db, options)
 	}
 
+	getChangelogCheckpointStore(): ChangelogCheckpointStore {
+		return this.checkpointStore
+	}
+
 	async close(): Promise<void> {
 		await this.rootDb.close()
 		this.stores.clear()
+	}
+}
+
+class LMDBChangelogCheckpointStore implements ChangelogCheckpointStore {
+	constructor(private readonly db: Database<Buffer, Buffer>) {}
+
+	get(topic: string, partition: number): Promise<bigint | undefined> {
+		const key = this.encodeKey(topic, partition)
+		const value = this.db.get(key)
+		if (value === undefined) {
+			return Promise.resolve(undefined)
+		}
+		return Promise.resolve(value.readBigInt64BE(0))
+	}
+
+	async set(topic: string, partition: number, offset: bigint): Promise<void> {
+		const key = this.encodeKey(topic, partition)
+		const value = Buffer.alloc(8)
+		value.writeBigInt64BE(offset, 0)
+		await this.db.put(key, value)
+	}
+
+	private encodeKey(topic: string, partition: number): Buffer {
+		return Buffer.from(`${topic}\u0000${partition}`, 'utf8')
 	}
 }
 

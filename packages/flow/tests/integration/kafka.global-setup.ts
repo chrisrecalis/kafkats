@@ -39,7 +39,14 @@ export default async function globalSetup() {
 
 	const image = process.env.KAFKA_TEST_IMAGE ?? DEFAULT_KAFKA_IMAGE
 
-	const container = await new KafkaContainer(image).withKraft().withStartupTimeout(60_000).start()
+	const container = await new KafkaContainer(image)
+		.withKraft()
+		.withEnvironment({
+			// Enable transactions in a single-broker test cluster
+			KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: '1',
+		})
+		.withStartupTimeout(60_000)
+		.start()
 
 	process.env.KAFKA_BROKERS = `${container.getHost()}:${container.getMappedPort(KAFKA_PORT)}`
 	process.env.KAFKA_TS_LOG_LEVEL ??= 'error'

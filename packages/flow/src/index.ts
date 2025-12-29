@@ -43,6 +43,7 @@ export {
 } from '@/state/changelog.js'
 export type {
 	StateStoreProvider,
+	ChangelogCheckpointStore,
 	KeyValueStore,
 	WindowStore,
 	SessionStore,
