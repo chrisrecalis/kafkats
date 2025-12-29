@@ -50,12 +50,12 @@ const committedOffsets = await admin.fetchTopicOffsets('events', [0, 1, 2], 'lat
 
 #### Options
 
-| Option           | Type                                      | Default            | Description                                   |
-| ---------------- | ----------------------------------------- | ------------------ | --------------------------------------------- |
-| `topic`          | `string`                                  | -                  | Topic name                                    |
-| `partitions`     | `number[]`                                | -                  | Partition indices to fetch offsets for        |
-| `which`          | `'earliest' \| 'latest'`                  | -                  | Which offset to fetch                         |
-| `isolationLevel` | `'read_uncommitted' \| 'read_committed'`  | `read_uncommitted` | Controls visibility of transactional messages |
+| Option           | Type                                     | Default            | Description                                   |
+| ---------------- | ---------------------------------------- | ------------------ | --------------------------------------------- |
+| `topic`          | `string`                                 | -                  | Topic name                                    |
+| `partitions`     | `number[]`                               | -                  | Partition indices to fetch offsets for        |
+| `which`          | `'earliest' \| 'latest'`                 | -                  | Which offset to fetch                         |
+| `isolationLevel` | `'read_uncommitted' \| 'read_committed'` | `read_uncommitted` | Controls visibility of transactional messages |
 
 ### Listing Topics
 

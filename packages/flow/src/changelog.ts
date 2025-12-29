@@ -1,6 +1,7 @@
 import type { KafkaClient, Producer } from '@kafkats/client'
+import type { SendResult } from '@kafkats/client'
 import type { Codec } from './codec.js'
-import type { KeyValueStore, WindowedKey } from './state.js'
+import type { ChangelogCheckpointStore, KeyValueStore, WindowedKey } from './state.js'
 
 /**
  * Configuration for changelog topics backing state stores.
@@ -149,7 +150,7 @@ interface TransactionLike {
 	send(
 		topic: string,
 		messages: { key?: Buffer | null; value: Buffer | null; headers?: Record<string, Buffer>; partition?: number }
-	): Promise<unknown>
+	): Promise<SendResult>
 }
 
 /**
@@ -161,7 +162,8 @@ export class ChangelogWriter<K, V> {
 		private readonly keyCodec: Codec<K>,
 		private readonly valueCodec: Codec<V>,
 		private readonly getProducer: () => Producer,
-		private readonly getTransaction: () => TransactionLike | null
+		private readonly getTransaction: () => TransactionLike | null,
+		private readonly onWriteAck?: (result: SendResult) => void | Promise<void>
 	) {}
 
 	/**
@@ -173,15 +175,17 @@ export class ChangelogWriter<K, V> {
 		const transaction = this.getTransaction()
 
 		if (transaction) {
-			await transaction.send(this.topicName, {
+			const result = await transaction.send(this.topicName, {
 				key: keyBuffer,
 				value: valueBuffer,
 			})
+			await this.onWriteAck?.(result)
 		} else {
-			await this.getProducer().send(this.topicName, {
+			const result = await this.getProducer().send(this.topicName, {
 				key: keyBuffer,
 				value: valueBuffer,
 			})
+			await this.onWriteAck?.(result)
 		}
 	}
 
@@ -192,17 +196,12 @@ export class ChangelogWriter<K, V> {
 		const keyBuffer = this.keyCodec.encode(key)
 		const transaction = this.getTransaction()
 
-		// Kafka supports null values for tombstones, but types may not reflect this
-		// Use type assertion to work around the type restriction
-		const tombstoneMessage = {
-			key: keyBuffer,
-			value: null as unknown as Buffer,
-		}
-
 		if (transaction) {
-			await transaction.send(this.topicName, tombstoneMessage)
+			const result = await transaction.send(this.topicName, { key: keyBuffer, value: null })
+			await this.onWriteAck?.(result)
 		} else {
-			await this.getProducer().send(this.topicName, tombstoneMessage)
+			const result = await this.getProducer().send(this.topicName, { key: keyBuffer, value: null })
+			await this.onWriteAck?.(result)
 		}
 	}
 }
@@ -222,7 +221,12 @@ export class ChangelogRestorer<K, V> {
 	 * Restore state by consuming the changelog topic from the beginning.
 	 * @returns Number of records restored
 	 */
-	async restore(client: KafkaClient, options?: ChangelogRestorationOptions, partitions?: number[]): Promise<number> {
+	async restore(
+		client: KafkaClient,
+		options?: ChangelogRestorationOptions,
+		partitions?: number[],
+		checkpointStore?: ChangelogCheckpointStore
+	): Promise<number> {
 		const admin = client.admin()
 		const [desc] = await admin.describeTopics([this.topicName])
 		if (!desc) {
@@ -249,10 +253,28 @@ export class ChangelogRestorer<K, V> {
 		])
 
 		const assigned = [...new Set(topicPartitions)].sort((a, b) => a - b)
+		const checkpointOffsets = checkpointStore
+			? new Map<number, bigint>(
+					(
+						await Promise.all(
+							assigned.map(async partition => {
+								const offset = await checkpointStore.get(this.topicName, partition)
+								return offset !== undefined ? ([partition, offset] as const) : null
+							})
+						)
+					).filter((pair): pair is readonly [number, bigint] => pair !== null)
+				)
+			: new Map<number, bigint>()
+
 		const pendingPartitions = new Set<number>()
 		const assignment = assigned.flatMap(partition => {
-			const startOffset = startOffsets.get(partition)
+			const earliestOffset = startOffsets.get(partition)
 			const endOffset = endOffsets.get(partition)
+			const checkpointOffset = checkpointOffsets.get(partition)
+			const startOffset =
+				checkpointOffset !== undefined && earliestOffset !== undefined && checkpointOffset > earliestOffset
+					? checkpointOffset
+					: earliestOffset
 
 			if (startOffset === undefined || endOffset === undefined) {
 				throw new Error(`Missing offset information for ${this.topicName}-${partition}`)
@@ -372,6 +394,18 @@ export class ChangelogRestorer<K, V> {
 			if (pendingPartitions.size > 0) {
 				throw new Error(`Aborted restoring changelog "${this.topicName}"`, { cause: abortReason })
 			}
+		}
+
+		if (checkpointStore) {
+			await Promise.all(
+				assigned.map(async partition => {
+					const endOffset = endOffsets.get(partition)
+					if (endOffset === undefined) {
+						return
+					}
+					await checkpointStore.set(this.topicName, partition, endOffset)
+				})
+			).catch(() => {})
 		}
 
 		return restoredCount

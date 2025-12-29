@@ -2,11 +2,15 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { KafkaClient, type Producer } from '@kafkats/client'
 import {
 	ChangelogPartitionMismatchError,
+	type ChangelogCheckpointStore,
 	SourceTopicNotFoundError,
 	TimeWindows,
 	buildChangelogTopicName,
 	codec,
+	ChangelogRestorer,
 	flow,
+	InMemoryKeyValueStore,
+	InMemoryStateStoreProvider,
 } from '../../src/index.js'
 import { MultiTopicCollector, createTopics, requireKafkaBrokers, uniqueTopicName } from './test-helpers.js'
 
@@ -755,6 +759,28 @@ describe('stream-stream joins', () => {
 })
 
 describe('changelog topics and restoration', () => {
+	class MemoryCheckpointStore implements ChangelogCheckpointStore {
+		private readonly offsets = new Map<string, bigint>()
+
+		async get(topic: string, partition: number): Promise<bigint | undefined> {
+			return this.offsets.get(`${topic}:${partition}`)
+		}
+
+		async set(topic: string, partition: number, offset: bigint): Promise<void> {
+			this.offsets.set(`${topic}:${partition}`, offset)
+		}
+	}
+
+	class CheckpointingInMemoryStateStoreProvider extends InMemoryStateStoreProvider {
+		constructor(private readonly checkpoints: ChangelogCheckpointStore) {
+			super()
+		}
+
+		getChangelogCheckpointStore(): ChangelogCheckpointStore {
+			return this.checkpoints
+		}
+	}
+
 	it('creates changelog topics with the same partition count as the source topic', async () => {
 		const input = uniqueTopicName('flow-it-changelog-src')
 		const outputTopic = uniqueTopicName('flow-it-changelog-out')
@@ -926,6 +952,287 @@ describe('changelog topics and restoration', () => {
 			await withTimeout('app2.close', app2.close(), 20_000).catch(() => {})
 			await withTimeout('app1.close', app1.close(), 20_000).catch(() => {})
 			await withTimeout('output collector stop', out.stop(), 15_000).catch(() => {})
+		}
+	}, 60_000)
+
+	it('ChangelogRestorer resumes from checkpoint offsets', async () => {
+		const changelogTopic = uniqueTopicName('flow-it-changelog-checkpoint')
+		await createTopics(client, [{ name: changelogTopic, partitions: 1 }])
+
+		const r1 = await producer.send(changelogTopic, { key: 'a', value: numberCodec.encode(1) })
+		await producer.send(changelogTopic, { key: 'a', value: numberCodec.encode(2) })
+		await producer.send(changelogTopic, { key: 'a', value: numberCodec.encode(3) })
+
+		const store = new InMemoryKeyValueStore<string, number>('counts', {
+			keyCodec: stringCodec,
+			valueCodec: numberCodec,
+		})
+		await store.init()
+
+		const checkpoint = new MemoryCheckpointStore()
+		await checkpoint.set(changelogTopic, 0, r1.offset + 1n)
+
+		const restorer = new ChangelogRestorer(changelogTopic, stringCodec, numberCodec, store)
+		const restored = await restorer.restore(
+			client,
+			{
+				idleTimeoutMs: 2_000,
+				initialIdleTimeoutMs: 10_000,
+				checkIntervalMs: 200,
+				consumerMaxWaitMs: 200,
+			},
+			[0],
+			checkpoint
+		)
+
+		expect(restored).toBe(2)
+		expect(await store.get('a')).toBe(3)
+
+		const admin = client.admin()
+		const endOffsets = await admin.fetchTopicOffsets(changelogTopic, [0], 'latest', {
+			isolationLevel: 'read_committed',
+		})
+		expect(await checkpoint.get(changelogTopic, 0)).toBe(endOffsets.get(0))
+	}, 60_000)
+
+	it('writes changelog checkpoints when checkpoint store is available', async () => {
+		const input = uniqueTopicName('flow-it-checkpoint-src')
+		const outputTopic = uniqueTopicName('flow-it-checkpoint-out')
+		const appId = `flow-it-checkpoint-${Date.now()}`
+		const storeName = 'counts'
+		const changelogTopic = buildChangelogTopicName(appId, storeName)
+
+		await createTopics(client, [{ name: input, partitions: 1 }, { name: outputTopic }])
+
+		const checkpointStore = new MemoryCheckpointStore()
+		const provider = new CheckpointingInMemoryStateStoreProvider(checkpointStore)
+
+		const app = flow({
+			applicationId: appId,
+			client,
+			numStreamThreads: 1,
+			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 100 },
+			stateStoreProvider: provider,
+			changelog: {
+				restoration: {
+					idleTimeoutMs: 2_000,
+					initialIdleTimeoutMs: 10_000,
+					checkIntervalMs: 200,
+					consumerMaxWaitMs: 200,
+				},
+			},
+		})
+
+		app.stream(input, { key: stringCodec, value: numberCodec })
+			.groupByKey()
+			.count({ storeName, key: stringCodec, value: numberCodec })
+			.toStream()
+			.to(outputTopic)
+
+		const out = new MultiTopicCollector({
+			client,
+			groupId: `${appId}-collector-${Date.now()}`,
+			topics: [{ topic: outputTopic, keyCodec: stringCodec, valueCodec: numberCodec }],
+		})
+
+		try {
+			await withTimeout('output collector start', out.start(), 15_000)
+			await withTimeout('app.start', app.start(), 20_000)
+
+			await withTimeout(
+				'produce input (1)',
+				producer.send(input, { key: 'a', value: numberCodec.encode(1) }),
+				15_000
+			)
+			await withTimeout(
+				'produce input (2)',
+				producer.send(input, { key: 'a', value: numberCodec.encode(1) }),
+				15_000
+			)
+			await withTimeout(
+				'produce input (3)',
+				producer.send(input, { key: 'a', value: numberCodec.encode(1) }),
+				15_000
+			)
+			await out.waitFor(outputTopic, m => m.key === 'a' && m.value === 3)
+
+			await withTimeout('app.close', app.close(), 20_000)
+
+			const admin = client.admin()
+			const endOffsets = await admin.fetchTopicOffsets(changelogTopic, [0], 'latest', {
+				isolationLevel: 'read_committed',
+			})
+			const endOffset = endOffsets.get(0)
+			if (endOffset === undefined) {
+				throw new Error(`Missing end offset for ${changelogTopic}-0`)
+			}
+
+			expect(await checkpointStore.get(changelogTopic, 0)).toBe(endOffset)
+		} finally {
+			await withTimeout('app.close', app.close(), 20_000).catch(() => {})
+			await withTimeout('output collector stop', out.stop(), 15_000).catch(() => {})
+		}
+	}, 60_000)
+
+	it('defers changelog checkpointing until an exactly_once transaction commits', async () => {
+		const input = uniqueTopicName('flow-it-eos-checkpoint-src')
+		const outputTopic = uniqueTopicName('flow-it-eos-checkpoint-out')
+		const appId = `flow-it-eos-checkpoint-${Date.now()}`
+		const storeName = 'counts'
+		const changelogTopic = buildChangelogTopicName(appId, storeName)
+
+		await createTopics(client, [{ name: input, partitions: 1 }, { name: outputTopic }])
+
+		const checkpointStore = new MemoryCheckpointStore()
+		const provider = new CheckpointingInMemoryStateStoreProvider(checkpointStore)
+
+		const app = flow({
+			applicationId: appId,
+			client,
+			numStreamThreads: 1,
+			processingGuarantee: 'exactly_once',
+			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 100 },
+			stateStoreProvider: provider,
+			changelog: {
+				restoration: {
+					idleTimeoutMs: 2_000,
+					initialIdleTimeoutMs: 10_000,
+					checkIntervalMs: 200,
+					consumerMaxWaitMs: 200,
+				},
+			},
+		})
+
+		app.stream(input, { key: stringCodec, value: numberCodec })
+			.groupByKey()
+			.count({ storeName, key: stringCodec, value: numberCodec })
+			.toStream()
+			.to(outputTopic)
+
+		const out = new MultiTopicCollector({
+			client,
+			groupId: `${appId}-collector-${Date.now()}`,
+			topics: [{ topic: outputTopic, keyCodec: stringCodec, valueCodec: numberCodec }],
+		})
+
+		try {
+			await withTimeout('output collector start', out.start(), 15_000)
+			await withTimeout('app.start', app.start(), 20_000)
+
+			await withTimeout(
+				'produce input (1)',
+				producer.send(input, { key: 'a', value: numberCodec.encode(1) }),
+				15_000
+			)
+			await withTimeout(
+				'produce input (2)',
+				producer.send(input, { key: 'a', value: numberCodec.encode(1) }),
+				15_000
+			)
+			await withTimeout(
+				'produce input (3)',
+				producer.send(input, { key: 'a', value: numberCodec.encode(1) }),
+				15_000
+			)
+
+			try {
+				await out.waitFor(outputTopic, m => m.key === 'a' && m.value === 3, 15_000)
+			} catch (error) {
+				const state = app.state()
+				const internalError = (app as unknown as { getError?: () => Error | null }).getError?.()
+				if (state === 'ERROR' && internalError) {
+					throw internalError
+				}
+
+				throw new Error(`Expected output to reach 3, but timed out (state=${state})`, {
+					cause: error instanceof Error ? error : new Error(String(error)),
+				})
+			}
+
+			await withTimeout('app.close', app.close(), 20_000)
+
+			const admin = client.admin()
+			const endOffsets = await admin.fetchTopicOffsets(changelogTopic, [0], 'latest', {
+				isolationLevel: 'read_committed',
+			})
+			const endOffset = endOffsets.get(0)
+			if (endOffset === undefined) {
+				throw new Error(`Missing end offset for ${changelogTopic}-0`)
+			}
+
+			// Checkpoints are only persisted after the transaction commits.
+			expect(await checkpointStore.get(changelogTopic, 0)).toBe(endOffset)
+		} finally {
+			await withTimeout('app.close', app.close(), 20_000).catch(() => {})
+			await withTimeout('output collector stop', out.stop(), 15_000).catch(() => {})
+		}
+	}, 60_000)
+
+	it('does not advance changelog checkpoints for aborted exactly_once transactions', async () => {
+		const input = uniqueTopicName('flow-it-eos-checkpoint-abort-src')
+		const outputTopic = uniqueTopicName('flow-it-eos-checkpoint-abort-out')
+		const appId = `flow-it-eos-checkpoint-abort-${Date.now()}`
+		const storeName = 'counts'
+		const changelogTopic = buildChangelogTopicName(appId, storeName)
+
+		await createTopics(client, [{ name: input, partitions: 1 }, { name: outputTopic }])
+
+		const checkpointStore = new MemoryCheckpointStore()
+		const provider = new CheckpointingInMemoryStateStoreProvider(checkpointStore)
+
+		const app = flow({
+			applicationId: appId,
+			client,
+			numStreamThreads: 1,
+			processingGuarantee: 'exactly_once',
+			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 100 },
+			stateStoreProvider: provider,
+			changelog: {
+				restoration: {
+					idleTimeoutMs: 2_000,
+					initialIdleTimeoutMs: 10_000,
+					checkIntervalMs: 200,
+					consumerMaxWaitMs: 200,
+				},
+			},
+		})
+
+		app.stream(input, { key: stringCodec, value: numberCodec })
+			.groupByKey()
+			.count({ storeName, key: stringCodec, value: numberCodec })
+			.toStream()
+			.peek(() => {
+				throw new Error('boom')
+			})
+			.to(outputTopic)
+
+		const waitForErrorState = async (timeoutMs: number) => {
+			const startedAt = Date.now()
+			while (Date.now() - startedAt < timeoutMs) {
+				if (app.state() === 'ERROR') {
+					return
+				}
+				await new Promise(resolve => setTimeout(resolve, 50))
+			}
+			throw new Error('Timed out waiting for app to enter ERROR state')
+		}
+
+		try {
+			await withTimeout('app.start', app.start(), 20_000)
+
+			const initial = await checkpointStore.get(changelogTopic, 0)
+
+			await withTimeout(
+				'produce input (1)',
+				producer.send(input, { key: 'a', value: numberCodec.encode(1) }),
+				15_000
+			)
+
+			await withTimeout('wait for ERROR', waitForErrorState(10_000), 12_000)
+
+			expect(await checkpointStore.get(changelogTopic, 0)).toBe(initial)
+		} finally {
+			await withTimeout('app.close', app.close(), 20_000).catch(() => {})
 		}
 	}, 60_000)
 

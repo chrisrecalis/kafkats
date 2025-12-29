@@ -155,6 +155,27 @@ export interface SessionStore<K, V> extends KeyValueStore<WindowedKey<K>, V> {
 }
 
 /**
+ * Durable store for tracking changelog restore/write progress.
+ *
+ * Implementations should be colocated with state storage so offsets are not
+ * reused across incompatible local state directories.
+ */
+export interface ChangelogCheckpointStore {
+	/**
+	 * Get the next offset to restore from for a changelog topic-partition.
+	 * Returns undefined if no checkpoint exists.
+	 */
+	get(topic: string, partition: number): Promise<bigint | undefined>
+
+	/**
+	 * Set the next offset to restore from for a changelog topic-partition.
+	 *
+	 * The offset should be the "next" offset (i.e. last-applied offset + 1).
+	 */
+	set(topic: string, partition: number, offset: bigint): Promise<void>
+}
+
+/**
  * Factory for creating state stores.
  *
  * Implementations can provide different storage backends (in-memory, LMDB,
@@ -163,6 +184,13 @@ export interface SessionStore<K, V> extends KeyValueStore<WindowedKey<K>, V> {
 export interface StateStoreProvider {
 	/** Provider name for debugging */
 	readonly name: string
+	/**
+	 * Optional changelog checkpoint store.
+	 *
+	 * If provided, Flow uses it to resume changelog restoration from the last
+	 * known applied offset, avoiding full replays when local state is durable.
+	 */
+	getChangelogCheckpointStore?(): ChangelogCheckpointStore | undefined
 
 	/**
 	 * Create a key-value store.
