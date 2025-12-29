@@ -57,6 +57,7 @@ export type {
 	TopicPartition,
 	ClusterDescription,
 	BrokerDescription,
+	CreateTopicsResult,
 	DeleteTopicsResult,
 	DeleteGroupsResult,
 } from '@/admin/index.js'
