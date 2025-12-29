@@ -37,28 +37,32 @@ features:
       details: ESM-first, async/await, full TypeScript support with comprehensive types and tree-shaking.
 ---
 
+<script setup>
+import { withBase } from 'vitepress'
+</script>
+
 <div class="vp-doc" style="padding: 0 24px;">
 
 ## Packages
 
 <div class="packages-grid">
 
-<a href="/client/" class="package-card">
+<a :href="withBase('/client/')" class="package-card">
   <h3>@kafkats/client</h3>
   <p>Core Kafka client with producer, consumer, SASL authentication, and low-level protocol access.</p>
 </a>
 
-<a href="/flow/" class="package-card">
+<a :href="withBase('/flow/')" class="package-card">
   <h3>@kafkats/flow</h3>
   <p>Kafka Streams-like DSL with KStream, KTable, windowing, aggregations, and joins.</p>
 </a>
 
-<a href="/flow-codec-zod/" class="package-card">
+<a :href="withBase('/flow-codec-zod/')" class="package-card">
   <h3>@kafkats/flow-codec-zod</h3>
   <p>Zod schema validation for type-safe message encoding and decoding.</p>
 </a>
 
-<a href="/flow-state-lmdb/" class="package-card">
+<a :href="withBase('/flow-state-lmdb/')" class="package-card">
   <h3>@kafkats/flow-state-lmdb</h3>
   <p>LMDB-backed persistent state stores for production stream processing.</p>
 </a>
