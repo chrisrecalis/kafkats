@@ -34,20 +34,22 @@ src/
 
 ## Testing
 
-Integration tests use testcontainers - each test gets its own Kafka container.
+Integration tests use a global Kafka setup via testcontainers (Docker required). A single Kafka container is started before all tests and shared across test files.
 
 ```typescript
-import { withKafka } from '../helpers/kafka.js'
+import { createClient } from '../helpers/kafka.js'
 import { uniqueName } from '../helpers/testkit.js'
 
-await withKafka(async ({ createClient }) => {
-	const topic = uniqueName('my-topic')
-	const client = createClient('test-id')
-	// ...
-})
+const client = createClient('test-id')
+await client.connect()
+
+const topic = uniqueName('my-topic')
+// ... test logic ...
+
+await client.disconnect()
 ```
 
-For SASL tests, use `withKafkaSasl` from `helpers/kafka-sasl.js`.
+For SASL tests, use `withKafkaSasl` from `helpers/kafka-sasl.js` (starts separate containers per auth mechanism).
 
 ## Performance Considerations
 

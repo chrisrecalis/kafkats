@@ -111,10 +111,7 @@ for (const result of results) {
 Validate topic configuration without creating:
 
 ```typescript
-const results = await admin.createTopics(
-	[{ name: 'test-topic', numPartitions: 3 }],
-	{ validateOnly: true }
-)
+const results = await admin.createTopics([{ name: 'test-topic', numPartitions: 3 }], { validateOnly: true })
 ```
 
 ### Deleting Topics

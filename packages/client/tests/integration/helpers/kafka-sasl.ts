@@ -9,7 +9,7 @@ import type { SaslConfig } from '@/network/types.js'
 export type SaslMechanism = 'PLAIN' | 'SCRAM-SHA-256' | 'SCRAM-SHA-512'
 
 export type KafkaSaslTestContext = {
-	kafka: StartedKafkaContainer
+	kafka?: StartedKafkaContainer
 	brokerAddress: string
 	logLevel: LogLevel
 	saslConfig: SaslConfig
@@ -32,7 +32,22 @@ let saslCleanupRegistered = false
 const useProcessCleanup = process.env.VITEST_INTEGRATION === '1'
 
 /**
+ * Get broker address from environment variable (set by global setup)
+ */
+function getPrewarmedBrokerAddress(mechanism: SaslMechanism): string | undefined {
+	switch (mechanism) {
+		case 'PLAIN':
+			return process.env.KAFKA_SASL_PLAIN_BROKERS
+		case 'SCRAM-SHA-256':
+			return process.env.KAFKA_SASL_SCRAM_256_BROKERS
+		case 'SCRAM-SHA-512':
+			return process.env.KAFKA_SASL_SCRAM_512_BROKERS
+	}
+}
+
+/**
  * Test helper that creates a Kafka container with SASL authentication enabled
+ * Uses pre-warmed containers from global setup if available
  */
 export async function withKafkaSasl<T>(
 	options: WithKafkaSaslOptions,
@@ -43,7 +58,7 @@ export async function withKafkaSasl<T>(
 	const key = `${options.mechanism}:${username}:${password}`
 
 	if (!sharedSaslContexts.has(key)) {
-		sharedSaslContexts.set(key, startKafkaSasl(options, username, password))
+		sharedSaslContexts.set(key, initSaslContext(options, username, password))
 	}
 
 	if (!saslCleanupRegistered) {
@@ -54,7 +69,10 @@ export async function withKafkaSasl<T>(
 				entries.map(async entryPromise => {
 					const entry = await entryPromise
 					await Promise.allSettled(entry.clients.map(client => client.disconnect()))
-					await entry.ctx.kafka.stop()
+					// Only stop container if we started it (not pre-warmed)
+					if (entry.ctx.kafka) {
+						await entry.ctx.kafka.stop()
+					}
 				})
 			)
 			sharedSaslContexts.clear()
@@ -73,6 +91,49 @@ export async function withKafkaSasl<T>(
 
 	const entry = await sharedSaslContexts.get(key)!
 	return await fn(entry.ctx)
+}
+
+async function initSaslContext(
+	options: WithKafkaSaslOptions,
+	username: string,
+	password: string
+): Promise<SharedSaslContext> {
+	const logLevel = (process.env.KAFKA_TS_LOG_LEVEL as LogLevel) ?? 'silent'
+
+	// Check for pre-warmed container from global setup
+	const prewarmedBroker = getPrewarmedBrokerAddress(options.mechanism)
+	if (prewarmedBroker && username === 'testuser' && password === 'testpass') {
+		// Use pre-warmed container
+		const saslConfig: SaslConfig = {
+			mechanism: options.mechanism,
+			username,
+			password,
+		}
+
+		const clients: KafkaClient[] = []
+		const createClient = (clientId: string) => {
+			const client = new KafkaClient({
+				brokers: [prewarmedBroker],
+				clientId,
+				logLevel,
+				sasl: saslConfig,
+			})
+			clients.push(client)
+			return client
+		}
+
+		const ctx: KafkaSaslTestContext = {
+			brokerAddress: prewarmedBroker,
+			logLevel,
+			saslConfig,
+			createClient,
+		}
+
+		return { ctx, clients }
+	}
+
+	// Fall back to starting a new container (for custom credentials)
+	return startKafkaSasl(options, username, password)
 }
 
 async function startKafkaSasl(
