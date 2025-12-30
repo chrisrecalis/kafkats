@@ -8,11 +8,14 @@ export default defineConfig({
 		},
 	},
 	test: {
-		// Integration tests share Kafka containers across files to avoid slow repeated startups.
-		maxWorkers: 1,
-		isolate: false,
-		testTimeout: 60_000,
-		hookTimeout: 120_000,
+		include: ['tests/integration/**/*.test.ts'],
+		globalSetup: ['tests/integration/kafka.global-setup.ts'],
+		pool: 'threads',
+		maxWorkers: 4,
+		fileParallelism: true,
+		testTimeout: 30_000,
+		hookTimeout: 60_000,
+		teardownTimeout: 60_000,
 		deps: {
 			optimizer: {
 				ssr: {
