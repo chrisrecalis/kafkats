@@ -22,6 +22,12 @@
 			"inputs": ["src/**", "tests/unit/**", "vitest*.config.ts"],
 			"env": ["KAFKA_TS_LOG_LEVEL"]
 		},
+		"test": {
+			"dependsOn": ["^build"],
+			"outputs": [],
+			"inputs": ["src/**", "tests/**", "vitest*.config.ts"],
+			"env": ["KAFKA_TS_LOG_LEVEL"]
+		},
 		"test:integration": {
 			"dependsOn": ["^build"],
 			"outputs": [],
