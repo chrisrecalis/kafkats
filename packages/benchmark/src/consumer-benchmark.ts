@@ -1,5 +1,5 @@
 import { Kafka as KafkaJs } from 'kafkajs'
-import { KafkaClient, codec, topic } from '@kafkats/client'
+import { KafkaClient } from '@kafkats/client'
 import { Consumer as PlatformaticConsumer, MessagesStreamModes } from '@platformatic/kafka'
 
 import { createTopicWithAssignments, startKafkaCluster, type StartedKafkaCluster } from './kafka-cluster.js'
@@ -19,6 +19,12 @@ interface ConsumerBenchmarkConfig {
 	messageSize: number
 }
 
+export interface BenchmarkRunOptions {
+	print?: boolean
+	diagnostics?: boolean
+	trace?: boolean
+}
+
 const DEFAULT_CONFIG: ConsumerBenchmarkConfig = {
 	messageCount: 10000,
 	messageSize: 1024,
@@ -34,9 +40,12 @@ async function seedTopic(
 	cluster: StartedKafkaCluster,
 	topicName: string,
 	messageCount: number,
-	messageSize: number
+	messageSize: number,
+	print: boolean
 ): Promise<void> {
-	console.log(`  Seeding ${messageCount} messages to ${topicName}...`)
+	if (print) {
+		console.log(`  Seeding ${messageCount} messages to ${topicName}...`)
+	}
 
 	const kafka = new KafkaJs({
 		clientId: 'benchmark-seeder',
@@ -61,21 +70,26 @@ async function seedTopic(
 	}
 
 	await producer.disconnect()
-	console.log(`  Seeding complete.`)
+	if (print) {
+		console.log(`  Seeding complete.`)
+	}
 }
 
 async function benchmarkKafkaTsConsumer(
 	cluster: StartedKafkaCluster,
-	config: ConsumerBenchmarkConfig
+	config: ConsumerBenchmarkConfig,
+	options: BenchmarkRunOptions
 ): Promise<BenchmarkResult> {
 	const { messageCount, messageSize } = config
 	const topicName = uniqueName('bench-consumer-kafkats')
-	const trace = createTraceCollector()
-	const diagnostics = startDiagnostics()
+	const trace = options.trace ? createTraceCollector() : null
+	const shouldPrint = options.print !== false
 
-	console.log('\n[kafkats] Starting consumer benchmark...')
+	if (shouldPrint) {
+		console.log('\n[kafkats] Starting consumer benchmark...')
+	}
 
-	await seedTopic(cluster, topicName, messageCount, messageSize)
+	await seedTopic(cluster, topicName, messageCount, messageSize, shouldPrint)
 
 	const client = new KafkaClient({
 		brokers: cluster.brokers,
@@ -85,8 +99,6 @@ async function benchmarkKafkaTsConsumer(
 
 	await client.connect()
 
-	const testTopic = topic<string>(topicName, { value: codec.string() })
-
 	const consumer = client.consumer({
 		groupId: uniqueName('bench-group-kafkats'),
 		autoOffsetReset: 'earliest',
@@ -94,16 +106,18 @@ async function benchmarkKafkaTsConsumer(
 		maxWaitMs: ALIGNED_CONSUMER_CONFIG.maxWaitMs,
 		minBytes: ALIGNED_CONSUMER_CONFIG.minBytes,
 		maxBytesPerPartition: ALIGNED_CONSUMER_CONFIG.maxBytesPerPartition,
-		trace: trace.trace,
+		trace: trace?.trace,
 	})
 
 	let messagesConsumed = 0
 	const latencies: number[] = []
 	const abortController = new AbortController()
 	let startTime = 0
+	let finishTime = 0
 
+	const diagnostics = options.diagnostics ? startDiagnostics() : null
 	const runPromise = consumer.runEach(
-		testTopic,
+		topicName,
 		(): Promise<void> => {
 			const handlerStart = performance.now()
 			// Start timing from first message (after group join)
@@ -113,14 +127,19 @@ async function benchmarkKafkaTsConsumer(
 			const msgTime = performance.now()
 			messagesConsumed++
 			latencies.push(msgTime - startTime)
-			trace.trace({
-				stage: 'benchmark_handler',
-				durationMs: performance.now() - handlerStart,
-				recordCount: 1,
-				bytes: messageSize,
-			})
+			if (trace) {
+				trace.trace({
+					stage: 'benchmark_handler',
+					durationMs: performance.now() - handlerStart,
+					recordCount: 1,
+					bytes: messageSize,
+				})
+			}
 
 			if (messagesConsumed >= messageCount) {
+				if (finishTime === 0) {
+					finishTime = performance.now()
+				}
 				abortController.abort()
 			}
 			return Promise.resolve()
@@ -148,7 +167,7 @@ async function benchmarkKafkaTsConsumer(
 
 	clearTimeout(timeout)
 
-	const endTime = performance.now()
+	const endTime = finishTime || performance.now()
 	const durationMs = endTime - startTime
 
 	await client.disconnect()
@@ -161,8 +180,8 @@ async function benchmarkKafkaTsConsumer(
 	const sortedLatencies = interLatencies.sort((a, b) => a - b)
 	const avgLatency = interLatencies.length > 0 ? interLatencies.reduce((a, b) => a + b, 0) / interLatencies.length : 0
 
-	const traceSummary = trace.getSummary()
-	if (Object.keys(traceSummary).length === 0) {
+	const traceSummary = trace?.getSummary()
+	if (traceSummary && Object.keys(traceSummary).length === 0 && options.print) {
 		console.log('  Warning: No trace events captured for kafkats consumer')
 	}
 
@@ -179,24 +198,31 @@ async function benchmarkKafkaTsConsumer(
 		p50LatencyMs: calculatePercentile(sortedLatencies, 50),
 		p95LatencyMs: calculatePercentile(sortedLatencies, 95),
 		p99LatencyMs: calculatePercentile(sortedLatencies, 99),
-		diagnostics: {
-			...diagnostics.stop(),
-			traceSummary,
-		},
+		diagnostics: diagnostics
+			? {
+					...diagnostics.stop(),
+					traceSummary,
+				}
+			: traceSummary
+				? { traceSummary }
+				: undefined,
 	}
 }
 
 async function benchmarkKafkaJsConsumer(
 	cluster: StartedKafkaCluster,
-	config: ConsumerBenchmarkConfig
+	config: ConsumerBenchmarkConfig,
+	options: BenchmarkRunOptions
 ): Promise<BenchmarkResult> {
 	const { messageCount, messageSize } = config
 	const topicName = uniqueName('bench-consumer-kafkajs')
-	const diagnostics = startDiagnostics()
+	const shouldPrint = options.print !== false
 
-	console.log('\n[kafkajs] Starting consumer benchmark...')
+	if (shouldPrint) {
+		console.log('\n[kafkajs] Starting consumer benchmark...')
+	}
 
-	await seedTopic(cluster, topicName, messageCount, messageSize)
+	await seedTopic(cluster, topicName, messageCount, messageSize, shouldPrint)
 
 	const kafka = new KafkaJs({
 		clientId: 'benchmark-kafkajs-consumer',
@@ -223,6 +249,7 @@ async function benchmarkKafkaJsConsumer(
 	})
 
 	let startTime = 0
+	const diagnostics = options.diagnostics ? startDiagnostics() : null
 
 	await consumer.run({
 		eachMessage: (): Promise<void> => {
@@ -278,21 +305,24 @@ async function benchmarkKafkaJsConsumer(
 		p50LatencyMs: calculatePercentile(sortedLatencies, 50),
 		p95LatencyMs: calculatePercentile(sortedLatencies, 95),
 		p99LatencyMs: calculatePercentile(sortedLatencies, 99),
-		diagnostics: diagnostics.stop(),
+		diagnostics: diagnostics?.stop(),
 	}
 }
 
 async function benchmarkPlatformaticConsumer(
 	cluster: StartedKafkaCluster,
-	config: ConsumerBenchmarkConfig
+	config: ConsumerBenchmarkConfig,
+	options: BenchmarkRunOptions
 ): Promise<BenchmarkResult> {
 	const { messageCount, messageSize } = config
 	const topicName = uniqueName('bench-consumer-platformatic')
-	const diagnostics = startDiagnostics()
+	const shouldPrint = options.print !== false
 
-	console.log('\n[platformatic] Starting consumer benchmark...')
+	if (shouldPrint) {
+		console.log('\n[platformatic] Starting consumer benchmark...')
+	}
 
-	await seedTopic(cluster, topicName, messageCount, messageSize)
+	await seedTopic(cluster, topicName, messageCount, messageSize, shouldPrint)
 
 	const consumer = new PlatformaticConsumer({
 		clientId: 'benchmark-platformatic-consumer',
@@ -313,6 +343,7 @@ async function benchmarkPlatformaticConsumer(
 	let messagesConsumed = 0
 	const latencies: number[] = []
 	let startTime = 0
+	const diagnostics = options.diagnostics ? startDiagnostics() : null
 
 	const completion = new Promise<void>((resolve, reject) => {
 		stream.on('data', () => {
@@ -364,32 +395,48 @@ async function benchmarkPlatformaticConsumer(
 		p50LatencyMs: calculatePercentile(sortedLatencies, 50),
 		p95LatencyMs: calculatePercentile(sortedLatencies, 95),
 		p99LatencyMs: calculatePercentile(sortedLatencies, 99),
-		diagnostics: diagnostics.stop(),
+		diagnostics: diagnostics?.stop(),
 	}
 }
 
 export async function runConsumerBenchmark(
 	cluster: StartedKafkaCluster,
-	config: Partial<ConsumerBenchmarkConfig> = {}
+	config: Partial<ConsumerBenchmarkConfig> = {},
+	options: BenchmarkRunOptions = {}
 ): Promise<{ kafkaTs: BenchmarkResult; kafkaJs: BenchmarkResult; platformatic: BenchmarkResult }> {
 	const fullConfig = { ...DEFAULT_CONFIG, ...config }
+	const opts: BenchmarkRunOptions = {
+		print: options.print !== false,
+		diagnostics: options.diagnostics === true,
+		trace: options.trace === true,
+	}
 
-	console.log('\n' + '='.repeat(60))
-	console.log('CONSUMER BENCHMARK')
-	console.log('='.repeat(60))
-	console.log(`  Message Count: ${fullConfig.messageCount}`)
-	console.log(`  Message Size:  ${fullConfig.messageSize} bytes`)
+	if (opts.print) {
+		console.log('\n' + '='.repeat(60))
+		console.log('CONSUMER BENCHMARK')
+		console.log('='.repeat(60))
+		console.log(`  Message Count: ${fullConfig.messageCount}`)
+		console.log(`  Message Size:  ${fullConfig.messageSize} bytes`)
+	}
 
-	const kafkaTs = await benchmarkKafkaTsConsumer(cluster, fullConfig)
-	printResult(kafkaTs)
+	const kafkaTs = await benchmarkKafkaTsConsumer(cluster, fullConfig, opts)
+	if (opts.print) {
+		printResult(kafkaTs)
+	}
 
-	const kafkaJs = await benchmarkKafkaJsConsumer(cluster, fullConfig)
-	printResult(kafkaJs)
+	const kafkaJs = await benchmarkKafkaJsConsumer(cluster, fullConfig, opts)
+	if (opts.print) {
+		printResult(kafkaJs)
+	}
 
-	const platformatic = await benchmarkPlatformaticConsumer(cluster, fullConfig)
-	printResult(platformatic)
+	const platformatic = await benchmarkPlatformaticConsumer(cluster, fullConfig, opts)
+	if (opts.print) {
+		printResult(platformatic)
+	}
 
-	printComparison(kafkaTs, kafkaJs, platformatic)
+	if (opts.print) {
+		printComparison(kafkaTs, kafkaJs, platformatic)
+	}
 
 	return { kafkaTs, kafkaJs, platformatic }
 }

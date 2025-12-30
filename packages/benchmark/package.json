@@ -11,9 +11,13 @@
 		"prebench:producer": "pnpm -C ../client build",
 		"prebench:consumer": "pnpm -C ../client build",
 		"prebench:all": "pnpm -C ../client build",
-		"bench:producer": "tsx src/producer-benchmark.ts",
-		"bench:consumer": "tsx src/consumer-benchmark.ts",
-		"bench:all": "tsx src/index.ts"
+		"bench:producer": "tsx src/index.ts --operation producer",
+		"bench:consumer": "tsx src/index.ts --operation consumer",
+		"bench:all": "tsx src/index.ts",
+		"preprofile:producer": "pnpm -C ../client build && pnpm build",
+		"profile:producer": "0x -D profiles/producer -- node dist/profile-producer.js",
+		"preprofile:consumer": "pnpm -C ../client build && pnpm build",
+		"profile:consumer": "0x -D profiles/consumer -- node dist/profile-consumer.js"
 	},
 	"engines": {
 		"node": ">=18"
@@ -24,6 +28,7 @@
 		"kafkajs": "^2.2.4"
 	},
 	"devDependencies": {
+		"0x": "^6.0.0",
 		"@types/node": "^24.10.1",
 		"tsx": "^4.20.6",
 		"typescript": "^5.9.3"

@@ -20,6 +20,12 @@ interface ProducerBenchmarkConfig {
 	batchSize: number
 }
 
+export interface BenchmarkRunOptions {
+	print?: boolean
+	diagnostics?: boolean
+	trace?: boolean
+}
+
 const DEFAULT_CONFIG: ProducerBenchmarkConfig = {
 	messageCount: 10000,
 	messageSize: 1024,
@@ -44,16 +50,18 @@ function getAlignedProducerConfig(messageSize: number, batchSize: number) {
 
 async function benchmarkKafkaTsProducer(
 	cluster: StartedKafkaCluster,
-	config: ProducerBenchmarkConfig
+	config: ProducerBenchmarkConfig,
+	options: BenchmarkRunOptions
 ): Promise<BenchmarkResult> {
 	const { messageCount, messageSize, batchSize } = config
 	const topicName = uniqueName('bench-producer-kafkats')
 	const message = generateMessage(messageSize)
-	const trace = createTraceCollector()
-	const diagnostics = startDiagnostics()
+	const trace = options.trace ? createTraceCollector() : null
 	const aligned = getAlignedProducerConfig(messageSize, batchSize)
 
-	console.log('\n[kafkats] Starting producer benchmark...')
+	if (options.print) {
+		console.log('\n[kafkats] Starting producer benchmark...')
+	}
 
 	const client = new KafkaClient({
 		brokers: cluster.brokers,
@@ -68,10 +76,14 @@ async function benchmarkKafkaTsProducer(
 
 	const producer = client.producer({
 		...aligned,
-		trace: trace.trace,
+		trace: trace?.trace,
 	})
 
 	const latencies: number[] = []
+	const diagnostics = options.diagnostics ? startDiagnostics() : null
+
+	// Warm up metadata/connection state for this new topic (not measured).
+	await producer.send(testTopic, [{ key: 'warmup', value: message }])
 	const startTime = performance.now()
 
 	// Send messages in batches (using array send like kafkajs)
@@ -110,24 +122,30 @@ async function benchmarkKafkaTsProducer(
 		p50LatencyMs: calculatePercentile(sortedLatencies, 50),
 		p95LatencyMs: calculatePercentile(sortedLatencies, 95),
 		p99LatencyMs: calculatePercentile(sortedLatencies, 99),
-		diagnostics: {
-			...diagnostics.stop(),
-			traceSummary: trace.getSummary(),
-		},
+		diagnostics: diagnostics
+			? {
+					...diagnostics.stop(),
+					traceSummary: trace?.getSummary(),
+				}
+			: trace
+				? { traceSummary: trace.getSummary() }
+				: undefined,
 	}
 }
 
 async function benchmarkKafkaJsProducer(
 	cluster: StartedKafkaCluster,
-	config: ProducerBenchmarkConfig
+	config: ProducerBenchmarkConfig,
+	options: BenchmarkRunOptions
 ): Promise<BenchmarkResult> {
 	const { messageCount, messageSize, batchSize } = config
 	const topicName = uniqueName('bench-producer-kafkajs')
 	const message = generateMessage(messageSize)
-	const diagnostics = startDiagnostics()
 	const aligned = getAlignedProducerConfig(messageSize, batchSize)
 
-	console.log('\n[kafkajs] Starting producer benchmark...')
+	if (options.print) {
+		console.log('\n[kafkajs] Starting producer benchmark...')
+	}
 
 	const kafka = new KafkaJs({
 		clientId: 'benchmark-kafkajs',
@@ -146,6 +164,15 @@ async function benchmarkKafkaJsProducer(
 	await producer.connect()
 
 	const latencies: number[] = []
+	const diagnostics = options.diagnostics ? startDiagnostics() : null
+
+	// Warm up metadata/connection state for this new topic (not measured).
+	await producer.send({
+		topic: topicName,
+		messages: [{ key: 'warmup', value: message }],
+		acks: -1,
+		compression: CompressionTypes.None,
+	})
 	const startTime = performance.now()
 
 	// Send messages in batches
@@ -189,20 +216,22 @@ async function benchmarkKafkaJsProducer(
 		p50LatencyMs: calculatePercentile(sortedLatencies, 50),
 		p95LatencyMs: calculatePercentile(sortedLatencies, 95),
 		p99LatencyMs: calculatePercentile(sortedLatencies, 99),
-		diagnostics: diagnostics.stop(),
+		diagnostics: diagnostics?.stop(),
 	}
 }
 
 async function benchmarkPlatformaticProducer(
 	cluster: StartedKafkaCluster,
-	config: ProducerBenchmarkConfig
+	config: ProducerBenchmarkConfig,
+	options: BenchmarkRunOptions
 ): Promise<BenchmarkResult> {
 	const { messageCount, messageSize, batchSize } = config
 	const topicName = uniqueName('bench-producer-platformatic')
 	const message = generateMessage(messageSize)
-	const diagnostics = startDiagnostics()
 
-	console.log('\n[platformatic] Starting producer benchmark...')
+	if (options.print) {
+		console.log('\n[platformatic] Starting producer benchmark...')
+	}
 
 	await createTopicWithAssignments(cluster, topicName, 3)
 
@@ -216,6 +245,13 @@ async function benchmarkPlatformaticProducer(
 	})
 
 	const latencies: number[] = []
+	const diagnostics = options.diagnostics ? startDiagnostics() : null
+
+	// Warm up metadata/connection state for this new topic (not measured).
+	await producer.send({
+		messages: [{ topic: topicName, key: 'warmup', value: message }],
+		acks: ProduceAcks.ALL,
+	})
 	const startTime = performance.now()
 
 	for (let i = 0; i < messageCount; i += batchSize) {
@@ -256,33 +292,49 @@ async function benchmarkPlatformaticProducer(
 		p50LatencyMs: calculatePercentile(sortedLatencies, 50),
 		p95LatencyMs: calculatePercentile(sortedLatencies, 95),
 		p99LatencyMs: calculatePercentile(sortedLatencies, 99),
-		diagnostics: diagnostics.stop(),
+		diagnostics: diagnostics?.stop(),
 	}
 }
 
 export async function runProducerBenchmark(
 	cluster: StartedKafkaCluster,
-	config: Partial<ProducerBenchmarkConfig> = {}
+	config: Partial<ProducerBenchmarkConfig> = {},
+	options: BenchmarkRunOptions = {}
 ): Promise<{ kafkaTs: BenchmarkResult; kafkaJs: BenchmarkResult; platformatic: BenchmarkResult }> {
 	const fullConfig = { ...DEFAULT_CONFIG, ...config }
+	const opts: BenchmarkRunOptions = {
+		print: options.print !== false,
+		diagnostics: options.diagnostics === true,
+		trace: options.trace === true,
+	}
 
-	console.log('\n' + '='.repeat(60))
-	console.log('PRODUCER BENCHMARK')
-	console.log('='.repeat(60))
-	console.log(`  Message Count: ${fullConfig.messageCount}`)
-	console.log(`  Message Size:  ${fullConfig.messageSize} bytes`)
-	console.log(`  Batch Size:    ${fullConfig.batchSize}`)
+	if (opts.print) {
+		console.log('\n' + '='.repeat(60))
+		console.log('PRODUCER BENCHMARK')
+		console.log('='.repeat(60))
+		console.log(`  Message Count: ${fullConfig.messageCount}`)
+		console.log(`  Message Size:  ${fullConfig.messageSize} bytes`)
+		console.log(`  Batch Size:    ${fullConfig.batchSize}`)
+	}
 
-	const kafkaTs = await benchmarkKafkaTsProducer(cluster, fullConfig)
-	printResult(kafkaTs)
+	const kafkaTs = await benchmarkKafkaTsProducer(cluster, fullConfig, opts)
+	if (opts.print) {
+		printResult(kafkaTs)
+	}
 
-	const kafkaJs = await benchmarkKafkaJsProducer(cluster, fullConfig)
-	printResult(kafkaJs)
+	const kafkaJs = await benchmarkKafkaJsProducer(cluster, fullConfig, opts)
+	if (opts.print) {
+		printResult(kafkaJs)
+	}
 
-	const platformatic = await benchmarkPlatformaticProducer(cluster, fullConfig)
-	printResult(platformatic)
+	const platformatic = await benchmarkPlatformaticProducer(cluster, fullConfig, opts)
+	if (opts.print) {
+		printResult(platformatic)
+	}
 
-	printComparison(kafkaTs, kafkaJs, platformatic)
+	if (opts.print) {
+		printComparison(kafkaTs, kafkaJs, platformatic)
+	}
 
 	return { kafkaTs, kafkaJs, platformatic }
 }

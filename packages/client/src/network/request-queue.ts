@@ -25,6 +25,7 @@ export interface RequestQueueOptions {
 export class RequestQueue {
 	private readonly pending = new Map<number, PendingRequest>()
 	private readonly waiting: QueuedRequest[] = []
+	private waitingHead = 0
 	private correlationId = 0
 	private readonly maxInFlight: number
 	private readonly defaultTimeoutMs: number
@@ -62,14 +63,14 @@ export class RequestQueue {
 	 * Number of queued requests (waiting to be sent)
 	 */
 	get queuedCount(): number {
-		return this.waiting.length
+		return this.waiting.length - this.waitingHead
 	}
 
 	/**
 	 * Total pending requests (in-flight + queued)
 	 */
 	get totalPending(): number {
-		return this.pending.size + this.waiting.length
+		return this.pending.size + this.queuedCount
 	}
 
 	/**
@@ -157,7 +158,11 @@ export class RequestQueue {
 		for (const request of this.waiting) {
 			request.reject(rejectError)
 		}
+		for (let i = this.waitingHead; i < this.waiting.length; i++) {
+			this.waiting[i]!.reject(rejectError)
+		}
 		this.waiting.length = 0
+		this.waitingHead = 0
 	}
 
 	/**
@@ -169,6 +174,7 @@ export class RequestQueue {
 		}
 		this.pending.clear()
 		this.waiting.length = 0
+		this.waitingHead = 0
 	}
 
 	/**
@@ -223,9 +229,22 @@ export class RequestQueue {
 	 * Process the waiting queue, sending requests if slots are available
 	 */
 	private processQueue(): void {
-		while (this.canSendImmediately() && this.waiting.length > 0) {
-			const next = this.waiting.shift()!
+		while (this.canSendImmediately() && this.waitingHead < this.waiting.length) {
+			const next = this.waiting[this.waitingHead++]!
 			this.sendRequest(next)
+		}
+
+		// Compact the queue to avoid unbounded growth and keep queuedCount accurate.
+		if (this.waitingHead > 0 && this.waitingHead === this.waiting.length) {
+			this.waiting.length = 0
+			this.waitingHead = 0
+			return
+		}
+
+		// Periodic compaction when head grows large.
+		if (this.waitingHead > 1024 && this.waitingHead > this.waiting.length / 2) {
+			this.waiting.splice(0, this.waitingHead)
+			this.waitingHead = 0
 		}
 	}
 }
