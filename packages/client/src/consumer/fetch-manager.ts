@@ -1035,18 +1035,48 @@ export class FetchManager {
 		// Fast path: no aborted transactional ranges to filter.
 		// This is the common case (non-transactional workloads).
 		if (abortedRanges.length === 0) {
+			if (batches.length === 0) {
+				return result
+			}
+
+			// Common case: a single non-control batch.
+			// Avoid copying the records array into a new array.
+			if (batches.length === 1) {
+				const batch = batches[0]!
+				if (isControlBatch(batch.attributes)) {
+					return result
+				}
+				return batch.records
+			}
+
+			// Multiple batches: pre-size output to avoid repeated growth.
+			let totalRecords = 0
 			for (const batch of batches) {
 				// Control batches contain transactional markers (commit/abort) and should never be exposed as user messages.
 				if (isControlBatch(batch.attributes)) {
 					continue
 				}
 
+				totalRecords += batch.records.length
+			}
+
+			if (totalRecords === 0) {
+				return result
+			}
+
+			const out = new Array<DecodedRecord>(totalRecords)
+			let outIndex = 0
+			for (const batch of batches) {
+				if (isControlBatch(batch.attributes)) {
+					continue
+				}
+
 				const records = batch.records
 				for (let i = 0; i < records.length; i++) {
-					result.push(records[i]!)
+					out[outIndex++] = records[i]!
 				}
 			}
-			return result
+			return out
 		}
 
 		for (const batch of batches) {

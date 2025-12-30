@@ -26,8 +26,25 @@ src/
 Benchmarks use a persistent Docker Compose Kafka cluster. Start it once, then run benchmarks repeatedly:
 
 ```bash
-docker compose -f packages/benchmark/docker-compose.yml up -d
+KAFKA_ADVERTISED_HOST=localhost docker compose -f packages/benchmark/docker-compose.yml up -d
 KAFKA_BROKERS=localhost:19292,localhost:19293,localhost:19294 pnpm -C packages/benchmark bench:all
+#
+# If running from a container/devcontainer, use:
+# KAFKA_ADVERTISED_HOST=host.docker.internal docker compose -f packages/benchmark/docker-compose.yml up -d
+# KAFKA_BROKERS=host.docker.internal:19292,host.docker.internal:19293,host.docker.internal:19294 pnpm -C packages/benchmark bench:all
+```
+
+### Flags
+
+All `bench:*` scripts run the same runner (`src/index.ts`).
+
+```bash
+pnpm -C packages/benchmark bench:all -- --iterations 10 --warmup 1
+pnpm -C packages/benchmark bench:producer -- --messageCount 50000 --messageSize 1024 --batchSize 500
+pnpm -C packages/benchmark bench:consumer -- --messageCount 100000 --messageSize 1024
+
+# Optional diagnostics / trace + NDJSON output (paths are relative to packages/benchmark)
+pnpm -C packages/benchmark bench:all -- --diagnostics --trace --json results/bench.ndjson
 ```
 
 Results compare:
