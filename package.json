@@ -6,9 +6,16 @@
 	"type": "module",
 	"packageManager": "pnpm@10.11.0",
 	"scripts": {
-		"lint": "eslint \"packages/**/*.{ts,tsx}\"",
-		"lint:fix": "eslint \"packages/**/*.{ts,tsx}\" --fix",
+		"build": "turbo run build",
+		"clean": "turbo run clean",
+		"lint": "turbo run build --filter=@kafkats/* && eslint \"packages/**/*.{ts,tsx}\"",
+		"lint:fix": "turbo run build --filter=@kafkats/* && eslint \"packages/**/*.{ts,tsx}\" --fix",
+		"typecheck": "turbo run typecheck",
+		"test": "turbo run test:unit",
+		"test:unit": "turbo run test:unit",
+		"test:integration": "turbo run test:integration",
 		"format": "prettier --write \"packages/**/*.{ts,tsx,json,md}\"",
+		"format:check": "prettier --check \"packages/**/*.{ts,tsx,json,md}\"",
 		"docs:dev": "pnpm -C packages/docs dev",
 		"docs:build": "pnpm -C packages/docs build",
 		"docs:preview": "pnpm -C packages/docs preview",
@@ -22,6 +29,7 @@
 		"eslint-plugin-prettier": "^5.5.4",
 		"globals": "^16.5.0",
 		"prettier": "^3.6.2",
+		"turbo": "^2.7.2",
 		"typescript-eslint": "^8.47.0"
 	}
 }

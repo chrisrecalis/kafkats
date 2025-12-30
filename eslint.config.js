@@ -26,13 +26,6 @@ export default defineConfig([
 				tsconfigRootDir: import.meta.dirname,
 			},
 		},
-		settings: {
-			'import/resolver': {
-				typescript: {
-					project: ['packages/*/tsconfig.json'],
-				},
-			},
-		},
 		rules: {
 			'@typescript-eslint/no-floating-promises': 'off',
 		},
