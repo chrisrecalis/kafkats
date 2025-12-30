@@ -30,7 +30,7 @@
 		"test:unit": "vitest run tests/unit",
 		"typecheck": "tsc -p tsconfig.json --noEmit",
 		"clean": "rm -rf dist",
-		"prepack": "pnpm build"
+		"prepack": "pnpm -w turbo run build --filter=$npm_package_name"
 	},
 	"dependencies": {
 		"@kafkats/client": "workspace:^"

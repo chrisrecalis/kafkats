@@ -27,7 +27,7 @@
 		"typecheck": "tsc -p tsconfig.json --noEmit",
 		"clean": "rm -rf dist",
 		"benchmark:consumer": "tsx benchmarks/consumer-benchmark.ts",
-		"prepack": "pnpm build"
+		"prepack": "pnpm -w turbo run build --filter=$npm_package_name"
 	},
 	"devDependencies": {
 		"@eslint/js": "^9.39.1",
