@@ -5,9 +5,24 @@
  * Uses the Castagnoli polynomial (0x1EDC6F41) which is optimized for
  * hardware acceleration on modern CPUs.
  *
- * This implementation uses the "slice-by-8" algorithm which processes
- * 8 bytes at a time using 8 lookup tables for improved performance.
+ * This module uses native hardware-accelerated CRC32C via @node-rs/crc32
+ * when available, with a fallback to a pure JS "slice-by-8" implementation.
  */
+
+import { createRequire } from 'node:module'
+
+type NativeCrc32c = (data: Uint8Array) => number
+
+let nativeCrc32c: NativeCrc32c | null = null
+try {
+	const require = createRequire(import.meta.url)
+	const mod = require('@node-rs/crc32') as { crc32c?: unknown }
+	if (typeof mod.crc32c === 'function') {
+		nativeCrc32c = mod.crc32c as NativeCrc32c
+	}
+} catch {
+	// Optional native implementation not installed/available.
+}
 
 // CRC32C polynomial (Castagnoli): 0x1EDC6F41
 // Reversed/reflected polynomial for table generation: 0x82F63B78
@@ -60,15 +75,9 @@ const T6 = CRC32C_TABLES[6]!
 const T7 = CRC32C_TABLES[7]!
 
 /**
- * Calculate CRC32C checksum of a buffer using slice-by-8 algorithm
- *
- * @param data - The buffer to calculate checksum for
- * @param start - Optional start offset (default: 0)
- * @param length - Optional length (default: data.length - start)
- * @returns The CRC32C checksum as an unsigned 32-bit integer
+ * Calculate CRC32C checksum using pure JS slice-by-8 algorithm.
  */
-export function crc32c(data: Buffer, start: number = 0, length?: number): number {
-	const end = length !== undefined ? start + length : data.length
+function crc32cJS(data: Buffer, start: number, end: number): number {
 	let crc = 0xffffffff
 	let i = start
 
@@ -100,6 +109,28 @@ export function crc32c(data: Buffer, start: number = 0, length?: number): number
 
 	// Final XOR and ensure unsigned
 	return (crc ^ 0xffffffff) >>> 0
+}
+
+/**
+ * Calculate CRC32C checksum of a buffer.
+ *
+ * Uses native hardware-accelerated CRC32C when available, falling back to the
+ * pure JS slice-by-8 implementation otherwise.
+ *
+ * @param data - The buffer to calculate checksum for
+ * @param start - Optional start offset (default: 0)
+ * @param length - Optional length (default: data.length - start)
+ * @returns The CRC32C checksum as an unsigned 32-bit integer
+ */
+export function crc32c(data: Buffer, start: number = 0, length?: number): number {
+	const end = length !== undefined ? start + length : data.length
+
+	if (nativeCrc32c !== null) {
+		const view = start === 0 && end === data.length ? data : data.subarray(start, end)
+		return nativeCrc32c(view) >>> 0
+	}
+
+	return crc32cJS(data, start, end)
 }
 
 /**

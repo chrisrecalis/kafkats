@@ -31,6 +31,7 @@
 	},
 	"devDependencies": {
 		"@eslint/js": "^9.39.1",
+		"@node-rs/crc32": "^1.10.6",
 		"@testcontainers/kafka": "^11.8.1",
 		"@types/node": "^24.10.1",
 		"@typescript-eslint/eslint-plugin": "^8.47.0",
@@ -51,5 +52,13 @@
 		"typescript": "^5.9.3",
 		"typescript-eslint": "^8.47.0",
 		"vitest": "^4.0.12"
+	},
+	"peerDependencies": {
+		"@node-rs/crc32": "^1.10.6"
+	},
+	"peerDependenciesMeta": {
+		"@node-rs/crc32": {
+			"optional": true
+		}
 	}
 }
