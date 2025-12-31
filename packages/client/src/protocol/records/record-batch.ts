@@ -19,11 +19,13 @@
  */
 
 import { Encoder, Decoder } from '@/protocol/primitives/index.js'
+import { varIntSize } from '@/protocol/primitives/varint.js'
 import { crc32c } from '@/utils/crc32c.js'
 import {
-	encodeRecord,
+	encodeRecordTo,
 	decodeRecord,
 	decodeRecordInBatch,
+	sizeOfRecordBody,
 	type KafkaRecord,
 	type DecodedRecord,
 } from '@/protocol/records/record.js'
@@ -122,11 +124,15 @@ export function encodeRecordBatchSync(batch: RecordBatch, options: EncodeRecordB
 		throw new Error('encodeRecordBatchSync cannot be used with compression')
 	}
 
-	const recordsEncoder = new Encoder()
-	for (const record of batch.records) {
-		recordsEncoder.writeRaw(encodeRecord(record))
+	const records = batch.records
+	const recordCount = records.length
+	const recordBodySizes = new Array<number>(recordCount)
+	let recordsSize = 0
+	for (let i = 0; i < recordCount; i++) {
+		const bodySize = sizeOfRecordBody(records[i]!)
+		recordBodySizes[i] = bodySize
+		recordsSize += varIntSize(bodySize) + bodySize
 	}
-	const recordsBuffer = recordsEncoder.toBuffer()
 
 	let attributes = batch.attributes & ~COMPRESSION_CODEC_MASK
 	if (options.isTransactional) {
@@ -139,32 +145,38 @@ export function encodeRecordBatchSync(batch: RecordBatch, options: EncodeRecordB
 		attributes |= TIMESTAMP_TYPE_MASK
 	}
 
-	// CRC covers everything from attributes to end of records
-	const crcEncoder = new Encoder()
-	crcEncoder.writeInt16(attributes)
-	crcEncoder.writeInt32(batch.lastOffsetDelta)
-	crcEncoder.writeInt64(batch.baseTimestamp)
-	crcEncoder.writeInt64(batch.maxTimestamp)
-	crcEncoder.writeInt64(batch.producerId)
-	crcEncoder.writeInt16(batch.producerEpoch)
-	crcEncoder.writeInt32(batch.baseSequence)
-	crcEncoder.writeInt32(batch.records.length)
-	crcEncoder.writeRaw(recordsBuffer)
-
-	const crcData = crcEncoder.toBuffer()
-	const crcValue = crc32c(crcData)
-
-	const batchLength = 4 + 1 + 4 + crcData.length // partitionLeaderEpoch + magic + crc + data
+	// CRC data is everything from attributes to end of records.
+	// Fixed-size header (40 bytes) + record bytes.
+	const crcDataLength = 40 + recordsSize
+	const batchLength = 4 + 1 + 4 + crcDataLength // partitionLeaderEpoch + magic + crc + data
 
 	const encoder = new Encoder(8 + 4 + batchLength)
 	encoder.writeInt64(batch.baseOffset)
 	encoder.writeInt32(batchLength)
 	encoder.writeInt32(batch.partitionLeaderEpoch)
 	encoder.writeInt8(batch.magic)
-	encoder.writeUInt32(crcValue) // CRC as unsigned
-	encoder.writeRaw(crcData)
 
-	return encoder.toBuffer()
+	const crcOffset = encoder.size()
+	encoder.writeUInt32(0) // placeholder; filled after CRC computation
+	const crcDataStart = encoder.size()
+
+	encoder.writeInt16(attributes)
+	encoder.writeInt32(batch.lastOffsetDelta)
+	encoder.writeInt64(batch.baseTimestamp)
+	encoder.writeInt64(batch.maxTimestamp)
+	encoder.writeInt64(batch.producerId)
+	encoder.writeInt16(batch.producerEpoch)
+	encoder.writeInt32(batch.baseSequence)
+	encoder.writeInt32(recordCount)
+
+	for (let i = 0; i < recordCount; i++) {
+		encodeRecordTo(encoder, records[i]!, recordBodySizes[i])
+	}
+
+	const result = encoder.toBuffer()
+	const crcValue = crc32c(result, crcDataStart, result.length - crcDataStart)
+	result.writeUInt32BE(crcValue, crcOffset)
+	return result
 }
 
 /**
@@ -182,9 +194,19 @@ export async function encodeRecordBatch(batch: RecordBatch, options: EncodeRecor
 		return encodeRecordBatchSync(batch, options)
 	}
 
-	const recordsEncoder = new Encoder()
-	for (const record of batch.records) {
-		recordsEncoder.writeRaw(encodeRecord(record))
+	const records = batch.records
+	const recordCount = records.length
+	const recordBodySizes = new Array<number>(recordCount)
+	let recordsSize = 0
+	for (let i = 0; i < recordCount; i++) {
+		const bodySize = sizeOfRecordBody(records[i]!)
+		recordBodySizes[i] = bodySize
+		recordsSize += varIntSize(bodySize) + bodySize
+	}
+
+	const recordsEncoder = new Encoder(recordsSize)
+	for (let i = 0; i < recordCount; i++) {
+		encodeRecordTo(recordsEncoder, records[i]!, recordBodySizes[i])
 	}
 	let recordsBuffer = recordsEncoder.toBuffer()
 
@@ -206,32 +228,34 @@ export async function encodeRecordBatch(batch: RecordBatch, options: EncodeRecor
 	}
 	recordsBuffer = await codec.compress(recordsBuffer)
 
-	// CRC covers everything from attributes to end of records
-	const crcEncoder = new Encoder()
-	crcEncoder.writeInt16(attributes)
-	crcEncoder.writeInt32(batch.lastOffsetDelta)
-	crcEncoder.writeInt64(batch.baseTimestamp)
-	crcEncoder.writeInt64(batch.maxTimestamp)
-	crcEncoder.writeInt64(batch.producerId)
-	crcEncoder.writeInt16(batch.producerEpoch)
-	crcEncoder.writeInt32(batch.baseSequence)
-	crcEncoder.writeInt32(batch.records.length)
-	crcEncoder.writeRaw(recordsBuffer)
-
-	const crcData = crcEncoder.toBuffer()
-	const crcValue = crc32c(crcData)
-
-	const batchLength = 4 + 1 + 4 + crcData.length // partitionLeaderEpoch + magic + crc + data
+	// CRC data is everything from attributes to end of records.
+	const crcDataLength = 40 + recordsBuffer.length
+	const batchLength = 4 + 1 + 4 + crcDataLength // partitionLeaderEpoch + magic + crc + data
 
 	const encoder = new Encoder(8 + 4 + batchLength)
 	encoder.writeInt64(batch.baseOffset)
 	encoder.writeInt32(batchLength)
 	encoder.writeInt32(batch.partitionLeaderEpoch)
 	encoder.writeInt8(batch.magic)
-	encoder.writeUInt32(crcValue) // CRC as unsigned
-	encoder.writeRaw(crcData)
 
-	return encoder.toBuffer()
+	const crcOffset = encoder.size()
+	encoder.writeUInt32(0) // placeholder; filled after CRC computation
+	const crcDataStart = encoder.size()
+
+	encoder.writeInt16(attributes)
+	encoder.writeInt32(batch.lastOffsetDelta)
+	encoder.writeInt64(batch.baseTimestamp)
+	encoder.writeInt64(batch.maxTimestamp)
+	encoder.writeInt64(batch.producerId)
+	encoder.writeInt16(batch.producerEpoch)
+	encoder.writeInt32(batch.baseSequence)
+	encoder.writeInt32(recordCount)
+	encoder.writeRaw(recordsBuffer)
+
+	const result = encoder.toBuffer()
+	const crcValue = crc32c(result, crcDataStart, result.length - crcDataStart)
+	result.writeUInt32BE(crcValue, crcOffset)
+	return result
 }
 
 /**
@@ -428,7 +452,7 @@ export function createRecordBatch(
 		key?: string | Buffer | null
 		value: string | Buffer | null
 		headers?: { [key: string]: string | Buffer | null }
-		timestamp?: number
+		timestamp?: number | bigint
 	}>,
 	baseOffset: bigint = 0n,
 	baseTimestamp?: bigint,
@@ -444,7 +468,12 @@ export function createRecordBatch(
 
 	for (let i = 0; i < messages.length; i++) {
 		const msg = messages[i]!
-		const msgTimestamp = msg.timestamp !== undefined ? BigInt(msg.timestamp) : now
+		let msgTimestamp: bigint
+		if (msg.timestamp !== undefined) {
+			msgTimestamp = typeof msg.timestamp === 'bigint' ? msg.timestamp : BigInt(msg.timestamp)
+		} else {
+			msgTimestamp = now
+		}
 		const timestampDelta = Number(msgTimestamp - actualBaseTimestamp)
 
 		if (msgTimestamp > maxTimestamp) {

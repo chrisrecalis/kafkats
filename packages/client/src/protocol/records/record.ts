@@ -72,84 +72,9 @@ export interface DecodeRecordInBatchOptions {
  * @returns The encoded record as a buffer
  */
 export function encodeRecord(record: KafkaRecord): Buffer {
-	const headerKeyBuffers: Buffer[] = record.headers.map(h => Buffer.from(h.key, 'utf-8'))
-
-	let bodySize = 1 // attributes (int8)
-	bodySize += varIntSize(record.timestampDelta)
-	bodySize += varIntSize(record.offsetDelta)
-
-	// Key size
-	if (record.key === null) {
-		bodySize += varIntSize(-1)
-	} else {
-		bodySize += varIntSize(record.key.length)
-		bodySize += record.key.length
-	}
-
-	// Value size
-	if (record.value === null) {
-		bodySize += varIntSize(-1)
-	} else {
-		bodySize += varIntSize(record.value.length)
-		bodySize += record.value.length
-	}
-
-	// Headers size
-	bodySize += varIntSize(record.headers.length)
-	for (let i = 0; i < record.headers.length; i++) {
-		const keyBytes = headerKeyBuffers[i]!
-		const header = record.headers[i]!
-		bodySize += varIntSize(keyBytes.length)
-		bodySize += keyBytes.length
-
-		if (header.value === null) {
-			bodySize += varIntSize(-1)
-		} else {
-			bodySize += varIntSize(header.value.length)
-			bodySize += header.value.length
-		}
-	}
-
-	const totalSize = varIntSize(bodySize) + bodySize
-	const encoder = new Encoder(totalSize)
-
-	encoder.writeVarInt(bodySize)
-	encoder.writeInt8(record.attributes)
-	encoder.writeVarInt(record.timestampDelta)
-	encoder.writeVarInt(record.offsetDelta)
-
-	// Key (varInt length, -1 for null)
-	if (record.key === null) {
-		encoder.writeVarInt(-1)
-	} else {
-		encoder.writeVarInt(record.key.length)
-		encoder.writeRaw(record.key)
-	}
-
-	// Value (varInt length, -1 for null)
-	if (record.value === null) {
-		encoder.writeVarInt(-1)
-	} else {
-		encoder.writeVarInt(record.value.length)
-		encoder.writeRaw(record.value)
-	}
-
-	// Headers
-	encoder.writeVarInt(record.headers.length)
-	for (let i = 0; i < record.headers.length; i++) {
-		const keyBytes = headerKeyBuffers[i]!
-		const header = record.headers[i]!
-		encoder.writeVarInt(keyBytes.length)
-		encoder.writeRaw(keyBytes)
-
-		if (header.value === null) {
-			encoder.writeVarInt(-1)
-		} else {
-			encoder.writeVarInt(header.value.length)
-			encoder.writeRaw(header.value)
-		}
-	}
-
+	const bodySize = sizeOfRecordBody(record)
+	const encoder = new Encoder(varIntSize(bodySize) + bodySize)
+	encodeRecordTo(encoder, record, bodySize)
 	return encoder.toBuffer()
 }
 
@@ -159,8 +84,99 @@ export function encodeRecord(record: KafkaRecord): Buffer {
  * @param encoder - The encoder to write to
  * @param record - The record to encode
  */
-export function encodeRecordTo(encoder: IEncoder, record: KafkaRecord): void {
-	encoder.writeRaw(encodeRecord(record))
+export function encodeRecordTo(
+	encoder: IEncoder,
+	record: KafkaRecord,
+	bodySize: number = sizeOfRecordBody(record)
+): void {
+	const key = record.key
+	const value = record.value
+	const headers = record.headers
+	const headersLen = headers.length
+
+	encoder.writeVarInt(bodySize)
+	encoder.writeInt8(record.attributes)
+	encoder.writeVarInt(record.timestampDelta)
+	encoder.writeVarInt(record.offsetDelta)
+
+	// Key (varInt length, -1 for null)
+	if (key === null) {
+		encoder.writeVarInt(-1)
+	} else {
+		encoder.writeVarInt(key.length)
+		encoder.writeRaw(key)
+	}
+
+	// Value (varInt length, -1 for null)
+	if (value === null) {
+		encoder.writeVarInt(-1)
+	} else {
+		encoder.writeVarInt(value.length)
+		encoder.writeRaw(value)
+	}
+
+	// Headers
+	encoder.writeVarInt(headersLen)
+	for (let i = 0; i < headersLen; i++) {
+		const header = headers[i]!
+		const headerKeyBytes = Buffer.from(header.key, 'utf-8')
+		encoder.writeVarInt(headerKeyBytes.length)
+		encoder.writeRaw(headerKeyBytes)
+
+		if (header.value === null) {
+			encoder.writeVarInt(-1)
+		} else {
+			encoder.writeVarInt(header.value.length)
+			encoder.writeRaw(header.value)
+		}
+	}
+}
+
+export function sizeOfRecordBody(record: KafkaRecord): number {
+	let bodySize = 1 // attributes (int8)
+	bodySize += varIntSize(record.timestampDelta)
+	bodySize += varIntSize(record.offsetDelta)
+
+	const key = record.key
+	if (key === null) {
+		bodySize += varIntSize(-1)
+	} else {
+		bodySize += varIntSize(key.length)
+		bodySize += key.length
+	}
+
+	const value = record.value
+	if (value === null) {
+		bodySize += varIntSize(-1)
+	} else {
+		bodySize += varIntSize(value.length)
+		bodySize += value.length
+	}
+
+	const headers = record.headers
+	const headersLen = headers.length
+	bodySize += varIntSize(headersLen)
+
+	for (let i = 0; i < headersLen; i++) {
+		const header = headers[i]!
+		const headerKeyLength = Buffer.byteLength(header.key, 'utf-8')
+		bodySize += varIntSize(headerKeyLength)
+		bodySize += headerKeyLength
+
+		if (header.value === null) {
+			bodySize += varIntSize(-1)
+		} else {
+			bodySize += varIntSize(header.value.length)
+			bodySize += header.value.length
+		}
+	}
+
+	return bodySize
+}
+
+export function sizeOfRecord(record: KafkaRecord): number {
+	const bodySize = sizeOfRecordBody(record)
+	return varIntSize(bodySize) + bodySize
 }
 
 /**

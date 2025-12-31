@@ -17,7 +17,11 @@
 		"preprofile:producer": "pnpm -C ../client build && pnpm build",
 		"profile:producer": "0x -D profiles/producer -- node dist/profile-producer.js",
 		"preprofile:consumer": "pnpm -C ../client build && pnpm build",
-		"profile:consumer": "0x -D profiles/consumer -- node dist/profile-consumer.js"
+		"profile:consumer": "0x -D profiles/consumer -- node dist/profile-consumer.js",
+		"preheap:producer": "pnpm -C ../client build && pnpm build",
+		"heap:producer": "node dist/heap-producer.js",
+		"preheap:consumer": "pnpm -C ../client build && pnpm build",
+		"heap:consumer": "node dist/heap-consumer.js"
 	},
 	"engines": {
 		"node": ">=18"

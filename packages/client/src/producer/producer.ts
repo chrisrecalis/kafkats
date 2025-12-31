@@ -358,24 +358,20 @@ export class Producer extends EventEmitter<ProducerEvents> {
 				this.inflightBatches.set(batchId, { topic, partition, messages: messagesToSend, recordCount })
 			}
 
-			const records = messagesToSend.map(msg => ({
-				key: msg.key,
-				value: msg.value,
-				headers: Object.fromEntries(Object.entries(msg.headers).map(([k, v]) => [k, v])),
-				timestamp: Number(msg.timestamp),
-			}))
-
-			const baseTimestamp =
-				messagesToSend.length > 0
-					? messagesToSend.reduce(
-							(min, msg) => (msg.timestamp < min ? msg.timestamp : min),
-							messagesToSend[0]!.timestamp
-						)
-					: undefined
+			let baseTimestamp: bigint | undefined
+			if (messagesToSend.length > 0) {
+				baseTimestamp = messagesToSend[0]!.timestamp
+				for (let i = 1; i < messagesToSend.length; i++) {
+					const ts = messagesToSend[i]!.timestamp
+					if (ts < baseTimestamp) {
+						baseTimestamp = ts
+					}
+				}
+			}
 
 			const encodeStart = performance.now()
 			const recordBatch = createRecordBatch(
-				records,
+				messagesToSend,
 				0n,
 				baseTimestamp,
 				this.config.idempotent ? this.producerId : -1n,

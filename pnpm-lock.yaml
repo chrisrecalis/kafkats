@@ -63,6 +63,9 @@ importers:
       '@eslint/js':
         specifier: ^9.39.1
         version: 9.39.1
+      '@node-rs/crc32':
+        specifier: ^1.10.6
+        version: 1.10.6
       '@testcontainers/kafka':
         specifier: ^11.8.1
         version: 11.8.1
@@ -5563,7 +5566,6 @@ snapshots:
       '@node-rs/crc32-win32-arm64-msvc': 1.10.6
       '@node-rs/crc32-win32-ia32-msvc': 1.10.6
       '@node-rs/crc32-win32-x64-msvc': 1.10.6
-    optional: true
 
   '@node-rs/helper@1.6.0':
     dependencies:

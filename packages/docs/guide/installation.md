@@ -47,6 +47,28 @@ yarn add @kafkats/flow
 
 ## Optional Packages
 
+### Native CRC32C (Recommended)
+
+For maximum producer/consumer throughput, install the optional native CRC32C implementation:
+
+::: code-group
+
+```bash [pnpm]
+pnpm add @node-rs/crc32
+```
+
+```bash [npm]
+npm install @node-rs/crc32
+```
+
+```bash [yarn]
+yarn add @node-rs/crc32
+```
+
+:::
+
+If not installed, kafkats falls back to a pure TypeScript CRC32C implementation.
+
 ### Zod Codec
 
 For schema validation with Zod:

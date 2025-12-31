@@ -24,7 +24,7 @@ export class Encoder implements IEncoder {
 	private position: number
 
 	constructor(initialSize: number = 256) {
-		this.buffer = Buffer.alloc(nextPowerOfTwo(initialSize))
+		this.buffer = Buffer.allocUnsafe(nextPowerOfTwo(initialSize))
 		this.position = 0
 	}
 
@@ -35,7 +35,7 @@ export class Encoder implements IEncoder {
 		const required = this.position + bytes
 		if (required > this.buffer.length) {
 			const newSize = nextPowerOfTwo(required)
-			const newBuffer = Buffer.alloc(newSize)
+			const newBuffer = Buffer.allocUnsafe(newSize)
 			this.buffer.copy(newBuffer, 0, 0, this.position)
 			this.buffer = newBuffer
 		}
