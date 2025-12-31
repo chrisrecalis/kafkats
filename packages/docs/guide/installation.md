@@ -67,6 +67,8 @@ yarn add @node-rs/crc32
 
 :::
 
+With native CRC32C enabled, kafkats can exceed the throughput of other popular Kafka clients.
+
 If not installed, kafkats falls back to a pure TypeScript CRC32C implementation.
 
 ### Zod Codec
