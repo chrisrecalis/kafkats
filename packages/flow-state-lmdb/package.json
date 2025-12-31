@@ -48,7 +48,7 @@
 		"lmdb": "^3.2.6"
 	},
 	"peerDependencies": {
-		"@kafkats/flow": "workspace:^"
+		"@kafkats/flow": "workspace:>=0.1.0"
 	},
 	"devDependencies": {
 		"@kafkats/flow": "workspace:^",
