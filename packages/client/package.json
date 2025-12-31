@@ -16,6 +16,24 @@
 		"dist"
 	],
 	"license": "MIT",
+	"keywords": [
+		"kafka",
+		"client",
+		"producer",
+		"consumer",
+		"streaming",
+		"typescript",
+		"protocol"
+	],
+	"homepage": "https://chrisrecalis.github.io/kafkats",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/chrisrecalis/kafkats.git",
+		"directory": "packages/client"
+	},
+	"bugs": {
+		"url": "https://github.com/chrisrecalis/kafkats/issues"
+	},
 	"engines": {
 		"node": ">=18"
 	},
