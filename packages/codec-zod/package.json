@@ -16,6 +16,24 @@
 		"dist"
 	],
 	"license": "MIT",
+	"keywords": [
+		"kafka",
+		"zod",
+		"codec",
+		"validation",
+		"schema",
+		"serialization",
+		"typescript"
+	],
+	"homepage": "https://chrisrecalis.github.io/kafkats",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/chrisrecalis/kafkats.git",
+		"directory": "packages/codec-zod"
+	},
+	"bugs": {
+		"url": "https://github.com/chrisrecalis/kafkats/issues"
+	},
 	"engines": {
 		"node": ">=18"
 	},

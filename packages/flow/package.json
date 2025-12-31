@@ -20,6 +20,26 @@
 		"dist"
 	],
 	"license": "MIT",
+	"keywords": [
+		"kafka",
+		"streams",
+		"streaming",
+		"dsl",
+		"ktable",
+		"kstream",
+		"aggregation",
+		"windowing",
+		"typescript"
+	],
+	"homepage": "https://chrisrecalis.github.io/kafkats",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/chrisrecalis/kafkats.git",
+		"directory": "packages/flow"
+	},
+	"bugs": {
+		"url": "https://github.com/chrisrecalis/kafkats/issues"
+	},
 	"engines": {
 		"node": ">=18"
 	},
