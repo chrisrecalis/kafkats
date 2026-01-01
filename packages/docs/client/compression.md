@@ -166,7 +166,7 @@ import { ZstdCodec } from 'zstd-codec'
 import { CompressionType, compressionCodecs, createZstdCodec } from '@kafkats/client'
 
 // Initialize and register within callback
-ZstdCodec.run((zstd) => {
+ZstdCodec.run(zstd => {
 	const simple = new zstd.Simple()
 	compressionCodecs.register(CompressionType.Zstd, createZstdCodec(simple))
 })
@@ -181,10 +181,7 @@ Zstd supports compression levels from 1-22 (default: 3). Lower levels are faster
 ```typescript
 import { compress, decompress } from '@mongodb-js/zstd'
 
-compressionCodecs.register(
-	CompressionType.Zstd,
-	createZstdCodec({ compress, decompress }, { level: 6 })
-)
+compressionCodecs.register(CompressionType.Zstd, createZstdCodec({ compress, decompress }, { level: 6 }))
 ```
 
 ## Transparent Decompression
@@ -224,15 +221,18 @@ Choose your compression strategy based on your use case:
 ## Supported Libraries Summary
 
 ### Snappy
+
 - **Native**: [`snappy`](https://www.npmjs.com/package/snappy) - Fastest, napi-rs based
 - **Pure JS**: [`snappyjs`](https://www.npmjs.com/package/snappyjs)
 
 ### LZ4
+
 - **Native**: [`lz4-napi`](https://www.npmjs.com/package/lz4-napi) - Fastest, napi-rs based
 - **Native**: [`lz4`](https://www.npmjs.com/package/lz4) - node-lz4, encode/decode API
 - **Pure JS**: [`lz4js`](https://www.npmjs.com/package/lz4js)
 
 ### Zstd
+
 - **Native**: [`@mongodb-js/zstd`](https://www.npmjs.com/package/@mongodb-js/zstd) - MongoDB's binding
 - **Native**: [`zstd-napi`](https://www.npmjs.com/package/zstd-napi) - Node-API binding
 - **WASM**: [`zstd-codec`](https://www.npmjs.com/package/zstd-codec) - Emscripten based
