@@ -128,72 +128,278 @@ class CodecRegistry implements CompressionCodecRegistry {
 export const compressionCodecs = new CodecRegistry()
 
 /**
+ * Snappy library interface for native async libraries (e.g., 'snappy' npm package)
+ */
+export interface SnappyNativeLib {
+	compress: (data: Buffer | Uint8Array | string) => Promise<Buffer>
+	uncompress: (data: Buffer) => Promise<Buffer>
+}
+
+/**
+ * Snappy library interface for pure JS libraries (e.g., 'snappyjs' npm package)
+ */
+export interface SnappyJsLib {
+	compress: (data: ArrayBuffer | Buffer | Uint8Array) => ArrayBuffer | Uint8Array
+	uncompress: (data: ArrayBuffer | Buffer | Uint8Array) => ArrayBuffer | Uint8Array
+}
+
+/**
+ * Union type for all supported Snappy library interfaces
+ */
+export type SnappyLib = SnappyNativeLib | SnappyJsLib
+
+/**
  * Factory function to create a Snappy codec from an external library
  *
- * @param snappy - The snappy library (e.g., 'snappy' npm package)
+ * Supports the following libraries:
+ * - **Native**: `snappy` - Fastest Snappy compression library using napi-rs
+ * - **Pure JS**: `snappyjs` - Pure JavaScript implementation for browsers
+ *
+ * @param snappy - The snappy library instance
  * @returns A compression codec
  *
- * @example
+ * @example Native snappy (async)
  * ```typescript
  * import snappy from 'snappy'
  * compressionCodecs.register(CompressionType.Snappy, createSnappyCodec(snappy))
  * ```
+ *
+ * @example Pure JS snappyjs (sync)
+ * ```typescript
+ * import * as SnappyJS from 'snappyjs'
+ * compressionCodecs.register(CompressionType.Snappy, createSnappyCodec(SnappyJS))
+ * ```
  */
-export function createSnappyCodec(snappy: {
-	compress: (data: Buffer) => Promise<Buffer>
-	uncompress: (data: Buffer) => Promise<Buffer>
-}): CompressionCodec {
-	return {
-		compress: snappy.compress,
-		decompress: snappy.uncompress,
+export function createSnappyCodec(snappy: SnappyLib): CompressionCodec {
+	// Detect if this is an async library by checking if the result is a Promise
+	// We do this by calling compress with a tiny buffer and checking the result type
+	const testResult = snappy.compress(Buffer.alloc(1))
+	const isAsync = testResult instanceof Promise
+
+	if (isAsync) {
+		// Native async library (snappy)
+		const asyncLib = snappy as SnappyNativeLib
+		return {
+			compress: asyncLib.compress,
+			decompress: asyncLib.uncompress,
+		}
+	} else {
+		// Pure JS sync library (snappyjs)
+		const syncLib = snappy as SnappyJsLib
+		return {
+			compress(data: Buffer): Promise<Buffer> {
+				const result = syncLib.compress(data)
+				return Promise.resolve(Buffer.from(result as ArrayBuffer))
+			},
+			decompress(data: Buffer): Promise<Buffer> {
+				const result = syncLib.uncompress(data)
+				return Promise.resolve(Buffer.from(result as ArrayBuffer))
+			},
+		}
 	}
 }
 
 /**
+ * LZ4 library interface for node-lz4 (encode/decode API)
+ */
+export interface Lz4NodeLib {
+	encode: (data: Buffer) => Buffer
+	decode: (data: Buffer) => Buffer
+}
+
+/**
+ * LZ4 library interface for lz4js (pure JS, compress/decompress API)
+ */
+export interface Lz4JsLib {
+	compress: (data: ArrayLike<number> | Uint8Array) => Uint8Array
+	decompress: (data: ArrayLike<number> | Uint8Array) => Uint8Array
+}
+
+/**
+ * LZ4 library interface for lz4-napi (native async, compress/uncompress API)
+ */
+export interface Lz4NapiLib {
+	compress: (data: Buffer | Uint8Array | string) => Promise<Buffer>
+	uncompress: (data: Buffer | Uint8Array | string) => Promise<Buffer>
+}
+
+/**
+ * Union type for all supported LZ4 library interfaces
+ */
+export type Lz4Lib = Lz4NodeLib | Lz4JsLib | Lz4NapiLib
+
+/**
  * Factory function to create an LZ4 codec from an external library
  *
- * @param lz4 - The lz4 library (e.g., 'lz4' npm package)
+ * Supports the following libraries:
+ * - **Native (node-lz4)**: `lz4` - encode/decode API
+ * - **Pure JS**: `lz4js` - Pure JavaScript implementation for browsers
+ * - **Native (napi)**: `lz4-napi` - Fastest LZ4 library using napi-rs
+ *
+ * @param lz4 - The LZ4 library instance
  * @returns A compression codec
  *
- * @example
+ * @example node-lz4 (encode/decode API)
  * ```typescript
  * import lz4 from 'lz4'
  * compressionCodecs.register(CompressionType.Lz4, createLz4Codec(lz4))
  * ```
+ *
+ * @example lz4js (pure JS)
+ * ```typescript
+ * import * as lz4js from 'lz4js'
+ * compressionCodecs.register(CompressionType.Lz4, createLz4Codec(lz4js))
+ * ```
+ *
+ * @example lz4-napi (native async)
+ * ```typescript
+ * import * as lz4 from 'lz4-napi'
+ * compressionCodecs.register(CompressionType.Lz4, createLz4Codec(lz4))
+ * ```
  */
-export function createLz4Codec(lz4: {
-	encode: (data: Buffer) => Buffer
-	decode: (data: Buffer) => Buffer
-}): CompressionCodec {
+export function createLz4Codec(lz4: Lz4Lib): CompressionCodec {
+	// Detect library type by checking available methods
+	if ('encode' in lz4 && 'decode' in lz4) {
+		// node-lz4 with encode/decode API
+		return {
+			compress(data: Buffer): Promise<Buffer> {
+				return Promise.resolve(lz4.encode(data))
+			},
+			decompress(data: Buffer): Promise<Buffer> {
+				return Promise.resolve(lz4.decode(data))
+			},
+		}
+	}
+
+	if ('uncompress' in lz4) {
+		// lz4-napi with async compress/uncompress API
+		return {
+			compress: lz4.compress,
+			decompress: lz4.uncompress,
+		}
+	}
+
+	// lz4js with sync compress/decompress API
 	return {
 		compress(data: Buffer): Promise<Buffer> {
-			return Promise.resolve(lz4.encode(data))
+			const result = lz4.compress(data)
+			return Promise.resolve(Buffer.from(result))
 		},
 		decompress(data: Buffer): Promise<Buffer> {
-			return Promise.resolve(lz4.decode(data))
+			const result = lz4.decompress(data)
+			return Promise.resolve(Buffer.from(result))
 		},
 	}
+}
+
+/**
+ * Zstd library interface for async native libraries (e.g., '@mongodb-js/zstd', 'zstd-napi')
+ */
+export interface ZstdNativeAsyncLib {
+	compress: (data: Buffer, level?: number) => Promise<Buffer>
+	decompress: (data: Buffer) => Promise<Buffer>
+}
+
+/**
+ * Zstd library interface for WASM/sync libraries (e.g., '@oneidentity/zstd-js' ZstdSimple)
+ */
+export interface ZstdWasmLib {
+	compress: (data: Uint8Array, level?: number) => Uint8Array
+	decompress: (data: Uint8Array) => Uint8Array
+}
+
+/**
+ * Zstd library interface for zstd-codec (Simple API after initialization)
+ */
+export interface ZstdCodecSimpleLib {
+	compress: (data: Uint8Array, level?: number) => Uint8Array
+	decompress: (data: Uint8Array, maxSize?: number) => Uint8Array
+}
+
+/**
+ * Union type for all supported Zstd library interfaces
+ */
+export type ZstdLib = ZstdNativeAsyncLib | ZstdWasmLib | ZstdCodecSimpleLib
+
+/**
+ * Options for creating a Zstd codec
+ */
+export interface ZstdCodecOptions {
+	/**
+	 * Compression level (1-22, default: 3)
+	 * Lower = faster, higher = better compression
+	 */
+	level?: number
 }
 
 /**
  * Factory function to create a Zstd codec from an external library
  *
- * @param zstd - The zstd library (e.g., '@mongodb-js/zstd' npm package)
+ * Supports the following libraries:
+ * - **Native**: `@mongodb-js/zstd` - MongoDB's native Zstd binding
+ * - **Native**: `zstd-napi` - Native Zstd using Node-API
+ * - **WASM**: `@oneidentity/zstd-js` - ZstdSimple or ZstdStream from init
+ * - **WASM**: `zstd-codec` - Zstd codec powered by Emscripten
+ *
+ * @param zstd - The Zstd library instance (or ZstdSimple/ZstdStream from @oneidentity/zstd-js)
+ * @param options - Optional configuration
  * @returns A compression codec
  *
- * @example
+ * @example @mongodb-js/zstd (native async)
  * ```typescript
  * import { compress, decompress } from '@mongodb-js/zstd'
  * compressionCodecs.register(CompressionType.Zstd, createZstdCodec({ compress, decompress }))
  * ```
+ *
+ * @example zstd-napi (native async)
+ * ```typescript
+ * import { compress, decompress } from 'zstd-napi'
+ * compressionCodecs.register(CompressionType.Zstd, createZstdCodec({ compress, decompress }))
+ * ```
+ *
+ * @example @oneidentity/zstd-js (WASM)
+ * ```typescript
+ * import { ZstdInit } from '@oneidentity/zstd-js'
+ * const { ZstdSimple } = await ZstdInit()
+ * compressionCodecs.register(CompressionType.Zstd, createZstdCodec(ZstdSimple))
+ * ```
+ *
+ * @example zstd-codec (WASM)
+ * ```typescript
+ * import { ZstdCodec } from 'zstd-codec'
+ * ZstdCodec.run((zstd) => {
+ *   const simple = new zstd.Simple()
+ *   compressionCodecs.register(CompressionType.Zstd, createZstdCodec(simple))
+ * })
+ * ```
  */
-export function createZstdCodec(zstd: {
-	compress: (data: Buffer, level?: number) => Promise<Buffer>
-	decompress: (data: Buffer) => Promise<Buffer>
-}): CompressionCodec {
-	return {
-		compress: (data: Buffer) => zstd.compress(data),
-		decompress: zstd.decompress,
+export function createZstdCodec(zstd: ZstdLib, options?: ZstdCodecOptions): CompressionCodec {
+	const level = options?.level ?? 3
+
+	// Detect if this is an async library by checking if the result is a Promise
+	const testResult = zstd.compress(Buffer.alloc(1), level)
+	const isAsync = testResult instanceof Promise
+
+	if (isAsync) {
+		// Native async library (@mongodb-js/zstd, zstd-napi)
+		const asyncLib = zstd as ZstdNativeAsyncLib
+		return {
+			compress: (data: Buffer) => asyncLib.compress(data, level),
+			decompress: asyncLib.decompress,
+		}
+	} else {
+		// WASM/sync library (@oneidentity/zstd-js, zstd-codec)
+		const syncLib = zstd as ZstdWasmLib
+		return {
+			compress(data: Buffer): Promise<Buffer> {
+				const result = syncLib.compress(data, level)
+				return Promise.resolve(Buffer.from(result))
+			},
+			decompress(data: Buffer): Promise<Buffer> {
+				const result = syncLib.decompress(data)
+				return Promise.resolve(Buffer.from(result))
+			},
+		}
 	}
 }
 

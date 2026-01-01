@@ -76,6 +76,7 @@ export default defineConfig({
 				{
 					text: 'Fundamentals',
 					items: [
+						{ text: 'Compression', link: '/client/compression' },
 						{ text: 'Codecs', link: '/client/codecs' },
 						{ text: 'Authentication', link: '/client/authentication' },
 						{ text: 'Error Handling', link: '/client/errors' },

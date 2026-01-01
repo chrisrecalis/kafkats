@@ -187,6 +187,10 @@ const producer = client.producer({
 | `'gzip'`   | Slow      | Best              |
 | `'zstd'`   | Medium    | Best              |
 
+::: tip Compression Libraries
+GZIP is built-in. For Snappy, LZ4, and Zstd, you need to install and register a compression library. See [Compression](/client/compression) for supported libraries and setup instructions.
+:::
+
 ## Error Handling and Retries
 
 The producer automatically retries on retriable errors:
