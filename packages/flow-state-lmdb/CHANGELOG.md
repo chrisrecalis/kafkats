@@ -1,5 +1,17 @@
 # @kafkats/flow-state-lmdb
 
+## 0.3.0
+
+### Minor Changes
+
+- d7a02fe: - fix(client): fix compression
+    - docs: update compression documentation
+
+### Patch Changes
+
+- Updated dependencies [d7a02fe]
+    - @kafkats/flow@0.3.0
+
 ## 0.2.0
 
 ### Minor Changes
