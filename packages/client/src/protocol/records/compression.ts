@@ -153,7 +153,7 @@ export type SnappyLib = SnappyNativeLib | SnappyJsLib
  *
  * Supports the following libraries:
  * - **Native**: `snappy` - Fastest Snappy compression library using napi-rs
- * - **Pure JS**: `snappyjs` - Pure JavaScript implementation for browsers
+ * - **Pure JS**: `snappyjs` - Pure JavaScript implementation
  *
  * @param snappy - The snappy library instance
  * @returns A compression codec
@@ -233,7 +233,7 @@ export type Lz4Lib = Lz4NodeLib | Lz4JsLib | Lz4NapiLib
  *
  * Supports the following libraries:
  * - **Native (node-lz4)**: `lz4` - encode/decode API
- * - **Pure JS**: `lz4js` - Pure JavaScript implementation for browsers
+ * - **Pure JS**: `lz4js` - Pure JavaScript implementation
  * - **Native (napi)**: `lz4-napi` - Fastest LZ4 library using napi-rs
  *
  * @param lz4 - The LZ4 library instance

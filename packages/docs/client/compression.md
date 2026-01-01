@@ -39,16 +39,16 @@ const producer = client.producer({
 
 ## Pluggable Compression Libraries
 
-For Snappy, LZ4, and Zstd, you must install a compression library and register it. kafkats supports multiple libraries for each algorithm, giving you flexibility to choose based on your needs (pure JS for browser compatibility, native for performance).
+For Snappy, LZ4, and Zstd, you must install a compression library and register it. kafkats supports multiple libraries for each algorithm.
 
 ### Snappy
 
-| Library    | Type      | Performance | Browser Support |
-| ---------- | --------- | ----------- | --------------- |
-| `snappy`   | Native    | Fastest     | No              |
-| `snappyjs` | Pure JS   | Good        | Yes             |
+| Library    | Type    | Performance |
+| ---------- | ------- | ----------- |
+| `snappy`   | Native  | Fastest     |
+| `snappyjs` | Pure JS | Good        |
 
-#### Native Snappy (Recommended for Node.js)
+#### snappy (Recommended)
 
 ```bash
 npm install snappy
@@ -61,7 +61,7 @@ import { CompressionType, compressionCodecs, createSnappyCodec } from '@kafkats/
 compressionCodecs.register(CompressionType.Snappy, createSnappyCodec(snappy))
 ```
 
-#### Pure JS Snappy (Browser Compatible)
+#### snappyjs
 
 ```bash
 npm install snappyjs
@@ -76,13 +76,13 @@ compressionCodecs.register(CompressionType.Snappy, createSnappyCodec(SnappyJS))
 
 ### LZ4
 
-| Library     | Type      | Performance | Browser Support |
-| ----------- | --------- | ----------- | --------------- |
-| `lz4-napi`  | Native    | Fastest     | No              |
-| `lz4`       | Native    | Fast        | No              |
-| `lz4js`     | Pure JS   | Good        | Yes             |
+| Library    | Type    | Performance |
+| ---------- | ------- | ----------- |
+| `lz4-napi` | Native  | Fastest     |
+| `lz4`      | Native  | Fast        |
+| `lz4js`    | Pure JS | Good        |
 
-#### lz4-napi (Recommended for Node.js)
+#### lz4-napi (Recommended)
 
 ```bash
 npm install lz4-napi
@@ -108,7 +108,7 @@ import { CompressionType, compressionCodecs, createLz4Codec } from '@kafkats/cli
 compressionCodecs.register(CompressionType.Lz4, createLz4Codec(lz4))
 ```
 
-#### lz4js (Pure JS, Browser Compatible)
+#### lz4js
 
 ```bash
 npm install lz4js
@@ -123,13 +123,13 @@ compressionCodecs.register(CompressionType.Lz4, createLz4Codec(lz4js))
 
 ### Zstd
 
-| Library            | Type   | Performance | Browser Support |
-| ------------------ | ------ | ----------- | --------------- |
-| `@mongodb-js/zstd` | Native | Fastest     | No              |
-| `zstd-napi`        | Native | Fastest     | No              |
-| `zstd-codec`       | WASM   | Good        | Yes             |
+| Library            | Type   | Performance |
+| ------------------ | ------ | ----------- |
+| `@mongodb-js/zstd` | Native | Fastest     |
+| `zstd-napi`        | Native | Fastest     |
+| `zstd-codec`       | WASM   | Good        |
 
-#### @mongodb-js/zstd (Recommended for Node.js)
+#### @mongodb-js/zstd (Recommended)
 
 ```bash
 npm install @mongodb-js/zstd
@@ -155,7 +155,7 @@ import { CompressionType, compressionCodecs, createZstdCodec } from '@kafkats/cl
 compressionCodecs.register(CompressionType.Zstd, createZstdCodec({ compress, decompress }))
 ```
 
-#### zstd-codec (WASM, Browser Compatible)
+#### zstd-codec
 
 ```bash
 npm install zstd-codec
@@ -214,29 +214,28 @@ Make sure the compression codec is registered before consuming messages that use
 
 Choose your compression strategy based on your use case:
 
-| Use Case                    | Recommended  | Why                                    |
-| --------------------------- | ------------ | -------------------------------------- |
-| High throughput, low CPU    | LZ4 or None  | Fastest compression/decompression      |
-| Network-constrained         | Zstd or Gzip | Best compression ratio                 |
-| Balanced workload           | Snappy       | Good mix of speed and compression      |
-| Log/text data               | Gzip or Zstd | Text compresses well with these        |
-| Browser deployment          | Pure JS libs | No native dependencies                 |
+| Use Case                 | Recommended  | Why                               |
+| ------------------------ | ------------ | --------------------------------- |
+| High throughput, low CPU | LZ4 or None  | Fastest compression/decompression |
+| Network-constrained      | Zstd or Gzip | Best compression ratio            |
+| Balanced workload        | Snappy       | Good mix of speed and compression |
+| Log/text data            | Gzip or Zstd | Text compresses well with these   |
 
 ## Supported Libraries Summary
 
 ### Snappy
 - **Native**: [`snappy`](https://www.npmjs.com/package/snappy) - Fastest, napi-rs based
-- **Pure JS**: [`snappyjs`](https://www.npmjs.com/package/snappyjs) - Browser compatible
+- **Pure JS**: [`snappyjs`](https://www.npmjs.com/package/snappyjs)
 
 ### LZ4
 - **Native**: [`lz4-napi`](https://www.npmjs.com/package/lz4-napi) - Fastest, napi-rs based
 - **Native**: [`lz4`](https://www.npmjs.com/package/lz4) - node-lz4, encode/decode API
-- **Pure JS**: [`lz4js`](https://www.npmjs.com/package/lz4js) - Browser compatible
+- **Pure JS**: [`lz4js`](https://www.npmjs.com/package/lz4js)
 
 ### Zstd
 - **Native**: [`@mongodb-js/zstd`](https://www.npmjs.com/package/@mongodb-js/zstd) - MongoDB's binding
 - **Native**: [`zstd-napi`](https://www.npmjs.com/package/zstd-napi) - Node-API binding
-- **WASM**: [`zstd-codec`](https://www.npmjs.com/package/zstd-codec) - Emscripten based, browser compatible
+- **WASM**: [`zstd-codec`](https://www.npmjs.com/package/zstd-codec) - Emscripten based
 
 ## Custom Codecs
 
