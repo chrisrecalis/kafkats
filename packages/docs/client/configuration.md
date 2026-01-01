@@ -38,7 +38,7 @@ const client = new KafkaClient({
 ```typescript
 const producer = client.producer({
 	acks: 'all',
-	compression: 'snappy',
+	compression: 'gzip', // Snappy/LZ4/Zstd require codec registration
 	lingerMs: 5,
 	maxBatchBytes: 16384,
 	retries: 3,
@@ -82,6 +82,10 @@ const producer = client.producer({
 | `'snappy'` | Fast    | Good  | Balanced choice          |
 | `'lz4'`    | Fastest | Good  | Best for high throughput |
 | `'zstd'`   | Medium  | Best  | Modern, efficient        |
+
+::: tip Register codecs
+Gzip is built-in. Register codecs for `'snappy'`, `'lz4'`, or `'zstd'` before enabling them (see [Producer compression](/client/producer#compression)).
+:::
 
 ## Consumer Configuration
 

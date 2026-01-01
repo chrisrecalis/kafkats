@@ -20,12 +20,16 @@ pnpm add @kafkats/client
 ## Quick Example
 
 ```typescript
-import { KafkaClient } from '@kafkats/client'
+import { CompressionType, KafkaClient, compressionCodecs, createSnappyCodec } from '@kafkats/client'
+import snappy from 'snappy'
 
 const client = new KafkaClient({
 	clientId: 'my-app',
 	brokers: ['localhost:9092'],
 })
+
+// Register non-gzip codecs once during startup
+compressionCodecs.register(CompressionType.Snappy, createSnappyCodec(snappy))
 
 // Create a producer
 const producer = client.producer({

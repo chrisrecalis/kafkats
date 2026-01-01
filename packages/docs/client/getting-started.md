@@ -53,7 +53,7 @@ const client = new KafkaClient({
 ```typescript
 const producer = client.producer({
 	acks: 'all', // Wait for all replicas
-	compression: 'snappy', // Compress messages
+	compression: 'gzip', // Use snappy/lz4/zstd after registering a codec
 	lingerMs: 5, // Batch for 5ms
 })
 
@@ -63,6 +63,10 @@ await producer.send('my-topic', [{ value: 'Hello!' }])
 // Close when done
 await producer.disconnect()
 ```
+
+::: tip Compression codecs
+Gzip works out of the box. Register a codec before using `'snappy'`, `'lz4'`, or `'zstd'` (see [Producer compression](/client/producer#compression)).
+:::
 
 See [Producer API](/client/producer) for full documentation.
 

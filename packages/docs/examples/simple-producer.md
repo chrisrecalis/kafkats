@@ -5,7 +5,8 @@ A basic example of producing messages to Kafka.
 ## Code
 
 ```typescript
-import { KafkaClient, topic, string, json } from '@kafkats/client'
+import { CompressionType, KafkaClient, compressionCodecs, createSnappyCodec, topic, string, json } from '@kafkats/client'
+import snappy from 'snappy'
 
 // Define a typed topic
 interface UserEvent {
@@ -25,6 +26,9 @@ async function main() {
 		clientId: 'simple-producer',
 		brokers: ['localhost:9092'],
 	})
+
+	// Register non-gzip codecs once at startup
+	compressionCodecs.register(CompressionType.Snappy, createSnappyCodec(snappy))
 
 	// Create producer
 	const producer = client.producer({

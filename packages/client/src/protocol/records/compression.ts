@@ -8,6 +8,9 @@
 
 import { gzipSync, gunzipSync } from 'node:zlib'
 
+type NodeCallbackCompressionFn = (data: Buffer, callback: (error: unknown, output: Buffer) => void) => unknown
+type CompressionImpl = ((data: Buffer) => Buffer | Promise<Buffer> | undefined) | NodeCallbackCompressionFn
+
 /**
  * Compression type identifiers (stored in RecordBatch attributes)
  */
@@ -40,6 +43,74 @@ export interface CompressionCodec {
 export interface SyncCompressionCodec extends CompressionCodec {
 	compressSync(data: Buffer): Buffer
 	decompressSync(data: Buffer): Buffer
+}
+
+function normalizeCompressionFn(fn: CompressionImpl, context: unknown): (data: Buffer) => Promise<Buffer> {
+	return async (data: Buffer) => {
+		try {
+			const result = (fn as (data: Buffer) => Buffer | Promise<Buffer> | undefined).call(context, data)
+			if (result !== undefined) {
+				return await Promise.resolve(result)
+			}
+		} catch (error) {
+			if (fn.length < 2) {
+				throw error
+			}
+			return new Promise<Buffer>((resolve, reject) => {
+				try {
+					;(fn as NodeCallbackCompressionFn).call(context, data, (callbackError, output) => {
+						if (callbackError) {
+							reject(callbackError)
+							return
+						}
+						resolve(output)
+					})
+				} catch (callbackError) {
+					reject(callbackError)
+				}
+			})
+		}
+
+		if (fn.length >= 2) {
+			return new Promise<Buffer>((resolve, reject) => {
+				try {
+					;(fn as NodeCallbackCompressionFn).call(context, data, (error, output) => {
+						if (error) {
+							reject(error)
+							return
+						}
+						resolve(output)
+					})
+				} catch (error) {
+					reject(error)
+				}
+			})
+		}
+
+		throw new Error('Compression function returned undefined')
+	}
+}
+
+function pickCompressionFn(
+	implementation: unknown,
+	candidates: string[],
+	codecName: string,
+	role: 'compress' | 'decompress'
+): (data: Buffer) => Promise<Buffer> {
+	for (const target of [implementation, (implementation as { default?: unknown })?.default]) {
+		if (!target || typeof target !== 'object' && typeof target !== 'function') {
+			continue
+		}
+
+		for (const name of candidates) {
+			const candidate = (target as Record<string, unknown>)[name]
+			if (typeof candidate === 'function') {
+				return normalizeCompressionFn(candidate as CompressionImpl, target)
+			}
+		}
+	}
+
+	throw new Error(`${codecName} implementation is missing a ${role} function`)
 }
 
 /**
@@ -138,14 +209,36 @@ export const compressionCodecs = new CodecRegistry()
  * import snappy from 'snappy'
  * compressionCodecs.register(CompressionType.Snappy, createSnappyCodec(snappy))
  * ```
+ *
+ * Supports callback-based implementations (e.g., 'snappy') and N-API builds such as '@kafkajs/snappy'.
  */
-export function createSnappyCodec(snappy: {
-	compress: (data: Buffer) => Promise<Buffer>
-	uncompress: (data: Buffer) => Promise<Buffer>
-}): CompressionCodec {
+export function createSnappyCodec(
+	snappy: {
+		compress?: CompressionImpl
+		compressAsync?: CompressionImpl
+		compressSync?: CompressionImpl
+		decompress?: CompressionImpl
+		decompressSync?: CompressionImpl
+		uncompress?: CompressionImpl
+		uncompressSync?: CompressionImpl
+	} = {}
+): CompressionCodec {
+	const compress = pickCompressionFn(
+		snappy,
+		['compress', 'compressAsync', 'compressSync'],
+		'Snappy',
+		'compress'
+	)
+	const decompress = pickCompressionFn(
+		snappy,
+		['uncompress', 'decompress', 'uncompressAsync', 'decompressAsync', 'decompressSync', 'uncompressSync'],
+		'Snappy',
+		'decompress'
+	)
+
 	return {
-		compress: snappy.compress,
-		decompress: snappy.uncompress,
+		compress,
+		decompress,
 	}
 }
 
@@ -160,18 +253,38 @@ export function createSnappyCodec(snappy: {
  * import lz4 from 'lz4'
  * compressionCodecs.register(CompressionType.Lz4, createLz4Codec(lz4))
  * ```
+ *
+ * Works with sync JavaScript implementations as well as native/N-API builds like 'lz4-napi'.
  */
-export function createLz4Codec(lz4: {
-	encode: (data: Buffer) => Buffer
-	decode: (data: Buffer) => Buffer
-}): CompressionCodec {
+export function createLz4Codec(
+	lz4: {
+		compress?: CompressionImpl
+		compressSync?: CompressionImpl
+		decompress?: CompressionImpl
+		decompressSync?: CompressionImpl
+		decompressBlock?: CompressionImpl
+		uncompress?: CompressionImpl
+		uncompressSync?: CompressionImpl
+		encode?: CompressionImpl
+		decode?: CompressionImpl
+	} = {}
+): CompressionCodec {
+	const compress = pickCompressionFn(
+		lz4,
+		['encode', 'compress', 'compressSync'],
+		'LZ4',
+		'compress'
+	)
+	const decompress = pickCompressionFn(
+		lz4,
+		['decode', 'decompress', 'uncompress', 'decompressSync', 'uncompressSync', 'decompressBlock'],
+		'LZ4',
+		'decompress'
+	)
+
 	return {
-		compress(data: Buffer): Promise<Buffer> {
-			return Promise.resolve(lz4.encode(data))
-		},
-		decompress(data: Buffer): Promise<Buffer> {
-			return Promise.resolve(lz4.decode(data))
-		},
+		compress,
+		decompress,
 	}
 }
 
@@ -186,14 +299,35 @@ export function createLz4Codec(lz4: {
  * import { compress, decompress } from '@mongodb-js/zstd'
  * compressionCodecs.register(CompressionType.Zstd, createZstdCodec({ compress, decompress }))
  * ```
+ *
+ * Compatible with WASM implementations (e.g., '@mongodb-js/zstd') and N-API libraries such as '@kafkajs/zstd'.
  */
-export function createZstdCodec(zstd: {
-	compress: (data: Buffer, level?: number) => Promise<Buffer>
-	decompress: (data: Buffer) => Promise<Buffer>
-}): CompressionCodec {
+export function createZstdCodec(
+	zstd: {
+		compress?: CompressionImpl
+		compressSync?: CompressionImpl
+		compressAsync?: CompressionImpl
+		decompress?: CompressionImpl
+		decompressSync?: CompressionImpl
+		decompressAsync?: CompressionImpl
+	} = {}
+): CompressionCodec {
+	const compress = pickCompressionFn(
+		zstd,
+		['compress', 'compressAsync', 'compressSync'],
+		'Zstd',
+		'compress'
+	)
+	const decompress = pickCompressionFn(
+		zstd,
+		['decompress', 'decompressAsync', 'decompressSync'],
+		'Zstd',
+		'decompress'
+	)
+
 	return {
-		compress: (data: Buffer) => zstd.compress(data),
-		decompress: zstd.decompress,
+		compress,
+		decompress,
 	}
 }
 

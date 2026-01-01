@@ -16,7 +16,7 @@ const client = new KafkaClient({
 
 const producer = client.producer({
 	acks: 'all', // Wait for all replicas
-	compression: 'snappy', // Compress batches
+	compression: 'gzip', // Snappy/LZ4/Zstd require codec registration
 	lingerMs: 5, // Batch for 5ms
 })
 ```
@@ -174,10 +174,27 @@ await producer.flush()
 Enable compression to reduce network bandwidth:
 
 ```typescript
+import { CompressionType, compressionCodecs, createLz4Codec, createSnappyCodec, createZstdCodec } from '@kafkats/client'
+import snappy from 'snappy' // or '@kafkajs/snappy'
+import lz4 from 'lz4' // or 'lz4-napi'
+import { compress, decompress } from '@mongodb-js/zstd' // or '@kafkajs/zstd'
+
+// Register codecs once during startup (gzip is built-in)
+compressionCodecs.register(CompressionType.Snappy, createSnappyCodec(snappy))
+compressionCodecs.register(CompressionType.Lz4, createLz4Codec(lz4))
+compressionCodecs.register(CompressionType.Zstd, createZstdCodec({ compress, decompress }))
+
+// Assuming `client` is already created
 const producer = client.producer({
 	compression: 'snappy', // Also: 'gzip', 'lz4', 'zstd', 'none'
 })
 ```
+
+Supported compression libraries:
+
+- **Snappy** — `snappy` (callback-based) or `@kafkajs/snappy` (N-API)
+- **LZ4** — `lz4` (sync) or `lz4-napi` (native/N-API)
+- **Zstd** — `@mongodb-js/zstd` (WASM) or `@kafkajs/zstd` (N-API)
 
 | Type       | Speed     | Compression Ratio |
 | ---------- | --------- | ----------------- |
