@@ -78,10 +78,12 @@ const producer = client.producer({
 | Type       | Speed   | Ratio | Notes                    |
 | ---------- | ------- | ----- | ------------------------ |
 | `'none'`   | Fastest | 1:1   | No compression           |
-| `'gzip'`   | Slow    | Best  | Good for text            |
+| `'gzip'`   | Slow    | Best  | Good for text, built-in  |
 | `'snappy'` | Fast    | Good  | Balanced choice          |
 | `'lz4'`    | Fastest | Good  | Best for high throughput |
 | `'zstd'`   | Medium  | Best  | Modern, efficient        |
+
+GZIP is built-in. For Snappy, LZ4, and Zstd, you need to install and register a compression library. See [Compression](/client/compression) for supported libraries.
 
 ## Consumer Configuration
 

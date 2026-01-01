@@ -13,8 +13,8 @@ describe('compression registry', () => {
 	it('registers and retrieves codecs', async () => {
 		const payload = Buffer.from('hello')
 		const snappy = createSnappyCodec({
-			compress: async data => data,
-			uncompress: async data => data,
+			compress: async (data: Buffer | Uint8Array | string) => Buffer.from(data),
+			uncompress: async (data: Buffer) => data,
 		})
 		compressionCodecs.register(CompressionType.Snappy, snappy)
 
@@ -60,8 +60,8 @@ describe('compression registry', () => {
 
 	it('creates a Zstd codec from async functions', async () => {
 		const codec = createZstdCodec({
-			compress: async data => data,
-			decompress: async data => data,
+			compress: async (data: Buffer) => data,
+			decompress: async (data: Buffer) => data,
 		})
 		const payload = Buffer.from('zstd')
 		const compressed = await codec.compress(payload)
