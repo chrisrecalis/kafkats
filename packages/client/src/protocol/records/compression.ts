@@ -301,14 +301,6 @@ export interface ZstdNativeAsyncLib {
 }
 
 /**
- * Zstd library interface for WASM/sync libraries (e.g., '@oneidentity/zstd-js' ZstdSimple)
- */
-export interface ZstdWasmLib {
-	compress: (data: Uint8Array, level?: number) => Uint8Array
-	decompress: (data: Uint8Array) => Uint8Array
-}
-
-/**
  * Zstd library interface for zstd-codec (Simple API after initialization)
  */
 export interface ZstdCodecSimpleLib {
@@ -319,7 +311,7 @@ export interface ZstdCodecSimpleLib {
 /**
  * Union type for all supported Zstd library interfaces
  */
-export type ZstdLib = ZstdNativeAsyncLib | ZstdWasmLib | ZstdCodecSimpleLib
+export type ZstdLib = ZstdNativeAsyncLib | ZstdCodecSimpleLib
 
 /**
  * Options for creating a Zstd codec
@@ -338,10 +330,9 @@ export interface ZstdCodecOptions {
  * Supports the following libraries:
  * - **Native**: `@mongodb-js/zstd` - MongoDB's native Zstd binding
  * - **Native**: `zstd-napi` - Native Zstd using Node-API
- * - **WASM**: `@oneidentity/zstd-js` - ZstdSimple or ZstdStream from init
  * - **WASM**: `zstd-codec` - Zstd codec powered by Emscripten
  *
- * @param zstd - The Zstd library instance (or ZstdSimple/ZstdStream from @oneidentity/zstd-js)
+ * @param zstd - The Zstd library instance
  * @param options - Optional configuration
  * @returns A compression codec
  *
@@ -355,13 +346,6 @@ export interface ZstdCodecOptions {
  * ```typescript
  * import { compress, decompress } from 'zstd-napi'
  * compressionCodecs.register(CompressionType.Zstd, createZstdCodec({ compress, decompress }))
- * ```
- *
- * @example @oneidentity/zstd-js (WASM)
- * ```typescript
- * import { ZstdInit } from '@oneidentity/zstd-js'
- * const { ZstdSimple } = await ZstdInit()
- * compressionCodecs.register(CompressionType.Zstd, createZstdCodec(ZstdSimple))
  * ```
  *
  * @example zstd-codec (WASM)
@@ -388,8 +372,8 @@ export function createZstdCodec(zstd: ZstdLib, options?: ZstdCodecOptions): Comp
 			decompress: asyncLib.decompress,
 		}
 	} else {
-		// WASM/sync library (@oneidentity/zstd-js, zstd-codec)
-		const syncLib = zstd as ZstdWasmLib
+		// WASM/sync library (zstd-codec)
+		const syncLib = zstd as ZstdCodecSimpleLib
 		return {
 			compress(data: Buffer): Promise<Buffer> {
 				const result = syncLib.compress(data, level)

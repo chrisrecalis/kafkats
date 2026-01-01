@@ -123,12 +123,11 @@ compressionCodecs.register(CompressionType.Lz4, createLz4Codec(lz4js))
 
 ### Zstd
 
-| Library              | Type   | Performance | Browser Support |
-| -------------------- | ------ | ----------- | --------------- |
-| `@mongodb-js/zstd`   | Native | Fastest     | No              |
-| `zstd-napi`          | Native | Fastest     | No              |
-| `@oneidentity/zstd-js` | WASM | Good        | Yes             |
-| `zstd-codec`         | WASM   | Good        | Yes             |
+| Library            | Type   | Performance | Browser Support |
+| ------------------ | ------ | ----------- | --------------- |
+| `@mongodb-js/zstd` | Native | Fastest     | No              |
+| `zstd-napi`        | Native | Fastest     | No              |
+| `zstd-codec`       | WASM   | Good        | Yes             |
 
 #### @mongodb-js/zstd (Recommended for Node.js)
 
@@ -154,21 +153,6 @@ import { compress, decompress } from 'zstd-napi'
 import { CompressionType, compressionCodecs, createZstdCodec } from '@kafkats/client'
 
 compressionCodecs.register(CompressionType.Zstd, createZstdCodec({ compress, decompress }))
-```
-
-#### @oneidentity/zstd-js (WASM, Browser Compatible)
-
-```bash
-npm install @oneidentity/zstd-js
-```
-
-```typescript
-import { ZstdInit } from '@oneidentity/zstd-js'
-import { CompressionType, compressionCodecs, createZstdCodec } from '@kafkats/client'
-
-// Initialize WASM module first
-const { ZstdSimple } = await ZstdInit()
-compressionCodecs.register(CompressionType.Zstd, createZstdCodec(ZstdSimple))
 ```
 
 #### zstd-codec (WASM, Browser Compatible)
@@ -252,8 +236,7 @@ Choose your compression strategy based on your use case:
 ### Zstd
 - **Native**: [`@mongodb-js/zstd`](https://www.npmjs.com/package/@mongodb-js/zstd) - MongoDB's binding
 - **Native**: [`zstd-napi`](https://www.npmjs.com/package/zstd-napi) - Node-API binding
-- **WASM**: [`@oneidentity/zstd-js`](https://www.npmjs.com/package/@oneidentity/zstd-js) - Browser compatible
-- **WASM**: [`zstd-codec`](https://www.npmjs.com/package/zstd-codec) - Emscripten based
+- **WASM**: [`zstd-codec`](https://www.npmjs.com/package/zstd-codec) - Emscripten based, browser compatible
 
 ## Custom Codecs
 
