@@ -141,6 +141,30 @@ import {
 	type DeleteGroupsRequest,
 } from '@/protocol/messages/requests/delete-groups.js'
 import { decodeDeleteGroupsResponse, type DeleteGroupsResponse } from '@/protocol/messages/responses/delete-groups.js'
+import {
+	encodeShareGroupHeartbeatRequest,
+	SHARE_GROUP_HEARTBEAT_VERSIONS,
+	type ShareGroupHeartbeatRequest,
+} from '@/protocol/messages/requests/share-group-heartbeat.js'
+import {
+	decodeShareGroupHeartbeatResponse,
+	type ShareGroupHeartbeatResponse,
+} from '@/protocol/messages/responses/share-group-heartbeat.js'
+import {
+	encodeShareFetchRequest,
+	SHARE_FETCH_VERSIONS,
+	type ShareFetchRequest,
+} from '@/protocol/messages/requests/share-fetch.js'
+import { decodeShareFetchResponse, type ShareFetchResponse } from '@/protocol/messages/responses/share-fetch.js'
+import {
+	encodeShareAcknowledgeRequest,
+	SHARE_ACKNOWLEDGE_VERSIONS,
+	type ShareAcknowledgeRequest,
+} from '@/protocol/messages/requests/share-acknowledge.js'
+import {
+	decodeShareAcknowledgeResponse,
+	type ShareAcknowledgeResponse,
+} from '@/protocol/messages/responses/share-acknowledge.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import { UnsupportedVersionError, KafkaProtocolError } from './errors.js'
 import type { BrokerConfig, VersionRange } from './types.js'
@@ -172,6 +196,9 @@ const CLIENT_API_VERSIONS: Partial<Record<ApiKey, { min: number; max: number }>>
 	[ApiKey.ListGroups]: LIST_GROUPS_VERSIONS,
 	[ApiKey.DescribeGroups]: DESCRIBE_GROUPS_VERSIONS,
 	[ApiKey.DeleteGroups]: DELETE_GROUPS_VERSIONS,
+	[ApiKey.ShareGroupHeartbeat]: SHARE_GROUP_HEARTBEAT_VERSIONS,
+	[ApiKey.ShareFetch]: SHARE_FETCH_VERSIONS,
+	[ApiKey.ShareAcknowledge]: SHARE_ACKNOWLEDGE_VERSIONS,
 }
 
 /**
@@ -758,6 +785,74 @@ export class Broker {
 
 		const durationMs = Date.now() - startTime
 		this.logger.debug('received response', { api: 'DeleteGroups', version, durationMs })
+		return response
+	}
+
+	async shareGroupHeartbeat(request: ShareGroupHeartbeatRequest): Promise<ShareGroupHeartbeatResponse> {
+		const version = this.getApiVersion(ApiKey.ShareGroupHeartbeat)
+		const startTime = Date.now()
+		this.logger.debug('sending request', { api: 'ShareGroupHeartbeat', version, groupId: request.groupId })
+
+		const responseBuffer = await this.connection.send(ApiKey.ShareGroupHeartbeat, version, encoder => {
+			encodeShareGroupHeartbeatRequest(encoder, version, request)
+		})
+
+		const decoder = new Decoder(responseBuffer)
+		decodeResponseHeader(decoder, ApiKey.ShareGroupHeartbeat, version)
+		let response: ShareGroupHeartbeatResponse
+		try {
+			response = decodeShareGroupHeartbeatResponse(decoder, version)
+		} catch (error) {
+			if (process.env.KAFKA_TS_DEBUG_SHARE_GROUP_HEARTBEAT === '1') {
+				const err = error instanceof Error ? error : new Error(String(error))
+				const maxHexBytes = 512
+				const hex = responseBuffer.subarray(0, maxHexBytes).toString('hex')
+				throw new Error(
+					`failed to decode ShareGroupHeartbeat response (v${version}, bytes=${responseBuffer.length}, offset=${decoder.offset()}, remaining=${decoder.remaining()}): ${err.message}; hex[0..${maxHexBytes}]=${hex}`,
+					{ cause: err }
+				)
+			}
+			throw error
+		}
+
+		const durationMs = Date.now() - startTime
+		this.logger.debug('received response', { api: 'ShareGroupHeartbeat', version, durationMs })
+		return response
+	}
+
+	async shareFetch(request: ShareFetchRequest): Promise<ShareFetchResponse> {
+		const version = this.getApiVersion(ApiKey.ShareFetch)
+		const startTime = Date.now()
+		this.logger.debug('sending request', { api: 'ShareFetch', version })
+
+		const responseBuffer = await this.fetchConnection.send(ApiKey.ShareFetch, version, encoder => {
+			encodeShareFetchRequest(encoder, version, request)
+		})
+
+		const decoder = new Decoder(responseBuffer)
+		decodeResponseHeader(decoder, ApiKey.ShareFetch, version)
+		const response = decodeShareFetchResponse(decoder, version)
+
+		const durationMs = Date.now() - startTime
+		this.logger.debug('received response', { api: 'ShareFetch', version, durationMs })
+		return response
+	}
+
+	async shareAcknowledge(request: ShareAcknowledgeRequest): Promise<ShareAcknowledgeResponse> {
+		const version = this.getApiVersion(ApiKey.ShareAcknowledge)
+		const startTime = Date.now()
+		this.logger.debug('sending request', { api: 'ShareAcknowledge', version })
+
+		const responseBuffer = await this.connection.send(ApiKey.ShareAcknowledge, version, encoder => {
+			encodeShareAcknowledgeRequest(encoder, version, request)
+		})
+
+		const decoder = new Decoder(responseBuffer)
+		decodeResponseHeader(decoder, ApiKey.ShareAcknowledge, version)
+		const response = decodeShareAcknowledgeResponse(decoder, version)
+
+		const durationMs = Date.now() - startTime
+		this.logger.debug('received response', { api: 'ShareAcknowledge', version, durationMs })
 		return response
 	}
 

@@ -82,6 +82,27 @@ await consumer.runEach('my-topic', async (message, ctx) => {
 
 See [Consumer API](/client/consumer) for full documentation.
 
+## Creating a ShareConsumer (experimental)
+
+Kafka Share Groups (KIP-932) provide queue-like consumption with per-record acknowledgements.
+
+```typescript
+const shareConsumer = client.shareConsumer({
+	groupId: 'my-share-group',
+})
+
+await shareConsumer.runEach('my-topic', async message => {
+	// For string topic subscriptions, key/value are raw Buffers (same as Consumer).
+	await process(message.value.toString('utf-8'))
+
+	// If you don't call ack/release/reject, the message is implicitly ack'd (ACCEPT) on success.
+	// await message.release()
+	// await message.reject()
+})
+```
+
+See [ShareConsumer API](/client/share-consumer) for requirements and full documentation.
+
 ## Typed Topics
 
 Define topics with type-safe codecs:

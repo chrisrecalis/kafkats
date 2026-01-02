@@ -33,7 +33,7 @@ export type {
 } from '@/producer/index.js'
 
 // Consumer
-export { Consumer } from '@/consumer/index.js'
+export { Consumer, ShareConsumer } from '@/consumer/index.js'
 export type {
 	ConsumerConfig,
 	TopicSubscription,
@@ -43,6 +43,12 @@ export type {
 	BatchHandler,
 	RunEachOptions,
 	RunBatchOptions,
+	ShareConsumerConfig,
+	ShareSubscriptionInput,
+	ShareMessage,
+	ShareMessageHandler,
+	ShareRunEachOptions,
+	ShareConsumerEvents,
 } from '@/consumer/index.js'
 
 // Admin
@@ -86,6 +92,8 @@ export type {
 export {
 	KafkaError,
 	KafkaProtocolError,
+	KafkaFeatureUnsupportedError,
+	KafkaFeatureDisabledError,
 	LeaderNotAvailableError,
 	CoordinatorNotAvailableError,
 	NotCoordinatorError,

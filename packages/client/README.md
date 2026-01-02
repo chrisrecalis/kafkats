@@ -7,6 +7,7 @@ A pure-protocol TypeScript Kafka client with producer, consumer, and admin APIs.
 - **Pure TypeScript** — Direct protocol implementation, not a wrapper
 - **Producer** — Batching, compression (gzip, snappy, lz4, zstd), custom partitioners
 - **Consumer** — Consumer groups, partition assignment, offset management
+- **ShareConsumer (experimental)** — Share Groups (KIP-932) with per-record acknowledgements
 - **Admin** — Topic management, consumer groups, cluster metadata
 - **SASL Auth** — PLAIN, SCRAM-SHA-256, SCRAM-SHA-512
 - **Typed Codecs** — Built-in string, JSON, and buffer codecs
@@ -34,6 +35,13 @@ const consumer = client.consumer({ groupId: 'my-group' })
 await consumer.runEach('events', async (message, ctx) => {
 	console.log(message.value?.toString())
 })
+
+// ShareConsumer (experimental)
+const shareConsumer = client.shareConsumer({ groupId: 'my-share-group' })
+	await shareConsumer.runEach('events', async message => {
+		console.log(message.value?.toString())
+		// If you don't call ack/release/reject, the message is implicitly ack'd (ACCEPT) on success.
+	})
 
 // Admin
 const admin = client.admin()

@@ -119,6 +119,10 @@ export enum ErrorCode {
 	FetchSessionTopicIdError = 106,
 	IneligibleReplica = 107,
 	NewLeaderElected = 108,
+	InvalidRecordState = 121,
+	ShareSessionNotFound = 122,
+	InvalidShareSessionEpoch = 123,
+	ShareSessionLimitReached = 133,
 }
 
 /**
@@ -142,6 +146,8 @@ const RETRIABLE_ERRORS = new Set<ErrorCode>([
 	ErrorCode.KafkaStorageError,
 	ErrorCode.FetchSessionIdNotFound,
 	ErrorCode.InvalidFetchSessionEpoch,
+	ErrorCode.ShareSessionNotFound,
+	ErrorCode.InvalidShareSessionEpoch,
 	ErrorCode.ListenerNotFound,
 	ErrorCode.FencedLeaderEpoch,
 	ErrorCode.UnknownLeaderEpoch,
@@ -217,6 +223,11 @@ export function getErrorMessage(code: ErrorCode): string {
 		[ErrorCode.MemberIdRequired]:
 			'The group member needs to have a valid member id before actually entering a consumer group',
 		[ErrorCode.FencedInstanceId]: 'The member with the given instance id has been fenced',
+		[ErrorCode.InvalidRecordState]:
+			'The record state is invalid. The acknowledgement of delivery could not be completed',
+		[ErrorCode.ShareSessionNotFound]: 'The share session was not found',
+		[ErrorCode.InvalidShareSessionEpoch]: 'The share session epoch is invalid',
+		[ErrorCode.ShareSessionLimitReached]: 'The limit of share sessions has been reached',
 	}
 
 	return messages[code] ?? `Unknown error code: ${code}`
