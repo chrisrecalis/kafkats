@@ -255,6 +255,6 @@ export const DEFAULT_SHARE_CONSUMER_CONFIG: Required<
 export const DEFAULT_SHARE_RUN_EACH_OPTIONS: Required<Pick<ShareRunEachOptions, 'concurrency'>> &
 	Required<Pick<ShareRunEachOptions, 'ackBatchSize' | 'idleBackoffMs'>> = {
 	concurrency: 10,
-	ackBatchSize: 100,
+	ackBatchSize: 1000,
 	idleBackoffMs: 200,
 }

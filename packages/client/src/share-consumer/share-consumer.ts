@@ -687,10 +687,12 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 					continue
 				}
 
+				const acquiredRecords = partitionResponse.acquiredRecords
+
 				for (const record of records) {
 					if (signal.aborted || this.state !== 'running') break
 
-					const range = partitionResponse.acquiredRecords.find(
+					const range = acquiredRecords.find(
 						r => record.offset >= r.firstOffset && record.offset <= r.lastOffset
 					)
 
@@ -721,67 +723,54 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 			return 0
 		}
 
-		const ctx: ConsumeContext = {
-			signal,
-			topic: item.topicName,
-			partition: item.partitionIndex,
-			offset: item.record.offset,
-		}
-
-		let acked = false
-		let released = false
-		let rejected = false
-		const createAlreadyHandledError = () =>
-			new Error(`Share message ${item.topicName}[${item.partitionIndex}]@${item.record.offset} already handled`)
-
-		const ack = async () => {
-			if (acked || released || rejected) {
-				throw createAlreadyHandledError()
-			}
-			acked = true
-			await ackManager.enqueue(item.topicName, item.topicId, item.partitionIndex, item.record.offset, ACK_ACCEPT)
-		}
-
-		const release = async () => {
-			if (acked || released || rejected) {
-				throw createAlreadyHandledError()
-			}
-			released = true
-			await ackManager.enqueue(item.topicName, item.topicId, item.partitionIndex, item.record.offset, ACK_RELEASE)
-		}
-
-		const reject = async () => {
-			if (acked || released || rejected) {
-				throw createAlreadyHandledError()
-			}
-			rejected = true
-			await ackManager.enqueue(item.topicName, item.topicId, item.partitionIndex, item.record.offset, ACK_REJECT)
-		}
+		let handled = 0 // 0=none, 1=acked, 2=released, 3=rejected
+		const { topicName, topicId, partitionIndex, record } = item
 
 		const message: ShareMessage<unknown, unknown> = {
-			topic: item.topicName,
-			partition: item.partitionIndex,
-			offset: item.record.offset,
-			timestamp: item.record.timestamp,
-			key: item.record.key === null ? null : item.keyDecoder(item.record.key),
-			value: item.record.value === null ? null : item.decoder(item.record.value ?? EMPTY_BUFFER),
-			headers: convertHeaders(item.record.headers),
-			ack,
-			release,
-			reject,
+			topic: topicName,
+			partition: partitionIndex,
+			offset: record.offset,
+			timestamp: record.timestamp,
+			key: record.key === null ? null : item.keyDecoder(record.key),
+			value: record.value === null ? null : item.decoder(record.value ?? EMPTY_BUFFER),
+			headers: convertHeaders(record.headers),
+			ack: async () => {
+				if (handled !== 0) {
+					throw new Error(`Share message ${topicName}[${partitionIndex}]@${record.offset} already handled`)
+				}
+				handled = 1
+				await ackManager.enqueue(topicName, topicId, partitionIndex, record.offset, ACK_ACCEPT)
+			},
+			release: async () => {
+				if (handled !== 0) {
+					throw new Error(`Share message ${topicName}[${partitionIndex}]@${record.offset} already handled`)
+				}
+				handled = 2
+				await ackManager.enqueue(topicName, topicId, partitionIndex, record.offset, ACK_RELEASE)
+			},
+			reject: async () => {
+				if (handled !== 0) {
+					throw new Error(`Share message ${topicName}[${partitionIndex}]@${record.offset} already handled`)
+				}
+				handled = 3
+				await ackManager.enqueue(topicName, topicId, partitionIndex, record.offset, ACK_REJECT)
+			},
 		}
 
 		if (item.deliveryCount !== undefined) {
 			message.deliveryCount = item.deliveryCount
 		}
 
-		await handler(message, ctx)
+		await handler(message, {
+			signal,
+			topic: topicName,
+			partition: partitionIndex,
+			offset: record.offset,
+		})
 
-		if (!acked && !released && !rejected && autoAckOnSuccess) {
-			acked = true
-			void ackManager
-				.enqueue(item.topicName, item.topicId, item.partitionIndex, item.record.offset, ACK_ACCEPT)
-				.catch(() => {})
+		if (handled === 0 && autoAckOnSuccess) {
+			handled = 1
+			void ackManager.enqueue(topicName, topicId, partitionIndex, record.offset, ACK_ACCEPT).catch(() => {})
 		}
 
 		return 1

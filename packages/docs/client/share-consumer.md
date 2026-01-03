@@ -164,17 +164,17 @@ await shareConsumer.runEach(userEvents, async message => {
 | Option         | Type          | Default | Description                                       |
 | -------------- | ------------- | ------- | ------------------------------------------------- |
 | `concurrency`  | `number`      | `10`    | Max records processed simultaneously              |
-| `ackBatchSize` | `number`      | `100`   | Flush acknowledgements when this many are pending |
+| `ackBatchSize` | `number`      | `1000`  | Flush acknowledgements when this many are pending |
 | `idleBackoffMs`| `number`      | `200`   | Backoff when no records are returned              |
 | `signal`       | `AbortSignal` | -       | Abort to stop the consumer                        |
 
 ::: details ackBatchSize tuning
-Acknowledgements are batched to reduce network overhead. With concurrent processing, fast handlers queue acks while slow handlers are still running. `ackBatchSize` controls when to flush pending acks without waiting for all handlers to complete.
+Acknowledgements are batched and coalesced to reduce network overhead. Consecutive offsets with the same acknowledgement type are combined into ranges before sending.
 
-- **Lower values** (e.g., 20): Acks sent sooner, reducing risk of lock timeout for slow handlers, but more network requests
-- **Higher values** (e.g., 500): Fewer requests, but acks delayed longer
+- **Lower values** (e.g., 100): Acks sent sooner, reducing risk of lock timeout for slow handlers, but more network requests
+- **Higher values** (e.g., 2000): Fewer requests, but acks delayed longer
 
-The default (100) works well for most workloads.
+The default (1000) works well for most workloads.
 :::
 
 ## Concurrency
@@ -238,7 +238,27 @@ shareConsumer.on('error', error => {
 })
 ```
 
+## When to Use Share Groups
+
+Share Groups decouple parallelism from partition count. They excel when:
+
+- **Message processing takes time** (10ms+): With regular consumer groups, concurrency is limited to partition count. Share Groups can process many messages concurrently regardless of partitions.
+- **You need queue-like semantics**: Messages are delivered to any available consumer, not tied to specific partitions.
+- **Ordering is not required**: Share Groups do not guarantee order.
+
+### Performance Comparison
+
+With 3 partitions, 20ms processing time per message, and 20 concurrent handlers:
+
+| Consumer Type | Throughput | Why |
+| ------------- | ---------- | --- |
+| Regular Consumer | ~50 msg/s | Limited to 3 concurrent (one per partition) |
+| Share Consumer | ~650 msg/s | 20 concurrent handlers |
+
+For trivial handlers (0ms processing), regular consumers may be faster due to lower protocol overhead.
+
 ## Limitations
 
 - No dead-letter queue / retry policy helpers
 - Share Groups do not support static membership
+- Requires Kafka 4.1+ with Share Groups enabled

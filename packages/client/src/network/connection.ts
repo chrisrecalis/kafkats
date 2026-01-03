@@ -48,6 +48,7 @@ export class Connection extends EventEmitter<ConnectionEvents> {
 	private readonly frameDecoder = new KafkaFrameDecoder()
 
 	private _state: ConnectionState = 'disconnected'
+	private connectPromise: Promise<void> | null = null
 
 	readonly host: string
 	readonly port: number
@@ -102,14 +103,30 @@ export class Connection extends EventEmitter<ConnectionEvents> {
 	 * Establish connection to the broker
 	 */
 	async connect(): Promise<void> {
-		if (this._state === 'connected' || this._state === 'connecting') {
+		// Already connected
+		if (this._state === 'connected') {
 			return
+		}
+
+		// Connection in progress - wait for it
+		if (this._state === 'connecting' && this.connectPromise) {
+			return this.connectPromise
 		}
 
 		this._state = 'connecting'
 		const startTime = Date.now()
 		this.logger.debug('connecting')
 
+		this.connectPromise = this.doConnect(startTime)
+
+		try {
+			await this.connectPromise
+		} finally {
+			this.connectPromise = null
+		}
+	}
+
+	private async doConnect(startTime: number): Promise<void> {
 		try {
 			this.socket = await this.socketFactory.connect(this.host, this.port)
 

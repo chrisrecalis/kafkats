@@ -16,7 +16,8 @@ export const ACK_REJECT = 3
 export type AcknowledgeType = typeof ACK_ACCEPT | typeof ACK_RELEASE | typeof ACK_REJECT
 
 type PendingAckEntry = {
-	batch: ShareAcknowledgeRequestPartition['acknowledgementBatches'][number]
+	offset: bigint
+	type: AcknowledgeType
 	resolve: () => void
 	reject: (error: Error) => void
 }
@@ -30,10 +31,67 @@ type PendingPartitionAcks = {
 	entries: PendingAckEntry[]
 }
 
+/**
+ * Coalesce sorted ack entries into ranges where consecutive offsets have the same type.
+ * This reduces the number of acknowledgement batches sent to the broker.
+ */
+function coalesceAckEntries(entries: PendingAckEntry[]): {
+	batches: ShareAcknowledgeRequestPartition['acknowledgementBatches']
+	entriesByBatch: PendingAckEntry[][]
+} {
+	if (entries.length === 0) {
+		return { batches: [], entriesByBatch: [] }
+	}
+
+	// Sort by offset
+	const sorted = [...entries].sort((a, b) => (a.offset < b.offset ? -1 : a.offset > b.offset ? 1 : 0))
+
+	const batches: ShareAcknowledgeRequestPartition['acknowledgementBatches'] = []
+	const entriesByBatch: PendingAckEntry[][] = []
+
+	let currentBatch: (typeof batches)[number] | null = null
+	let currentEntries: PendingAckEntry[] = []
+
+	for (const entry of sorted) {
+		if (
+			currentBatch === null ||
+			entry.type !== currentBatch.acknowledgeTypes[0] ||
+			entry.offset !== currentBatch.lastOffset + 1n
+		) {
+			// Start a new batch
+			if (currentBatch !== null) {
+				batches.push(currentBatch)
+				entriesByBatch.push(currentEntries)
+			}
+			currentBatch = {
+				firstOffset: entry.offset,
+				lastOffset: entry.offset,
+				acknowledgeTypes: [entry.type],
+			}
+			currentEntries = [entry]
+		} else {
+			// Extend current batch
+			currentBatch.lastOffset = entry.offset
+			currentEntries.push(entry)
+		}
+	}
+
+	if (currentBatch !== null) {
+		batches.push(currentBatch)
+		entriesByBatch.push(currentEntries)
+	}
+
+	return { batches, entriesByBatch }
+}
+
+/** Delay before flushing acks to allow batching (ms) */
+const ACK_FLUSH_DELAY_MS = 5
+
 export class AckManager {
 	private pendingByPartitionKey = new Map<string, PendingPartitionAcks>()
-	private scheduled = false
+	private scheduledTimer: ReturnType<typeof setTimeout> | null = null
 	private flushing: Promise<void> | null = null
+	private totalPending = 0
 
 	constructor(
 		private readonly groupId: string,
@@ -68,7 +126,6 @@ export class AckManager {
 			this.pendingByPartitionKey.set(key, pending)
 		}
 		pending.topicName = topicName
-		const entries = pending.entries
 
 		let resolve!: () => void
 		let reject!: (error: Error) => void
@@ -77,18 +134,17 @@ export class AckManager {
 			reject = rej
 		})
 
-		entries.push({
-			batch: {
-				firstOffset: offset,
-				lastOffset: offset,
-				acknowledgeTypes: [type],
-			},
+		pending.entries.push({
+			offset,
+			type,
 			resolve,
 			reject,
 		})
+		this.totalPending++
 
-		const pendingCount = entries.length
-		if (pendingCount >= this.ackBatchSize) {
+		if (this.totalPending >= this.ackBatchSize) {
+			// Batch is full, flush immediately
+			this.cancelScheduledFlush()
 			void this.flushAll().catch(err => {
 				this.logger.error('share acknowledge flush failed', { error: (err as Error).message })
 			})
@@ -99,17 +155,23 @@ export class AckManager {
 		return promise
 	}
 
+	private cancelScheduledFlush(): void {
+		if (this.scheduledTimer !== null) {
+			clearTimeout(this.scheduledTimer)
+			this.scheduledTimer = null
+		}
+	}
+
 	private scheduleFlush(): void {
-		if (this.scheduled) {
+		if (this.scheduledTimer !== null) {
 			return
 		}
-		this.scheduled = true
-		setTimeout(() => {
-			this.scheduled = false
+		this.scheduledTimer = setTimeout(() => {
+			this.scheduledTimer = null
 			void this.flushAll().catch(err => {
 				this.logger.error('share acknowledge flush failed', { error: (err as Error).message })
 			})
-		}, 0)
+		}, ACK_FLUSH_DELAY_MS)
 	}
 
 	async flushAll(): Promise<void> {
@@ -129,6 +191,7 @@ export class AckManager {
 			while (this.pendingByPartitionKey.size > 0) {
 				const snapshot = this.pendingByPartitionKey
 				this.pendingByPartitionKey = new Map()
+				this.totalPending = 0
 				await this.flushSnapshotWithRetry(snapshot)
 			}
 		} catch (error) {
@@ -139,6 +202,7 @@ export class AckManager {
 				}
 			}
 			this.pendingByPartitionKey.clear()
+			this.totalPending = 0
 			throw err
 		}
 	}
@@ -226,13 +290,15 @@ export class AckManager {
 
 					const topicMap = new Map<string, ShareAcknowledgeRequest['topics'][number]>()
 					for (const { partition } of items) {
+						const { batches } = coalesceAckEntries(partition.entries)
+
 						const topicEntry = topicMap.get(partition.topicId) ?? {
 							topicId: partition.topicId,
 							partitions: [],
 						}
 						topicEntry.partitions.push({
 							partitionIndex: partition.partitionIndex,
-							acknowledgementBatches: partition.entries.map(e => e.batch),
+							acknowledgementBatches: batches,
 						})
 						topicMap.set(partition.topicId, topicEntry)
 					}

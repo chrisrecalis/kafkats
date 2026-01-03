@@ -1,5 +1,4 @@
-import { Kafka as KafkaJs } from 'kafkajs'
-import { KafkaClient } from '@kafkats/client'
+import { KafkaClient, codec, topic } from '@kafkats/client'
 
 import { createTopicWithAssignments, startKafkaCluster, type StartedKafkaCluster } from './kafka-cluster.js'
 import {
@@ -38,45 +37,6 @@ const ALIGNED_SHARE_CONSUMER_CONFIG = {
 	batchSize: 100,
 } as const
 
-async function seedTopic(
-	cluster: StartedKafkaCluster,
-	topicName: string,
-	messageCount: number,
-	messageSize: number,
-	print: boolean
-): Promise<void> {
-	if (print) {
-		console.log(`  Seeding ${messageCount} messages to ${topicName}...`)
-	}
-
-	const kafka = new KafkaJs({
-		clientId: 'benchmark-seeder',
-		brokers: cluster.brokers,
-		logLevel: 0,
-	})
-
-	await createTopicWithAssignments(cluster, topicName, 3)
-
-	const producer = kafka.producer()
-	await producer.connect()
-
-	const message = generateMessage(messageSize)
-	const batchSize = 1000
-
-	for (let i = 0; i < messageCount; i += batchSize) {
-		const messages: { key: string; value: string }[] = []
-		for (let j = 0; j < batchSize && i + j < messageCount; j++) {
-			messages.push({ key: String(i + j), value: message })
-		}
-		await producer.send({ topic: topicName, messages })
-	}
-
-	await producer.disconnect()
-	if (print) {
-		console.log(`  Seeding complete.`)
-	}
-}
-
 async function benchmarkKafkaTsShareConsumer(
 	cluster: StartedKafkaCluster,
 	config: ShareConsumerBenchmarkConfig,
@@ -91,8 +51,6 @@ async function benchmarkKafkaTsShareConsumer(
 		console.log('\n[kafkats] Starting ShareConsumer benchmark...')
 	}
 
-	await seedTopic(cluster, topicName, messageCount, messageSize, shouldPrint)
-
 	const client = new KafkaClient({
 		brokers: cluster.brokers,
 		clientId: 'benchmark-kafkats-share-consumer',
@@ -100,6 +58,8 @@ async function benchmarkKafkaTsShareConsumer(
 	})
 
 	await client.connect()
+
+	await createTopicWithAssignments(cluster, topicName, 3)
 
 	const groupId = uniqueName('bench-share-group-kafkats')
 	const consumers = Array.from({ length: consumerCount }, () =>
@@ -163,16 +123,39 @@ async function benchmarkKafkaTsShareConsumer(
 			.catch(() => {})
 	)
 
-	// Wait for all consumers to be running
+	// Wait for consumers to have assignments before producing
 	await Promise.all(
 		consumers.map(
 			consumer =>
 				new Promise<void>((resolve, reject) => {
-					consumer.once('running', () => resolve())
+					consumer.once('partitionsAssigned', () => resolve())
 					consumer.once('error', err => reject(err))
 				})
 		)
 	)
+
+	if (shouldPrint) {
+		console.log(`  Seeding ${messageCount} messages to ${topicName}...`)
+	}
+
+	const producer = client.producer({ lingerMs: 0 })
+	const testTopic = topic<string, string>(topicName, { key: codec.string(), value: codec.string() })
+
+	const message = generateMessage(messageSize)
+	const batchSize = 1000
+
+	for (let i = 0; i < messageCount; i += batchSize) {
+		const messages: { key: string; value: string }[] = []
+		for (let j = 0; j < batchSize && i + j < messageCount; j++) {
+			messages.push({ key: String(i + j), value: message })
+		}
+		await producer.send(testTopic, messages)
+	}
+	await producer.flush()
+
+	if (shouldPrint) {
+		console.log(`  Seeding complete.`)
+	}
 
 	const timeout = setTimeout(() => {
 		console.log(`  Warning: Timeout reached with ${messagesConsumed}/${messageCount} messages`)
@@ -185,6 +168,7 @@ async function benchmarkKafkaTsShareConsumer(
 	const endTime = finishTime || performance.now()
 	const durationMs = endTime - startTime
 
+	await producer.disconnect()
 	await client.disconnect()
 
 	const interLatencies: number[] = []
