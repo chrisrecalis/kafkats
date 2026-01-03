@@ -33,12 +33,12 @@ const shareConsumer = client.shareConsumer({
 
 `runEach()` and `stream()` take a `subscription` argument.
 
-| Subscription               | What it does                                  | Example                                                        |
-| -------------------------- | --------------------------------------------- | -------------------------------------------------------------- |
-| Topic name                 | Consume raw `Buffer` key/value                | `shareConsumer.runEach('events', handler)`                     |
-| Multiple topics            | Consume multiple topics at once               | `shareConsumer.runEach(['events', 'logs'], handler)`           |
-| Typed topic (`topic(...)`) | Decode with codecs and infer types            | `shareConsumer.runEach(userEvents, handler)`                   |
-| Custom subscription        | Provide explicit decoders                     | `shareConsumer.runEach({ topic: 'events', decoder }, handler)` |
+| Subscription               | What it does                       | Example                                                        |
+| -------------------------- | ---------------------------------- | -------------------------------------------------------------- |
+| Topic name                 | Consume raw `Buffer` key/value     | `shareConsumer.runEach('events', handler)`                     |
+| Multiple topics            | Consume multiple topics at once    | `shareConsumer.runEach(['events', 'logs'], handler)`           |
+| Typed topic (`topic(...)`) | Decode with codecs and infer types | `shareConsumer.runEach(userEvents, handler)`                   |
+| Custom subscription        | Provide explicit decoders          | `shareConsumer.runEach({ topic: 'events', decoder }, handler)` |
 
 ## Processing Messages
 
@@ -161,12 +161,12 @@ await shareConsumer.runEach(userEvents, async message => {
 
 ### runEach Options
 
-| Option         | Type          | Default | Description                                       |
-| -------------- | ------------- | ------- | ------------------------------------------------- |
-| `concurrency`  | `number`      | `10`    | Max records processed simultaneously              |
-| `ackBatchSize` | `number`      | `1000`  | Flush acknowledgements when this many are pending |
-| `idleBackoffMs`| `number`      | `200`   | Backoff when no records are returned              |
-| `signal`       | `AbortSignal` | -       | Abort to stop the consumer                        |
+| Option          | Type          | Default | Description                                       |
+| --------------- | ------------- | ------- | ------------------------------------------------- |
+| `concurrency`   | `number`      | `10`    | Max records processed simultaneously              |
+| `ackBatchSize`  | `number`      | `1000`  | Flush acknowledgements when this many are pending |
+| `idleBackoffMs` | `number`      | `200`   | Backoff when no records are returned              |
+| `signal`        | `AbortSignal` | -       | Abort to stop the consumer                        |
 
 ::: details ackBatchSize tuning
 Acknowledgements are batched and coalesced to reduce network overhead. Consecutive offsets with the same acknowledgement type are combined into ranges before sending.
@@ -250,10 +250,10 @@ Share Groups decouple parallelism from partition count. They excel when:
 
 With 3 partitions, 20ms processing time per message, and 20 concurrent handlers:
 
-| Consumer Type | Throughput | Why |
-| ------------- | ---------- | --- |
-| Regular Consumer | ~50 msg/s | Limited to 3 concurrent (one per partition) |
-| Share Consumer | ~650 msg/s | 20 concurrent handlers |
+| Consumer Type    | Throughput | Why                                         |
+| ---------------- | ---------- | ------------------------------------------- |
+| Regular Consumer | ~50 msg/s  | Limited to 3 concurrent (one per partition) |
+| Share Consumer   | ~650 msg/s | 20 concurrent handlers                      |
 
 For trivial handlers (0ms processing), regular consumers may be faster due to lower protocol overhead.
 

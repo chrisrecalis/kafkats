@@ -38,10 +38,10 @@ await consumer.runEach('events', async (message, ctx) => {
 
 // ShareConsumer (experimental)
 const shareConsumer = client.shareConsumer({ groupId: 'my-share-group' })
-	await shareConsumer.runEach('events', async message => {
-		console.log(message.value?.toString())
-		// If you don't call ack/release/reject, the message is implicitly ack'd (ACCEPT) on success.
-	})
+await shareConsumer.runEach('events', async message => {
+	console.log(message.value?.toString())
+	// If you don't call ack/release/reject, the message is implicitly ack'd (ACCEPT) on success.
+})
 
 // Admin
 const admin = client.admin()
