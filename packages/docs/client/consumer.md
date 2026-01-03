@@ -192,7 +192,7 @@ The public consumer API currently focuses on automatic commits. If you need expl
 
 ## Backpressure: Pause and Resume
 
-Pause fetching from specific partitions while you’re overloaded:
+Pause fetching from specific partitions while you're overloaded:
 
 ```typescript
 consumer.pause([{ topic: 'events', partition: 0 }])

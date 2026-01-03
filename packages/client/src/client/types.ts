@@ -129,7 +129,7 @@ export interface PartitionMetadata {
 /**
  * Coordinator types
  */
-export type CoordinatorType = 'GROUP' | 'TRANSACTION'
+export type CoordinatorType = 'GROUP' | 'TRANSACTION' | 'SHARE'
 
 /**
  * Coordinator cache entry

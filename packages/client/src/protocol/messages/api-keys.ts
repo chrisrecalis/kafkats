@@ -67,6 +67,10 @@ export enum ApiKey {
 	DescribeTransactions = 65,
 	ListTransactions = 66,
 	AllocateProducerIds = 67,
+	ShareGroupHeartbeat = 76,
+	ShareGroupDescribe = 77,
+	ShareFetch = 78,
+	ShareAcknowledge = 79,
 }
 
 /**
@@ -139,6 +143,10 @@ export const FLEXIBLE_VERSION_MIN: Partial<Record<ApiKey, number>> = {
 	[ApiKey.DescribeTransactions]: 0,
 	[ApiKey.ListTransactions]: 0,
 	[ApiKey.AllocateProducerIds]: 0,
+	// Share Groups (Kafka 4.0+)
+	[ApiKey.ShareGroupHeartbeat]: 0,
+	[ApiKey.ShareFetch]: 0,
+	[ApiKey.ShareAcknowledge]: 0,
 }
 
 /**

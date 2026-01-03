@@ -42,7 +42,7 @@ This matters when producing:
 
 | Producer `acks` | Meaning                              | Typical use                         |
 | --------------- | ------------------------------------ | ----------------------------------- |
-| `'none'`        | Don’t wait for broker acknowledgment | Fire-and-forget logs (risk of loss) |
+| `'none'`        | Don't wait for broker acknowledgment | Fire-and-forget logs (risk of loss) |
 | `'leader'`      | Wait for the leader to write         | Lower latency, less durable         |
 | `'all'`         | Wait for all in-sync replicas        | Most durable (recommended default)  |
 
@@ -84,7 +84,7 @@ When a group has no committed offset (new group, offsets expired), `autoOffsetRe
 
 ## Delivery Semantics
 
-Kafka’s durability is a property of the log, but what your application observes depends on how you produce, consume, and commit offsets.
+Kafka's durability is a property of the log, but what your application observes depends on how you produce, consume, and commit offsets.
 
 | Semantics     | What you get                               | Typical approach                                              |
 | ------------- | ------------------------------------------ | ------------------------------------------------------------- |

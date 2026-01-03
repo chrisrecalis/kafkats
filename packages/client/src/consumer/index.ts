@@ -4,6 +4,7 @@
 
 // Main consumer
 export { Consumer } from './consumer.js'
+export { ShareConsumer } from '../share-consumer/share-consumer.js'
 
 // Types
 export type {
@@ -43,6 +44,17 @@ export {
 	DEFAULT_RUN_EACH_OPTIONS,
 	DEFAULT_RUN_BATCH_OPTIONS,
 } from './types.js'
+
+export type {
+	ShareConsumerConfig,
+	ShareSubscriptionInput,
+	ShareMessage,
+	ShareMessageHandler,
+	ShareRunEachOptions,
+	ShareConsumerEvents,
+} from '../share-consumer/types.js'
+
+export { DEFAULT_SHARE_CONSUMER_CONFIG, DEFAULT_SHARE_RUN_EACH_OPTIONS } from '../share-consumer/types.js'
 
 // Assignors
 export type { PartitionAssignor, MemberSubscription, RebalanceProtocol } from './assignors/index.js'

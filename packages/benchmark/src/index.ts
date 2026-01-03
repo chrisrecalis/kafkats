@@ -6,17 +6,22 @@ import os from 'node:os'
 import { startKafkaCluster } from './kafka-cluster.js'
 import { runProducerBenchmark } from './producer-benchmark.js'
 import { runConsumerBenchmark } from './consumer-benchmark.js'
+import { runShareConsumerBenchmark } from './share-consumer-benchmark.js'
 import type { BenchmarkResult } from './utils.js'
 import { formatBytes, formatNumber } from './utils.js'
 import { summarize } from './statistics.js'
 
-type SuiteResult = {
+type ComparisonSuiteResult = {
 	kafkaTs: BenchmarkResult
 	kafkaJs: BenchmarkResult
 	platformatic: BenchmarkResult
 }
 
-type Operation = 'producer' | 'consumer' | 'all'
+type ShareSuiteResult = {
+	kafkaTs: BenchmarkResult
+}
+
+type Operation = 'producer' | 'consumer' | 'share' | 'all'
 
 type RunOptions = {
 	print?: boolean
@@ -74,7 +79,7 @@ function writeJsonLine(path: string, payload: unknown): void {
 	appendFileSync(path, JSON.stringify(payload) + '\n')
 }
 
-function summarizeSuite(results: SuiteResult[], label: string): void {
+function summarizeComparisonSuite(results: ComparisonSuiteResult[], label: string): void {
 	const kafkats = results.map(r => r.kafkaTs.messagesPerSecond)
 	const kafkajs = results.map(r => r.kafkaJs.messagesPerSecond)
 	const platformatic = results.map(r => r.platformatic.messagesPerSecond)
@@ -102,6 +107,18 @@ function summarizeSuite(results: SuiteResult[], label: string): void {
 	)
 }
 
+function summarizeShareSuite(results: ShareSuiteResult[], label: string): void {
+	const kafkats = results.map(r => r.kafkaTs.messagesPerSecond)
+	const kafkatsStats = summarize(kafkats)
+
+	console.log('\n' + '='.repeat(60))
+	console.log(`${label.toUpperCase()} SUMMARY (${results.length} iterations)`)
+	console.log('='.repeat(60))
+	console.log(
+		`  kafkats: mean ${formatNumber(Math.round(kafkatsStats.mean))} msg/s (σ=${formatNumber(Math.round(kafkatsStats.stdev))}, min=${formatNumber(Math.round(kafkatsStats.min))}, max=${formatNumber(Math.round(kafkatsStats.max))})`
+	)
+}
+
 async function runOperation(options: {
 	label: 'producer' | 'consumer'
 	runId: string
@@ -110,12 +127,12 @@ async function runOperation(options: {
 	warmup: number
 	quiet: boolean
 	verbose: boolean
-	run: (opts: RunOptions) => Promise<SuiteResult>
+	run: (opts: RunOptions) => Promise<ComparisonSuiteResult>
 	diagnostics: boolean
 	trace: boolean
 }): Promise<void> {
 	const { label, runId, jsonPath, iterations, warmup, quiet, verbose, run, diagnostics, trace } = options
-	const measured: SuiteResult[] = []
+	const measured: ComparisonSuiteResult[] = []
 
 	for (let i = 0; i < warmup + iterations; i++) {
 		const isWarmup = i < warmup
@@ -142,7 +159,50 @@ async function runOperation(options: {
 		}
 	}
 
-	summarizeSuite(measured, label)
+	summarizeComparisonSuite(measured, label)
+}
+
+async function runShareOperation(options: {
+	label: 'share'
+	runId: string
+	jsonPath: string
+	iterations: number
+	warmup: number
+	quiet: boolean
+	verbose: boolean
+	run: (opts: RunOptions) => Promise<ShareSuiteResult>
+	diagnostics: boolean
+	trace: boolean
+}): Promise<void> {
+	const { label, runId, jsonPath, iterations, warmup, quiet, verbose, run, diagnostics, trace } = options
+	const measured: ShareSuiteResult[] = []
+
+	for (let i = 0; i < warmup + iterations; i++) {
+		const isWarmup = i < warmup
+		const iterationIndex = isWarmup ? i + 1 : i - warmup + 1
+
+		if (!quiet) {
+			console.log(
+				`[${label}] ${isWarmup ? `warmup ${iterationIndex}/${warmup}` : `iteration ${iterationIndex}/${iterations}`}`
+			)
+		}
+
+		const result = await run({
+			print: verbose && !isWarmup,
+			diagnostics: diagnostics && !isWarmup,
+			trace: trace && !isWarmup,
+		})
+
+		if (jsonPath) {
+			writeJsonLine(jsonPath, { type: label, runId, warmup: isWarmup, iteration: i, result })
+		}
+
+		if (!isWarmup) {
+			measured.push(result)
+		}
+	}
+
+	summarizeShareSuite(measured, label)
 }
 
 async function main(): Promise<void> {
@@ -155,6 +215,7 @@ async function main(): Promise<void> {
 	const messageCount = getNumberArg(args, 'messageCount', 10_000)
 	const messageSize = getNumberArg(args, 'messageSize', 1024)
 	const batchSize = getNumberArg(args, 'batchSize', 100)
+	const shareConsumers = getNumberArg(args, 'shareConsumers', 2)
 
 	const jsonPath = getStringArg(args, 'json', '')
 	const diagnostics = hasFlag(args, 'diagnostics')
@@ -173,8 +234,11 @@ async function main(): Promise<void> {
 		console.log(`  Operation:    ${operation}`)
 		console.log(`  Messages:     ${formatNumber(messageCount)}`)
 		console.log(`  Message Size: ${formatBytes(messageSize)}`)
-		if (operation !== 'consumer') {
+		if (operation === 'producer' || operation === 'all') {
 			console.log(`  Batch Size:   ${formatNumber(batchSize)}`)
+		}
+		if (operation === 'share' || operation === 'all') {
+			console.log(`  Share Consumers: ${formatNumber(shareConsumers)}`)
 		}
 		console.log(`  Diagnostics:  ${diagnostics ? 'on' : 'off'}`)
 		console.log(`  Trace:        ${trace ? 'on' : 'off'}`)
@@ -194,7 +258,17 @@ async function main(): Promise<void> {
 			arch: process.arch,
 			cpus: os.cpus()?.[0]?.model,
 			totalmem: os.totalmem(),
-			config: { iterations, warmup, operation, messageCount, messageSize, batchSize, diagnostics, trace },
+			config: {
+				iterations,
+				warmup,
+				operation,
+				messageCount,
+				messageSize,
+				batchSize,
+				shareConsumers,
+				diagnostics,
+				trace,
+			},
 		})
 	}
 
@@ -228,6 +302,26 @@ async function main(): Promise<void> {
 				diagnostics,
 				trace,
 				run: opts => runConsumerBenchmark(cluster, { messageCount, messageSize }, opts),
+			})
+		}
+
+		if (operation === 'share' || operation === 'all') {
+			await runShareOperation({
+				label: 'share',
+				runId,
+				jsonPath,
+				iterations,
+				warmup,
+				quiet,
+				verbose,
+				diagnostics,
+				trace,
+				run: opts =>
+					runShareConsumerBenchmark(
+						cluster,
+						{ messageCount, messageSize, consumerCount: shareConsumers },
+						opts
+					),
 			})
 		}
 	} finally {

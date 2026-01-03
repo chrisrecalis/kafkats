@@ -67,7 +67,10 @@ export default defineConfig({
 				},
 				{
 					text: 'Consumer',
-					items: [{ text: 'Consumer API', link: '/client/consumer' }],
+					items: [
+						{ text: 'Consumer API', link: '/client/consumer' },
+						{ text: 'ShareConsumer (experimental)', link: '/client/share-consumer' },
+					],
 				},
 				{
 					text: 'Admin',
