@@ -112,6 +112,40 @@ export class UnsupportedVersionError extends KafkaError {
 }
 
 /**
+ * A Kafka broker supports the protocol, but does not support a specific feature.
+ *
+ * @experimental
+ */
+export class KafkaFeatureUnsupportedError extends KafkaError {
+	readonly feature: string
+
+	constructor(feature: string, details?: string) {
+		super(
+			`Kafka feature unsupported: ${feature}${details ? ` (${details})` : ''}`,
+			ErrorCode.UnsupportedVersion,
+			false
+		)
+		this.name = 'KafkaFeatureUnsupportedError'
+		this.feature = feature
+	}
+}
+
+/**
+ * A Kafka feature exists but is disabled at the cluster level (e.g. feature flags).
+ *
+ * @experimental
+ */
+export class KafkaFeatureDisabledError extends KafkaError {
+	readonly feature: string
+
+	constructor(feature: string, message: string) {
+		super(message, ErrorCode.InvalidRequest, false)
+		this.name = 'KafkaFeatureDisabledError'
+		this.feature = feature
+	}
+}
+
+/**
  * Topic or partition does not exist
  */
 export class UnknownTopicOrPartitionError extends KafkaError {

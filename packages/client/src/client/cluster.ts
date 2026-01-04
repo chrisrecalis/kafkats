@@ -25,6 +25,7 @@ import type {
 	BrokerConfig,
 } from './types.js'
 import type { MetadataResponse } from '@/protocol/messages/responses/metadata.js'
+import { COORDINATOR_TYPE } from '@/protocol/messages/requests/find-coordinator.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import { noopLogger, type Logger } from '@/logger.js'
 
@@ -277,7 +278,7 @@ export class Cluster extends EventEmitter<ClusterEvents> {
 		const broker = await this.getAnyBroker()
 		const response = await broker.findCoordinator({
 			key,
-			keyType: type === 'GROUP' ? 0 : 1,
+			keyType: COORDINATOR_TYPE[type],
 			coordinatorKeys: [key],
 		})
 

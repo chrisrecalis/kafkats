@@ -10,6 +10,8 @@ import type { FetchRequest } from '@/protocol/messages/requests/fetch.js'
 import type { FetchPartitionResponse } from '@/protocol/messages/responses/fetch.js'
 import { Consumer } from '@/consumer/consumer.js'
 import type { ConsumerConfig } from '@/consumer/types.js'
+import { ShareConsumer } from '@/share-consumer/share-consumer.js'
+import type { ShareConsumerConfig } from '@/share-consumer/types.js'
 import { Producer } from '@/producer/producer.js'
 import type { ProducerConfig } from '@/producer/types.js'
 import { Admin } from '@/admin/admin.js'
@@ -306,6 +308,15 @@ export class KafkaClient {
 
 	consumer(config: ConsumerConfig): Consumer {
 		return new Consumer(this.cluster, config)
+	}
+
+	/**
+	 * Create a share consumer (Kafka Share Groups / KIP-932)
+	 *
+	 * @experimental
+	 */
+	shareConsumer(config: ShareConsumerConfig): ShareConsumer {
+		return new ShareConsumer(this.cluster, config)
 	}
 
 	/**
