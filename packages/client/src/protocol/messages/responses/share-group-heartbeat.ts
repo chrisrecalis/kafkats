@@ -5,6 +5,7 @@
 import type { IDecoder } from '@/protocol/primitives/index.js'
 import { ApiKey, isFlexibleVersion } from '@/protocol/messages/api-keys.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
+import { SHARE_GROUP_HEARTBEAT_VERSIONS } from '@/protocol/messages/requests/share-group-heartbeat.js'
 
 export interface ShareGroupAssignment {
 	topicId: string
@@ -22,6 +23,10 @@ export interface ShareGroupHeartbeatResponse {
 }
 
 export function decodeShareGroupHeartbeatResponse(decoder: IDecoder, version: number): ShareGroupHeartbeatResponse {
+	if (version < SHARE_GROUP_HEARTBEAT_VERSIONS.min || version > SHARE_GROUP_HEARTBEAT_VERSIONS.max) {
+		throw new Error(`Unsupported ShareGroupHeartbeat version: ${version}`)
+	}
+
 	const flexible = isFlexibleVersion(ApiKey.ShareGroupHeartbeat, version)
 	if (!flexible) {
 		throw new Error(`ShareGroupHeartbeat v${version} must be flexible`)

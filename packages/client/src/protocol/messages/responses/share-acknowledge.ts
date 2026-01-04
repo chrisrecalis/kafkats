@@ -5,6 +5,7 @@
 import type { IDecoder } from '@/protocol/primitives/index.js'
 import { ApiKey, isFlexibleVersion } from '@/protocol/messages/api-keys.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
+import { SHARE_ACKNOWLEDGE_VERSIONS } from '@/protocol/messages/requests/share-acknowledge.js'
 
 export interface ShareAcknowledgePartitionResponse {
 	partitionIndex: number
@@ -34,6 +35,10 @@ export interface ShareAcknowledgeResponse {
 }
 
 export function decodeShareAcknowledgeResponse(decoder: IDecoder, version: number): ShareAcknowledgeResponse {
+	if (version < SHARE_ACKNOWLEDGE_VERSIONS.min || version > SHARE_ACKNOWLEDGE_VERSIONS.max) {
+		throw new Error(`Unsupported ShareAcknowledge version: ${version}`)
+	}
+
 	const flexible = isFlexibleVersion(ApiKey.ShareAcknowledge, version)
 	if (!flexible) {
 		throw new Error(`ShareAcknowledge v${version} must be flexible`)

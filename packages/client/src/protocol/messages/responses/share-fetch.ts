@@ -5,6 +5,7 @@
 import type { IDecoder } from '@/protocol/primitives/index.js'
 import { ApiKey, isFlexibleVersion } from '@/protocol/messages/api-keys.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
+import { SHARE_FETCH_VERSIONS } from '@/protocol/messages/requests/share-fetch.js'
 
 export interface ShareFetchAcquiredRecordRange {
 	firstOffset: bigint
@@ -39,12 +40,16 @@ export interface ShareFetchResponse {
 	throttleTimeMs: number
 	errorCode: ErrorCode
 	errorMessage: string | null
-	acquisitionLockTimeoutMs?: number
+	acquisitionLockTimeoutMs: number
 	topics: ShareFetchTopicResponse[]
 	nodeEndpoints: ShareFetchNodeEndpoint[]
 }
 
 export function decodeShareFetchResponse(decoder: IDecoder, version: number): ShareFetchResponse {
+	if (version < SHARE_FETCH_VERSIONS.min || version > SHARE_FETCH_VERSIONS.max) {
+		throw new Error(`Unsupported ShareFetch version: ${version}`)
+	}
+
 	const flexible = isFlexibleVersion(ApiKey.ShareFetch, version)
 	if (!flexible) {
 		throw new Error(`ShareFetch v${version} must be flexible`)
@@ -54,7 +59,7 @@ export function decodeShareFetchResponse(decoder: IDecoder, version: number): Sh
 	const errorCode = decoder.readInt16() as ErrorCode
 	const errorMessage = decoder.readCompactNullableString()
 
-	const acquisitionLockTimeoutMs = version >= 1 ? decoder.readInt32() : undefined
+	const acquisitionLockTimeoutMs = decoder.readInt32()
 
 	const topics = decoder.readCompactArray(d => {
 		const topicId = d.readUUID()

@@ -803,16 +803,13 @@ export class Broker {
 		try {
 			response = decodeShareGroupHeartbeatResponse(decoder, version)
 		} catch (error) {
-			if (process.env.KAFKA_TS_DEBUG_SHARE_GROUP_HEARTBEAT === '1') {
-				const err = error instanceof Error ? error : new Error(String(error))
-				const maxHexBytes = 512
-				const hex = responseBuffer.subarray(0, maxHexBytes).toString('hex')
-				throw new Error(
-					`failed to decode ShareGroupHeartbeat response (v${version}, bytes=${responseBuffer.length}, offset=${decoder.offset()}, remaining=${decoder.remaining()}): ${err.message}; hex[0..${maxHexBytes}]=${hex}`,
-					{ cause: err }
-				)
-			}
-			throw error
+			const err = error instanceof Error ? error : new Error(String(error))
+			const maxHexBytes = 128
+			const hex = responseBuffer.subarray(0, maxHexBytes).toString('hex')
+			throw new Error(
+				`failed to decode ShareGroupHeartbeat response (v${version}, bytes=${responseBuffer.length}, offset=${decoder.offset()}, remaining=${decoder.remaining()}): ${err.message}; hex[0..${maxHexBytes}]=${hex}`,
+				{ cause: err }
+			)
 		}
 
 		const durationMs = Date.now() - startTime

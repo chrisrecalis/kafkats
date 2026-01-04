@@ -43,7 +43,7 @@ import type {
 import { DEFAULT_SHARE_CONSUMER_CONFIG, DEFAULT_SHARE_RUN_EACH_OPTIONS } from './types.js'
 
 import type { ShareGroupHeartbeatRequest } from '@/protocol/messages/requests/share-group-heartbeat.js'
-import type { ShareFetchRequestV1 } from '@/protocol/messages/requests/share-fetch.js'
+import type { ShareFetchRequest } from '@/protocol/messages/requests/share-fetch.js'
 import type { ShareAcknowledgeRequest } from '@/protocol/messages/requests/share-acknowledge.js'
 import type { ShareFetchResponse } from '@/protocol/messages/responses/share-fetch.js'
 import type { ShareAcknowledgeResponse } from '@/protocol/messages/responses/share-acknowledge.js'
@@ -271,10 +271,10 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 	private async shareFetch(
 		broker: Broker,
 		topicPartitions: Array<{ topicId: string; partitions: number[] }>,
-		overrides?: Partial<Pick<ShareFetchRequestV1, 'maxWaitMs' | 'minBytes'>>
+		overrides?: Partial<Pick<ShareFetchRequest, 'maxWaitMs' | 'minBytes'>>
 	): Promise<ShareFetchResponse> {
 		return this.enqueueShareSessionOp(broker, async epoch => {
-			const request: ShareFetchRequestV1 = {
+			const request: ShareFetchRequest = {
 				groupId: this.config.groupId,
 				memberId: this.memberId,
 				shareSessionEpoch: epoch,

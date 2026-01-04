@@ -21,13 +21,7 @@ export interface ShareFetchAcknowledgementBatch {
 	acknowledgeTypes: number[]
 }
 
-export interface ShareFetchRequestPartitionV0 {
-	partitionIndex: number
-	partitionMaxBytes: number
-	acknowledgementBatches: ShareFetchAcknowledgementBatch[]
-}
-
-export interface ShareFetchRequestPartitionV1 {
+export interface ShareFetchRequestPartition {
 	partitionIndex: number
 	acknowledgementBatches: ShareFetchAcknowledgementBatch[]
 }
@@ -42,18 +36,7 @@ export interface ShareFetchRequestForgottenTopic {
 	partitions: number[]
 }
 
-export interface ShareFetchRequestV0 {
-	groupId: string
-	memberId: string
-	shareSessionEpoch: number
-	maxWaitMs: number
-	minBytes: number
-	maxBytes: number
-	topics: Array<ShareFetchRequestTopic<ShareFetchRequestPartitionV0>>
-	forgottenTopicsData?: ShareFetchRequestForgottenTopic[]
-}
-
-export interface ShareFetchRequestV1 {
+export interface ShareFetchRequest {
 	groupId: string
 	memberId: string
 	shareSessionEpoch: number
@@ -62,11 +45,9 @@ export interface ShareFetchRequestV1 {
 	maxBytes: number
 	maxRecords: number
 	batchSize: number
-	topics: Array<ShareFetchRequestTopic<ShareFetchRequestPartitionV1>>
+	topics: Array<ShareFetchRequestTopic<ShareFetchRequestPartition>>
 	forgottenTopicsData?: ShareFetchRequestForgottenTopic[]
 }
-
-export type ShareFetchRequest = ShareFetchRequestV0 | ShareFetchRequestV1
 
 export function encodeShareFetchRequest(encoder: IEncoder, version: number, request: ShareFetchRequest): void {
 	if (version < SHARE_FETCH_VERSIONS.min || version > SHARE_FETCH_VERSIONS.max) {
@@ -78,12 +59,8 @@ export function encodeShareFetchRequest(encoder: IEncoder, version: number, requ
 		throw new Error(`ShareFetch v${version} must be flexible`)
 	}
 
-	// Runtime guard: helps JS callers / `any` avoid sending v0-shaped requests to v1 encoding.
-	if (version >= 1) {
-		const r1 = request as ShareFetchRequestV1
-		if (typeof r1.maxRecords !== 'number' || typeof r1.batchSize !== 'number') {
-			throw new Error('ShareFetch v1 requires maxRecords and batchSize')
-		}
+	if (typeof request.maxRecords !== 'number' || typeof request.batchSize !== 'number') {
+		throw new Error('ShareFetch v1 requires maxRecords and batchSize')
 	}
 
 	encoder.writeCompactNullableString(request.groupId)
@@ -93,19 +70,13 @@ export function encodeShareFetchRequest(encoder: IEncoder, version: number, requ
 	encoder.writeInt32(request.minBytes)
 	encoder.writeInt32(request.maxBytes)
 
-	if (version >= 1) {
-		const r1 = request as ShareFetchRequestV1
-		encoder.writeInt32(r1.maxRecords)
-		encoder.writeInt32(r1.batchSize)
-	}
+	encoder.writeInt32(request.maxRecords)
+	encoder.writeInt32(request.batchSize)
 
 	encoder.writeCompactArray(request.topics, (topic, te) => {
 		te.writeUUID(topic.topicId)
 		te.writeCompactArray(topic.partitions, (partition, pe) => {
 			pe.writeInt32(partition.partitionIndex)
-			if (version >= 1 && (partition as ShareFetchRequestPartitionV0).partitionMaxBytes !== undefined) {
-				throw new Error('ShareFetch v1 does not support partitionMaxBytes')
-			}
 			pe.writeCompactArray(partition.acknowledgementBatches, (batch, be) => {
 				be.writeInt64(batch.firstOffset)
 				be.writeInt64(batch.lastOffset)
