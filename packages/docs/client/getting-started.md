@@ -85,6 +85,7 @@ See [Consumer API](/client/consumer) for full documentation.
 ## Creating a ShareConsumer (experimental)
 
 Kafka Share Groups (KIP-932) provide queue-like consumption with per-record acknowledgements.
+They require Kafka 4.1+ with Share Groups enabled (see [ShareConsumer API](/client/share-consumer)).
 
 ```typescript
 const shareConsumer = client.shareConsumer({

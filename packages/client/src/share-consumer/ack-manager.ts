@@ -92,6 +92,7 @@ export class AckManager {
 	private scheduledTimer: ReturnType<typeof setTimeout> | null = null
 	private flushing: Promise<void> | null = null
 	private totalPending = 0
+	private closed = false
 
 	constructor(
 		private readonly groupId: string,
@@ -114,6 +115,11 @@ export class AckManager {
 		offset: bigint,
 		type: AcknowledgeType
 	): Promise<void> {
+		if (this.closed) {
+			// Consumer is stopping/stopped; ignore late acks (prevents timers firing after shutdown).
+			return Promise.resolve()
+		}
+
 		const key = `${topicId}:${partitionIndex}`
 		let pending = this.pendingByPartitionKey.get(key)
 		if (!pending) {
@@ -175,6 +181,7 @@ export class AckManager {
 	}
 
 	async flushAll(): Promise<void> {
+		this.cancelScheduledFlush()
 		if (this.flushing) {
 			return this.flushing
 		}
@@ -184,6 +191,19 @@ export class AckManager {
 		})
 		this.flushing = promise
 		return promise
+	}
+
+	/**
+	 * Stop scheduling periodic flushes and best-effort flush any outstanding acks.
+	 * After shutdown, all enqueues are ignored.
+	 */
+	async shutdown(): Promise<void> {
+		if (this.closed) {
+			return this.flushing ?? Promise.resolve()
+		}
+		this.closed = true
+		this.cancelScheduledFlush()
+		await this.flushAll()
 	}
 
 	private async flushAllLoop(): Promise<void> {

@@ -94,6 +94,8 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 	private state: ShareConsumerState = 'idle'
 	private abortController: AbortController | null = null
 	private runPromiseResolve: (() => void) | null = null
+	private runCleanupPromise: Promise<void> | null = null
+	private runCleanupResolve: (() => void) | null = null
 
 	private coordinator: Broker | null = null
 	private memberId: string = randomKafkaUuid()
@@ -126,9 +128,19 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 		return this.state === 'running'
 	}
 
-	stop(): void {
-		if (this.state === 'idle' || this.state === 'stopping') {
-			return
+	/**
+	 * Stop the consumer and wait for cleanup to complete.
+	 *
+	 * Returns a promise that resolves when all internal processes have finished,
+	 * including flushing pending acknowledgements and leaving the group.
+	 */
+	stop(): Promise<void> {
+		if (this.state === 'idle') {
+			return Promise.resolve()
+		}
+
+		if (this.state === 'stopping') {
+			return this.runCleanupPromise ?? Promise.resolve()
 		}
 
 		this.logger.info('stopping share consumer')
@@ -139,6 +151,8 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 			this.runPromiseResolve()
 			this.runPromiseResolve = null
 		}
+
+		return this.runCleanupPromise ?? Promise.resolve()
 	}
 
 	private startRun(externalSignal?: AbortSignal): void {
@@ -159,6 +173,11 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 		this.topicIdByName.clear()
 		this.topicNameById.clear()
 		this.subscribedTopics = []
+
+		// Create cleanup promise that resolves when finalizeRun completes
+		this.runCleanupPromise = new Promise<void>(resolve => {
+			this.runCleanupResolve = resolve
+		})
 
 		if (externalSignal) {
 			externalSignal.addEventListener('abort', () => {
@@ -196,6 +215,13 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 		this.state = 'idle'
 		this.emit('stopped')
 		this.logger.info('share consumer stopped')
+
+		// Resolve cleanup promise so stop() callers know cleanup is complete
+		if (this.runCleanupResolve) {
+			this.runCleanupResolve()
+			this.runCleanupResolve = null
+		}
+		this.runCleanupPromise = null
 	}
 
 	private emitError(error: unknown): void {
@@ -914,8 +940,8 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 				}
 			}
 		} finally {
-			// Best-effort final ack flush on shutdown
-			await ackManager.flushAll().catch(err => {
+			// Best-effort final ack flush on shutdown and prevent scheduled flushes
+			await ackManager.shutdown().catch(err => {
 				this.logger.error('failed to flush share acknowledgements during shutdown', {
 					error: (err as Error).message,
 				})

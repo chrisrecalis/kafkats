@@ -9,7 +9,13 @@ The share consumer reads records from Kafka topics using Kafka **Share Groups** 
 ## Requirements
 
 - Kafka brokers must support Share APIs (Kafka 4.1+)
-- Share Groups must be enabled on the cluster (for example `share.version=1`)
+- Share Groups must be enabled on the cluster (feature flag `share.version=1`)
+
+Enable Share Groups (Kafka 4.1+):
+
+```bash
+kafka-features.sh --bootstrap-server localhost:9092 upgrade --feature share.version=1
+```
 
 If the broker does not support Share APIs, `ShareConsumer` throws `KafkaFeatureUnsupportedError('share-groups')`.
 If Share Groups are supported but disabled, it throws `KafkaFeatureDisabledError('share-groups')`.
@@ -197,9 +203,11 @@ Stop the consumer gracefully:
 const run = shareConsumer.runEach('events', handler)
 
 // Later: stop consuming
-shareConsumer.stop()
+await shareConsumer.stop()
 await run
 ```
+
+`stop()` waits for shutdown cleanup to complete, including flushing any pending acknowledgements and leaving the share group.
 
 With abort signal:
 
@@ -210,6 +218,18 @@ const run = shareConsumer.runEach('events', handler, { signal: controller.signal
 // Later: stop consuming
 controller.abort()
 await run
+```
+
+## Starting Position (latest)
+
+Share Groups are queue-like: when a member starts fetching, it effectively begins from "now" (the current end offset).
+
+If you want to ensure you only process records produced after your consumer is ready, wait for `partitionsAssigned` before producing:
+
+```typescript
+shareConsumer.on('partitionsAssigned', () => {
+	// Safe point to produce messages you expect this ShareConsumer to receive.
+})
 ```
 
 ## ShareConsumer Events
