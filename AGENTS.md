@@ -19,6 +19,10 @@ This is a pnpm monorepo containing a pure-protocol TypeScript Kafka client and s
 
 Each package has its own `AGENTS.md` with package-specific guidance. **Read the package's AGENTS.md for testing instructions before running tests.**
 
+## Versioning
+
+All publishable packages (`@kafkats/client`, `@kafkats/flow`, `@kafkats/codec-zod`, `@kafkats/flow-state-lmdb`) are released in lockstep and share the same version number for minor and major releases. When creating changesets, include all four packages with the same bump type.
+
 ## Development Commands
 
 ```bash
