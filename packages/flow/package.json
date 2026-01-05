@@ -1,7 +1,7 @@
 {
 	"name": "@kafkats/flow",
 	"private": false,
-	"version": "0.3.0",
+	"version": "0.4.0",
 	"description": "Flow-level APIs built on top of @kafkats/client.",
 	"type": "module",
 	"main": "dist/index.js",

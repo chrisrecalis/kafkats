@@ -1,5 +1,18 @@
 # @kafkats/client
 
+## 0.4.0
+
+### Minor Changes
+
+- 34b2c63: ### Share Groups Support
+
+    Added KIP-932 Share Groups implementation with `ShareConsumer` class for scalable, lock-free message consumption without partition assignment.
+
+    ### Consumer Refactoring
+    - Refactored consumer to use modular batch-based processing architecture
+    - Simplified stream mode with poll-based API, removing separate stream-mode module
+    - Fixed `sessionLost` flag not being cleared after successful rejoin
+
 ## 0.3.0
 
 ### Minor Changes
