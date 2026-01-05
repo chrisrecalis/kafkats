@@ -53,14 +53,8 @@ import { OffsetManager } from './offset-manager.js'
 import { FetchManager } from './fetch-manager.js'
 import { noopLogger, type Logger } from '@/logger.js'
 
-/**
- * Consumer state
- */
 type ConsumerState = 'idle' | 'running' | 'stopping'
 
-/**
- * High-level Kafka consumer
- */
 export class Consumer extends EventEmitter<ConsumerEvents> {
 	private readonly cluster: Cluster
 	private readonly config: ResolvedConsumerConfig
@@ -254,9 +248,6 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		})
 	}
 
-	/**
-	 * Check if consumer is running
-	 */
 	get isRunning(): boolean {
 		return this.state === 'running'
 	}
@@ -299,11 +290,9 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			const manualAssignment = opts.assignment
 			const { subscriptions, topics } = this.getSubscriptionsAndTopics(subscription)
 
-			// Create components
 			const useConsumerGroup = !manualAssignment
 			this.initComponents(concurrency, useConsumerGroup, this.logger)
 
-			// Create partition provider
 			let manualOffsets: Map<string, bigint> | undefined
 			if (manualAssignment) {
 				const normalized = this.normalizeAndValidateManualAssignment(manualAssignment, topics)
@@ -341,13 +330,11 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 				this.logger.debug('starting consumer', { topics })
 			}
 
-			// Create callbacks and start provider
 			const callbacks = this.createProviderCallbacks(manualOffsets)
 			await this.partitionProvider.start(topics, callbacks)
 
 			this.emit('running')
 
-			// Start fetch loop
 			await this.startFetchLoopAndWait(() => startFetchLoop(subscriptions))
 		} catch (error) {
 			this.emitError(error)
@@ -432,7 +419,6 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			const { subscriptions, topics } = this.getSubscriptionsAndTopics(subscription)
 			const decoders = buildDecoderMaps(subscriptions)
 
-			// Create components
 			this.initComponents(1, true, this.logger)
 			const consumerGroup = this.consumerGroup
 			const offsetManager = this.offsetManager
@@ -442,7 +428,6 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 				return
 			}
 
-			// Create partition provider (same as runMode)
 			this.partitionProvider = new GroupPartitionProvider({
 				consumerGroup,
 				cluster: this.cluster,
@@ -456,29 +441,22 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 				isRunning: () => this.state === 'running',
 			})
 
-			// Start partition provider
 			const callbacks = this.createProviderCallbacks()
 			await this.partitionProvider.start(topics, callbacks)
 			this.emit('running')
 
-			// Start auto-commit
 			offsetManager.startAutoCommit(DEFAULT_RUN_EACH_OPTIONS.autoCommitIntervalMs)
 
-			// Simple poll-yield-mark loop
 			while (this.state === 'running' && !signal.aborted) {
-				// Poll for records
 				const batches = await fetchManager.poll()
 
 				if (batches.length === 0) {
-					// No records, wait briefly before next poll
 					await new Promise(r => setTimeout(r, 100))
 					continue
 				}
 
-				// Process each batch
 				for (const { topic, partition, records } of batches) {
 					for (const record of records) {
-						// Decode record to message
 						const message = decodeRecord(topic, partition, record, decoders)
 						const ctx: ConsumeContext = {
 							signal,
@@ -487,13 +465,11 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 							offset: record.offset,
 						}
 
-						// Yield to user
 						yield { message, ctx } as { message: Message<MsgOf<S>, KeyOf<S>>; ctx: ConsumeContext }
 
-						// Mark consumed AFTER yield returns (user has received message)
+						// Mark consumed after yield returns - user has received message
 						offsetManager.markConsumed(topic, partition, record.offset)
 
-						// Check if we should stop after each message
 						if (this.state !== 'running' || signal.aborted) {
 							return
 						}
@@ -520,7 +496,6 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		this.state = 'stopping'
 		this.abortController?.abort()
 
-		// Resolve run promise
 		if (this.runPromiseResolve) {
 			this.runPromiseResolve()
 			this.runPromiseResolve = null
@@ -607,12 +582,10 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			return
 		}
 
-		// Start auto-commit if enabled
 		if (autoCommit && this.commitOffsets) {
 			this.offsetManager.startAutoCommit(autoCommitIntervalMs)
 		}
 
-		// Create fetch callback using shared infrastructure
 		this.fetchCallback = createFetchCallback(
 			subscriptions,
 			processor,
@@ -620,21 +593,15 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			() => this.state === 'running'
 		)
 
-		// Process records from fetch
 		await this.fetchManager.start(this.fetchCallback)
 	}
 
-	/**
-	 * Clean up resources
-	 */
 	private async cleanup(): Promise<void> {
-		// Stop fetch manager
 		if (this.fetchManager) {
 			this.fetchManager.stop()
 		}
 
-		// Wait for the fetch loop to fully exit before committing offsets.
-		// This ensures the last processed message/batch has been marked as consumed.
+		// Wait for fetch loop to exit before committing - ensures last message was marked consumed
 		const fetchLoopPromise = this.fetchLoopPromise
 		this.fetchLoopPromise = null
 		if (fetchLoopPromise) {
@@ -645,7 +612,6 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			}
 		}
 
-		// Stop auto-commit and commit pending
 		if (this.offsetManager) {
 			this.offsetManager.stopAutoCommit()
 			if (this.commitOffsets && !this.sessionLost) {
@@ -657,7 +623,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			}
 		}
 
-		// Stop partition provider (handles leaving group for GroupPartitionProvider)
+		// Handles leaving consumer group
 		if (this.partitionProvider) {
 			try {
 				await this.partitionProvider.stop()
@@ -666,7 +632,6 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			}
 		}
 
-		// Clear references
 		this.consumerGroup = null
 		this.offsetManager = null
 		this.fetchManager = null
