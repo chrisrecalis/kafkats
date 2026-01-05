@@ -33,4 +33,3 @@ describe('Consumer', () => {
 		expect(consumerAny.offsetManager.commitPendingOffsets).toHaveBeenCalledTimes(1)
 	})
 })
-
