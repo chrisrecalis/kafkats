@@ -1,7 +1,7 @@
 {
 	"name": "@kafkats/client",
 	"private": false,
-	"version": "0.3.0",
+	"version": "0.4.0",
 	"description": "Pure-protocol Kafka client, consumer/producer, and EOS patterns in TypeScript.",
 	"type": "module",
 	"main": "dist/index.js",
