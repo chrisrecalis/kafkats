@@ -23,8 +23,8 @@ const REJOIN_BACKOFF_MS = 500
  * Callbacks for rebalance events
  */
 export interface RebalanceCallbacks {
-	onPartitionsRevoked: (partitions: TopicPartition[]) => void
-	onPartitionsAssigned: (partitions: TopicPartition[]) => void
+	onPartitionsRevoked: (partitions: TopicPartition[]) => void | Promise<void>
+	onPartitionsAssigned: (partitions: TopicPartition[]) => void | Promise<void>
 }
 
 /**

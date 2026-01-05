@@ -329,10 +329,7 @@ export class GroupPartitionProvider implements PartitionProvider {
 		}
 	}
 
-	private async setupPartitions(
-		assignment: TopicPartition[],
-		callbacks: PartitionProviderCallbacks
-	): Promise<void> {
+	private async setupPartitions(assignment: TopicPartition[], callbacks: PartitionProviderCallbacks): Promise<void> {
 		// Update group state
 		const coordinator = await this.cluster.getCoordinator('GROUP', this.groupId)
 		this.offsetManager.updateGroupState(
