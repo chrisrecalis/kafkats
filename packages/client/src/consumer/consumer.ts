@@ -190,6 +190,8 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	private createProviderCallbacks(manualOffsets?: Map<string, bigint>): PartitionProviderCallbacks {
 		return {
 			onPartitionsAssigned: async partitions => {
+				// Clear session lost flag - we have a valid session again after rejoin
+				this.sessionLost = false
 				const withOffsets = await this.resolvePartitionOffsets(partitions, manualOffsets)
 				this.fetchManager!.setPartitions(withOffsets)
 				this.emit('partitionsAssigned', partitions)
