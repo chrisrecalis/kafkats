@@ -12,6 +12,7 @@ import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import {
 	EachRecordProcessor,
 	BatchRecordProcessor,
+	StreamRecordProcessor,
 	createFetchCallback,
 	type RecordProcessor,
 	type FetchCallback,
@@ -22,7 +23,6 @@ import {
 	type PartitionProvider,
 	type PartitionProviderCallbacks,
 } from './partition-provider.js'
-import { runStreamLoop } from './stream-mode.js'
 import type {
 	ConsumerConfig,
 	ResolvedConsumerConfig,
@@ -419,6 +419,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	 *
 	 * - Also single-run: calling stream() during run() throws.
 	 * - Returns one message at a time.
+	 * - Uses push-pull adapter pattern: fetch loop pushes to queue, generator yields from queue.
 	 */
 	async *stream<S extends SubscriptionInput>(
 		subscription: S
@@ -426,10 +427,10 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		this.startRun(true)
 
 		try {
-			const { subscriptions } = this.getSubscriptionsAndTopics(subscription)
+			const { subscriptions, topics } = this.getSubscriptionsAndTopics(subscription)
 
-			// Create components (no internal component logging by default in stream mode)
-			this.initComponents(1, true, undefined)
+			// Create components
+			this.initComponents(1, true, this.logger)
 			const consumerGroup = this.consumerGroup
 			const offsetManager = this.offsetManager
 			const fetchManager = this.fetchManager
@@ -438,38 +439,76 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 				return
 			}
 
-			// Use the stream loop generator
-			yield* runStreamLoop<MsgOf<S>, KeyOf<S>>(
-				{
-					cluster: this.cluster,
-					groupId: this.config.groupId,
-					autoOffsetReset: this.config.autoOffsetReset,
-					logger: this.logger,
-				},
-				{ consumerGroup, offsetManager, fetchManager, signal },
-				subscriptions,
-				{
-					onPartitionsAssigned: partitions => this.emit('partitionsAssigned', partitions),
-					onPartitionsRevoked: partitions => this.emit('partitionsRevoked', partitions),
-					onPartitionsLost: partitions => {
-						this.logger.debug('session lost, partitions cannot be committed', {
-							partitionCount: partitions.length,
-						})
-						this.sessionLost = true
-						this.emit('partitionsLost', partitions)
-					},
-					onError: err => {
-						this.emitError(err)
-						if (err instanceof KafkaProtocolError && err.errorCode === ErrorCode.FencedInstanceId) {
-							this.stop()
-						}
-					},
-					onRunning: () => this.emit('running'),
-					onRebalance: () => this.emit('rebalance'),
-					isRunning: () => this.state === 'running',
-					setupPartitions: assignment => this.setupStreamPartitions(assignment),
+			// Create partition provider (same as runMode)
+			this.partitionProvider = new GroupPartitionProvider({
+				consumerGroup,
+				cluster: this.cluster,
+				groupId: this.config.groupId,
+				autoOffsetReset: this.config.autoOffsetReset,
+				commitOffsets: this.commitOffsets,
+				offsetManager,
+				fetchManager,
+				logger: this.logger,
+				signal,
+				isRunning: () => this.state === 'running',
+			})
+
+			// Start partition provider
+			const callbacks = this.createProviderCallbacks()
+			await this.partitionProvider.start(topics, callbacks)
+			this.emit('running')
+
+			// Push-pull adapter: queue bridges fetch callbacks (push) and generator (pull)
+			const messageQueue: Array<{ message: Message<unknown, unknown>; ctx: ConsumeContext }> = []
+			let resolveNext: (() => void) | null = null
+			const wakeUp = () => {
+				if (resolveNext) {
+					resolveNext()
+					resolveNext = null
 				}
-			)
+			}
+
+			// Create stream processor that pushes to queue
+			const processor = new StreamRecordProcessor(messageQueue, offsetManager, wakeUp)
+			this.fetchCallback = createFetchCallback(subscriptions, processor, signal, () => this.state === 'running')
+
+			// Start auto-commit and fetch loop in background
+			offsetManager.startAutoCommit(DEFAULT_RUN_EACH_OPTIONS.autoCommitIntervalMs)
+			this.fetchLoopPromise = fetchManager.start(this.fetchCallback)
+
+			// Track fetch errors
+			let fetchError: Error | null = null
+			this.fetchLoopPromise.catch(err => {
+				fetchError = err instanceof Error ? err : new Error(String(err))
+				wakeUp()
+			})
+
+			// Yield messages from queue
+			const onAbort = () => wakeUp()
+			signal.addEventListener('abort', onAbort)
+			try {
+				while (this.state === 'running' && !signal.aborted) {
+					if (fetchError) throw fetchError
+
+					// Wait for messages
+					if (messageQueue.length === 0) {
+						await new Promise<void>(resolve => {
+							resolveNext = resolve
+							setTimeout(resolve, 100) // Periodic check for errors/abort
+						})
+					}
+
+					// Yield all queued messages
+					while (messageQueue.length > 0) {
+						const item = messageQueue.shift()!
+						yield item as { message: Message<MsgOf<S>, KeyOf<S>>; ctx: ConsumeContext }
+					}
+				}
+
+				if (fetchError) throw fetchError
+			} finally {
+				signal.removeEventListener('abort', onAbort)
+			}
 		} finally {
 			await this.finalizeRun({ logCleanup: false, logStop: false })
 		}
@@ -562,27 +601,6 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			}
 			this.stop()
 		}
-	}
-
-	/**
-	 * Set up partitions for stream mode (used by stream-mode.ts)
-	 */
-	private async setupStreamPartitions(assignment: TopicPartition[]): Promise<void> {
-		const consumerGroup = this.consumerGroup
-		const offsetManager = this.offsetManager
-		const fetchManager = this.fetchManager
-
-		if (!consumerGroup || !offsetManager || !fetchManager) {
-			return
-		}
-
-		// Update offset manager with group state
-		const coordinator = await this.cluster.getCoordinator('GROUP', this.config.groupId)
-		offsetManager.updateGroupState(consumerGroup.currentMemberId, consumerGroup.currentGenerationId, coordinator)
-
-		// Resolve and set partitions
-		const partitionsWithOffsets = await this.resolvePartitionOffsets(assignment)
-		fetchManager.setPartitions(partitionsWithOffsets)
 	}
 
 	/**
