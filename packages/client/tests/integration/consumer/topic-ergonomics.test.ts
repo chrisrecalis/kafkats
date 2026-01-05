@@ -81,7 +81,7 @@ describe.concurrent('Consumer (integration) - topic ergonomics', () => {
 					consumer.stop()
 				}
 			},
-			{ autoCommit: false, maxBatchSize: 3, maxBatchWaitMs: 1000 }
+			{ autoCommit: false }
 		)
 
 		expect(received.slice(0, 3)).toEqual(['a', 'b', 'c'])

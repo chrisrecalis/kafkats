@@ -12,11 +12,11 @@ import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import {
 	EachRecordProcessor,
 	BatchRecordProcessor,
-	StreamRecordProcessor,
 	createFetchCallback,
 	type RecordProcessor,
 	type FetchCallback,
 } from './record-processor.js'
+import { buildDecoderMaps, decodeRecord } from './message-decoder.js'
 import {
 	ManualPartitionProvider,
 	GroupPartitionProvider,
@@ -419,7 +419,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	 *
 	 * - Also single-run: calling stream() during run() throws.
 	 * - Returns one message at a time.
-	 * - Uses push-pull adapter pattern: fetch loop pushes to queue, generator yields from queue.
+	 * - Simple poll-yield-mark loop: fetch records, yield each, mark consumed after yield.
 	 */
 	async *stream<S extends SubscriptionInput>(
 		subscription: S
@@ -428,6 +428,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 
 		try {
 			const { subscriptions, topics } = this.getSubscriptionsAndTopics(subscription)
+			const decoders = buildDecoderMaps(subscriptions)
 
 			// Create components
 			this.initComponents(1, true, this.logger)
@@ -458,56 +459,44 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			await this.partitionProvider.start(topics, callbacks)
 			this.emit('running')
 
-			// Push-pull adapter: queue bridges fetch callbacks (push) and generator (pull)
-			const messageQueue: Array<{ message: Message<unknown, unknown>; ctx: ConsumeContext }> = []
-			let resolveNext: (() => void) | null = null
-			const wakeUp = () => {
-				if (resolveNext) {
-					resolveNext()
-					resolveNext = null
-				}
-			}
-
-			// Create stream processor that pushes to queue
-			const processor = new StreamRecordProcessor(messageQueue, offsetManager, wakeUp)
-			this.fetchCallback = createFetchCallback(subscriptions, processor, signal, () => this.state === 'running')
-
-			// Start auto-commit and fetch loop in background
+			// Start auto-commit
 			offsetManager.startAutoCommit(DEFAULT_RUN_EACH_OPTIONS.autoCommitIntervalMs)
-			this.fetchLoopPromise = fetchManager.start(this.fetchCallback)
 
-			// Track fetch errors
-			let fetchError: Error | null = null
-			this.fetchLoopPromise.catch(err => {
-				fetchError = err instanceof Error ? err : new Error(String(err))
-				wakeUp()
-			})
+			// Simple poll-yield-mark loop
+			while (this.state === 'running' && !signal.aborted) {
+				// Poll for records
+				const batches = await fetchManager.poll()
 
-			// Yield messages from queue
-			const onAbort = () => wakeUp()
-			signal.addEventListener('abort', onAbort)
-			try {
-				while (this.state === 'running' && !signal.aborted) {
-					if (fetchError) throw fetchError
-
-					// Wait for messages
-					if (messageQueue.length === 0) {
-						await new Promise<void>(resolve => {
-							resolveNext = resolve
-							setTimeout(resolve, 100) // Periodic check for errors/abort
-						})
-					}
-
-					// Yield all queued messages
-					while (messageQueue.length > 0) {
-						const item = messageQueue.shift()!
-						yield item as { message: Message<MsgOf<S>, KeyOf<S>>; ctx: ConsumeContext }
-					}
+				if (batches.length === 0) {
+					// No records, wait briefly before next poll
+					await new Promise(r => setTimeout(r, 100))
+					continue
 				}
 
-				if (fetchError) throw fetchError
-			} finally {
-				signal.removeEventListener('abort', onAbort)
+				// Process each batch
+				for (const { topic, partition, records } of batches) {
+					for (const record of records) {
+						// Decode record to message
+						const message = decodeRecord(topic, partition, record, decoders)
+						const ctx: ConsumeContext = {
+							signal,
+							topic,
+							partition,
+							offset: record.offset,
+						}
+
+						// Yield to user
+						yield { message, ctx } as { message: Message<MsgOf<S>, KeyOf<S>>; ctx: ConsumeContext }
+
+						// Mark consumed AFTER yield returns (user has received message)
+						offsetManager.markConsumed(topic, partition, record.offset)
+
+						// Check if we should stop after each message
+						if (this.state !== 'running' || signal.aborted) {
+							return
+						}
+					}
+				}
 			}
 		} finally {
 			await this.finalizeRun({ logCleanup: false, logStop: false })

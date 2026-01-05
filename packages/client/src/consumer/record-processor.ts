@@ -1,7 +1,7 @@
 /**
  * Record processor abstraction for unified fetch loop handling
  *
- * Provides a strategy pattern for processing records in different modes (each/batch/stream).
+ * Provides a strategy pattern for processing records in different modes (each/batch).
  */
 
 import type { DecodedRecord } from '@/protocol/records/index.js'
@@ -145,40 +145,5 @@ export class BatchRecordProcessor implements RecordProcessor {
 			this.onError(error as Error)
 			throw error
 		}
-	}
-}
-
-/**
- * Processor for "stream" mode - queues messages for async iteration
- */
-export class StreamRecordProcessor implements RecordProcessor {
-	constructor(
-		private readonly messageQueue: Array<{ message: Message<unknown, unknown>; ctx: ConsumeContext }>,
-		private readonly offsetManager: OffsetManager,
-		private readonly wakeUp: () => void
-	) {}
-
-	processBatch(
-		messages: Message<unknown, unknown>[],
-		topic: string,
-		partition: number,
-		signal: AbortSignal
-	): Promise<void> {
-		for (const message of messages) {
-			const ctx: ConsumeContext = {
-				signal,
-				topic,
-				partition,
-				offset: message.offset,
-			}
-			this.messageQueue.push({ message, ctx })
-			this.offsetManager.markConsumed(message.topic, message.partition, message.offset)
-		}
-
-		if (messages.length > 0) {
-			this.wakeUp()
-		}
-
-		return Promise.resolve()
 	}
 }

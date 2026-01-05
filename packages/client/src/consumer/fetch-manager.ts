@@ -681,6 +681,169 @@ export class FetchManager {
 	}
 
 	/**
+	 * Poll for records from all ready partitions (pull-based API)
+	 *
+	 * Returns records grouped by topic/partition. Internal offsets are advanced
+	 * so subsequent polls return new records.
+	 */
+	async poll(): Promise<Array<{ topic: string; partition: number; records: DecodedRecord[] }>> {
+		const results: Array<{ topic: string; partition: number; records: DecodedRecord[] }> = []
+
+		// Get ready partitions
+		const readyPartitions = Array.from(this.partitionStates.values()).filter(s => !s.paused)
+		if (readyPartitions.length === 0) {
+			return results
+		}
+
+		// Group partitions by leader broker
+		const partitionsByBroker = new Map<number, { broker: Broker; partitions: PartitionState[] }>()
+
+		// Collect partitions needing leader lookup
+		const needsLookup: PartitionState[] = []
+		for (const state of readyPartitions) {
+			if (state.cachedLeader) {
+				const brokerId = state.cachedLeader.nodeId
+				if (!partitionsByBroker.has(brokerId)) {
+					partitionsByBroker.set(brokerId, { broker: state.cachedLeader, partitions: [] })
+				}
+				partitionsByBroker.get(brokerId)!.partitions.push(state)
+			} else {
+				needsLookup.push(state)
+			}
+		}
+
+		// Parallel leader lookups for cache misses
+		if (needsLookup.length > 0) {
+			const lookups = await Promise.all(
+				needsLookup.map(async state => {
+					try {
+						const leader = await this.cluster.getLeaderForPartition(state.topic, state.partition)
+						state.cachedLeader = leader
+						return { state, leader }
+					} catch (error) {
+						this.logger.error('failed to get leader', {
+							topic: state.topic,
+							partition: state.partition,
+							error: (error as Error).message,
+						})
+						return null
+					}
+				})
+			)
+
+			for (const result of lookups) {
+				if (!result) continue
+				const brokerId = result.leader.nodeId
+				if (!partitionsByBroker.has(brokerId)) {
+					partitionsByBroker.set(brokerId, { broker: result.leader, partitions: [] })
+				}
+				partitionsByBroker.get(brokerId)!.partitions.push(result.state)
+			}
+		}
+
+		if (partitionsByBroker.size === 0) {
+			return results
+		}
+
+		// Fetch from all brokers in parallel
+		const brokerResults = await Promise.all(
+			Array.from(partitionsByBroker.entries()).map(async ([brokerId, { broker, partitions }]) => {
+				const partitionResults: Array<{ topic: string; partition: number; records: DecodedRecord[] }> = []
+
+				try {
+					// Track fetch offsets for filtering
+					const fetchOffsetByKey = new Map<string, bigint>()
+
+					// Build topics array
+					const topicsMap = new Map<string, Array<{ state: PartitionState }>>()
+					for (const state of partitions) {
+						if (!topicsMap.has(state.topic)) {
+							topicsMap.set(state.topic, [])
+						}
+						topicsMap.get(state.topic)!.push({ state })
+						fetchOffsetByKey.set(tpKey(state.topic, state.partition), state.offset)
+					}
+
+					const topics = Array.from(topicsMap.entries()).map(([topic, parts]) => ({
+						topic,
+						topicId: '00000000-0000-0000-0000-000000000000',
+						partitions: parts.map(p => ({
+							partitionIndex: p.state.partition,
+							currentLeaderEpoch: -1,
+							fetchOffset: p.state.offset,
+							lastFetchedEpoch: -1,
+							logStartOffset: -1n,
+							partitionMaxBytes: this.config.maxBytesPerPartition,
+						})),
+					}))
+
+					const response = await broker.fetch({
+						replicaId: -1,
+						maxWaitMs: this.config.maxWaitMs,
+						minBytes: this.config.minBytes,
+						maxBytes: this.config.maxBytesPerPartition * partitions.length,
+						isolationLevel: this.config.isolationLevel === 'read_committed' ? 1 : 0,
+						topics,
+					})
+
+					// Process response
+					for (const topicResponse of response.topics) {
+						for (const partitionResponse of topicResponse.partitions) {
+							const key = tpKey(topicResponse.topic, partitionResponse.partitionIndex)
+							const state = this.partitionStates.get(key)
+							if (!state) continue
+
+							// Handle errors
+							if (partitionResponse.errorCode !== ErrorCode.None) {
+								await this.handleFetchError(state, partitionResponse.errorCode)
+								continue
+							}
+
+							// Decode records
+							if (partitionResponse.recordsData && partitionResponse.recordsData.length > 0) {
+								const decodeResult = this.decodeRecords(
+									state.topic,
+									state.partition,
+									partitionResponse.recordsData,
+									partitionResponse.abortedTransactions,
+									partitionResponse.lastStableOffset
+								)
+								let records = decodeResult instanceof Promise ? await decodeResult : decodeResult
+
+								const fetchOffset = fetchOffsetByKey.get(key)
+								if (fetchOffset !== undefined) {
+									records = filterRecordsFromOffset(records, fetchOffset)
+								}
+
+								if (records.length > 0) {
+									// Advance offset for next poll
+									state.offset = records[records.length - 1]!.offset + 1n
+									partitionResults.push({
+										topic: state.topic,
+										partition: state.partition,
+										records,
+									})
+								}
+							}
+						}
+					}
+				} catch (error) {
+					this.logger.error('broker fetch failed', { brokerId, error: (error as Error).message })
+				}
+
+				return partitionResults
+			})
+		)
+
+		// Flatten results
+		for (const brokerResult of brokerResults) {
+			results.push(...brokerResult)
+		}
+
+		return results
+	}
+
+	/**
 	 * Fetch loop for a single partition
 	 */
 	private async fetchPartitionLoop(
