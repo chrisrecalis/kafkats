@@ -37,12 +37,13 @@ describe.concurrent('Consumer (integration) - runBatch', () => {
 					consumer.stop()
 				}
 			},
-			{ autoCommit: false, maxBatchSize: 4, maxBatchWaitMs: 50 }
+			{ autoCommit: false }
 		)
 
 		const all = batches.flat()
 		expect(all).toEqual(Array.from({ length: 10 }, (_, i) => `m-${i}`))
-		expect(batches.every(b => b.length <= 4)).toBe(true)
+		// Batch size is determined by fetch, not a fixed max
+		expect(batches.length).toBeGreaterThanOrEqual(1)
 
 		await producer.disconnect()
 		await client.disconnect()
@@ -76,7 +77,7 @@ describe.concurrent('Consumer (integration) - runBatch', () => {
 				batches1.push(batch.map(m => m.value))
 				throw new Error('boom')
 			},
-			{ autoCommit: false, maxBatchSize: 3, maxBatchWaitMs: 50 }
+			{ autoCommit: false }
 		)
 		void run1.catch(() => {})
 
@@ -86,7 +87,8 @@ describe.concurrent('Consumer (integration) - runBatch', () => {
 		})
 
 		await expect(run1).rejects.toThrow(/boom/)
-		expect(batches1[0]).toEqual(['m-0', 'm-1', 'm-2'])
+		// The batch contains all messages from the fetch
+		expect(batches1[0]).toEqual(Array.from({ length: 5 }, (_, i) => `m-${i}`))
 
 		// Since the batch handler failed, offsets should not be committed and a new consumer should re-read from the start
 		const consumer2 = client.consumer({ groupId, autoOffsetReset: 'earliest' })

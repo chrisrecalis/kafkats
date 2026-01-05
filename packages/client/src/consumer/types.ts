@@ -170,8 +170,6 @@ export interface RunBatchOptions {
 	commitOffsets?: boolean
 	autoCommitIntervalMs?: number
 	signal?: AbortSignal
-	maxBatchSize?: number
-	maxBatchWaitMs?: number
 	/**
 	 * Manually assign the consumer to these partitions instead of joining a group.
 	 *
@@ -314,8 +312,6 @@ export const DEFAULT_RUN_BATCH_OPTIONS = {
 	autoCommit: true,
 	commitOffsets: true,
 	autoCommitIntervalMs: 5000,
-	maxBatchSize: 100,
-	maxBatchWaitMs: 50,
 } as const
 
 // ==================== Internal Types ====================
