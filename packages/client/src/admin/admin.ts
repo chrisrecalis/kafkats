@@ -17,6 +17,11 @@ import type {
 	CreateTopicsResult,
 	DeleteTopicsResult,
 	DeleteGroupsResult,
+	AclBinding,
+	AclBindingFilter,
+	DescribeAclsResult,
+	CreateAclResult,
+	DeleteAclsFilterResult,
 } from './types.js'
 import { createCreateTopicsRequest } from '@/protocol/messages/requests/create-topics.js'
 import { createDeleteTopicsRequest } from '@/protocol/messages/requests/delete-topics.js'
@@ -559,6 +564,233 @@ export class Admin {
 		}
 
 		this.logger.debug('deleted groups', { count: results.length })
+		return results
+	}
+
+	// ==================== ACL Operations ====================
+
+	/**
+	 * Describe ACLs matching a filter
+	 *
+	 * Queries the cluster for ACLs that match the specified filter criteria.
+	 * Use AclResourceType.ANY, AclOperation.ANY, etc. to match all values.
+	 *
+	 * @param filter - Filter criteria for ACLs to describe
+	 * @returns Resources with their matching ACLs
+	 *
+	 * @example
+	 * ```typescript
+	 * import { AclResourceType, AclResourcePatternType, AclOperation, AclPermissionType } from '@kafkats/client'
+	 *
+	 * // Describe all ACLs for topics
+	 * const result = await admin.describeAcls({
+	 *   resourceTypeFilter: AclResourceType.TOPIC,
+	 *   resourceNameFilter: null,
+	 *   patternTypeFilter: AclResourcePatternType.ANY,
+	 *   principalFilter: null,
+	 *   hostFilter: null,
+	 *   operation: AclOperation.ANY,
+	 *   permissionType: AclPermissionType.ANY,
+	 * })
+	 *
+	 * // Describe ACLs for a specific topic
+	 * const result = await admin.describeAcls({
+	 *   resourceTypeFilter: AclResourceType.TOPIC,
+	 *   resourceNameFilter: 'my-topic',
+	 *   patternTypeFilter: AclResourcePatternType.LITERAL,
+	 *   principalFilter: null,
+	 *   hostFilter: null,
+	 *   operation: AclOperation.ANY,
+	 *   permissionType: AclPermissionType.ANY,
+	 * })
+	 * ```
+	 */
+	async describeAcls(filter: AclBindingFilter): Promise<DescribeAclsResult> {
+		this.logger.debug('describing ACLs', { filter })
+
+		// ACL operations go to any broker (typically controller)
+		const controller = await this.cluster.getControllerBroker()
+
+		const response = await controller.describeAcls({
+			resourceTypeFilter: filter.resourceTypeFilter,
+			resourceNameFilter: filter.resourceNameFilter,
+			patternTypeFilter: filter.patternTypeFilter,
+			principalFilter: filter.principalFilter,
+			hostFilter: filter.hostFilter,
+			operation: filter.operation,
+			permissionType: filter.permissionType,
+		})
+
+		if (response.errorCode !== ErrorCode.None) {
+			this.logger.warn('describe ACLs failed', {
+				errorCode: response.errorCode,
+				errorMessage: response.errorMessage,
+			})
+		}
+
+		const result: DescribeAclsResult = {
+			errorCode: response.errorCode,
+			errorMessage: response.errorMessage,
+			resources: response.resources.map(r => ({
+				resourceType: r.resourceType,
+				resourceName: r.resourceName,
+				patternType: r.patternType,
+				acls: r.acls.map(a => ({
+					principal: a.principal,
+					host: a.host,
+					operation: a.operation,
+					permissionType: a.permissionType,
+				})),
+			})),
+		}
+
+		this.logger.debug('described ACLs', { resourceCount: result.resources.length })
+		return result
+	}
+
+	/**
+	 * Create ACL bindings
+	 *
+	 * Creates one or more ACL bindings in the cluster.
+	 *
+	 * @param acls - ACL bindings to create
+	 * @returns Results for each ACL creation (in the same order as input)
+	 *
+	 * @example
+	 * ```typescript
+	 * import { AclResourceType, AclResourcePatternType, AclOperation, AclPermissionType } from '@kafkats/client'
+	 *
+	 * // Allow User:alice to read from my-topic
+	 * const results = await admin.createAcls([{
+	 *   resourceType: AclResourceType.TOPIC,
+	 *   resourceName: 'my-topic',
+	 *   resourcePatternType: AclResourcePatternType.LITERAL,
+	 *   principal: 'User:alice',
+	 *   host: '*',
+	 *   operation: AclOperation.READ,
+	 *   permissionType: AclPermissionType.ALLOW,
+	 * }])
+	 *
+	 * // Allow User:bob to write to all topics with prefix "data-"
+	 * const results = await admin.createAcls([{
+	 *   resourceType: AclResourceType.TOPIC,
+	 *   resourceName: 'data-',
+	 *   resourcePatternType: AclResourcePatternType.PREFIXED,
+	 *   principal: 'User:bob',
+	 *   host: '*',
+	 *   operation: AclOperation.WRITE,
+	 *   permissionType: AclPermissionType.ALLOW,
+	 * }])
+	 * ```
+	 */
+	async createAcls(acls: AclBinding[]): Promise<CreateAclResult[]> {
+		this.logger.debug('creating ACLs', { count: acls.length })
+
+		const controller = await this.cluster.getControllerBroker()
+
+		const response = await controller.createAcls({
+			creations: acls.map(acl => ({
+				resourceType: acl.resourceType,
+				resourceName: acl.resourceName,
+				resourcePatternType: acl.resourcePatternType,
+				principal: acl.principal,
+				host: acl.host,
+				operation: acl.operation,
+				permissionType: acl.permissionType,
+			})),
+		})
+
+		const results: CreateAclResult[] = response.results.map(r => ({
+			errorCode: r.errorCode,
+			errorMessage: r.errorMessage,
+		}))
+
+		for (let i = 0; i < results.length; i++) {
+			const result = results[i]!
+			if (result.errorCode !== ErrorCode.None) {
+				this.logger.warn('ACL creation failed', {
+					index: i,
+					errorCode: result.errorCode,
+					errorMessage: result.errorMessage,
+				})
+			}
+		}
+
+		this.logger.debug('created ACLs', { count: results.length })
+		return results
+	}
+
+	/**
+	 * Delete ACLs matching filters
+	 *
+	 * Deletes all ACLs that match the specified filter criteria.
+	 * Use AclResourceType.ANY, AclOperation.ANY, etc. to match all values.
+	 *
+	 * @param filters - Filters for ACLs to delete
+	 * @returns Results for each filter with the ACLs that were deleted
+	 *
+	 * @example
+	 * ```typescript
+	 * import { AclResourceType, AclResourcePatternType, AclOperation, AclPermissionType } from '@kafkats/client'
+	 *
+	 * // Delete all ACLs for User:alice on my-topic
+	 * const results = await admin.deleteAcls([{
+	 *   resourceTypeFilter: AclResourceType.TOPIC,
+	 *   resourceNameFilter: 'my-topic',
+	 *   patternTypeFilter: AclResourcePatternType.LITERAL,
+	 *   principalFilter: 'User:alice',
+	 *   hostFilter: null,
+	 *   operation: AclOperation.ANY,
+	 *   permissionType: AclPermissionType.ANY,
+	 * }])
+	 *
+	 * // Each result contains the ACLs that were matched and deleted
+	 * for (const result of results) {
+	 *   console.log(`Deleted ${result.matchingAcls.length} ACLs`)
+	 * }
+	 * ```
+	 */
+	async deleteAcls(filters: AclBindingFilter[]): Promise<DeleteAclsFilterResult[]> {
+		this.logger.debug('deleting ACLs', { filterCount: filters.length })
+
+		const controller = await this.cluster.getControllerBroker()
+
+		const response = await controller.deleteAcls({
+			filters: filters.map(f => ({
+				resourceTypeFilter: f.resourceTypeFilter,
+				resourceNameFilter: f.resourceNameFilter,
+				patternTypeFilter: f.patternTypeFilter,
+				principalFilter: f.principalFilter,
+				hostFilter: f.hostFilter,
+				operation: f.operation,
+				permissionType: f.permissionType,
+			})),
+		})
+
+		const results: DeleteAclsFilterResult[] = response.filterResults.map(fr => ({
+			errorCode: fr.errorCode,
+			errorMessage: fr.errorMessage,
+			matchingAcls: fr.matchingAcls.map(ma => ({
+				resourceType: ma.resourceType,
+				resourceName: ma.resourceName,
+				resourcePatternType: ma.patternType,
+				principal: ma.principal,
+				host: ma.host,
+				operation: ma.operation,
+				permissionType: ma.permissionType,
+			})),
+		}))
+
+		for (const result of results) {
+			if (result.errorCode !== ErrorCode.None) {
+				this.logger.warn('ACL deletion failed', {
+					errorCode: result.errorCode,
+					errorMessage: result.errorMessage,
+				})
+			}
+		}
+
+		this.logger.debug('deleted ACLs', { filterCount: results.length })
 		return results
 	}
 

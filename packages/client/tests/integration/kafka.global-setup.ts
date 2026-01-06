@@ -28,6 +28,12 @@ async function startMainContainer(image: string): Promise<StartedKafkaContainer>
 		.withEnvironment({
 			KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: '1',
 			KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: '1',
+			// Enable ACL authorization with StandardAuthorizer (KRaft mode)
+			KAFKA_AUTHORIZER_CLASS_NAME: 'org.apache.kafka.metadata.authorizer.StandardAuthorizer',
+			// Allow ANONYMOUS user (unauthenticated connections) to be a super user for testing
+			KAFKA_SUPER_USERS: 'User:ANONYMOUS',
+			// Allow operations when no ACL is found (less restrictive for testing)
+			KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND: 'true',
 		})
 		.withStartupTimeout(60_000)
 		.start()

@@ -121,6 +121,24 @@ import {
 } from '@/protocol/messages/requests/delete-topics.js'
 import { decodeDeleteTopicsResponse, type DeleteTopicsResponse } from '@/protocol/messages/responses/delete-topics.js'
 import {
+	encodeDescribeAclsRequest,
+	DESCRIBE_ACLS_VERSIONS,
+	type DescribeAclsRequest,
+} from '@/protocol/messages/requests/describe-acls.js'
+import { decodeDescribeAclsResponse, type DescribeAclsResponse } from '@/protocol/messages/responses/describe-acls.js'
+import {
+	encodeCreateAclsRequest,
+	CREATE_ACLS_VERSIONS,
+	type CreateAclsRequest,
+} from '@/protocol/messages/requests/create-acls.js'
+import { decodeCreateAclsResponse, type CreateAclsResponse } from '@/protocol/messages/responses/create-acls.js'
+import {
+	encodeDeleteAclsRequest,
+	DELETE_ACLS_VERSIONS,
+	type DeleteAclsRequest,
+} from '@/protocol/messages/requests/delete-acls.js'
+import { decodeDeleteAclsResponse, type DeleteAclsResponse } from '@/protocol/messages/responses/delete-acls.js'
+import {
 	encodeListGroupsRequest,
 	LIST_GROUPS_VERSIONS,
 	type ListGroupsRequest,
@@ -193,6 +211,9 @@ const CLIENT_API_VERSIONS: Partial<Record<ApiKey, { min: number; max: number }>>
 	[ApiKey.EndTxn]: END_TXN_VERSIONS,
 	[ApiKey.TxnOffsetCommit]: TXN_OFFSET_COMMIT_VERSIONS,
 	[ApiKey.DeleteTopics]: DELETE_TOPICS_VERSIONS,
+	[ApiKey.DescribeAcls]: DESCRIBE_ACLS_VERSIONS,
+	[ApiKey.CreateAcls]: CREATE_ACLS_VERSIONS,
+	[ApiKey.DeleteAcls]: DELETE_ACLS_VERSIONS,
 	[ApiKey.ListGroups]: LIST_GROUPS_VERSIONS,
 	[ApiKey.DescribeGroups]: DESCRIBE_GROUPS_VERSIONS,
 	[ApiKey.DeleteGroups]: DELETE_GROUPS_VERSIONS,
@@ -718,6 +739,78 @@ export class Broker {
 
 		const durationMs = Date.now() - startTime
 		this.logger.debug('received response', { api: 'DeleteTopics', version, durationMs })
+		return response
+	}
+
+	async describeAcls(request: DescribeAclsRequest): Promise<DescribeAclsResponse> {
+		const version = this.getApiVersion(ApiKey.DescribeAcls)
+		const startTime = Date.now()
+		this.logger.debug('sending request', { api: 'DescribeAcls', version })
+
+		const responseBuffer = await this.connection.send(ApiKey.DescribeAcls, version, encoder => {
+			encodeDescribeAclsRequest(encoder, version, request)
+		})
+
+		const decoder = new Decoder(responseBuffer)
+		decodeResponseHeader(decoder, ApiKey.DescribeAcls, version)
+		const response = decodeDescribeAclsResponse(decoder, version)
+
+		const durationMs = Date.now() - startTime
+		this.logger.debug('received response', {
+			api: 'DescribeAcls',
+			version,
+			durationMs,
+			resourceCount: response.resources.length,
+		})
+		return response
+	}
+
+	async createAcls(request: CreateAclsRequest): Promise<CreateAclsResponse> {
+		const version = this.getApiVersion(ApiKey.CreateAcls)
+		const startTime = Date.now()
+		this.logger.debug('sending request', {
+			api: 'CreateAcls',
+			version,
+			aclCount: request.creations.length,
+		})
+
+		const responseBuffer = await this.connection.send(ApiKey.CreateAcls, version, encoder => {
+			encodeCreateAclsRequest(encoder, version, request)
+		})
+
+		const decoder = new Decoder(responseBuffer)
+		decodeResponseHeader(decoder, ApiKey.CreateAcls, version)
+		const response = decodeCreateAclsResponse(decoder, version)
+
+		const durationMs = Date.now() - startTime
+		this.logger.debug('received response', { api: 'CreateAcls', version, durationMs })
+		return response
+	}
+
+	async deleteAcls(request: DeleteAclsRequest): Promise<DeleteAclsResponse> {
+		const version = this.getApiVersion(ApiKey.DeleteAcls)
+		const startTime = Date.now()
+		this.logger.debug('sending request', {
+			api: 'DeleteAcls',
+			version,
+			filterCount: request.filters.length,
+		})
+
+		const responseBuffer = await this.connection.send(ApiKey.DeleteAcls, version, encoder => {
+			encodeDeleteAclsRequest(encoder, version, request)
+		})
+
+		const decoder = new Decoder(responseBuffer)
+		decodeResponseHeader(decoder, ApiKey.DeleteAcls, version)
+		const response = decodeDeleteAclsResponse(decoder, version)
+
+		const durationMs = Date.now() - startTime
+		this.logger.debug('received response', {
+			api: 'DeleteAcls',
+			version,
+			durationMs,
+			filterResultCount: response.filterResults.length,
+		})
 		return response
 	}
 
