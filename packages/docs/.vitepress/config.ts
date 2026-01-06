@@ -56,6 +56,7 @@ export default defineConfig({
 						{ text: 'Overview', link: '/client/' },
 						{ text: 'Getting Started', link: '/client/getting-started' },
 						{ text: 'Configuration', link: '/client/configuration' },
+						{ text: 'Migrating from KafkaJS', link: '/client/migration-from-kafkajs' },
 					],
 				},
 				{

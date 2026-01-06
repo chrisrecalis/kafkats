@@ -189,17 +189,14 @@ compressionCodecs.register(CompressionType.Zstd, createZstdCodec({ compress, dec
 Consumers automatically detect and decompress messages without any configuration. The compression type is stored in the RecordBatch header, so consumers can decode messages regardless of which compression was used by the producer.
 
 ```typescript
-// Producer uses snappy compression
-const producer = client.producer({ compression: 'snappy' })
-await producer.send('my-topic', [{ value: 'compressed data' }])
+// Producer uses gzip compression (built-in)
+const producer = client.producer({ compression: 'gzip' })
+await producer.send('my-topic', [{ value: Buffer.from('compressed data') }])
 
-// Consumer automatically decompresses - no config needed!
+// Consumer automatically decompresses
 const consumer = client.consumer({ groupId: 'my-group' })
-await consumer.subscribe('my-topic')
-
-for await (const batch of consumer) {
-	// Messages are automatically decompressed
-	console.log(batch.messages[0].value) // 'compressed data'
+for await (const { message } of consumer.stream('my-topic')) {
+	console.log(message.value.toString()) // 'compressed data'
 }
 ```
 

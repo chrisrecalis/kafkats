@@ -172,3 +172,140 @@ export interface CreateTopicsResult {
 	/** Replication factor */
 	replicationFactor: number
 }
+
+// Re-export ACL enums for convenience
+export {
+	AclResourceType,
+	AclResourcePatternType,
+	AclOperation,
+	AclPermissionType,
+} from '@/protocol/messages/requests/describe-acls.js'
+
+import type {
+	AclResourceType,
+	AclResourcePatternType,
+	AclOperation,
+	AclPermissionType,
+} from '@/protocol/messages/requests/describe-acls.js'
+
+/**
+ * ACL binding representing a single access control entry
+ */
+export interface AclBinding {
+	/** Resource type (TOPIC, GROUP, CLUSTER, etc.) */
+	resourceType: AclResourceType
+	/** Resource name */
+	resourceName: string
+	/** Resource pattern type (LITERAL, PREFIXED) */
+	resourcePatternType: AclResourcePatternType
+	/** Principal (e.g., "User:alice") */
+	principal: string
+	/** Host (use "*" for all hosts) */
+	host: string
+	/** Operation (READ, WRITE, CREATE, etc.) */
+	operation: AclOperation
+	/** Permission type (ALLOW or DENY) */
+	permissionType: AclPermissionType
+}
+
+/**
+ * ACL filter for describe and delete operations
+ */
+export interface AclBindingFilter {
+	/** Resource type filter (use ANY to match all) */
+	resourceTypeFilter: AclResourceType
+	/** Resource name filter (null matches any) */
+	resourceNameFilter: string | null
+	/** Resource pattern type filter (use ANY to match all) */
+	patternTypeFilter: AclResourcePatternType
+	/** Principal filter (null matches any) */
+	principalFilter: string | null
+	/** Host filter (null matches any) */
+	hostFilter: string | null
+	/** Operation filter (use ANY to match all) */
+	operation: AclOperation
+	/** Permission type filter (use ANY to match all) */
+	permissionType: AclPermissionType
+}
+
+/**
+ * ACL entry in a resource
+ */
+export interface AclEntry {
+	/** Principal */
+	principal: string
+	/** Host */
+	host: string
+	/** Operation */
+	operation: AclOperation
+	/** Permission type */
+	permissionType: AclPermissionType
+}
+
+/**
+ * Resource with its ACLs
+ */
+export interface AclResource {
+	/** Resource type */
+	resourceType: AclResourceType
+	/** Resource name */
+	resourceName: string
+	/** Resource pattern type */
+	patternType: AclResourcePatternType
+	/** ACL entries for this resource */
+	acls: AclEntry[]
+}
+
+/**
+ * Result of a describe ACLs operation
+ */
+export interface DescribeAclsResult {
+	/** Error code (None if successful) */
+	errorCode: ErrorCode
+	/** Error message */
+	errorMessage: string | null
+	/** Resources with their ACLs */
+	resources: AclResource[]
+}
+
+/**
+ * Result of a single ACL creation
+ */
+export interface CreateAclResult {
+	/** Error code (None if successful) */
+	errorCode: ErrorCode
+	/** Error message */
+	errorMessage: string | null
+}
+
+/**
+ * A matching ACL that was deleted
+ */
+export interface DeletedAcl {
+	/** Resource type */
+	resourceType: AclResourceType
+	/** Resource name */
+	resourceName: string
+	/** Resource pattern type */
+	resourcePatternType: AclResourcePatternType
+	/** Principal */
+	principal: string
+	/** Host */
+	host: string
+	/** Operation */
+	operation: AclOperation
+	/** Permission type */
+	permissionType: AclPermissionType
+}
+
+/**
+ * Result of a delete ACLs filter
+ */
+export interface DeleteAclsFilterResult {
+	/** Error code (None if successful) */
+	errorCode: ErrorCode
+	/** Error message */
+	errorMessage: string | null
+	/** ACLs that matched and were deleted */
+	matchingAcls: DeletedAcl[]
+}

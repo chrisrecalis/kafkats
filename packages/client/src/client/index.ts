@@ -66,7 +66,19 @@ export type {
 	CreateTopicsResult,
 	DeleteTopicsResult,
 	DeleteGroupsResult,
+	// ACL types
+	AclBinding,
+	AclBindingFilter,
+	AclEntry,
+	AclResource,
+	DescribeAclsResult,
+	CreateAclResult,
+	DeletedAcl,
+	DeleteAclsFilterResult,
 } from '@/admin/index.js'
+
+// ACL enums
+export { AclResourceType, AclResourcePatternType, AclOperation, AclPermissionType } from '@/admin/index.js'
 
 // Cluster and broker
 export { Cluster } from './cluster.js'
