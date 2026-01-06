@@ -29,3 +29,7 @@ coverage
 # Tooling
 .claude/
 .turbo/
+
+# Claude Code credentials
+.claude
+.claude.json

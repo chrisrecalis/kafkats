@@ -11,15 +11,14 @@
 	},
 	"remoteEnv": {
 		"ANTHROPIC_API_KEY": "${localEnv:ANTHROPIC_API_KEY}",
-		"OPENAI_API_KEY": "${localEnv:OPENAI_API_KEY}"
+		"OPENAI_API_KEY": "${localEnv:OPENAI_API_KEY}",
+		"CLAUDE_CODE_OAUTH_TOKEN": "${localEnv:CLAUDE_CODE_OAUTH_TOKEN}"
 	},
 	"mounts": [
-		"source=${localEnv:HOME}/.claude,target=/home/node/.claude,type=bind,consistency=cached",
-		"source=${localEnv:HOME}/.claude.json,target=/home/node/.claude.json,type=bind,consistency=cached",
-		"source=${localEnv:HOME}/.codex,target=/home/node/.codex,type=bind,consistency=cached",
 		"source=kafkats-node_modules,target=${containerWorkspaceFolder}/node_modules,type=volume"
 	],
 	"postCreateCommand": "bash .devcontainer/postCreate.sh",
+	"postStartCommand": "mkdir -p ~/.claude && echo '{\"hasCompletedOnboarding\": true}' > ~/.claude.json",
 	"customizations": {
 		"vscode": {
 			"extensions": [
@@ -29,5 +28,11 @@
 				"esbenp.prettier-vscode"
 			]
 		}
+	},
+	"portsAttributes": {
+		"onAutoForward": "silent"
+	},
+	"otherPortsAttributes": {
+		"onAutoForward": "silent"
 	}
 }
