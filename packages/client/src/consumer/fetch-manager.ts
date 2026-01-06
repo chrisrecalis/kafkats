@@ -362,6 +362,32 @@ export class FetchManager {
 	}
 
 	/**
+	 * Seek to a specific offset for a partition
+	 *
+	 * Updates the fetch position for the partition to the given offset.
+	 * The next fetch request will request records starting from this offset.
+	 *
+	 * @param topic - Topic name
+	 * @param partition - Partition index
+	 * @param offset - The offset to fetch from next
+	 */
+	seekPartition(topic: string, partition: number, offset: bigint): void {
+		const key = tpKey(topic, partition)
+		const state = this.partitionStates.get(key)
+		if (state) {
+			this.logger.debug('seeking partition', {
+				topic,
+				partition,
+				previousOffset: String(state.offset),
+				newOffset: String(offset),
+			})
+			state.offset = offset
+		} else {
+			this.logger.warn('seek attempted on unassigned partition', { topic, partition })
+		}
+	}
+
+	/**
 	 * Update offset for a partition (after consuming)
 	 */
 	updateOffset(topic: string, partition: number, offset: bigint): void {

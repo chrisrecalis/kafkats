@@ -276,6 +276,32 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	}
 
 	/**
+	 * Seek to a specific offset for a partition.
+	 *
+	 * Repositions the fetch position for the specified partition to the given offset.
+	 * The next fetch will start at this offset.
+	 *
+	 * Common use cases:
+	 * - Replaying messages: seek to an earlier offset
+	 * - Skipping ahead: seek to a later offset
+	 * - Resetting to a known position after handling errors
+	 *
+	 * Note: This only affects the fetch position, not the committed offset.
+	 * If you want to persist the position, you'll need to commit after seeking.
+	 *
+	 * @param topic - Topic name
+	 * @param partition - Partition index
+	 * @param offset - The offset to seek to (will fetch from this offset next)
+	 * @throws If consumer is not running
+	 */
+	seek(topic: string, partition: number, offset: bigint): void {
+		if (this.state !== 'running' || !this.fetchManager) {
+			throw new Error('Consumer is not running')
+		}
+		this.fetchManager.seekPartition(topic, partition, offset)
+	}
+
+	/**
 	 * Unified run mode implementation using PartitionProvider
 	 */
 	private async runMode(

@@ -187,7 +187,7 @@ When `autoCommit: true` and `commitOffsets: true`, the consumer:
 If you set `autoCommit: false` (or `commitOffsets: false`), the consumer will not commit offsets. On restart it will resume from the last committed offsets (or apply `autoOffsetReset` if none exist).
 
 ::: tip Manual commits
-The public consumer API currently focuses on automatic commits. If you need explicit offset commits / seeking, use `pause()`/`resume()` for backpressure and consider managing offsets externally until manual commit APIs are exposed.
+The public consumer API currently focuses on automatic commits. If you need explicit offset commits, consider managing offsets externally until manual commit APIs are exposed.
 :::
 
 ## Backpressure: Pause and Resume
@@ -199,6 +199,35 @@ consumer.pause([{ topic: 'events', partition: 0 }])
 // ... catch up ...
 consumer.resume([{ topic: 'events', partition: 0 }])
 ```
+
+## Seeking to a Specific Offset
+
+Reposition the consumer to a specific offset for a partition:
+
+```typescript
+// Seek to a specific offset
+consumer.seek('events', 0, 100n)
+
+// Seek to the beginning
+consumer.seek('events', 0, 0n)
+```
+
+The seek only affects the **next fetch** - messages already fetched will still be delivered. For controlled seeking, combine with pause/resume:
+
+```typescript
+await consumer.runEach('events', async (message, ctx) => {
+	if (shouldReplay(message)) {
+		// Pause, seek, resume pattern for controlled repositioning
+		consumer.pause([{ topic: ctx.topic, partition: ctx.partition }])
+		consumer.seek(ctx.topic, ctx.partition, 0n) // Seek to beginning
+		consumer.resume([{ topic: ctx.topic, partition: ctx.partition }])
+	}
+})
+```
+
+::: warning
+Seeking does not affect committed offsets. If you want to persist the new position, you'll need to commit after seeking. On restart, the consumer will resume from the last committed offset.
+:::
 
 ## Consumer Events
 
