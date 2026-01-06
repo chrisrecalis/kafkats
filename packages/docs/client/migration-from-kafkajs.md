@@ -711,7 +711,6 @@ process.on('SIGINT', shutdown)
 
 ### Features in KafkaJS not yet in @kafkats/client
 
-- `consumer.seek()` for manual offset positioning
 - `consumer.commitOffsets()` for manual offset commits outside handlers
 - Admin partition reassignment (`alterPartitionReassignments`)
 - Advanced retry options (e.g., `multiplier`, `factor` for exponential backoff)
