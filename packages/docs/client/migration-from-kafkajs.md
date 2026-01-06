@@ -8,9 +8,9 @@ This guide helps you migrate from [KafkaJS](https://kafka.js.org/) to `@kafkats/
 
 - **Pure TypeScript** - Written from scratch in TypeScript with full type safety
 - **Type-safe topics** - Define topics with codecs for compile-time type checking
-- **Modern API** - Cleaner async/await patterns without legacy callbacks
+- **Modern API** - Async-first APIs like `runEach()`/`runBatch()`/`transaction()`
 - **Active development** - Regular updates with modern Kafka protocol support
-- **Share Groups** - Support for KIP-932 Share Groups (Kafka 4.1+)
+- **Share Groups** - Support for KIP-932 Share Groups
 - **Transactions** - Full exactly-once semantics with transactional producer
 
 ## Quick Comparison
@@ -30,7 +30,7 @@ This guide helps you migrate from [KafkaJS](https://kafka.js.org/) to `@kafkats/
 ### KafkaJS
 
 ```typescript
-const { Kafka } = require('kafkajs')
+const { Kafka, logLevel } = require('kafkajs')
 
 const kafka = new Kafka({
   clientId: 'my-app',
@@ -63,7 +63,7 @@ const client = new KafkaClient({
   requestTimeoutMs: 30000,
   tls: { enabled: true },
   sasl: {
-    mechanism: 'scram-sha-256',
+    mechanism: 'SCRAM-SHA-256',
     username: 'user',
     password: 'pass',
   },
@@ -80,9 +80,9 @@ const client = new KafkaClient({
 | `connectionTimeout` | `connectionTimeoutMs` | Explicit `Ms` suffix |
 | `requestTimeout` | `requestTimeoutMs` | Explicit `Ms` suffix |
 | `ssl: true` | `tls: { enabled: true }` | Renamed to `tls` |
-| `ssl: {...}` | `tls: {...}` | Same options as Node.js `tls.connect()` |
-| `sasl` | `sasl` | Same structure |
-| `retry` | N/A | Retry configured per producer |
+| `ssl: {...}` | `tls: { enabled: true, ... }` | Same options as Node.js `tls.connect()` |
+| `sasl` | `sasl` | Same structure, but mechanism is `'PLAIN' | 'SCRAM-SHA-256' | 'SCRAM-SHA-512'` |
+| `retry` | `producer({ retries, retryBackoffMs, maxRetryBackoffMs })` | Retry is configured per producer |
 | `logLevel` | `logLevel` | String values: `'debug'`, `'info'`, `'warn'`, `'error'` |
 
 ## Producer Migration
@@ -90,11 +90,12 @@ const client = new KafkaClient({
 ### KafkaJS
 
 ```typescript
+const { Partitioners, CompressionTypes } = require('kafkajs')
+
 const producer = kafka.producer({
   createPartitioner: Partitioners.DefaultPartitioner,
   allowAutoTopicCreation: true,
   idempotent: true,
-  transactionalId: 'my-txn-id',
   maxInFlightRequests: 5,
 })
 
@@ -120,9 +121,9 @@ await producer.disconnect()
 const producer = client.producer({
   partitioner: 'murmur2', // or 'round-robin' or custom function
   idempotent: true,
-  transactionalId: 'my-txn-id',
   maxInFlight: 5,
   acks: 'all', // 'all' | 'leader' | 'none'
+  // 'gzip' works out of the box; for 'snappy'/'lz4'/'zstd' you must register a codec first
   compression: 'gzip', // 'none' | 'gzip' | 'snappy' | 'lz4' | 'zstd'
   lingerMs: 5,
   maxBatchBytes: 16384,
@@ -138,6 +139,10 @@ const result = await producer.send('my-topic', [
 
 await producer.disconnect()
 ```
+
+::: tip Transactional producers
+If you configure `transactionalId`, you must use `producer.transaction(...)` and cannot call `producer.send(...)` directly.
+:::
 
 ### Type-Safe Producer with Codecs
 
@@ -170,10 +175,10 @@ await producer.send(orderTopic, {
 | `acks: -1` | `acks: 'all'` | String values: `'all'`, `'leader'`, `'none'` |
 | `acks: 1` | `acks: 'leader'` | |
 | `acks: 0` | `acks: 'none'` | |
-| `timeout` | `requestTimeoutMs` | |
-| `compression` | `compression` | String values: `'gzip'`, `'snappy'`, etc. |
+| `timeout` | `requestTimeoutMs` | Configured on the producer (not per-send) |
+| `compression` | `compression` | `gzip` is built-in; `snappy`/`lz4`/`zstd` require `npm install` + codec registration (see [Compression](/client/compression)) |
 | `idempotent` | `idempotent` | Same |
-| `transactionalId` | `transactionalId` | Same |
+| `transactionalId` | `transactionalId` | Use `producer.transaction(...)` for sends |
 | `maxInFlightRequests` | `maxInFlight` | Shorter name |
 | N/A | `lingerMs` | Batching delay (new feature) |
 | N/A | `maxBatchBytes` | Batch size limit (new feature) |
@@ -360,12 +365,14 @@ await consumer.runEach(orderTopic, async (message) => {
 **KafkaJS:**
 
 ```typescript
-consumer.on('consumer.group_join', ({ groupId, memberId }) => {
-  console.log('Joined group', groupId)
+const { GROUP_JOIN, REBALANCING } = consumer.events
+
+consumer.on(GROUP_JOIN, e => {
+  console.log('Joined group', e.payload.groupId)
 })
 
-consumer.on('consumer.rebalancing', () => {
-  console.log('Rebalancing...')
+consumer.on(REBALANCING, e => {
+  console.log('Rebalancing...', e.payload.groupId)
 })
 ```
 
@@ -520,7 +527,7 @@ const groups = await admin.describeGroups(['my-group'])
 // Delete groups
 await admin.deleteGroups(['old-group'])
 
-// No disconnect needed - shares client connection pool
+// No `admin.disconnect()`; call `client.disconnect()` when shutting down
 ```
 
 ### Admin API Mapping
@@ -559,7 +566,12 @@ await producer.send({
 ### @kafkats/client
 
 ```typescript
-// Compression is built-in - no external packages needed
+import snappy from 'snappy'
+import { CompressionType, compressionCodecs, createSnappyCodec } from '@kafkats/client'
+
+// GZIP works out of the box; Snappy/LZ4/Zstd require registering a codec.
+compressionCodecs.register(CompressionType.Snappy, createSnappyCodec(snappy))
+
 const producer = client.producer({
   compression: 'snappy', // 'none' | 'gzip' | 'snappy' | 'lz4' | 'zstd'
 })
@@ -567,7 +579,7 @@ const producer = client.producer({
 await producer.send('my-topic', [{ value: Buffer.from('data') }])
 ```
 
-All compression codecs are built-in and work out of the box.
+See the [Compression docs](/client/compression) for more details and supported libraries.
 
 ## Error Handling
 
@@ -631,10 +643,15 @@ process.on('SIGINT', shutdown)
 ### @kafkats/client
 
 ```typescript
+const consumerRun = consumer.runEach('my-topic', async (message) => {
+  // ...
+})
+
 const shutdown = async () => {
   consumer.stop() // Graceful stop
+  await consumerRun.catch(() => {}) // Optional: wait for runEach/runBatch to exit
   await producer.disconnect()
-  // Admin doesn't need disconnect
+  await client.disconnect() // Close all broker connections
 }
 
 process.on('SIGTERM', shutdown)
@@ -655,7 +672,7 @@ process.on('SIGINT', shutdown)
    - Remove `await producer.connect()`
    - Change message values to `Buffer` (or use typed topics)
    - Update `acks` to string values
-   - Update compression to string values
+   - Update compression to string values (`'gzip'` works out of the box; for `'snappy'`/`'lz4'`/`'zstd'` you must `npm install` a library and register the codec)
 
 4. **Update consumer code**
    - Replace `subscribe()` + `run()` with `runEach()` or `runBatch()`
@@ -670,9 +687,9 @@ process.on('SIGINT', shutdown)
    - Import new error types
    - Update `instanceof` checks
 
-7. **Remove external compression packages**
-   - Delete `kafkajs-snappy`, `kafkajs-lz4`, etc.
-   - Compression is built-in
+7. **Update compression setup**
+   - GZIP works without any packages
+   - For Snappy/LZ4/Zstd: install a compression library (e.g. `npm install snappy`) and register via `compressionCodecs.register(...)` — see [Compression docs](/client/compression)
 
 ## Feature Differences
 
@@ -680,17 +697,16 @@ process.on('SIGINT', shutdown)
 
 - **Type-safe topics** with compile-time checking
 - **Share Groups** (KIP-932) for queue-like consumption
-- **Built-in compression** for all codecs
 - **Cooperative sticky assignor** by default
 - **Stream mode** with async iterators
 
 ### Features in KafkaJS not yet in @kafkats/client
 
-- `seek()` method for manual offset positioning
-- `commitOffsets()` for manual offset commits outside handlers
-- ACL management
-- Partition reassignment
-- Some advanced retry configurations
+- `consumer.seek()` for manual offset positioning
+- `consumer.commitOffsets()` for manual offset commits outside handlers
+- Admin ACL management (`createAcls`, `deleteAcls`, `describeAcls`)
+- Admin partition reassignment (`alterPartitionReassignments`)
+- Advanced retry options (e.g., `multiplier`, `factor` for exponential backoff)
 
 ## Getting Help
 
