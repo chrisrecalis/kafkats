@@ -310,6 +310,163 @@ interface BrokerDescription {
 }
 ```
 
+## ACL Operations
+
+Access Control Lists (ACLs) control which users can perform which operations on which resources.
+
+### Describing ACLs
+
+Query ACLs matching a filter:
+
+```typescript
+import { AclResourceType, AclResourcePatternType, AclOperation, AclPermissionType } from '@kafkats/client'
+
+// Describe all ACLs for a specific topic
+const result = await admin.describeAcls({
+	resourceTypeFilter: AclResourceType.TOPIC,
+	resourceNameFilter: 'my-topic',
+	patternTypeFilter: AclResourcePatternType.LITERAL,
+	principalFilter: null, // null matches any
+	hostFilter: null,
+	operation: AclOperation.ANY,
+	permissionType: AclPermissionType.ANY,
+})
+
+for (const resource of result.resources) {
+	console.log(`${resource.resourceType}: ${resource.resourceName}`)
+	for (const acl of resource.acls) {
+		console.log(`  ${acl.principal} ${acl.permissionType} ${acl.operation}`)
+	}
+}
+```
+
+Describe all ACLs in the cluster:
+
+```typescript
+const result = await admin.describeAcls({
+	resourceTypeFilter: AclResourceType.ANY,
+	resourceNameFilter: null,
+	patternTypeFilter: AclResourcePatternType.ANY,
+	principalFilter: null,
+	hostFilter: null,
+	operation: AclOperation.ANY,
+	permissionType: AclPermissionType.ANY,
+})
+```
+
+### Creating ACLs
+
+Create ACL bindings to grant or deny access:
+
+```typescript
+// Allow User:alice to read from my-topic
+const results = await admin.createAcls([
+	{
+		resourceType: AclResourceType.TOPIC,
+		resourceName: 'my-topic',
+		resourcePatternType: AclResourcePatternType.LITERAL,
+		principal: 'User:alice',
+		host: '*',
+		operation: AclOperation.READ,
+		permissionType: AclPermissionType.ALLOW,
+	},
+])
+
+for (const result of results) {
+	if (result.errorCode === 0) {
+		console.log('ACL created successfully')
+	} else {
+		console.log(`Failed: ${result.errorMessage}`)
+	}
+}
+```
+
+Create prefixed ACLs to match multiple resources:
+
+```typescript
+// Allow User:bob to write to all topics starting with "events-"
+await admin.createAcls([
+	{
+		resourceType: AclResourceType.TOPIC,
+		resourceName: 'events-',
+		resourcePatternType: AclResourcePatternType.PREFIXED,
+		principal: 'User:bob',
+		host: '*',
+		operation: AclOperation.WRITE,
+		permissionType: AclPermissionType.ALLOW,
+	},
+])
+```
+
+### Deleting ACLs
+
+Delete ACLs matching a filter:
+
+```typescript
+// Delete all ACLs for User:alice on my-topic
+const results = await admin.deleteAcls([
+	{
+		resourceTypeFilter: AclResourceType.TOPIC,
+		resourceNameFilter: 'my-topic',
+		patternTypeFilter: AclResourcePatternType.LITERAL,
+		principalFilter: 'User:alice',
+		hostFilter: null,
+		operation: AclOperation.ANY,
+		permissionType: AclPermissionType.ANY,
+	},
+])
+
+for (const result of results) {
+	console.log(`Deleted ${result.matchingAcls.length} ACLs`)
+}
+```
+
+### ACL Types
+
+#### Resource Types
+
+| Type               | Description              |
+| ------------------ | ------------------------ |
+| `TOPIC`            | Topic resource           |
+| `GROUP`            | Consumer group           |
+| `CLUSTER`          | Cluster-level operations |
+| `TRANSACTIONAL_ID` | Transactional ID         |
+| `DELEGATION_TOKEN` | Delegation token         |
+| `ANY`              | Match any (for filters)  |
+
+#### Operations
+
+| Operation          | Description             |
+| ------------------ | ----------------------- |
+| `READ`             | Read from resource      |
+| `WRITE`            | Write to resource       |
+| `CREATE`           | Create resource         |
+| `DELETE`           | Delete resource         |
+| `ALTER`            | Alter resource          |
+| `DESCRIBE`         | Describe resource       |
+| `CLUSTER_ACTION`   | Cluster actions         |
+| `DESCRIBE_CONFIGS` | Describe configs        |
+| `ALTER_CONFIGS`    | Alter configs           |
+| `IDEMPOTENT_WRITE` | Idempotent writes       |
+| `ALL`              | All operations          |
+| `ANY`              | Match any (for filters) |
+
+#### Pattern Types
+
+| Type       | Description                |
+| ---------- | -------------------------- |
+| `LITERAL`  | Exact resource name match  |
+| `PREFIXED` | Resource name prefix match |
+| `ANY`      | Match any (for filters)    |
+
+#### Permission Types
+
+| Type    | Description             |
+| ------- | ----------------------- |
+| `ALLOW` | Allow the operation     |
+| `DENY`  | Deny the operation      |
+| `ANY`   | Match any (for filters) |
+
 ## Error Handling
 
 Admin operations return results with error codes for each item:
