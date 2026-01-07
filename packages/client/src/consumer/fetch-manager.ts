@@ -18,10 +18,10 @@ import {
 } from '@/protocol/records/index.js'
 import type { DecodedRecord } from '@/protocol/records/index.js'
 import { Decoder } from '@/protocol/primitives/decoder.js'
-import type { TopicPartition, AutoOffsetReset, IsolationLevel, ConsumerTraceFn } from './types.js'
+import type { TopicPartition, AutoOffsetReset, IsolationLevel, PartitionBatch } from './types.js'
 import type { OffsetManager } from './offset-manager.js'
 import { noopLogger, type Logger } from '@/logger.js'
-import { tpKey } from '@/utils/topic-partition.js'
+import { tpKey, formatPartitions } from '@/utils/topic-partition.js'
 import { sleep } from '@/utils/sleep.js'
 
 function filterRecordsFromOffset(records: DecodedRecord[], minOffset: bigint): DecodedRecord[] {
@@ -41,80 +41,164 @@ function filterRecordsFromOffset(records: DecodedRecord[], minOffset: bigint): D
 }
 
 /**
- * Simple semaphore for concurrency control
+ * Completed fetch from a single partition
+ * Similar to Java client's CompletedFetch
  */
-class Semaphore {
-	private available: number
-	private readonly waiting: Array<{ resolve: () => void }> = []
+interface CompletedFetch {
+	topic: string
+	partition: number
+	records: DecodedRecord[]
+	byteSize: number
+}
 
-	constructor(capacity: number) {
-		this.available = capacity
+/**
+ * Buffer for completed fetches with memory bounding and wait/signal
+ */
+class FetchBuffer {
+	private queue: CompletedFetch[] = []
+	private bufferedBytes = 0
+	private readonly maxBytes: number
+	private waiters: Array<() => void> = []
+
+	constructor(maxBytes: number) {
+		this.maxBytes = maxBytes
 	}
 
 	/**
-	 * Acquire a semaphore slot
-	 * @param signal - Optional abort signal to cancel waiting
-	 * @returns true if acquired, false if aborted while waiting
+	 * Add a completed fetch to the buffer and signal any waiters
 	 */
-	async acquire(signal?: AbortSignal): Promise<boolean> {
-		if (this.available > 0) {
-			this.available--
+	add(fetch: CompletedFetch): void {
+		this.queue.push(fetch)
+		this.bufferedBytes += fetch.byteSize
+		this.signalWaiters()
+	}
+
+	/**
+	 * Drain all buffered fetches
+	 */
+	drain(): CompletedFetch[] {
+		const result = this.queue
+		this.queue = []
+		this.bufferedBytes = 0
+		return result
+	}
+
+	isEmpty(): boolean {
+		return this.queue.length === 0
+	}
+
+	isFull(): boolean {
+		return this.bufferedBytes >= this.maxBytes
+	}
+
+	/**
+	 * Wait for data to be available in the buffer
+	 * @returns true if data is available, false if timeout/aborted
+	 */
+	async waitForData(timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
+		if (!this.isEmpty()) {
 			return true
 		}
 
 		return new Promise<boolean>(resolve => {
+			let timeoutId: ReturnType<typeof setTimeout> | null = null
 			let onAbort: (() => void) | null = null
 
 			const cleanup = () => {
+				if (timeoutId) {
+					clearTimeout(timeoutId)
+					timeoutId = null
+				}
 				if (signal && onAbort) {
 					signal.removeEventListener('abort', onAbort)
 				}
-				onAbort = null
-			}
-
-			const entry = {
-				resolve: () => {
-					cleanup()
-					resolve(true)
-				},
-			}
-			this.waiting.push(entry)
-
-			// If signal is provided, listen for abort
-			if (signal) {
-				onAbort = () => {
-					// Remove from waiting queue
-					const idx = this.waiting.indexOf(entry)
-					if (idx !== -1) {
-						this.waiting.splice(idx, 1)
-					}
-					cleanup()
-					resolve(false) // Return false to indicate aborted, don't reject
+				// Remove from waiters
+				const idx = this.waiters.indexOf(waiterCallback)
+				if (idx !== -1) {
+					this.waiters.splice(idx, 1)
 				}
+			}
 
+			const waiterCallback = () => {
+				cleanup()
+				resolve(true)
+			}
+
+			this.waiters.push(waiterCallback)
+
+			// Set timeout
+			timeoutId = setTimeout(() => {
+				cleanup()
+				resolve(false)
+			}, timeoutMs)
+
+			// Handle abort signal
+			if (signal) {
 				if (signal.aborted) {
-					// Already aborted
-					const idx = this.waiting.indexOf(entry)
-					if (idx !== -1) {
-						this.waiting.splice(idx, 1)
-					}
 					cleanup()
 					resolve(false)
 					return
 				}
-
+				onAbort = () => {
+					cleanup()
+					resolve(false)
+				}
 				signal.addEventListener('abort', onAbort)
 			}
 		})
 	}
 
-	release(): void {
-		const next = this.waiting.shift()
-		if (next) {
-			next.resolve()
-		} else {
-			this.available++
+	/**
+	 * Signal all waiters that data is available
+	 */
+	private signalWaiters(): void {
+		const waiters = this.waiters
+		this.waiters = []
+		for (const waiter of waiters) {
+			waiter()
 		}
+	}
+
+	/**
+	 * Clear all buffered data
+	 */
+	clear(): void {
+		this.queue = []
+		this.bufferedBytes = 0
+	}
+
+	/**
+	 * Remove buffered data for partitions not in the given set
+	 */
+	removePartitionsNotIn(validKeys: Set<string>): void {
+		let newBytes = 0
+		const filtered: CompletedFetch[] = []
+		for (const f of this.queue) {
+			if (validKeys.has(tpKey(f.topic, f.partition))) {
+				filtered.push(f)
+				newBytes += f.byteSize
+			}
+		}
+		this.queue = filtered
+		this.bufferedBytes = newBytes
+	}
+
+	/**
+	 * Remove buffered data for specific partitions
+	 */
+	removePartitions(partitions: Array<{ topic: string; partition: number }>): void {
+		if (partitions.length === 0) return
+		const keysToRemove = new Set(partitions.map(p => tpKey(p.topic, p.partition)))
+		let newBytes = 0
+		const filtered: CompletedFetch[] = []
+		for (const f of this.queue) {
+			if (!keysToRemove.has(tpKey(f.topic, f.partition))) {
+				filtered.push(f)
+				newBytes += f.byteSize
+			}
+		}
+		this.queue = filtered
+		this.bufferedBytes = newBytes
 	}
 }
 
@@ -139,7 +223,8 @@ export interface FetchManagerConfig {
 	maxWaitMs: number
 	partitionConcurrency: number
 	isolationLevel: IsolationLevel
-	trace?: ConsumerTraceFn
+	/** Maximum bytes to buffer for poll() mode. Default: maxBytesPerPartition * 10 */
+	maxBufferedBytes?: number
 }
 
 /**
@@ -155,20 +240,6 @@ export const DEFAULT_FETCH_CONFIG: FetchManagerConfig = {
 
 /**
  * Fetch manager
- */
-/**
- * Callback type for handling fetched records
- * Uses DecodedRecord directly to avoid intermediate Message object creation
- */
-type FetchRecordsCallback = (topic: string, partition: number, records: DecodedRecord[]) => Promise<void>
-
-type ActiveLoop = {
-	abortController: AbortController
-	promise: Promise<void>
-}
-
-/**
- * Fetch manager
  *
  * Uses broker-level fetch batching: groups all ready partitions by their leader broker
  * and issues one fetch request per broker containing all partitions.
@@ -177,48 +248,28 @@ export class FetchManager {
 	private readonly cluster: Cluster
 	private readonly config: FetchManagerConfig
 	private readonly partitionStates: Map<string, PartitionState> = new Map()
-	private readonly activeLoops: Map<string, ActiveLoop> = new Map() // Track active fetch loops (legacy)
-	private readonly semaphore: Semaphore
 	private readonly logger: Logger
-	private readonly trace?: ConsumerTraceFn
 	private readonly autoOffsetReset?: AutoOffsetReset
 	private readonly offsetManager?: OffsetManager
 	private abortController: AbortController | null = null
-	private onRecordsCallback: FetchRecordsCallback | null = null // Store callback for addPartitions
 	private running = false
-	private useBrokerBatching = true // Use broker-level batching (faster than per-partition loops)
+
+	// Buffered poll mode fields
+	private fetchBuffer: FetchBuffer | null = null
+	private brokerInFlight: Map<number, boolean> = new Map()
 
 	constructor(
 		cluster: Cluster,
-		configOrOffsetManager?: Partial<FetchManagerConfig> | OffsetManager,
-		autoOffsetResetOrLogger?: AutoOffsetReset | Logger,
-		configOrLogger?: Partial<FetchManagerConfig> | Logger,
-		maybeLogger?: Logger
+		offsetManager: OffsetManager,
+		autoOffsetReset: AutoOffsetReset,
+		config: Partial<FetchManagerConfig>,
+		logger?: Logger
 	) {
 		this.cluster = cluster
-
-		// Handle overloaded constructor signatures
-		// Signature 1 (new): cluster, offsetManager, autoOffsetReset, config, logger
-		// Signature 2 (old): cluster, config, logger
-		if (
-			configOrOffsetManager &&
-			typeof configOrOffsetManager === 'object' &&
-			'getEarliestOffset' in configOrOffsetManager
-		) {
-			// New signature
-			this.offsetManager = configOrOffsetManager
-			this.autoOffsetReset = autoOffsetResetOrLogger as AutoOffsetReset
-			this.config = { ...DEFAULT_FETCH_CONFIG, ...(configOrLogger as Partial<FetchManagerConfig>) }
-			this.logger = maybeLogger?.child({ component: 'fetch-manager' }) ?? noopLogger
-			this.trace = this.config.trace
-		} else {
-			// Old signature (for backwards compatibility with tests)
-			this.config = { ...DEFAULT_FETCH_CONFIG, ...(configOrOffsetManager as Partial<FetchManagerConfig>) }
-			this.logger = (autoOffsetResetOrLogger as Logger)?.child?.({ component: 'fetch-manager' }) ?? noopLogger
-			this.trace = this.config.trace
-		}
-
-		this.semaphore = new Semaphore(this.config.partitionConcurrency)
+		this.offsetManager = offsetManager
+		this.autoOffsetReset = autoOffsetReset
+		this.config = { ...DEFAULT_FETCH_CONFIG, ...config }
+		this.logger = logger?.child({ component: 'fetch-manager' }) ?? noopLogger
 	}
 
 	/**
@@ -228,14 +279,19 @@ export class FetchManager {
 	setPartitions(partitions: Array<TopicPartition & { offset: bigint }>): void {
 		this.logger.debug('setting partitions', {
 			count: partitions.length,
-			partitions: partitions.map(p => `${p.topic}-${p.partition}`),
+			partitions: formatPartitions(partitions),
 		})
 		// Abort all existing partition loops
 		for (const state of this.partitionStates.values()) {
 			state.abortController.abort()
 		}
 		this.partitionStates.clear()
-		this.activeLoops.clear()
+
+		// Clear buffer for removed partitions (keep only new partitions)
+		if (this.fetchBuffer) {
+			const newKeys = new Set(partitions.map(p => tpKey(p.topic, p.partition)))
+			this.fetchBuffer.removePartitionsNotIn(newKeys)
+		}
 
 		for (const tp of partitions) {
 			const key = tpKey(tp.topic, tp.partition)
@@ -249,26 +305,17 @@ export class FetchManager {
 			}
 			this.partitionStates.set(key, state)
 		}
-
-		// If we're already running, restart partition loops for the new assignment.
-		if (!this.useBrokerBatching && this.running && this.onRecordsCallback) {
-			for (const [key, state] of this.partitionStates.entries()) {
-				const promise = this.fetchPartitionLoop(state, this.onRecordsCallback, state.abortController.signal)
-				this.activeLoops.set(key, { abortController: state.abortController, promise })
-			}
-		}
 	}
 
 	/**
 	 * Add partitions incrementally (used for cooperative rebalance)
-	 * Starts fetch loops for newly added partitions if the manager is running
 	 */
 	addPartitions(partitions: Array<TopicPartition & { offset: bigint }>): void {
 		if (partitions.length === 0) return
 
 		this.logger.debug('adding partitions', {
 			count: partitions.length,
-			partitions: partitions.map(p => `${p.topic}-${p.partition}`),
+			partitions: formatPartitions(partitions),
 		})
 
 		for (const tp of partitions) {
@@ -288,12 +335,6 @@ export class FetchManager {
 				cachedLeader: null,
 			}
 			this.partitionStates.set(key, state)
-
-			// If running and we have a callback, start a fetch loop for this partition
-			if (!this.useBrokerBatching && this.running && this.onRecordsCallback) {
-				const promise = this.fetchPartitionLoop(state, this.onRecordsCallback, state.abortController.signal)
-				this.activeLoops.set(key, { abortController: state.abortController, promise })
-			}
 		}
 	}
 
@@ -306,7 +347,7 @@ export class FetchManager {
 
 		this.logger.debug('removing partitions', {
 			count: partitions.length,
-			partitions: partitions.map(p => `${p.topic}-${p.partition}`),
+			partitions: formatPartitions(partitions),
 		})
 
 		for (const tp of partitions) {
@@ -316,20 +357,20 @@ export class FetchManager {
 				// Abort the partition's fetch loop
 				state.abortController.abort()
 				this.partitionStates.delete(key)
-				this.activeLoops.delete(key)
 			}
 		}
 	}
 
 	/**
 	 * Pause partitions (stop fetching but keep state)
+	 * Also clears any buffered records for the paused partitions
 	 */
 	pausePartitions(partitions: TopicPartition[]): void {
 		if (partitions.length === 0) return
 
 		this.logger.debug('pausing partitions', {
 			count: partitions.length,
-			partitions: partitions.map(p => `${p.topic}-${p.partition}`),
+			partitions: formatPartitions(partitions),
 		})
 
 		for (const tp of partitions) {
@@ -339,6 +380,9 @@ export class FetchManager {
 				state.paused = true
 			}
 		}
+
+		// Clear buffered records for paused partitions to ensure they are not delivered
+		this.fetchBuffer?.removePartitions(partitions)
 	}
 
 	/**
@@ -349,7 +393,7 @@ export class FetchManager {
 
 		this.logger.debug('resuming partitions', {
 			count: partitions.length,
-			partitions: partitions.map(p => `${p.topic}-${p.partition}`),
+			partitions: formatPartitions(partitions),
 		})
 
 		for (const tp of partitions) {
@@ -399,263 +443,6 @@ export class FetchManager {
 	}
 
 	/**
-	 * Start the fetch loop
-	 *
-	 * @param onRecords - Callback for each batch of records from a partition
-	 */
-	async start(onRecords: FetchRecordsCallback): Promise<void> {
-		if (this.running) {
-			return
-		}
-
-		this.logger.info('starting fetch manager', {
-			partitionCount: this.partitionStates.size,
-			concurrency: this.config.partitionConcurrency,
-			useBrokerBatching: this.useBrokerBatching,
-		})
-		this.running = true
-		this.abortController = new AbortController()
-		this.onRecordsCallback = onRecords // Store for addPartitions
-
-		if (this.useBrokerBatching) {
-			// New: Single fetch loop with broker-level batching
-			await this.brokerBatchedFetchLoop(onRecords)
-		} else {
-			// Legacy: Per-partition fetch loops
-			for (const [key, state] of this.partitionStates.entries()) {
-				const promise = this.fetchPartitionLoop(state, onRecords, state.abortController.signal)
-				this.activeLoops.set(key, { abortController: state.abortController, promise })
-			}
-
-			while (this.running) {
-				const loops = Array.from(this.activeLoops.values()).map(loop => loop.promise)
-				if (loops.length === 0) {
-					await sleep(100, { signal: this.abortController.signal }).catch(() => {})
-					if (!this.running) break
-					continue
-				}
-				await Promise.race(loops).catch(() => {})
-			}
-
-			await Promise.all(Array.from(this.activeLoops.values()).map(loop => loop.promise)).catch(() => {})
-			this.activeLoops.clear()
-		}
-
-		this.onRecordsCallback = null
-		this.logger.debug('fetch manager stopped')
-	}
-
-	/**
-	 * Broker-batched fetch loop - groups partitions by broker and issues one fetch per broker
-	 */
-	private async brokerBatchedFetchLoop(onRecords: FetchRecordsCallback): Promise<void> {
-		const signal = this.abortController!.signal
-
-		while (this.running && !signal.aborted) {
-			try {
-				// Get all ready (non-paused) partitions
-				const readyPartitions = Array.from(this.partitionStates.values()).filter(s => !s.paused)
-
-				if (readyPartitions.length === 0) {
-					await sleep(100, { signal }).catch(() => {})
-					continue
-				}
-
-				// Group partitions by leader broker (using cached leaders when available)
-				const partitionsByBroker = new Map<number, { broker: Broker; partitions: PartitionState[] }>()
-
-				// Collect partitions needing leader lookup
-				const needsLookup: PartitionState[] = []
-				for (const state of readyPartitions) {
-					if (state.cachedLeader) {
-						const brokerId = state.cachedLeader.nodeId
-						if (!partitionsByBroker.has(brokerId)) {
-							partitionsByBroker.set(brokerId, { broker: state.cachedLeader, partitions: [] })
-						}
-						partitionsByBroker.get(brokerId)!.partitions.push(state)
-					} else {
-						needsLookup.push(state)
-					}
-				}
-
-				// Parallel leader lookups for cache misses
-				if (needsLookup.length > 0) {
-					const lookups = await Promise.all(
-						needsLookup.map(async state => {
-							try {
-								const leader = await this.cluster.getLeaderForPartition(state.topic, state.partition)
-								state.cachedLeader = leader
-								return { state, leader }
-							} catch (error) {
-								this.logger.error('failed to get leader', {
-									topic: state.topic,
-									partition: state.partition,
-									error: (error as Error).message,
-								})
-								return null
-							}
-						})
-					)
-
-					for (const result of lookups) {
-						if (!result) continue
-						const brokerId = result.leader.nodeId
-						if (!partitionsByBroker.has(brokerId)) {
-							partitionsByBroker.set(brokerId, { broker: result.leader, partitions: [] })
-						}
-						partitionsByBroker.get(brokerId)!.partitions.push(result.state)
-					}
-				}
-
-				if (partitionsByBroker.size === 0) {
-					await sleep(100, { signal }).catch(() => {})
-					continue
-				}
-
-				// Issue fetch requests to all brokers in parallel
-				const fetchPromises = Array.from(partitionsByBroker.entries()).map(
-					async ([brokerId, { broker, partitions }]) => {
-						try {
-							// Track fetch offsets used for this request per partition so we can filter
-							// record batches that may start before the requested offset.
-							const fetchOffsetByKey = new Map<string, bigint>()
-
-							// Build topics array for this broker's partitions
-							const topicsMap = new Map<string, Array<{ state: PartitionState }>>()
-							for (const state of partitions) {
-								if (!topicsMap.has(state.topic)) {
-									topicsMap.set(state.topic, [])
-								}
-								topicsMap.get(state.topic)!.push({ state })
-								fetchOffsetByKey.set(tpKey(state.topic, state.partition), state.offset)
-							}
-
-							const topics = Array.from(topicsMap.entries()).map(([topic, parts]) => ({
-								topic,
-								topicId: '00000000-0000-0000-0000-000000000000',
-								partitions: parts.map(p => ({
-									partitionIndex: p.state.partition,
-									currentLeaderEpoch: -1,
-									fetchOffset: p.state.offset,
-									lastFetchedEpoch: -1,
-									logStartOffset: -1n,
-									partitionMaxBytes: this.config.maxBytesPerPartition,
-								})),
-							}))
-
-							const fetchStart = performance.now()
-							const response = await broker.fetch({
-								replicaId: -1,
-								maxWaitMs: this.config.maxWaitMs,
-								minBytes: this.config.minBytes,
-								maxBytes: this.config.maxBytesPerPartition * partitions.length,
-								isolationLevel: this.config.isolationLevel === 'read_committed' ? 1 : 0,
-								topics,
-							})
-							const fetchEnd = performance.now()
-							if (this.trace) {
-								this.trace({
-									stage: 'fetch_request',
-									durationMs: fetchEnd - fetchStart,
-									brokerId,
-									recordCount: partitions.length,
-								})
-							}
-
-							const processPromises: Promise<void>[] = []
-
-							// Process response for each partition
-							for (const topicResponse of response.topics) {
-								for (const partitionResponse of topicResponse.partitions) {
-									const key = tpKey(topicResponse.topic, partitionResponse.partitionIndex)
-									const state = this.partitionStates.get(key)
-									if (!state) continue
-
-									// Handle errors
-									if (partitionResponse.errorCode !== ErrorCode.None) {
-										await this.handleFetchError(state, partitionResponse.errorCode)
-										continue
-									}
-
-									// Decode and deliver records
-									if (partitionResponse.recordsData && partitionResponse.recordsData.length > 0) {
-										const decodeStart = performance.now()
-										const decodeResult = this.decodeRecords(
-											state.topic,
-											state.partition,
-											partitionResponse.recordsData,
-											partitionResponse.abortedTransactions,
-											partitionResponse.lastStableOffset
-										)
-										// Handle both sync and async cases efficiently
-										let records =
-											decodeResult instanceof Promise ? await decodeResult : decodeResult
-										const decodeEnd = performance.now()
-										if (this.trace) {
-											this.trace({
-												stage: 'decode_records',
-												durationMs: decodeEnd - decodeStart,
-												recordCount: records.length,
-												bytes: partitionResponse.recordsData?.length ?? 0,
-												topic: state.topic,
-												partition: state.partition,
-											})
-										}
-
-										const fetchOffset = fetchOffsetByKey.get(key)
-										if (fetchOffset !== undefined) {
-											records = filterRecordsFromOffset(records, fetchOffset)
-										}
-
-										if (records.length > 0) {
-											processPromises.push(
-												(async () => {
-													const acquired = await this.semaphore.acquire(signal)
-													if (!acquired) return
-													try {
-														const handlerStart = performance.now()
-														await onRecords(state.topic, state.partition, records)
-														const handlerEnd = performance.now()
-														if (this.trace) {
-															this.trace({
-																stage: 'handler',
-																durationMs: handlerEnd - handlerStart,
-																recordCount: records.length,
-																topic: state.topic,
-																partition: state.partition,
-															})
-														}
-														state.offset = records[records.length - 1]!.offset + 1n
-													} finally {
-														this.semaphore.release()
-													}
-												})()
-											)
-										}
-									}
-								}
-							}
-
-							// Wait for all partition processing for this broker (respecting semaphore limits)
-							if (processPromises.length > 0) {
-								await Promise.all(processPromises)
-							}
-						} catch (error) {
-							this.logger.error('broker fetch failed', { brokerId, error: (error as Error).message })
-						}
-					}
-				)
-
-				await Promise.all(fetchPromises)
-			} catch (error) {
-				if (signal.aborted) break
-				this.logger.error('fetch loop error', { error: (error as Error).message })
-				await sleep(1000, { signal }).catch(() => {})
-			}
-		}
-	}
-
-	/**
 	 * Handle fetch error for a partition
 	 */
 	private async handleFetchError(state: PartitionState, errorCode: ErrorCode): Promise<void> {
@@ -696,7 +483,7 @@ export class FetchManager {
 	 * Stop the fetch loop
 	 */
 	stop(): void {
-		this.logger.info('stopping fetch manager')
+		this.logger.debug('stopping fetch manager')
 		this.running = false
 		// Abort global controller (for sleep in start loop)
 		this.abortController?.abort()
@@ -704,29 +491,98 @@ export class FetchManager {
 		for (const state of this.partitionStates.values()) {
 			state.abortController.abort()
 		}
+		// Cleanup buffered poll mode
+		if (this.fetchBuffer) {
+			this.fetchBuffer.clear()
+			this.fetchBuffer = null
+		}
+		this.brokerInFlight.clear()
 	}
 
 	/**
-	 * Poll for records from all ready partitions (pull-based API)
-	 *
-	 * Returns records grouped by topic/partition. Internal offsets are advanced
-	 * so subsequent polls return new records.
+	 * Background fetch loop for buffered poll mode
+	 * Continuously fetches from brokers and buffers results
+	 * Uses one-outstanding-fetch-per-broker pattern like Java client
 	 */
-	async poll(): Promise<Array<{ topic: string; partition: number; records: DecodedRecord[] }>> {
-		const results: Array<{ topic: string; partition: number; records: DecodedRecord[] }> = []
+	private async runBackgroundFetchLoop(): Promise<void> {
+		const signal = this.abortController?.signal
+		// Reusable array to avoid allocations on every iteration
+		const readyPartitions: PartitionState[] = []
 
-		// Get ready partitions
-		const readyPartitions = Array.from(this.partitionStates.values()).filter(s => !s.paused)
-		if (readyPartitions.length === 0) {
-			return results
+		while (this.running && !signal?.aborted) {
+			try {
+				// Get ready (non-paused) partitions - reuse array
+				readyPartitions.length = 0
+				for (const state of this.partitionStates.values()) {
+					if (!state.paused) {
+						readyPartitions.push(state)
+					}
+				}
+
+				if (readyPartitions.length === 0) {
+					await sleep(100, { signal }).catch(() => {})
+					continue
+				}
+
+				// Group partitions by leader broker
+				const partitionsByBroker = await this.groupPartitionsByBroker(readyPartitions)
+
+				if (partitionsByBroker.size === 0) {
+					await sleep(100, { signal }).catch(() => {})
+					continue
+				}
+
+				// Issue fetch to each broker that doesn't have in-flight request
+				let fetchesIssued = 0
+				for (const [brokerId, { broker, partitions }] of partitionsByBroker) {
+					if (this.brokerInFlight.get(brokerId)) {
+						continue // Skip if already fetching from this broker
+					}
+
+					this.brokerInFlight.set(brokerId, true)
+					fetchesIssued++
+
+					// Fire and forget - don't await, let it run in background
+					this.fetchFromBrokerToBuffer(broker, partitions)
+						.catch(error => {
+							this.logger.error('background fetch failed', {
+								brokerId,
+								error: (error as Error).message,
+							})
+						})
+						.finally(() => {
+							this.brokerInFlight.set(brokerId, false)
+						})
+				}
+
+				// Only sleep when necessary to prevent busy-loop
+				if (this.fetchBuffer?.isFull()) {
+					// Buffer is full, wait for consumer to drain it
+					await sleep(10, { signal }).catch(() => {})
+				} else if (fetchesIssued === 0) {
+					// All brokers have in-flight requests, wait briefly
+					await sleep(1, { signal }).catch(() => {})
+				}
+				// If fetches were issued and buffer is not full, continue immediately
+			} catch (error) {
+				if (signal?.aborted) break
+				this.logger.error('background fetch loop error', { error: (error as Error).message })
+				await sleep(100, { signal }).catch(() => {})
+			}
 		}
+	}
 
-		// Group partitions by leader broker
+	/**
+	 * Group partitions by their leader broker
+	 */
+	private async groupPartitionsByBroker(
+		partitions: PartitionState[]
+	): Promise<Map<number, { broker: Broker; partitions: PartitionState[] }>> {
 		const partitionsByBroker = new Map<number, { broker: Broker; partitions: PartitionState[] }>()
 
 		// Collect partitions needing leader lookup
 		const needsLookup: PartitionState[] = []
-		for (const state of readyPartitions) {
+		for (const state of partitions) {
 			if (state.cachedLeader) {
 				const brokerId = state.cachedLeader.nodeId
 				if (!partitionsByBroker.has(brokerId)) {
@@ -767,340 +623,137 @@ export class FetchManager {
 			}
 		}
 
-		if (partitionsByBroker.size === 0) {
-			return results
-		}
-
-		// Fetch from all brokers in parallel
-		const brokerResults = await Promise.all(
-			Array.from(partitionsByBroker.entries()).map(async ([brokerId, { broker, partitions }]) => {
-				const partitionResults: Array<{ topic: string; partition: number; records: DecodedRecord[] }> = []
-
-				try {
-					// Track fetch offsets for filtering
-					const fetchOffsetByKey = new Map<string, bigint>()
-
-					// Build topics array
-					const topicsMap = new Map<string, Array<{ state: PartitionState }>>()
-					for (const state of partitions) {
-						if (!topicsMap.has(state.topic)) {
-							topicsMap.set(state.topic, [])
-						}
-						topicsMap.get(state.topic)!.push({ state })
-						fetchOffsetByKey.set(tpKey(state.topic, state.partition), state.offset)
-					}
-
-					const topics = Array.from(topicsMap.entries()).map(([topic, parts]) => ({
-						topic,
-						topicId: '00000000-0000-0000-0000-000000000000',
-						partitions: parts.map(p => ({
-							partitionIndex: p.state.partition,
-							currentLeaderEpoch: -1,
-							fetchOffset: p.state.offset,
-							lastFetchedEpoch: -1,
-							logStartOffset: -1n,
-							partitionMaxBytes: this.config.maxBytesPerPartition,
-						})),
-					}))
-
-					const response = await broker.fetch({
-						replicaId: -1,
-						maxWaitMs: this.config.maxWaitMs,
-						minBytes: this.config.minBytes,
-						maxBytes: this.config.maxBytesPerPartition * partitions.length,
-						isolationLevel: this.config.isolationLevel === 'read_committed' ? 1 : 0,
-						topics,
-					})
-
-					// Process response
-					for (const topicResponse of response.topics) {
-						for (const partitionResponse of topicResponse.partitions) {
-							const key = tpKey(topicResponse.topic, partitionResponse.partitionIndex)
-							const state = this.partitionStates.get(key)
-							if (!state) continue
-
-							// Handle errors
-							if (partitionResponse.errorCode !== ErrorCode.None) {
-								await this.handleFetchError(state, partitionResponse.errorCode)
-								continue
-							}
-
-							// Decode records
-							if (partitionResponse.recordsData && partitionResponse.recordsData.length > 0) {
-								const decodeResult = this.decodeRecords(
-									state.topic,
-									state.partition,
-									partitionResponse.recordsData,
-									partitionResponse.abortedTransactions,
-									partitionResponse.lastStableOffset
-								)
-								let records = decodeResult instanceof Promise ? await decodeResult : decodeResult
-
-								const fetchOffset = fetchOffsetByKey.get(key)
-								if (fetchOffset !== undefined) {
-									records = filterRecordsFromOffset(records, fetchOffset)
-								}
-
-								if (records.length > 0) {
-									// Advance offset for next poll
-									state.offset = records[records.length - 1]!.offset + 1n
-									partitionResults.push({
-										topic: state.topic,
-										partition: state.partition,
-										records,
-									})
-								}
-							}
-						}
-					}
-				} catch (error) {
-					this.logger.error('broker fetch failed', { brokerId, error: (error as Error).message })
-				}
-
-				return partitionResults
-			})
-		)
-
-		// Flatten results
-		for (const brokerResult of brokerResults) {
-			results.push(...brokerResult)
-		}
-
-		return results
+		return partitionsByBroker
 	}
 
 	/**
-	 * Fetch loop for a single partition
+	 * Fetch from a single broker and add results to buffer
 	 */
-	private async fetchPartitionLoop(
-		state: PartitionState,
-		onRecords: FetchRecordsCallback,
-		signal: AbortSignal
-	): Promise<void> {
-		const key = tpKey(state.topic, state.partition)
-		this.logger.debug('starting fetch loop for partition', {
-			topic: state.topic,
-			partition: state.partition,
-			startOffset: String(state.offset),
-		})
+	private async fetchFromBrokerToBuffer(broker: Broker, partitions: PartitionState[]): Promise<void> {
+		if (!this.fetchBuffer) return
 
-		try {
-			while (this.running && !signal.aborted) {
-				try {
-					// Acquire semaphore slot (pass signal to avoid leak on abort)
-					const acquired = await this.semaphore.acquire(signal)
+		// Track fetch offsets for filtering
+		const fetchOffsetByKey = new Map<string, bigint>()
 
-					// If aborted while waiting, exit cleanly (no semaphore slot held)
-					if (!acquired) {
-						break
-					}
-
-					if (!this.running || signal.aborted) {
-						this.semaphore.release()
-						break
-					}
-
-					try {
-						// Skip if paused
-						if (state.paused) {
-							await sleep(100, { signal })
-							continue
-						}
-
-						// Fetch records
-						const records = await this.fetchRecords(state)
-
-						if (records.length > 0) {
-							this.logger.debug('fetched records', {
-								topic: state.topic,
-								partition: state.partition,
-								count: records.length,
-								highOffset: String(records[records.length - 1]!.offset),
-							})
-							await onRecords(state.topic, state.partition, records)
-
-							const lastRecord = records[records.length - 1]!
-							state.offset = lastRecord.offset + 1n
-						} else {
-							// No records - wait a bit before next fetch
-							await sleep(100, { signal })
-						}
-					} finally {
-						this.semaphore.release()
-					}
-				} catch (error) {
-					if (signal.aborted) {
-						break
-					}
-
-					this.logger.error('fetch error', {
-						topic: state.topic,
-						partition: state.partition,
-						error: (error as Error).message,
-					})
-
-					// Back off before retrying
-					try {
-						await sleep(1000, { signal })
-					} catch {
-						break
-					}
-				}
+		// Build topics array
+		const topicsMap = new Map<string, Array<{ state: PartitionState }>>()
+		for (const state of partitions) {
+			if (!topicsMap.has(state.topic)) {
+				topicsMap.set(state.topic, [])
 			}
-		} finally {
-			// Clean up: remove from active loops when exiting
-			const current = this.activeLoops.get(key)
-			if (current && current.abortController === state.abortController) {
-				this.activeLoops.delete(key)
-			}
-			this.logger.debug('fetch loop ended for partition', { topic: state.topic, partition: state.partition })
+			topicsMap.get(state.topic)!.push({ state })
+			fetchOffsetByKey.set(tpKey(state.topic, state.partition), state.offset)
 		}
-	}
 
-	/**
-	 * Fetch records from a partition
-	 */
-	private async fetchRecords(state: PartitionState): Promise<DecodedRecord[]> {
-		// Use cached leader or lookup
-		if (!state.cachedLeader) {
-			state.cachedLeader = await this.cluster.getLeaderForPartition(state.topic, state.partition)
-		}
-		const leader = state.cachedLeader
-		const fetchOffset = state.offset
+		const topics = Array.from(topicsMap.entries()).map(([topic, parts]) => ({
+			topic,
+			topicId: '00000000-0000-0000-0000-000000000000',
+			partitions: parts.map(p => ({
+				partitionIndex: p.state.partition,
+				currentLeaderEpoch: -1,
+				fetchOffset: p.state.offset,
+				lastFetchedEpoch: -1,
+				logStartOffset: -1n,
+				partitionMaxBytes: this.config.maxBytesPerPartition,
+			})),
+		}))
 
-		const response = await leader.fetch({
+		const response = await broker.fetch({
 			replicaId: -1,
 			maxWaitMs: this.config.maxWaitMs,
 			minBytes: this.config.minBytes,
-			maxBytes: this.config.maxBytesPerPartition * this.partitionStates.size,
+			maxBytes: this.config.maxBytesPerPartition * partitions.length,
 			isolationLevel: this.config.isolationLevel === 'read_committed' ? 1 : 0,
-			topics: [
-				{
-					topic: state.topic,
-					topicId: '00000000-0000-0000-0000-000000000000',
-					partitions: [
-						{
-							partitionIndex: state.partition,
-							currentLeaderEpoch: -1,
-							fetchOffset: state.offset,
-							lastFetchedEpoch: -1,
-							logStartOffset: -1n,
-							partitionMaxBytes: this.config.maxBytesPerPartition,
-						},
-					],
-				},
-			],
+			topics,
 		})
 
-		this.logger.debug('fetch response received', {
-			topic: state.topic,
-			partition: state.partition,
-			topicCount: response.topics.length,
-			errorCode: response.errorCode,
-		})
+		// Process response for each partition
+		for (const topicResponse of response.topics) {
+			for (const partitionResponse of topicResponse.partitions) {
+				const key = tpKey(topicResponse.topic, partitionResponse.partitionIndex)
+				const state = this.partitionStates.get(key)
+				if (!state) continue
 
-		// Find our partition response
-		const topicResponse = response.topics.find(t => t.topic === state.topic)
-		const partitionResponse = topicResponse?.partitions.find(p => p.partitionIndex === state.partition)
+				// Handle errors
+				if (partitionResponse.errorCode !== ErrorCode.None) {
+					await this.handleFetchError(state, partitionResponse.errorCode)
+					continue
+				}
 
-		this.logger.debug('partition response', {
-			topic: state.topic,
-			partition: state.partition,
-			found: !!partitionResponse,
-			errorCode: partitionResponse?.errorCode,
-			highWatermark: partitionResponse?.highWatermark?.toString(),
-			recordsDataLength: partitionResponse?.recordsData?.length,
-		})
+				// Decode records
+				if (partitionResponse.recordsData && partitionResponse.recordsData.length > 0) {
+					const decodeResult = this.decodeRecords(
+						partitionResponse.recordsData,
+						partitionResponse.abortedTransactions,
+						partitionResponse.lastStableOffset
+					)
+					let records = decodeResult instanceof Promise ? await decodeResult : decodeResult
 
-		if (!partitionResponse) {
-			return []
-		}
-
-		// Handle errors
-		if (partitionResponse.errorCode !== ErrorCode.None) {
-			// Handle specific errors
-			switch (partitionResponse.errorCode) {
-				case ErrorCode.OffsetOutOfRange:
-					// If offsetManager and autoOffsetReset are configured, apply recovery strategy
-					if (this.offsetManager && this.autoOffsetReset) {
-						this.logger.error('offset out of range, resetting based on autoOffsetReset strategy', {
-							topic: state.topic,
-							partition: state.partition,
-							currentOffset: String(state.offset),
-							strategy: this.autoOffsetReset,
-						})
-
-						// Apply autoOffsetReset strategy
-						switch (this.autoOffsetReset) {
-							case 'earliest':
-								state.offset = await this.offsetManager.getEarliestOffset(state.topic, state.partition)
-								this.logger.info('reset to earliest offset', {
-									topic: state.topic,
-									partition: state.partition,
-									newOffset: String(state.offset),
-								})
-								break
-							case 'latest':
-								state.offset = await this.offsetManager.getLatestOffset(state.topic, state.partition)
-								this.logger.info('reset to latest offset', {
-									topic: state.topic,
-									partition: state.partition,
-									newOffset: String(state.offset),
-								})
-								break
-							case 'none':
-								throw new Error(
-									`Offset out of range for ${state.topic}-${state.partition} at offset ${state.offset} and autoOffsetReset is 'none'`
-								)
-						}
-						// Return empty to continue the fetch loop with the new offset
-						return []
-					} else {
-						// Fall back to old behavior if not configured
-						this.logger.error('offset out of range', {
-							topic: state.topic,
-							partition: state.partition,
-							offset: String(state.offset),
-						})
-						throw new Error(`Offset out of range: ${state.offset}`)
+					const fetchOffset = fetchOffsetByKey.get(key)
+					if (fetchOffset !== undefined) {
+						records = filterRecordsFromOffset(records, fetchOffset)
 					}
 
-				case ErrorCode.NotLeaderOrFollower:
-				case ErrorCode.UnknownTopicOrPartition:
-					// Invalidate cached leader and refresh metadata
-					state.cachedLeader = null
-					this.logger.debug('refreshing metadata due to fetch error', {
-						topic: state.topic,
-						partition: state.partition,
-						errorCode: partitionResponse.errorCode,
-					})
-					await this.cluster.refreshMetadata([state.topic])
-					return []
+					if (records.length > 0) {
+						// Advance offset for next fetch
+						state.offset = records[records.length - 1]!.offset + 1n
 
-				default:
-					this.logger.error('fetch protocol error', {
-						topic: state.topic,
-						partition: state.partition,
-						errorCode: partitionResponse.errorCode,
-					})
-					throw new Error(`Fetch error ${partitionResponse.errorCode} for ${state.topic}-${state.partition}`)
+						// Estimate byte size for memory tracking
+						let byteSize = 0
+						for (const record of records) {
+							byteSize += (record.key?.length ?? 0) + (record.value?.length ?? 0) + 64
+						}
+
+						// Add to buffer
+						this.fetchBuffer.add({
+							topic: state.topic,
+							partition: state.partition,
+							records,
+							byteSize,
+						})
+					}
+				}
 			}
 		}
+	}
 
-		// Decode records
-		if (!partitionResponse.recordsData || partitionResponse.recordsData.length === 0) {
-			return []
+	/**
+	 * Poll for records from all ready partitions (pull-based API)
+	 *
+	 * Uses buffered polling with background fetch loop for better performance.
+	 * The background loop is started lazily on first call.
+	 *
+	 * Returns records grouped by topic/partition. Internal offsets are advanced
+	 * so subsequent polls return new records.
+	 */
+	async poll(): Promise<PartitionBatch[]> {
+		// Lazy initialization: start background fetch loop on first call
+		if (!this.fetchBuffer) {
+			const maxBufferedBytes = this.config.maxBufferedBytes ?? this.config.maxBytesPerPartition * 10
+			this.fetchBuffer = new FetchBuffer(maxBufferedBytes)
+			this.running = true
+			this.abortController = new AbortController()
+			// Fire and forget - loop runs until stopped via running=false or abort signal
+			this.runBackgroundFetchLoop()
 		}
 
-		const decodeResult = this.decodeRecords(
-			state.topic,
-			state.partition,
-			partitionResponse.recordsData,
-			partitionResponse.abortedTransactions,
-			partitionResponse.lastStableOffset
-		)
-		const records = decodeResult instanceof Promise ? await decodeResult : decodeResult
-		return filterRecordsFromOffset(records, fetchOffset)
+		// Return immediately if buffer has data
+		if (!this.fetchBuffer.isEmpty()) {
+			return this.drainBuffer()
+		}
+
+		// Wait for data to arrive (up to maxWaitMs)
+		const hasData = await this.fetchBuffer.waitForData(this.config.maxWaitMs, this.abortController?.signal)
+
+		return hasData ? this.drainBuffer() : []
+	}
+
+	/**
+	 * Drain buffer and return completed fetches directly
+	 */
+	private drainBuffer(): PartitionBatch[] {
+		if (!this.fetchBuffer) return []
+		return this.fetchBuffer.drain()
 	}
 
 	/**
@@ -1109,8 +762,6 @@ export class FetchManager {
 	 * Returns sync result or Promise depending on whether compression is encountered
 	 */
 	private decodeRecords(
-		_topic: string,
-		_partition: number,
 		data: Buffer,
 		abortedTransactions: Array<{ producerId: bigint; firstOffset: bigint }>,
 		lastStableOffset: bigint

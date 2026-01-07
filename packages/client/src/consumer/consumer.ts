@@ -9,13 +9,8 @@ import { EventEmitter } from 'node:events'
 import type { Cluster } from '@/client/cluster.js'
 import { KafkaProtocolError } from '@/client/errors.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
-import {
-	EachRecordProcessor,
-	BatchRecordProcessor,
-	createFetchCallback,
-	type RecordProcessor,
-	type FetchCallback,
-} from './record-processor.js'
+import { pmapVoid } from '@/utils/pmap.js'
+import type { DecodedRecord } from '@/protocol/records/index.js'
 import { buildDecoderMaps, decodeRecord } from './message-decoder.js'
 import {
 	ManualPartitionProvider,
@@ -37,9 +32,9 @@ import type {
 	BatchHandler,
 	RunEachOptions,
 	RunBatchOptions,
+	StreamOptions,
 	TopicPartition,
 	ManualAssignment,
-	ConsumerTraceFn,
 } from './types.js'
 import {
 	DEFAULT_CONSUMER_CONFIG,
@@ -55,11 +50,18 @@ import { noopLogger, type Logger } from '@/logger.js'
 
 type ConsumerState = 'idle' | 'running' | 'stopping'
 
+type InternalBatchHandler = (
+	topic: string,
+	partition: number,
+	records: DecodedRecord[],
+	decoders: ReturnType<typeof buildDecoderMaps>,
+	ctx: { signal: AbortSignal; offsetManager: OffsetManager; commitOffsets: boolean }
+) => Promise<void>
+
 export class Consumer extends EventEmitter<ConsumerEvents> {
 	private readonly cluster: Cluster
 	private readonly config: ResolvedConsumerConfig
 	private readonly logger: Logger
-	private readonly trace?: ConsumerTraceFn
 
 	private state: ConsumerState = 'idle'
 	private commitOffsets = true
@@ -72,13 +74,11 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	private abortController: AbortController | null = null
 	private runPromiseResolve: (() => void) | null = null
 	private runPromiseReject: ((error: Error) => void) | null = null
-	private fetchCallback: FetchCallback | null = null
 
 	constructor(cluster: Cluster, config: ConsumerConfig) {
 		super()
 		this.cluster = cluster
 		this.logger = cluster.getLogger()?.child({ component: 'consumer', groupId: config.groupId }) ?? noopLogger
-		this.trace = config.trace
 		this.config = {
 			groupId: config.groupId,
 			groupInstanceId: config.groupInstanceId || undefined,
@@ -172,7 +172,6 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 				maxWaitMs: this.config.maxWaitMs,
 				partitionConcurrency,
 				isolationLevel: this.config.isolationLevel,
-				trace: this.trace,
 			},
 			logger
 		)
@@ -302,13 +301,57 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	}
 
 	/**
+	 * Internal batch handler type for poll-based processing
+	 */
+	private async runPollLoop(
+		subscriptions: TopicSubscription<unknown, unknown>[],
+		batchHandler: InternalBatchHandler,
+		concurrency: number,
+		autoCommitIntervalMs: number,
+		autoCommit: boolean
+	): Promise<void> {
+		const fetchManager = this.fetchManager!
+		const offsetManager = this.offsetManager!
+		const signal = this.abortController!.signal
+		const decoders = buildDecoderMaps(subscriptions)
+
+		if (autoCommit && this.commitOffsets) {
+			offsetManager.startAutoCommit(autoCommitIntervalMs)
+		}
+
+		const handlerCtx = { signal, offsetManager, commitOffsets: this.commitOffsets }
+
+		while (this.state === 'running' && !signal.aborted) {
+			const batches = await fetchManager.poll()
+
+			if (batches.length === 0) {
+				continue
+			}
+
+			try {
+				await pmapVoid(
+					batches,
+					batch => batchHandler(batch.topic, batch.partition, batch.records, decoders, handlerCtx),
+					concurrency,
+					signal
+				)
+			} catch (error) {
+				this.emitError(error)
+				throw error
+			}
+		}
+	}
+
+	/**
 	 * Unified run mode implementation using PartitionProvider
 	 */
-	private async runMode(
+	private async run(
 		subscription: SubscriptionInput,
 		opts: RunEachOptions | RunBatchOptions,
 		concurrency: number,
-		startFetchLoop: (subscriptions: TopicSubscription<unknown, unknown>[]) => Promise<void>
+		batchHandler: InternalBatchHandler,
+		autoCommitIntervalMs: number,
+		autoCommit: boolean
 	): Promise<void> {
 		this.startRun(opts.commitOffsets !== false, opts.signal)
 
@@ -361,7 +404,9 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 
 			this.emit('running')
 
-			await this.startFetchLoopAndWait(() => startFetchLoop(subscriptions))
+			await this.startFetchLoopAndWait(() =>
+				this.runPollLoop(subscriptions, batchHandler, concurrency, autoCommitIntervalMs, autoCommit)
+			)
 		} catch (error) {
 			this.emitError(error)
 			throw error
@@ -383,20 +428,33 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	): Promise<void> {
 		const opts = { ...DEFAULT_RUN_EACH_OPTIONS, ...options }
 		const concurrency = opts.partitionConcurrency ?? DEFAULT_RUN_EACH_OPTIONS.partitionConcurrency
-		await this.runMode(subscription, opts, concurrency, subscriptions => {
-			const processor = new EachRecordProcessor(
-				handler as MessageHandler<unknown, unknown>,
-				this.offsetManager!,
-				this.commitOffsets,
-				this.createProcessorErrorHandler()
-			)
-			return this.startFetchLoop(
-				subscriptions,
-				processor,
-				opts.autoCommitIntervalMs ?? DEFAULT_RUN_EACH_OPTIONS.autoCommitIntervalMs,
-				opts.autoCommit !== false
-			)
-		})
+
+		await this.run(
+			subscription,
+			opts,
+			concurrency,
+			async (topic, partition, records, decoders, ctx) => {
+				for (const record of records) {
+					if (ctx.signal.aborted) return
+
+					const message = decodeRecord(topic, partition, record, decoders)
+					const consumeCtx: ConsumeContext = {
+						signal: ctx.signal,
+						topic,
+						partition,
+						offset: record.offset,
+					}
+
+					await handler(message as Message<MsgOf<S>, KeyOf<S>>, consumeCtx)
+
+					if (ctx.commitOffsets) {
+						ctx.offsetManager.markConsumed(topic, partition, record.offset)
+					}
+				}
+			},
+			opts.autoCommitIntervalMs ?? DEFAULT_RUN_EACH_OPTIONS.autoCommitIntervalMs,
+			opts.autoCommit !== false
+		)
 	}
 
 	/**
@@ -413,20 +471,34 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	): Promise<void> {
 		const opts = { ...DEFAULT_RUN_BATCH_OPTIONS, ...options }
 		const concurrency = opts.partitionConcurrency ?? DEFAULT_RUN_BATCH_OPTIONS.partitionConcurrency
-		await this.runMode(subscription, opts, concurrency, subscriptions => {
-			const processor = new BatchRecordProcessor(
-				handler as BatchHandler<unknown, unknown>,
-				this.offsetManager!,
-				this.commitOffsets,
-				this.createProcessorErrorHandler()
-			)
-			return this.startFetchLoop(
-				subscriptions,
-				processor,
-				opts.autoCommitIntervalMs ?? DEFAULT_RUN_BATCH_OPTIONS.autoCommitIntervalMs,
-				opts.autoCommit !== false
-			)
-		})
+
+		await this.run(
+			subscription,
+			opts,
+			concurrency,
+			async (topic, partition, records, decoders, ctx) => {
+				if (records.length === 0) return
+
+				const messages = records.map(r => decodeRecord(topic, partition, r, decoders))
+				const lastRecord = records[records.length - 1]!
+				const consumeCtx: ConsumeContext = {
+					signal: ctx.signal,
+					topic,
+					partition,
+					offset: lastRecord.offset,
+				}
+
+				await handler(messages as Message<MsgOf<S>, KeyOf<S>>[], consumeCtx)
+
+				if (ctx.commitOffsets) {
+					for (const record of records) {
+						ctx.offsetManager.markConsumed(topic, partition, record.offset)
+					}
+				}
+			},
+			opts.autoCommitIntervalMs ?? DEFAULT_RUN_BATCH_OPTIONS.autoCommitIntervalMs,
+			opts.autoCommit !== false
+		)
 	}
 
 	/**
@@ -437,47 +509,74 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	 * - Simple poll-yield-mark loop: fetch records, yield each, mark consumed after yield.
 	 */
 	async *stream<S extends SubscriptionInput>(
-		subscription: S
+		subscription: S,
+		options?: StreamOptions
 	): AsyncIterable<{ message: Message<MsgOf<S>, KeyOf<S>>; ctx: ConsumeContext }> {
-		this.startRun(true)
+		const commitOffsets = options?.commitOffsets !== false
+		const autoCommitIntervalMs: number = options?.autoCommitIntervalMs ?? 5000
+		this.startRun(commitOffsets, options?.signal)
 
 		try {
+			const manualAssignment = options?.assignment
 			const { subscriptions, topics } = this.getSubscriptionsAndTopics(subscription)
 			const decoders = buildDecoderMaps(subscriptions)
 
-			this.initComponents(1, true, this.logger)
-			const consumerGroup = this.consumerGroup
-			const offsetManager = this.offsetManager
-			const fetchManager = this.fetchManager
+			const useConsumerGroup = !manualAssignment
+			this.initComponents(1, useConsumerGroup, this.logger)
+
+			const offsetManager = this.offsetManager!
+			const fetchManager = this.fetchManager!
 			const signal = this.abortController!.signal
-			if (!consumerGroup || !offsetManager || !fetchManager) {
-				return
+
+			let manualOffsets: Map<string, bigint> | undefined
+			if (manualAssignment) {
+				const normalized = this.normalizeAndValidateManualAssignment(manualAssignment, topics)
+				manualOffsets = new Map()
+				for (const tp of normalized) {
+					if (tp.offset !== undefined) {
+						manualOffsets.set(`${tp.topic}:${tp.partition}`, tp.offset)
+					}
+				}
+				this.partitionProvider = new ManualPartitionProvider({
+					assignment: normalized,
+					cluster: this.cluster,
+					groupId: this.config.groupId,
+					offsetManager,
+					signal,
+				})
+				this.logger.debug('starting consumer stream', {
+					topics,
+					assignmentMode: 'manual',
+					assignedPartitionCount: normalized.length,
+				})
+			} else {
+				this.partitionProvider = new GroupPartitionProvider({
+					consumerGroup: this.consumerGroup!,
+					cluster: this.cluster,
+					groupId: this.config.groupId,
+					autoOffsetReset: this.config.autoOffsetReset,
+					commitOffsets: this.commitOffsets && !this.sessionLost,
+					offsetManager,
+					fetchManager,
+					logger: this.logger,
+					signal,
+					isRunning: () => this.state === 'running',
+				})
+				this.logger.debug('starting consumer stream', { topics })
 			}
 
-			this.partitionProvider = new GroupPartitionProvider({
-				consumerGroup,
-				cluster: this.cluster,
-				groupId: this.config.groupId,
-				autoOffsetReset: this.config.autoOffsetReset,
-				commitOffsets: this.commitOffsets,
-				offsetManager,
-				fetchManager,
-				logger: this.logger,
-				signal,
-				isRunning: () => this.state === 'running',
-			})
-
-			const callbacks = this.createProviderCallbacks()
+			const callbacks = this.createProviderCallbacks(manualOffsets)
 			await this.partitionProvider.start(topics, callbacks)
 			this.emit('running')
 
-			offsetManager.startAutoCommit(DEFAULT_RUN_EACH_OPTIONS.autoCommitIntervalMs)
+			if (this.commitOffsets) {
+				offsetManager.startAutoCommit(autoCommitIntervalMs)
+			}
 
 			while (this.state === 'running' && !signal.aborted) {
 				const batches = await fetchManager.poll()
 
 				if (batches.length === 0) {
-					await new Promise(r => setTimeout(r, 100))
 					continue
 				}
 
@@ -494,7 +593,9 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 						yield { message, ctx } as { message: Message<MsgOf<S>, KeyOf<S>>; ctx: ConsumeContext }
 
 						// Mark consumed after yield returns - user has received message
-						offsetManager.markConsumed(topic, partition, record.offset)
+						if (this.commitOffsets) {
+							offsetManager.markConsumed(topic, partition, record.offset)
+						}
 
 						if (this.state !== 'running' || signal.aborted) {
 							return
@@ -581,47 +682,6 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		return result
 	}
 
-	/**
-	 * Create error handler for record processors
-	 */
-	private createProcessorErrorHandler(): (error: Error) => void {
-		return (error: Error) => {
-			if (this.runPromiseReject) {
-				this.runPromiseReject(error)
-				this.runPromiseReject = null
-				this.runPromiseResolve = null
-			}
-			this.stop()
-		}
-	}
-
-	/**
-	 * Unified fetch loop for all processing modes
-	 */
-	private async startFetchLoop(
-		subscriptions: TopicSubscription<unknown, unknown>[],
-		processor: RecordProcessor,
-		autoCommitIntervalMs: number,
-		autoCommit: boolean
-	): Promise<void> {
-		if (!this.fetchManager || !this.offsetManager) {
-			return
-		}
-
-		if (autoCommit && this.commitOffsets) {
-			this.offsetManager.startAutoCommit(autoCommitIntervalMs)
-		}
-
-		this.fetchCallback = createFetchCallback(
-			subscriptions,
-			processor,
-			this.abortController!.signal,
-			() => this.state === 'running'
-		)
-
-		await this.fetchManager.start(this.fetchCallback)
-	}
-
 	private async cleanup(): Promise<void> {
 		if (this.fetchManager) {
 			this.fetchManager.stop()
@@ -663,7 +723,6 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		this.fetchManager = null
 		this.partitionProvider = null
 		this.abortController = null
-		this.fetchCallback = null
 		this.runPromiseReject = null
 	}
 
