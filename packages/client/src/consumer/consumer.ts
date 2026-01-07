@@ -247,15 +247,21 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		})
 	}
 
+	/**
+	 * Whether the consumer is currently running.
+	 */
 	get isRunning(): boolean {
 		return this.state === 'running'
 	}
 
 	/**
-	 * Pause fetching from specific partitions (backpressure control).
+	 * Pause fetching from specific partitions.
 	 *
-	 * While paused, the consumer remains in the group and continues heartbeating,
-	 * but it will not fetch new records from the paused partitions until resumed.
+	 * Useful for backpressure control when processing cannot keep up with incoming messages.
+	 * The consumer remains in the group and continues heartbeating while paused.
+	 *
+	 * @param partitions - The partitions to pause
+	 * @throws If the consumer is not running
 	 */
 	pause(partitions: TopicPartition[]): void {
 		if (this.state !== 'running' || !this.fetchManager) {
@@ -265,7 +271,10 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	}
 
 	/**
-	 * Resume fetching from specific partitions after a pause().
+	 * Resume fetching from previously paused partitions.
+	 *
+	 * @param partitions - The partitions to resume
+	 * @throws If the consumer is not running
 	 */
 	resume(partitions: TopicPartition[]): void {
 		if (this.state !== 'running' || !this.fetchManager) {
@@ -416,10 +425,22 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	}
 
 	/**
-	 * Run the consumer loop processing one message at a time
+	 * Consume messages one at a time.
 	 *
-	 * - One consumer → one run. Calling runEach() again while active throws.
-	 * - Resolves when stop() is called, options.signal aborts, or a fatal error occurs.
+	 * Starts the consumer and invokes the handler for each message. The promise resolves
+	 * when {@link stop} is called, the abort signal fires, or a fatal error occurs.
+	 *
+	 * @param subscription - Topic(s) to consume from
+	 * @param handler - Async function called for each message
+	 * @param options - Optional configuration for offsets, concurrency, and assignment
+	 * @throws If the consumer is already running
+	 *
+	 * @example
+	 * ```ts
+	 * await consumer.runEach('my-topic', async (message, ctx) => {
+	 *   console.log(message.value)
+	 * })
+	 * ```
 	 */
 	async runEach<S extends SubscriptionInput>(
 		subscription: S,
@@ -458,11 +479,26 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	}
 
 	/**
-	 * Run the consumer loop processing messages in batches
+	 * Consume messages in batches.
 	 *
-	 * - One consumer → one run. Calling runBatch() again while active throws.
-	 * - Resolves when stop() is called, options.signal aborts, or a fatal error occurs.
-	 * - Offsets are only marked as consumed after the batch handler completes successfully.
+	 * Starts the consumer and invokes the handler with batches of messages from each partition.
+	 * Offsets are committed only after the handler completes successfully, providing at-least-once
+	 * semantics. The promise resolves when {@link stop} is called, the abort signal fires, or
+	 * a fatal error occurs.
+	 *
+	 * @param subscription - Topic(s) to consume from
+	 * @param handler - Async function called for each batch of messages
+	 * @param options - Optional configuration for offsets, concurrency, and assignment
+	 * @throws If the consumer is already running
+	 *
+	 * @example
+	 * ```ts
+	 * await consumer.runBatch('my-topic', async (messages, ctx) => {
+	 *   for (const msg of messages) {
+	 *     console.log(msg.value)
+	 *   }
+	 * })
+	 * ```
 	 */
 	async runBatch<S extends SubscriptionInput>(
 		subscription: S,
@@ -502,11 +538,23 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	}
 
 	/**
-	 * Async iterator mode
+	 * Consume messages as an async iterable.
 	 *
-	 * - Also single-run: calling stream() during run() throws.
-	 * - Returns one message at a time.
-	 * - Simple poll-yield-mark loop: fetch records, yield each, mark consumed after yield.
+	 * Returns an async iterator that yields messages one at a time. This is useful for
+	 * integrating with `for await...of` loops and stream processing pipelines.
+	 * The iterator completes when you break out of the loop or call {@link stop}.
+	 *
+	 * @param subscription - Topic(s) to consume from
+	 * @param options - Optional configuration for offsets and assignment
+	 * @throws If the consumer is already running
+	 *
+	 * @example
+	 * ```ts
+	 * for await (const { message, ctx } of consumer.stream('my-topic')) {
+	 *   console.log(message.value)
+	 *   if (shouldStop) break
+	 * }
+	 * ```
 	 */
 	async *stream<S extends SubscriptionInput>(
 		subscription: S,
@@ -609,10 +657,11 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	}
 
 	/**
-	 * Graceful shutdown
+	 * Stop the consumer gracefully.
 	 *
-	 * - Idempotent
-	 * - Causes run()/stream() to resolve once fully stopped
+	 * Signals the consumer to stop fetching and exit the run loop. Any pending offsets
+	 * are committed before shutdown completes. This method is idempotent and safe to
+	 * call multiple times.
 	 */
 	stop(): void {
 		if (this.state === 'idle' || this.state === 'stopping') {
