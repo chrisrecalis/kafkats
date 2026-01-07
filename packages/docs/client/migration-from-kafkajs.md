@@ -73,17 +73,17 @@ const client = new KafkaClient({
 
 ### Configuration Mapping
 
-| KafkaJS             | @kafkats/client                                            | Notes                                                   |
-| ------------------- | ---------------------------------------------------------- | ------------------------------------------------------- | --------------- | ---------------- |
-| `clientId`          | `clientId`                                                 | Same                                                    |
-| `brokers`           | `brokers`                                                  | Same                                                    |
-| `connectionTimeout` | `connectionTimeoutMs`                                      | Explicit `Ms` suffix                                    |
-| `requestTimeout`    | `requestTimeoutMs`                                         | Explicit `Ms` suffix                                    |
-| `ssl: true`         | `tls: { enabled: true }`                                   | Renamed to `tls`                                        |
-| `ssl: {...}`        | `tls: { enabled: true, ... }`                              | Same options as Node.js `tls.connect()`                 |
-| `sasl`              | `sasl`                                                     | Same structure, but mechanism is `'PLAIN'               | 'SCRAM-SHA-256' | 'SCRAM-SHA-512'` |
-| `retry`             | `producer({ retries, retryBackoffMs, maxRetryBackoffMs })` | Retry is configured per producer                        |
-| `logLevel`          | `logLevel`                                                 | String values: `'debug'`, `'info'`, `'warn'`, `'error'` |
+| KafkaJS             | @kafkats/client                                            | Notes                                                        |
+| ------------------- | ---------------------------------------------------------- | ------------------------------------------------------------ |
+| `clientId`          | `clientId`                                                 | Same                                                         |
+| `brokers`           | `brokers`                                                  | Same                                                         |
+| `connectionTimeout` | `connectionTimeoutMs`                                      | Explicit `Ms` suffix                                         |
+| `requestTimeout`    | `requestTimeoutMs`                                         | Explicit `Ms` suffix                                         |
+| `ssl: true`         | `tls: { enabled: true }`                                   | Renamed to `tls`                                             |
+| `ssl: {...}`        | `tls: { enabled: true, ... }`                              | Same options as Node.js `tls.connect()`                      |
+| `sasl`              | `sasl`                                                     | Same structure, mechanism: `'PLAIN'`, `'SCRAM-SHA-256'`, etc |
+| `retry`             | `producer({ retries, retryBackoffMs, maxRetryBackoffMs })` | Retry is configured per producer                             |
+| `logLevel`          | `logLevel`                                                 | String values: `'debug'`, `'info'`, `'warn'`, `'error'`      |
 
 ## Producer Migration
 
