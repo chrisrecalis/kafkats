@@ -128,6 +128,42 @@ export interface ConsumeContext {
 	offset: bigint
 }
 
+/**
+ * Context provided to batch handlers with offset resolution support
+ */
+export interface BatchConsumeContext extends ConsumeContext {
+	/**
+	 * Mark a message's offset as resolved/processed.
+	 *
+	 * Call this after successfully processing each message to enable partial batch commits.
+	 * If the handler crashes, only resolved offsets will be committed, preventing
+	 * reprocessing of already-handled messages.
+	 *
+	 * @param offset - The offset of the message to mark as resolved
+	 *
+	 * @example
+	 * ```ts
+	 * consumer.runBatch(topic, async (batch, ctx) => {
+	 *   for (const message of batch) {
+	 *     await processMessage(message)
+	 *     ctx.resolveOffset(message.offset)  // Mark as processed
+	 *   }
+	 * })
+	 * ```
+	 */
+	resolveOffset(offset: bigint): void
+
+	/**
+	 * The first offset in the batch (convenience accessor)
+	 */
+	firstOffset: bigint
+
+	/**
+	 * The last offset in the batch (convenience accessor)
+	 */
+	lastOffset: bigint
+}
+
 // ==================== Handler Types ====================
 
 /**
@@ -138,7 +174,7 @@ export type MessageHandler<V = Buffer, K = Buffer> = (message: Message<V, K>, ct
 /**
  * Handler for batch message mode
  */
-export type BatchHandler<V = Buffer, K = Buffer> = (batch: Message<V, K>[], ctx: ConsumeContext) => Promise<void>
+export type BatchHandler<V = Buffer, K = Buffer> = (batch: Message<V, K>[], ctx: BatchConsumeContext) => Promise<void>
 
 // ==================== Run Options ====================
 

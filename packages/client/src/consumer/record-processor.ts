@@ -6,7 +6,14 @@
 
 import type { DecodedRecord } from '@/protocol/records/index.js'
 import { buildDecoderMaps, decodeRecord } from './message-decoder.js'
-import type { Message, ConsumeContext, MessageHandler, BatchHandler, TopicSubscription } from './types.js'
+import type {
+	Message,
+	ConsumeContext,
+	BatchConsumeContext,
+	MessageHandler,
+	BatchHandler,
+	TopicSubscription,
+} from './types.js'
 import type { OffsetManager } from './offset-manager.js'
 
 /**
@@ -124,24 +131,53 @@ export class BatchRecordProcessor implements RecordProcessor {
 			return
 		}
 
+		const firstMessage = messages[0]!
 		const lastMessage = messages[messages.length - 1]!
-		const ctx: ConsumeContext = {
+
+		// Track offsets resolved by the handler
+		const resolvedOffsets = new Set<bigint>()
+
+		const ctx: BatchConsumeContext = {
 			signal,
 			topic,
 			partition,
 			offset: lastMessage.offset,
+			firstOffset: firstMessage.offset,
+			lastOffset: lastMessage.offset,
+			resolveOffset: (offset: bigint) => {
+				resolvedOffsets.add(offset)
+			},
 		}
 
 		try {
 			await this.handler(messages, ctx)
 
-			// Mark all offsets as consumed after handler succeeds
+			// Mark offsets as consumed after handler succeeds
 			if (this.commitOffsets) {
-				for (const msg of messages) {
-					this.offsetManager.markConsumed(msg.topic, msg.partition, msg.offset)
+				if (resolvedOffsets.size > 0) {
+					// User explicitly resolved some offsets - only commit those
+					for (const msg of messages) {
+						if (resolvedOffsets.has(msg.offset)) {
+							this.offsetManager.markConsumed(msg.topic, msg.partition, msg.offset)
+						}
+					}
+				} else {
+					// No explicit resolves - commit all (backward compatible)
+					for (const msg of messages) {
+						this.offsetManager.markConsumed(msg.topic, msg.partition, msg.offset)
+					}
 				}
 			}
 		} catch (error) {
+			// On error, still commit any offsets that were explicitly resolved
+			// This enables partial progress even on failure
+			if (this.commitOffsets && resolvedOffsets.size > 0) {
+				for (const msg of messages) {
+					if (resolvedOffsets.has(msg.offset)) {
+						this.offsetManager.markConsumed(msg.topic, msg.partition, msg.offset)
+					}
+				}
+			}
 			this.onError(error as Error)
 			throw error
 		}

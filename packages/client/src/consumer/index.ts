@@ -19,6 +19,7 @@ export type {
 	// Message
 	Message,
 	ConsumeContext,
+	BatchConsumeContext,
 	// Handlers
 	MessageHandler,
 	BatchHandler,
