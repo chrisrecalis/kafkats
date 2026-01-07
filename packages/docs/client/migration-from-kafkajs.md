@@ -337,8 +337,8 @@ await consumer.runBatch(
 	async (messages, ctx) => {
 		for (const message of messages) {
 			await processMessage(message)
+			ctx.markConsumed(message.offset) // Mark offset for commit
 		}
-		// Offsets are committed after batch completes successfully
 	},
 	{
 		autoCommit: true,
@@ -346,6 +346,12 @@ await consumer.runBatch(
 	}
 )
 ```
+
+::: tip Partial batch commits
+The `ctx.markConsumed(offset)` function marks individual message offsets for commit. If your handler crashes partway through a batch, only the marked offsets will be committed on the next auto-commit cycle, preventing reprocessing of already-handled messages.
+
+If you don't call `markConsumed()`, all offsets are committed when the batch handler completes successfully (backward compatible behavior).
+:::
 
 ### Type-Safe Consumer
 
@@ -711,7 +717,7 @@ process.on('SIGINT', shutdown)
 
 ### Features in KafkaJS not yet in @kafkats/client
 
-- `consumer.commitOffsets()` for manual offset commits outside handlers
+- `consumer.commitOffsets()` for manual offset commits outside handlers (use `ctx.markConsumed()` inside batch handlers)
 - Admin partition reassignment (`alterPartitionReassignments`)
 - Advanced retry options (e.g., `multiplier`, `factor` for exponential backoff)
 

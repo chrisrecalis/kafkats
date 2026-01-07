@@ -134,8 +134,8 @@ export class BatchRecordProcessor implements RecordProcessor {
 		const firstMessage = messages[0]!
 		const lastMessage = messages[messages.length - 1]!
 
-		// Track offsets resolved by the handler
-		const resolvedOffsets = new Set<bigint>()
+		// Track offsets marked as consumed by the handler
+		const markedOffsets = new Set<bigint>()
 
 		const ctx: BatchConsumeContext = {
 			signal,
@@ -144,8 +144,8 @@ export class BatchRecordProcessor implements RecordProcessor {
 			offset: lastMessage.offset,
 			firstOffset: firstMessage.offset,
 			lastOffset: lastMessage.offset,
-			resolveOffset: (offset: bigint) => {
-				resolvedOffsets.add(offset)
+			markConsumed: (offset: bigint) => {
+				markedOffsets.add(offset)
 			},
 		}
 
@@ -154,26 +154,26 @@ export class BatchRecordProcessor implements RecordProcessor {
 
 			// Mark offsets as consumed after handler succeeds
 			if (this.commitOffsets) {
-				if (resolvedOffsets.size > 0) {
-					// User explicitly resolved some offsets - only commit those
+				if (markedOffsets.size > 0) {
+					// User explicitly marked some offsets - only commit those
 					for (const msg of messages) {
-						if (resolvedOffsets.has(msg.offset)) {
+						if (markedOffsets.has(msg.offset)) {
 							this.offsetManager.markConsumed(msg.topic, msg.partition, msg.offset)
 						}
 					}
 				} else {
-					// No explicit resolves - commit all (backward compatible)
+					// No explicit marks - commit all (backward compatible)
 					for (const msg of messages) {
 						this.offsetManager.markConsumed(msg.topic, msg.partition, msg.offset)
 					}
 				}
 			}
 		} catch (error) {
-			// On error, still commit any offsets that were explicitly resolved
+			// On error, still commit any offsets that were explicitly marked
 			// This enables partial progress even on failure
-			if (this.commitOffsets && resolvedOffsets.size > 0) {
+			if (this.commitOffsets && markedOffsets.size > 0) {
 				for (const msg of messages) {
-					if (resolvedOffsets.has(msg.offset)) {
+					if (markedOffsets.has(msg.offset)) {
 						this.offsetManager.markConsumed(msg.topic, msg.partition, msg.offset)
 					}
 				}

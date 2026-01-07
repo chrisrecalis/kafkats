@@ -118,11 +118,11 @@ describe.concurrent('Consumer (integration) - runBatch', () => {
 		await client.disconnect()
 	})
 
-	it('resolveOffset commits only resolved offsets on success', async () => {
-		const client = createClient('it-runBatch-resolveOffset')
+	it('markConsumed commits only marked offsets on success', async () => {
+		const client = createClient('it-runBatch-markConsumed')
 		await client.connect()
 
-		const topicName = uniqueName('it-runBatch-resolveOffset')
+		const topicName = uniqueName('it-runBatch-markConsumed')
 		const testTopic = topic<string>(topicName, {
 			value: string(),
 		})
@@ -139,12 +139,12 @@ describe.concurrent('Consumer (integration) - runBatch', () => {
 		const groupId = uniqueName('it-group')
 		const consumer1 = client.consumer({ groupId, autoOffsetReset: 'earliest' })
 
-		// Consume and resolve only first 3 messages
+		// Consume and mark only first 3 messages as consumed
 		await consumer1.runBatch(
 			testTopic,
 			async (batch, ctx) => {
 				for (let i = 0; i < 3; i++) {
-					ctx.resolveOffset(batch[i]!.offset)
+					ctx.markConsumed(batch[i]!.offset)
 				}
 				consumer1.stop()
 			},
@@ -174,11 +174,11 @@ describe.concurrent('Consumer (integration) - runBatch', () => {
 		await client.disconnect()
 	})
 
-	it('resolveOffset commits partial progress on handler failure', async () => {
-		const client = createClient('it-runBatch-resolveOffset-fail')
+	it('markConsumed commits partial progress on handler failure', async () => {
+		const client = createClient('it-runBatch-markConsumed-fail')
 		await client.connect()
 
-		const topicName = uniqueName('it-runBatch-resolveOffset-fail')
+		const topicName = uniqueName('it-runBatch-markConsumed-fail')
 		const testTopic = topic<string>(topicName, {
 			value: string(),
 		})
@@ -195,13 +195,13 @@ describe.concurrent('Consumer (integration) - runBatch', () => {
 		const groupId = uniqueName('it-group')
 		const consumer1 = client.consumer({ groupId, autoOffsetReset: 'earliest' })
 
-		// Consume, resolve 2 messages, then throw
+		// Consume, mark 2 messages, then throw
 		const run1 = consumer1.runBatch(
 			testTopic,
 			async (batch, ctx) => {
-				// Resolve first 2 messages
-				ctx.resolveOffset(batch[0]!.offset)
-				ctx.resolveOffset(batch[1]!.offset)
+				// Mark first 2 messages as consumed
+				ctx.markConsumed(batch[0]!.offset)
+				ctx.markConsumed(batch[1]!.offset)
 				// Then fail
 				throw new Error('partial-fail')
 			},
@@ -211,7 +211,7 @@ describe.concurrent('Consumer (integration) - runBatch', () => {
 
 		await expect(run1).rejects.toThrow(/partial-fail/)
 
-		// Wait for commit of resolved offsets
+		// Wait for commit of marked offsets
 		await setTimeout(200)
 
 		// Second consumer should read from offset 2 (messages m-2, m-3, m-4)

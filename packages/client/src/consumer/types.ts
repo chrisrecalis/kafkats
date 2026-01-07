@@ -133,25 +133,25 @@ export interface ConsumeContext {
  */
 export interface BatchConsumeContext extends ConsumeContext {
 	/**
-	 * Mark a message's offset as resolved/processed.
+	 * Mark a message's offset as consumed.
 	 *
 	 * Call this after successfully processing each message to enable partial batch commits.
-	 * If the handler crashes, only resolved offsets will be committed, preventing
-	 * reprocessing of already-handled messages.
+	 * If the handler crashes, only marked offsets will be committed on the next auto-commit
+	 * cycle, preventing reprocessing of already-handled messages.
 	 *
-	 * @param offset - The offset of the message to mark as resolved
+	 * @param offset - The offset of the message to mark as consumed
 	 *
 	 * @example
 	 * ```ts
 	 * consumer.runBatch(topic, async (batch, ctx) => {
 	 *   for (const message of batch) {
 	 *     await processMessage(message)
-	 *     ctx.resolveOffset(message.offset)  // Mark as processed
+	 *     ctx.markConsumed(message.offset)  // Mark as processed
 	 *   }
 	 * })
 	 * ```
 	 */
-	resolveOffset(offset: bigint): void
+	markConsumed(offset: bigint): void
 
 	/**
 	 * The first offset in the batch (convenience accessor)
