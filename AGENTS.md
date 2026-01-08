@@ -54,6 +54,11 @@ General notes:
 - Default parallelism: 3 workers (configurable via `VITEST_MAX_WORKERS`)
 - Set `KAFKA_TS_LOG_LEVEL=debug` for verbose client logs
 
+**WARNING: VS Code Dev Containers**
+- Do NOT kill or stop Docker containers when running inside a VS Code dev container
+- The dev container itself runs as a Docker container, and killing containers can terminate your development session
+- Run `docker ps` to see running containers before attempting any cleanup
+
 ## Code Style
 
 - **Formatting**: Prettier with tabs, 120 char width, single quotes, no semicolons

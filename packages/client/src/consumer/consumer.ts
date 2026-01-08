@@ -340,7 +340,13 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			try {
 				await pmapVoid(
 					batches,
-					batch => batchHandler(batch.topic, batch.partition, batch.records, decoders, handlerCtx),
+					batch => {
+						// Skip batches from partitions that were revoked during rebalance
+						if (!fetchManager.isPartitionAssigned(batch.topic, batch.partition)) {
+							return Promise.resolve()
+						}
+						return batchHandler(batch.topic, batch.partition, batch.records, decoders, handlerCtx)
+					},
 					concurrency,
 					signal
 				)
@@ -629,6 +635,11 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 				}
 
 				for (const { topic, partition, records } of batches) {
+					// Skip batches from partitions that were revoked during rebalance
+					if (!fetchManager.isPartitionAssigned(topic, partition)) {
+						continue
+					}
+
 					for (const record of records) {
 						const message = decodeRecord(topic, partition, record, decoders)
 						const ctx: ConsumeContext = {

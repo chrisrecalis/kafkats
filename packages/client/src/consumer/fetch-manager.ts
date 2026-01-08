@@ -340,7 +340,7 @@ export class FetchManager {
 
 	/**
 	 * Remove partitions incrementally (used for cooperative rebalance)
-	 * Aborts fetch loops for removed partitions
+	 * Aborts fetch loops for removed partitions and clears buffered records
 	 */
 	removePartitions(partitions: TopicPartition[]): void {
 		if (partitions.length === 0) return
@@ -359,6 +359,9 @@ export class FetchManager {
 				this.partitionStates.delete(key)
 			}
 		}
+
+		// Clear buffered records for removed partitions
+		this.fetchBuffer?.removePartitions(partitions)
 	}
 
 	/**
@@ -440,6 +443,14 @@ export class FetchManager {
 		if (state) {
 			state.offset = offset + 1n // Next offset to fetch
 		}
+	}
+
+	/**
+	 * Check if a partition is currently assigned to this consumer
+	 * Used to filter stale records after rebalance
+	 */
+	isPartitionAssigned(topic: string, partition: number): boolean {
+		return this.partitionStates.has(tpKey(topic, partition))
 	}
 
 	/**
