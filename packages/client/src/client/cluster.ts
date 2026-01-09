@@ -402,16 +402,27 @@ export class Cluster extends EventEmitter<ClusterEvents> {
 	}
 
 	async refreshMetadata(topics?: string[]): Promise<ClusterMetadata> {
-		// Deduplicate concurrent refresh requests
-		if (this.metadataRefreshPromise) {
+		// Deduplicate concurrent refresh requests ONLY for full metadata refreshes.
+		// Topic-specific refreshes must not be deduplicated because concurrent requests
+		// with different topic lists would get incorrect metadata (only the first request's
+		// topics would be fetched, leaving subsequent requests missing their topics).
+		if (!topics && this.metadataRefreshPromise) {
 			return this.metadataRefreshPromise
 		}
 
-		this.metadataRefreshPromise = this.doRefreshMetadata(topics)
+		const promise = this.doRefreshMetadata(topics)
+
+		// Only cache full metadata refresh promises for deduplication
+		if (!topics) {
+			this.metadataRefreshPromise = promise
+		}
+
 		try {
-			return await this.metadataRefreshPromise
+			return await promise
 		} finally {
-			this.metadataRefreshPromise = null
+			if (!topics) {
+				this.metadataRefreshPromise = null
+			}
 		}
 	}
 
