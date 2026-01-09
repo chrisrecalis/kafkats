@@ -18,7 +18,7 @@ describe('Consumer', () => {
 			removePartitions: vi.fn(),
 		}
 		consumerAny.offsetManager = {
-			setAssignedPartitions: vi.fn(),
+			addAssignedPartitions: vi.fn(),
 			removeAssignedPartitions: vi.fn(),
 			commitPendingOffsets: vi.fn(),
 			clearPartitions: vi.fn(),

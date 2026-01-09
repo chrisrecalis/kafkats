@@ -187,7 +187,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			onPartitionsAssigned: async partitionsWithOffsets => {
 				this.sessionLost = false
 				const partitions = partitionsWithOffsets.map(p => ({ topic: p.topic, partition: p.partition }))
-				this.offsetManager!.setAssignedPartitions(partitions)
+				this.offsetManager!.addAssignedPartitions(partitions)
 				this.partitionTracker!.assign(partitions)
 				this.fetchManager!.addPartitions(partitionsWithOffsets)
 				this.emit('partitionsAssigned', partitions)

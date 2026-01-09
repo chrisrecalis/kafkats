@@ -77,17 +77,20 @@ export class OffsetManager {
 	}
 
 	/**
-	 * Set the currently assigned partitions (Java client model).
-	 * Called after rebalance when new assignment is received.
-	 * Replaces all previously assigned partitions.
+	 * Add partitions to the assigned set (Java client model).
+	 * Called after rebalance when new partitions are assigned.
+	 * Additive: does not clear existing partitions (important for cooperative rebalance
+	 * where onPartitionsAssigned only receives newly added partitions, not kept ones).
 	 */
-	setAssignedPartitions(partitions: TopicPartition[]): void {
-		this.assignedPartitions.clear()
+	addAssignedPartitions(partitions: TopicPartition[]): void {
 		for (const tp of partitions) {
 			const key = tpKey(tp.topic, tp.partition)
 			this.assignedPartitions.add(key)
 		}
-		this.logger.debug('assigned partitions updated', { count: this.assignedPartitions.size })
+		this.logger.debug('assigned partitions added', {
+			added: partitions.length,
+			total: this.assignedPartitions.size,
+		})
 	}
 
 	/**
