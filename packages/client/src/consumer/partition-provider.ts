@@ -21,6 +21,7 @@ import { CoordinatorNotAvailableError, NotCoordinatorError } from '@/client/erro
 export type TopicPartitionOffset = TopicPartition & { offset: bigint }
 
 export interface PartitionProviderCallbacks {
+	onRebalance: () => void
 	onPartitionsAssigned: (partitions: TopicPartitionOffset[]) => Promise<void>
 	onPartitionsRevoked: (partitions: TopicPartition[]) => Promise<void>
 	onPartitionsLost: (partitions: TopicPartition[]) => void
@@ -202,6 +203,9 @@ export class GroupPartitionProvider implements PartitionProvider {
 		this.rebalancePending = false
 
 		try {
+			// Notify listeners that rebalance is starting
+			this.callbacks.onRebalance()
+
 			const previousAssignment = this.consumerGroup.currentAssignment
 			if (this.consumerGroup.currentRebalanceProtocol === 'eager') {
 				await this.handleEagerRebalance(previousAssignment)

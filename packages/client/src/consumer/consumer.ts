@@ -183,6 +183,9 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 
 	private createProviderCallbacks(): PartitionProviderCallbacks {
 		return {
+			onRebalance: () => {
+				this.emit('rebalance')
+			},
 			// eslint-disable-next-line @typescript-eslint/require-await
 			onPartitionsAssigned: async partitionsWithOffsets => {
 				this.sessionLost = false
