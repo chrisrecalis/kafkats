@@ -31,4 +31,3 @@ describe('OffsetManager', () => {
 		expect(offsetManager.isPartitionAssigned('t', 1)).toBe(true)
 	})
 })
-
