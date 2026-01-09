@@ -78,3 +78,7 @@ export { OffsetManager } from './offset-manager.js'
 // Fetch manager (for advanced use)
 export { FetchManager } from './fetch-manager.js'
 export type { FetchManagerConfig } from './fetch-manager.js'
+
+// Partition tracker (for advanced use - coordinates partition ownership and processing state)
+export { PartitionTracker } from './partition-tracker.js'
+export type { PartitionTrackerConfig } from './partition-tracker.js'

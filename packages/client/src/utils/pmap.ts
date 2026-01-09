@@ -66,7 +66,11 @@ export async function pmapVoid<T>(
 							resolvePromise()
 						}
 					} else if (active === 0) {
-						error ? rejectPromise(error) : resolvePromise()
+						if (error) {
+							rejectPromise(error)
+						} else {
+							resolvePromise()
+						}
 					}
 				})
 				.catch(err => {

@@ -46,6 +46,7 @@ import {
 import { ConsumerGroup } from './consumer-group.js'
 import { OffsetManager } from './offset-manager.js'
 import { FetchManager } from './fetch-manager.js'
+import { PartitionTracker } from './partition-tracker.js'
 import { noopLogger, type Logger } from '@/logger.js'
 
 type ConsumerState = 'idle' | 'running' | 'stopping'
@@ -69,6 +70,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	private consumerGroup: ConsumerGroup | null = null
 	private offsetManager: OffsetManager | null = null
 	private fetchManager: FetchManager | null = null
+	private partitionTracker: PartitionTracker | null = null
 	private partitionProvider: PartitionProvider | null = null
 	private fetchLoopPromise: Promise<void> | null = null
 	private abortController: AbortController | null = null
@@ -153,6 +155,8 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	}
 
 	private initComponents(partitionConcurrency: number, useConsumerGroup: boolean, logger?: Logger): void {
+		this.partitionTracker = new PartitionTracker({ logger })
+
 		if (useConsumerGroup) {
 			this.consumerGroup = new ConsumerGroup(this.cluster, this.config, logger)
 		}
@@ -177,19 +181,22 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		)
 	}
 
-	/**
-	 * Create callbacks for partition provider events
-	 */
-	private createProviderCallbacks(manualOffsets?: Map<string, bigint>): PartitionProviderCallbacks {
+	private createProviderCallbacks(): PartitionProviderCallbacks {
 		return {
-			onPartitionsAssigned: async partitions => {
-				// Clear session lost flag - we have a valid session again after rejoin
+			// eslint-disable-next-line @typescript-eslint/require-await
+			onPartitionsAssigned: async partitionsWithOffsets => {
 				this.sessionLost = false
-				const withOffsets = await this.resolvePartitionOffsets(partitions, manualOffsets)
-				this.fetchManager!.setPartitions(withOffsets)
+				const partitions = partitionsWithOffsets.map(p => ({ topic: p.topic, partition: p.partition }))
+				this.offsetManager!.setAssignedPartitions(partitions)
+				this.partitionTracker!.assign(partitions)
+				this.fetchManager!.addPartitions(partitionsWithOffsets)
 				this.emit('partitionsAssigned', partitions)
 			},
 			onPartitionsRevoked: async partitions => {
+				if (this.partitionTracker) {
+					await this.partitionTracker.revoke(partitions)
+				}
+				this.offsetManager!.removeAssignedPartitions(partitions)
 				this.fetchManager!.removePartitions(partitions)
 				if (this.commitOffsets && !this.sessionLost) {
 					await this.offsetManager!.commitPendingOffsets()
@@ -198,10 +205,11 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 				this.emit('partitionsRevoked', partitions)
 			},
 			onPartitionsLost: partitions => {
-				this.logger.debug('session lost, partitions cannot be committed', {
-					partitionCount: partitions.length,
-				})
 				this.sessionLost = true
+				this.offsetManager!.removeAssignedPartitions(partitions)
+				for (const tp of partitions) {
+					this.partitionTracker?.endProcessing(tp.topic, tp.partition)
+				}
 				this.offsetManager!.clearPartitions(partitions)
 				this.fetchManager!.removePartitions(partitions)
 				this.emit('partitionsLost', partitions)
@@ -217,7 +225,6 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 					this.stop()
 				}
 			},
-			resolveOffsets: partitions => this.resolvePartitionOffsets(partitions, manualOffsets),
 		}
 	}
 
@@ -321,6 +328,8 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	): Promise<void> {
 		const fetchManager = this.fetchManager!
 		const offsetManager = this.offsetManager!
+		const partitionTracker = this.partitionTracker!
+		const partitionProvider = this.partitionProvider!
 		const signal = this.abortController!.signal
 		const decoders = buildDecoderMaps(subscriptions)
 
@@ -333,6 +342,11 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		while (this.state === 'running' && !signal.aborted) {
 			const batches = await fetchManager.poll()
 
+			// Handle any pending rebalance after poll returns but before processing
+			// This ensures revoked partitions are removed before we check assignments
+			await partitionProvider.checkAndHandleRebalance()
+			if (this.state !== 'running' || signal.aborted) break
+
 			if (batches.length === 0) {
 				continue
 			}
@@ -340,12 +354,24 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			try {
 				await pmapVoid(
 					batches,
-					batch => {
+					async batch => {
 						// Skip batches from partitions that were revoked during rebalance
+						// Check both FetchManager (has partition state) and PartitionTracker (assigned + not revoking)
 						if (!fetchManager.isPartitionAssigned(batch.topic, batch.partition)) {
-							return Promise.resolve()
+							return
 						}
-						return batchHandler(batch.topic, batch.partition, batch.records, decoders, handlerCtx)
+
+						// Mark partition as processing - returns false if partition is not assigned or being revoked
+						if (!partitionTracker.startProcessing(batch.topic, batch.partition)) {
+							return
+						}
+
+						try {
+							await batchHandler(batch.topic, batch.partition, batch.records, decoders, handlerCtx)
+						} finally {
+							// Mark processing complete - this unblocks any pending revoke() wait
+							partitionTracker.endProcessing(batch.topic, batch.partition)
+						}
 					},
 					concurrency,
 					signal
@@ -377,20 +403,14 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			const useConsumerGroup = !manualAssignment
 			this.initComponents(concurrency, useConsumerGroup, this.logger)
 
-			let manualOffsets: Map<string, bigint> | undefined
 			if (manualAssignment) {
 				const normalized = this.normalizeAndValidateManualAssignment(manualAssignment, topics)
-				manualOffsets = new Map()
-				for (const tp of normalized) {
-					if (tp.offset !== undefined) {
-						manualOffsets.set(`${tp.topic}:${tp.partition}`, tp.offset)
-					}
-				}
 				this.partitionProvider = new ManualPartitionProvider({
 					assignment: normalized,
 					cluster: this.cluster,
 					groupId: this.config.groupId,
 					offsetManager: this.offsetManager!,
+					autoOffsetReset: this.config.autoOffsetReset,
 					signal: this.abortController?.signal,
 				})
 				this.logger.debug('starting consumer', {
@@ -404,9 +424,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 					cluster: this.cluster,
 					groupId: this.config.groupId,
 					autoOffsetReset: this.config.autoOffsetReset,
-					commitOffsets: this.commitOffsets && !this.sessionLost,
 					offsetManager: this.offsetManager!,
-					fetchManager: this.fetchManager!,
 					logger: this.logger,
 					signal: this.abortController?.signal,
 					isRunning: () => this.state === 'running',
@@ -414,7 +432,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 				this.logger.debug('starting consumer', { topics })
 			}
 
-			const callbacks = this.createProviderCallbacks(manualOffsets)
+			const callbacks = this.createProviderCallbacks()
 			await this.partitionProvider.start(topics, callbacks)
 
 			this.emit('running')
@@ -582,20 +600,14 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			const fetchManager = this.fetchManager!
 			const signal = this.abortController!.signal
 
-			let manualOffsets: Map<string, bigint> | undefined
 			if (manualAssignment) {
 				const normalized = this.normalizeAndValidateManualAssignment(manualAssignment, topics)
-				manualOffsets = new Map()
-				for (const tp of normalized) {
-					if (tp.offset !== undefined) {
-						manualOffsets.set(`${tp.topic}:${tp.partition}`, tp.offset)
-					}
-				}
 				this.partitionProvider = new ManualPartitionProvider({
 					assignment: normalized,
 					cluster: this.cluster,
 					groupId: this.config.groupId,
 					offsetManager,
+					autoOffsetReset: this.config.autoOffsetReset,
 					signal,
 				})
 				this.logger.debug('starting consumer stream', {
@@ -609,9 +621,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 					cluster: this.cluster,
 					groupId: this.config.groupId,
 					autoOffsetReset: this.config.autoOffsetReset,
-					commitOffsets: this.commitOffsets && !this.sessionLost,
 					offsetManager,
-					fetchManager,
 					logger: this.logger,
 					signal,
 					isRunning: () => this.state === 'running',
@@ -619,7 +629,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 				this.logger.debug('starting consumer stream', { topics })
 			}
 
-			const callbacks = this.createProviderCallbacks(manualOffsets)
+			const callbacks = this.createProviderCallbacks()
 			await this.partitionProvider.start(topics, callbacks)
 			this.emit('running')
 
@@ -627,8 +637,16 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 				offsetManager.startAutoCommit(autoCommitIntervalMs)
 			}
 
+			const partitionTracker = this.partitionTracker!
+			const partitionProvider = this.partitionProvider
+
 			while (this.state === 'running' && !signal.aborted) {
 				const batches = await fetchManager.poll()
+
+				// Handle any pending rebalance after poll returns but before processing
+				// This ensures revoked partitions are removed before we check assignments
+				await partitionProvider.checkAndHandleRebalance()
+				if (this.state !== 'running' || signal.aborted) break
 
 				if (batches.length === 0) {
 					continue
@@ -640,25 +658,35 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 						continue
 					}
 
-					for (const record of records) {
-						const message = decodeRecord(topic, partition, record, decoders)
-						const ctx: ConsumeContext = {
-							signal,
-							topic,
-							partition,
-							offset: record.offset,
-						}
+					// Mark partition as processing - returns false if partition is not assigned or being revoked
+					if (!partitionTracker.startProcessing(topic, partition)) {
+						continue
+					}
 
-						yield { message, ctx } as { message: Message<MsgOf<S>, KeyOf<S>>; ctx: ConsumeContext }
+					try {
+						for (const record of records) {
+							const message = decodeRecord(topic, partition, record, decoders)
+							const ctx: ConsumeContext = {
+								signal,
+								topic,
+								partition,
+								offset: record.offset,
+							}
 
-						// Mark consumed after yield returns - user has received message
-						if (this.commitOffsets) {
-							offsetManager.markConsumed(topic, partition, record.offset)
-						}
+							yield { message, ctx } as { message: Message<MsgOf<S>, KeyOf<S>>; ctx: ConsumeContext }
 
-						if (this.state !== 'running' || signal.aborted) {
-							return
+							// Mark consumed after yield returns - user has received message
+							if (this.commitOffsets) {
+								offsetManager.markConsumed(topic, partition, record.offset)
+							}
+
+							if (this.state !== 'running' || signal.aborted) {
+								return
+							}
 						}
+					} finally {
+						// Mark processing complete - this unblocks any pending revoke() wait
+						partitionTracker.endProcessing(topic, partition)
 					}
 				}
 			}
@@ -709,39 +737,6 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		return [...byKey.values()]
 	}
 
-	/**
-	 * Resolve starting offsets for partitions
-	 */
-	private async resolvePartitionOffsets(
-		assignment: TopicPartition[],
-		manualOffsets?: Map<string, bigint>
-	): Promise<Array<TopicPartition & { offset: bigint }>> {
-		const offsetManager = this.offsetManager
-		if (!offsetManager) {
-			return []
-		}
-
-		const committedOffsets = await offsetManager.fetchCommittedOffsets(assignment)
-		const result: Array<TopicPartition & { offset: bigint }> = []
-
-		for (const tp of assignment) {
-			const key = `${tp.topic}:${tp.partition}`
-			const manualOffset = manualOffsets?.get(key)
-			const offset =
-				manualOffset !== undefined
-					? manualOffset
-					: await offsetManager.resolveStartingOffset(
-							tp.topic,
-							tp.partition,
-							this.config.autoOffsetReset,
-							committedOffsets
-						)
-			result.push({ ...tp, offset })
-		}
-
-		return result
-	}
-
 	private async cleanup(): Promise<void> {
 		if (this.fetchManager) {
 			this.fetchManager.stop()
@@ -781,6 +776,8 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		this.consumerGroup = null
 		this.offsetManager = null
 		this.fetchManager = null
+		this.partitionTracker?.clear()
+		this.partitionTracker = null
 		this.partitionProvider = null
 		this.abortController = null
 		this.runPromiseReject = null

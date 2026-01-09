@@ -35,6 +35,10 @@ export class OffsetManager {
 	// Consumed offsets (next offset to commit = consumed + 1)
 	private readonly consumedOffsets: Map<string, bigint> = new Map()
 
+	// Currently assigned partitions (Java client model protection)
+	// Prevents markConsumed for revoked partitions during rebalance race
+	private readonly assignedPartitions: Set<string> = new Set()
+
 	// Auto-commit state
 	private autoCommitTimer: ReturnType<typeof setTimeout> | null = null
 	private abortController: AbortController | null = null
@@ -73,11 +77,63 @@ export class OffsetManager {
 	}
 
 	/**
+	 * Set the currently assigned partitions (Java client model).
+	 * Called after rebalance when new assignment is received.
+	 * Replaces all previously assigned partitions.
+	 */
+	setAssignedPartitions(partitions: TopicPartition[]): void {
+		this.assignedPartitions.clear()
+		for (const tp of partitions) {
+			const key = tpKey(tp.topic, tp.partition)
+			this.assignedPartitions.add(key)
+		}
+		this.logger.debug('assigned partitions updated', { count: this.assignedPartitions.size })
+	}
+
+	/**
+	 * Remove partitions from the assigned set (for cooperative rebalance revoke).
+	 * Called when partitions are revoked during incremental rebalance.
+	 */
+	removeAssignedPartitions(partitions: TopicPartition[]): void {
+		for (const tp of partitions) {
+			const key = tpKey(tp.topic, tp.partition)
+			this.assignedPartitions.delete(key)
+		}
+		this.logger.debug('partitions removed from assignment', {
+			removedCount: partitions.length,
+			remainingCount: this.assignedPartitions.size,
+		})
+	}
+
+	/**
+	 * Check if a partition is currently assigned
+	 */
+	isPartitionAssigned(topic: string, partition: number): boolean {
+		const key = tpKey(topic, partition)
+		return this.assignedPartitions.has(key)
+	}
+
+	/**
 	 * Mark a message as consumed
 	 * The committed offset will be the next offset (consumed + 1)
+	 *
+	 * Protected by partition assignment check (Java client model):
+	 * If the partition was revoked during rebalance, this is a no-op to prevent
+	 * committing offsets for partitions we no longer own.
 	 */
 	markConsumed(topic: string, partition: number, offset: bigint): void {
 		const key = tpKey(topic, partition)
+
+		// Protect against race condition: handler completes after partition revoked
+		if (!this.assignedPartitions.has(key)) {
+			this.logger.debug('ignoring markConsumed for unassigned partition', {
+				topic,
+				partition,
+				offset: offset.toString(),
+			})
+			return
+		}
+
 		const current = this.consumedOffsets.get(key) ?? -1n
 		if (offset > current) {
 			this.consumedOffsets.set(key, offset)
@@ -139,6 +195,7 @@ export class OffsetManager {
 
 	/**
 	 * Commit all pending offsets
+	 * Filters to only assigned partitions (Java client model protection)
 	 */
 	async commitPendingOffsets(): Promise<void> {
 		if (this.consumedOffsets.size === 0 || !this.coordinator) {
@@ -147,9 +204,16 @@ export class OffsetManager {
 
 		this.logger.debug('committing offsets', { count: this.consumedOffsets.size })
 
-		// Build commit request
+		// Build commit request - filter to only assigned partitions
 		const topicMap = new Map<string, Map<number, bigint>>()
+		const keysToCommit: string[] = []
 		for (const [key, offset] of this.consumedOffsets) {
+			// Skip partitions that were revoked during rebalance
+			if (!this.assignedPartitions.has(key)) {
+				this.logger.debug('skipping commit for unassigned partition', { key })
+				continue
+			}
+			keysToCommit.push(key)
 			const [topic, partitionStr] = key.split(':')
 			const partition = parseInt(partitionStr!, 10)
 
@@ -157,6 +221,12 @@ export class OffsetManager {
 				topicMap.set(topic!, new Map())
 			}
 			topicMap.get(topic!)!.set(partition, offset + 1n)
+		}
+
+		// Nothing to commit if all partitions were filtered out
+		if (topicMap.size === 0) {
+			this.logger.debug('no assigned partitions to commit')
+			return
 		}
 
 		const topics = Array.from(topicMap.entries()).map(([name, partitions]) => ({
@@ -192,7 +262,10 @@ export class OffsetManager {
 		}
 
 		this.logger.debug('offsets committed successfully')
-		this.consumedOffsets.clear()
+		// Only clear the keys that were actually committed
+		for (const key of keysToCommit) {
+			this.consumedOffsets.delete(key)
+		}
 	}
 
 	/**
