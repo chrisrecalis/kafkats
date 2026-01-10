@@ -27,3 +27,10 @@ export function parseKey(key: string): TopicPartition {
 	const [topic, partitionStr] = key.split(':')
 	return { topic: topic!, partition: parseInt(partitionStr!, 10) }
 }
+
+/**
+ * Format an array of topic-partitions for logging
+ */
+export function formatPartitions(partitions: TopicPartition[]): string[] {
+	return partitions.map(p => `${p.topic}-${p.partition}`)
+}

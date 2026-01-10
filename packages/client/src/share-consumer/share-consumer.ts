@@ -64,7 +64,7 @@ import {
 	toShareTopicSubscription,
 	toTopicPartitionKey,
 } from './share-consumer-helpers.js'
-import { pmap } from './pmap.js'
+import { pmap } from '@/utils/pmap.js'
 
 const EMPTY_BUFFER = Buffer.alloc(0)
 

@@ -4,6 +4,7 @@
 
 import type { Cluster } from '@/client/cluster.js'
 import type { TopicDefinition, DecoderLike } from '@/topic.js'
+import type { DecodedRecord } from '@/protocol/records/index.js'
 export { normalizeDecoder } from '@/topic.js'
 export type { Decoder, DecoderLike } from '@/topic.js'
 
@@ -180,6 +181,23 @@ export interface RunBatchOptions {
 	assignment?: ManualAssignment[]
 }
 
+/**
+ * Options for stream() - async iterator mode
+ */
+export interface StreamOptions {
+	commitOffsets?: boolean
+	autoCommitIntervalMs?: number
+	signal?: AbortSignal
+	/**
+	 * Manually assign the consumer to these partitions instead of joining a group.
+	 *
+	 * - Skips JoinGroup/SyncGroup and does not emit rebalance events.
+	 * - Offsets (if commitOffsets is enabled) are still committed under `groupId`,
+	 *   but without group generation/member metadata.
+	 */
+	assignment?: ManualAssignment[]
+}
+
 // ==================== Consumer Configuration ====================
 
 /**
@@ -323,6 +341,13 @@ export interface TopicPartition {
 
 export interface TopicPartitionOffset extends TopicPartition {
 	offset: bigint
+}
+
+/**
+ * A batch of records from a single partition
+ */
+export interface PartitionBatch extends TopicPartition {
+	records: DecodedRecord[]
 }
 
 export interface ManualAssignment extends TopicPartition {

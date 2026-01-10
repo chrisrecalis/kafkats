@@ -236,8 +236,7 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 			const needsRejoin = this.rebalanceProtocol === 'cooperative' && newlyRevoked.length > 0
 
 			if (needsRejoin) {
-				// Phase 1: new partitions being revoked, caller should commit/pause them and call rejoin
-				this.logger.info('cooperative rebalance: partitions need revocation', {
+				this.logger.debug('cooperative rebalance: partitions need revocation', {
 					newlyRevokedCount: newlyRevoked.length,
 					totalRevokedCount: result.revoked.length,
 					pendingRevocationCount: this.pendingRevocation.length,
@@ -812,7 +811,7 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 			case ErrorCode.UnknownMemberId: {
 				// Fatal session loss - lost generation without ability to commit
 				// Emit sessionLost with the partitions we lost (can't commit them anymore)
-				this.logger.info('session lost - unknown member id', { memberId: this.memberId })
+				this.logger.warn('session lost - unknown member id', { memberId: this.memberId })
 				const lostPartitions = [...this.ownedPartitions]
 				this.memberId = ''
 				this.generationId = -1
@@ -839,8 +838,7 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 
 			case ErrorCode.IllegalGeneration:
 				// Common during cooperative rebalances
-				// Clear generation but keep memberId for rejoin attempt
-				this.logger.info('illegal generation', { generationId: this.generationId })
+				this.logger.debug('illegal generation', { generationId: this.generationId })
 				this.generationId = -1
 				this.emit('rebalance')
 				break
@@ -853,8 +851,7 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 
 			case ErrorCode.FencedInstanceId: {
 				// Fatal error - another instance with same groupInstanceId is active
-				// Emit sessionLost before resetting - can't commit offsets for these partitions
-				this.logger.info('session lost - instance fenced', { groupInstanceId: this.config.groupInstanceId })
+				this.logger.warn('session lost - instance fenced', { groupInstanceId: this.config.groupInstanceId })
 				const fencedPartitions = [...this.ownedPartitions]
 				this.ownedPartitions = []
 				this.pendingRevocation = []

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { pmap } from '@/share-consumer/pmap.js'
+import { pmap, pmapVoid } from '@/utils/pmap.js'
 
 describe('pmap', () => {
 	it('maps all items with the given function', async () => {
@@ -217,5 +217,117 @@ describe('pmap', () => {
 		// But it was already in-flight, so its result should be captured
 		expect(results).toContain('first')
 		expect(results).toContain('second')
+	})
+})
+
+describe('pmapVoid', () => {
+	it('executes function for all items', async () => {
+		const items = [1, 2, 3, 4, 5]
+		const processed: number[] = []
+		const fn = async (x: number) => {
+			processed.push(x)
+		}
+
+		await pmapVoid(items, fn, 2)
+
+		expect(processed.sort()).toEqual([1, 2, 3, 4, 5])
+	})
+
+	it('returns void (undefined)', async () => {
+		const items = [1, 2, 3]
+		const result = await pmapVoid(items, async () => {}, 2)
+		expect(result).toBeUndefined()
+	})
+
+	it('respects concurrency limit', async () => {
+		const concurrency = 2
+		let currentActive = 0
+		let maxActive = 0
+
+		const items = [1, 2, 3, 4, 5, 6]
+		const fn = async (_x: number) => {
+			currentActive++
+			maxActive = Math.max(maxActive, currentActive)
+			await new Promise(r => setTimeout(r, 10))
+			currentActive--
+		}
+
+		await pmapVoid(items, fn, concurrency)
+
+		expect(maxActive).toBeLessThanOrEqual(concurrency)
+	})
+
+	it('handles concurrency of 1 (sequential)', async () => {
+		const order: number[] = []
+		const items = [1, 2, 3]
+
+		const fn = async (x: number) => {
+			order.push(x)
+			await new Promise(r => setTimeout(r, 5))
+		}
+
+		await pmapVoid(items, fn, 1)
+
+		expect(order).toEqual([1, 2, 3])
+	})
+
+	it('handles empty input', async () => {
+		const fn = vi.fn(async () => {})
+		await pmapVoid([], fn, 2)
+		expect(fn).not.toHaveBeenCalled()
+	})
+
+	it('handles already aborted signal', async () => {
+		const controller = new AbortController()
+		controller.abort()
+
+		const fn = vi.fn(async () => {})
+		await pmapVoid([1, 2, 3], fn, 2, controller.signal)
+
+		expect(fn).not.toHaveBeenCalled()
+	})
+
+	it('stops processing when signal is aborted', async () => {
+		const controller = new AbortController()
+		const processed: number[] = []
+		const items = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+
+		const fn = async (x: number) => {
+			processed.push(x)
+			await new Promise(r => setTimeout(r, 20))
+			if (x === 2) {
+				controller.abort()
+			}
+		}
+
+		await pmapVoid(items, fn, 2, controller.signal)
+
+		expect(processed.length).toBeLessThan(items.length)
+	})
+
+	it('propagates errors from the function', async () => {
+		const items = [1, 2, 3]
+		const fn = async (x: number) => {
+			if (x === 2) {
+				throw new Error('test error')
+			}
+		}
+
+		await expect(pmapVoid(items, fn, 2)).rejects.toThrow('test error')
+	})
+
+	it('handles unlimited concurrency fast path', async () => {
+		const items = [1, 2, 3]
+		const processed: number[] = []
+
+		await pmapVoid(
+			items,
+			async x => {
+				processed.push(x)
+			},
+			10
+		)
+
+		expect(processed.sort()).toEqual([1, 2, 3])
 	})
 })
