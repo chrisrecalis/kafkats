@@ -62,3 +62,4 @@ await consumer.runEach('events', async message => {
 - [ShareConsumer (experimental)](/client/share-consumer) - Share Groups (KIP-932)
 - [Codecs](/client/codecs) - Type-safe serialization
 - [Authentication](/client/authentication) - SASL configuration
+- [Benchmarks](/client/benchmarks) - Performance comparisons
