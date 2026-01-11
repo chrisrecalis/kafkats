@@ -4,8 +4,7 @@
 
 import type { SaslConfig } from '@/network/types.js'
 import type { SaslMechanism } from './sasl-mechanism.js'
-import { PlainMechanism } from './plain.js'
-import { ScramSha256Mechanism, ScramSha512Mechanism } from './scram.js'
+import { createSaslMechanism } from './create-mechanism.js'
 import { ApiKey } from '@/protocol/messages/api-keys.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import { Encoder, Decoder } from '@/protocol/primitives/index.js'
@@ -31,6 +30,8 @@ export type SendRawFn = (requestBuffer: Buffer) => Promise<Buffer>
 export interface SaslAuthenticatorOptions {
 	config: SaslConfig
 	clientId: string
+	brokerHost: string
+	brokerPort: number
 	logger?: Logger
 	/** Function to send raw request and receive raw response */
 	sendRaw: SendRawFn
@@ -39,16 +40,25 @@ export interface SaslAuthenticatorOptions {
 export class SaslAuthenticator {
 	private readonly config: SaslConfig
 	private readonly clientId: string
+	private readonly brokerHost: string
+	private readonly brokerPort: number
 	private readonly logger?: Logger
 	private readonly sendRaw: SendRawFn
 	private correlationId = 0
 	private enabledMechanisms: string[] | null = null
+	private _sessionLifetimeMs: bigint | undefined
 
 	constructor(options: SaslAuthenticatorOptions) {
 		this.config = options.config
 		this.clientId = options.clientId
+		this.brokerHost = options.brokerHost
+		this.brokerPort = options.brokerPort
 		this.logger = options.logger
 		this.sendRaw = options.sendRaw
+	}
+
+	get sessionLifetimeMs(): bigint | undefined {
+		return this._sessionLifetimeMs
 	}
 
 	/**
@@ -58,7 +68,11 @@ export class SaslAuthenticator {
 		this.logger?.debug('starting SASL authentication', { mechanism: this.config.mechanism })
 
 		await this.performHandshake()
-		const mechanism = this.createMechanism()
+		const mechanism = createSaslMechanism(this.config, {
+			host: this.brokerHost,
+			port: this.brokerPort,
+			clientId: this.clientId,
+		})
 		await this.performAuthentication(mechanism)
 
 		this.logger?.debug('SASL authentication successful', { mechanism: this.config.mechanism })
@@ -102,30 +116,6 @@ export class SaslAuthenticator {
 			enabledMechanisms: response.enabledMechanisms,
 		})
 		this.enabledMechanisms = response.enabledMechanisms
-	}
-
-	private createMechanism(): SaslMechanism {
-		const mechanismConfig = {
-			username: this.config.username,
-			password: this.config.password,
-		}
-
-		switch (this.config.mechanism) {
-			case 'PLAIN':
-				return new PlainMechanism(mechanismConfig)
-			case 'SCRAM-SHA-256':
-				return new ScramSha256Mechanism(mechanismConfig)
-			case 'SCRAM-SHA-512':
-				return new ScramSha512Mechanism(mechanismConfig)
-			default: {
-				// Exhaustive check - this should never happen
-				const mechanism: never = this.config.mechanism
-				throw new SaslAuthenticationError(
-					mechanism as string,
-					`Unsupported SASL mechanism: ${mechanism as string}`
-				)
-			}
-		}
 	}
 
 	private async performAuthentication(mechanism: SaslMechanism): Promise<void> {
@@ -177,6 +167,8 @@ export class SaslAuthenticator {
 					`${mechanism.name} authentication failed${response.errorMessage ? `: ${response.errorMessage}` : ''}`
 				)
 			}
+
+			this._sessionLifetimeMs = response.sessionLifetimeMs
 
 			// Pass server response to mechanism for next round
 			result = await authGenerator.next(response.authBytes)

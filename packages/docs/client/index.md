@@ -7,7 +7,7 @@ The core Kafka client package providing producer, consumer, and low-level protoc
 - **Pure Protocol** - Direct Kafka wire protocol implementation, no native dependencies
 - **Type-Safe** - Full TypeScript support with comprehensive types
 - **High Performance** - Optimized batching, zero-copy operations
-- **SASL Authentication** - PLAIN, SCRAM-SHA-256, SCRAM-SHA-512
+- **SASL Authentication** - PLAIN, SCRAM-SHA-256, SCRAM-SHA-512, OAUTHBEARER
 - **Transactions** - Full exactly-once semantics support
 - **Compression** - gzip, snappy, lz4, zstd
 

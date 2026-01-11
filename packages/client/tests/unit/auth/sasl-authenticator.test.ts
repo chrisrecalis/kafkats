@@ -49,6 +49,8 @@ describe('SaslAuthenticator error mapping', () => {
 				password: 'pass',
 			},
 			clientId,
+			brokerHost: 'localhost',
+			brokerPort: 9092,
 			sendRaw: async () => {
 				const next = responses.shift()
 				if (!next) {
@@ -84,6 +86,8 @@ describe('SaslAuthenticator error mapping', () => {
 				password: 'pass',
 			},
 			clientId,
+			brokerHost: 'localhost',
+			brokerPort: 9092,
 			sendRaw: async () => {
 				const next = responses.shift()
 				if (!next) {

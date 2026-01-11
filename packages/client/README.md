@@ -9,7 +9,7 @@ A pure-protocol TypeScript Kafka client with producer, consumer, and admin APIs.
 - **Consumer** — Consumer groups, partition assignment, offset management
 - **ShareConsumer (experimental)** — Share Groups (KIP-932) with per-record acknowledgements
 - **Admin** — Topic management, consumer groups, cluster metadata
-- **SASL Auth** — PLAIN, SCRAM-SHA-256, SCRAM-SHA-512
+- **SASL Auth** — PLAIN, SCRAM-SHA-256, SCRAM-SHA-512, OAUTHBEARER
 - **Typed Codecs** — Built-in string, JSON, and buffer codecs
 
 ## Installation
@@ -29,6 +29,19 @@ const client = new KafkaClient({ brokers: ['localhost:9092'] })
 const producer = client.producer()
 await producer.connect()
 await producer.send('events', [{ key: 'user-1', value: 'hello' }])
+
+// SASL OAUTHBEARER (e.g. AWS MSK IAM)
+const clientWithSasl = new KafkaClient({
+	brokers: ['b-1.example:9098'],
+	clientId: 'my-app',
+	tls: { enabled: true },
+	sasl: {
+		mechanism: 'OAUTHBEARER',
+		oauthBearerProvider: async ({ host, port }) => ({
+			value: await getTokenForBroker(`${host}:${port}`),
+		}),
+	},
+})
 
 // Consumer
 const consumer = client.consumer({ groupId: 'my-group' })

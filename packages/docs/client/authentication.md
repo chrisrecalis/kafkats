@@ -9,14 +9,29 @@ kafkats supports SASL authentication for secure Kafka connections.
 | `PLAIN`         | Username/password (use with TLS) |
 | `SCRAM-SHA-256` | Challenge-response, SHA-256      |
 | `SCRAM-SHA-512` | Challenge-response, SHA-512      |
+| `OAUTHBEARER`   | Bearer token (e.g. AWS MSK IAM)  |
 
 ## SASL Options
 
-| Option      | Type                                            | Required | Description         |
-| ----------- | ----------------------------------------------- | -------- | ------------------- |
+SASL config is a discriminated union keyed by `mechanism`.
+
+### PLAIN / SCRAM
+
+| Option      | Type                                 | Required | Description         |
+| ----------- | ------------------------------------ | -------- | ------------------- |
 | `mechanism` | `'PLAIN' \| 'SCRAM-SHA-256' \| 'SCRAM-SHA-512'` | Yes      | SASL mechanism name |
-| `username`  | `string`                                        | Yes      | SASL username       |
-| `password`  | `string`                                        | Yes      | SASL password       |
+| `username`  | `string`                             | Yes      | SASL username       |
+| `password`  | `string`                             | Yes      | SASL password       |
+
+### OAUTHBEARER
+
+| Option                | Type                                                                      | Required | Description |
+| --------------------- | ------------------------------------------------------------------------- | -------- | ----------- |
+| `mechanism`           | `'OAUTHBEARER'`                                                           | Yes      | SASL mechanism name |
+| `oauthBearerProvider` | `(context) => ({ value, extensions? })`                                   | Yes      | Returns the bearer token (and optional extensions) for the broker |
+| `reauthenticationThresholdMs` | `number`                                                           | No       | Reauthenticate when this many milliseconds remain of broker session lifetime (default: `10000`) |
+
+`context` includes `{ host, port, clientId }`.
 
 ## SASL/PLAIN
 
@@ -71,6 +86,29 @@ const client = new KafkaClient({
 		mechanism: 'SCRAM-SHA-512',
 		username: 'my-username',
 		password: 'my-password',
+	},
+})
+```
+
+## OAUTHBEARER
+
+Provide a bearer token per broker connection via `oauthBearerProvider`. Tokens are commonly short-lived, so generate them on demand and refresh when needed.
+
+If the broker has periodic reauthentication enabled (`connections.max.reauth.ms`), kafkats will automatically reauthenticate on the existing connection using `SaslAuthenticate` before the session expires.
+
+```typescript
+import { KafkaClient } from '@kafkats/client'
+
+const client = new KafkaClient({
+	clientId: 'my-app',
+	brokers: ['kafka.example.com:9093'],
+	tls: { enabled: true },
+	sasl: {
+		mechanism: 'OAUTHBEARER',
+		oauthBearerProvider: async ({ host, port }) => {
+			const value = await getTokenForBroker(`${host}:${port}`)
+			return { value }
+		},
 	},
 })
 ```
@@ -159,13 +197,25 @@ const client = new KafkaClient({
 	clientId: process.env.KAFKA_CLIENT_ID || 'my-app',
 	brokers: (process.env.KAFKA_BROKERS || 'localhost:9092').split(','),
 	tls: process.env.KAFKA_TLS_ENABLED === 'true' ? { enabled: true } : undefined,
-	sasl: process.env.KAFKA_SASL_USERNAME
-		? {
-				mechanism: (process.env.KAFKA_SASL_MECHANISM || 'SCRAM-SHA-256') as 'SCRAM-SHA-256',
-				username: process.env.KAFKA_SASL_USERNAME,
-				password: process.env.KAFKA_SASL_PASSWORD!,
-			}
-		: undefined,
+	sasl:
+		process.env.KAFKA_SASL_MECHANISM === 'OAUTHBEARER'
+			? {
+					mechanism: 'OAUTHBEARER',
+					oauthBearerProvider: async () => {
+						// For Amazon MSK IAM, install the AWS signer:
+						//   pnpm add aws-msk-iam-sasl-signer-js
+						const { generateAuthToken } = await import('aws-msk-iam-sasl-signer-js')
+						const { token } = await generateAuthToken({ region: process.env.AWS_REGION! })
+						return { value: token }
+					},
+				}
+			: process.env.KAFKA_SASL_USERNAME
+				? {
+						mechanism: (process.env.KAFKA_SASL_MECHANISM || 'SCRAM-SHA-256') as 'SCRAM-SHA-256',
+						username: process.env.KAFKA_SASL_USERNAME,
+						password: process.env.KAFKA_SASL_PASSWORD!,
+					}
+				: undefined,
 })
 ```
 
@@ -188,7 +238,49 @@ const client = new KafkaClient({
 
 ### Amazon MSK (IAM)
 
-For MSK with IAM authentication, you'll need to implement a custom SASL mechanism or use AWS-specific libraries. kafkats supports the standard SASL mechanisms listed above.
+Amazon MSK IAM can be used via SASL `OAUTHBEARER` by returning a SigV4-based token from `oauthBearerProvider`.
+
+References:
+
+- [AWS MSK Developer Guide: Configure clients for IAM access control](https://docs.aws.amazon.com/msk/latest/developerguide/configure-clients-for-iam-access-control.html)
+- [AWS MSK IAM SASL signer for JavaScript (`aws-msk-iam-sasl-signer-js`)](https://github.com/aws/aws-msk-iam-sasl-signer-js#getting-started)
+
+```typescript
+import { KafkaClient } from '@kafkats/client'
+
+async function createMskIamToken(options: { region: string }): Promise<string> {
+	// Recommended: use AWS' official MSK IAM SASL signer (Node.js)
+	// Install:
+	//   pnpm add aws-msk-iam-sasl-signer-js
+	// (AWS also documents installing from GitHub:
+	//   npm install https://github.com/aws/aws-msk-iam-sasl-signer-js)
+	// It also supports fetching creds from a profile or role:
+	//   generateAuthTokenFromProfile({ region, awsProfileName })
+	//   generateAuthTokenFromRole({ region, awsRoleArn, awsRoleSessionName? })
+	const { generateAuthToken } = await import('aws-msk-iam-sasl-signer-js')
+	const { token, expiryTime } = await generateAuthToken({ region: options.region })
+	// expiryTime is milliseconds since epoch (useful if you want to cache/refresh)
+	return token
+}
+
+const client = new KafkaClient({
+	clientId: 'my-app',
+	brokers: ['b-1.msk.example.amazonaws.com:9098'],
+	tls: { enabled: true },
+	sasl: {
+		mechanism: 'OAUTHBEARER',
+		oauthBearerProvider: async () => ({ value: await createMskIamToken({ region: 'us-east-1' }) }),
+	},
+})
+```
+
+::: warning Token lifetime
+MSK IAM tokens are short-lived. Generate them on demand inside `oauthBearerProvider` rather than hard-coding a static token.
+:::
+
+::: tip How the token is built
+The AWS signer generates a SigV4 presigned URL for the `kafka-cluster` service with `Action=kafka-cluster:Connect`, then base64url-encodes it for use as the OAUTHBEARER token.
+:::
 
 ### Redpanda
 

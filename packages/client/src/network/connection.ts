@@ -6,16 +6,27 @@ import type * as net from 'node:net'
 import type * as tls from 'node:tls'
 import { EventEmitter } from 'node:events'
 import type { ConnectionConfig, ConnectionState, SaslConfig } from '@/network/types.js'
-import type { ApiKey } from '@/protocol/messages/api-keys.js'
+import { ApiKey } from '@/protocol/messages/api-keys.js'
 import { SocketFactory, type SocketFactoryOptions } from '@/network/socket-factory.js'
 import { RequestQueue, type RequestQueueOptions } from '@/network/request-queue.js'
 import { ConnectionClosedError, NetworkError } from '@/network/errors.js'
 import { KafkaFrameDecoder } from '@/network/kafka-frame-decoder.js'
-import { Encoder } from '@/protocol/primitives/index.js'
-import { encodeRequestHeader } from '@/protocol/messages/headers.js'
+import { Decoder, Encoder } from '@/protocol/primitives/index.js'
+import { decodeResponseHeader, encodeRequestHeader } from '@/protocol/messages/headers.js'
 import { noopLogger, type Logger } from '@/logger.js'
 import { SaslAuthenticator } from '@/auth/sasl-authenticator.js'
+import { createSaslMechanism } from '@/auth/create-mechanism.js'
+import type { SaslMechanism } from '@/auth/sasl-mechanism.js'
 import { sleep } from '@/utils/sleep.js'
+import { encodeSaslAuthenticateRequest } from '@/protocol/messages/requests/sasl-authenticate.js'
+import { decodeSaslAuthenticateResponse } from '@/protocol/messages/responses/sasl-authenticate.js'
+import { ErrorCode } from '@/protocol/messages/error-codes.js'
+import {
+	IllegalSaslStateError,
+	KafkaProtocolError,
+	SaslAuthenticationError,
+	UnsupportedSaslMechanismError,
+} from '@/client/errors.js'
 
 export interface ConnectionOptions extends ConnectionConfig {
 	host: string
@@ -49,6 +60,10 @@ export class Connection extends EventEmitter<ConnectionEvents> {
 
 	private _state: ConnectionState = 'disconnected'
 	private connectPromise: Promise<void> | null = null
+
+	private saslReauthTimer: ReturnType<typeof setTimeout> | null = null
+	private saslReauthPromise: Promise<void> | null = null
+	private saslSessionLifetimeMs: bigint | undefined
 
 	readonly host: string
 	readonly port: number
@@ -146,6 +161,8 @@ export class Connection extends EventEmitter<ConnectionEvents> {
 			this.socket.on('error', this.handleError.bind(this))
 			this.socket.on('close', this.handleClose.bind(this))
 
+			this.scheduleSaslReauthentication(this.saslSessionLifetimeMs)
+
 			const durationMs = Date.now() - startTime
 			this.logger.debug('connected', { durationMs })
 			this.emit('connect')
@@ -167,11 +184,128 @@ export class Connection extends EventEmitter<ConnectionEvents> {
 		const authenticator = new SaslAuthenticator({
 			config: this.saslConfig!,
 			clientId: this.clientId,
+			brokerHost: this.host,
+			brokerPort: this.port,
 			logger: this.logger,
 			sendRaw: requestBuffer => this.sendRaw(requestBuffer),
 		})
 
 		await authenticator.authenticate()
+		this.saslSessionLifetimeMs = authenticator.sessionLifetimeMs
+	}
+
+	private clearSaslReauthTimer(): void {
+		if (this.saslReauthTimer) {
+			clearTimeout(this.saslReauthTimer)
+			this.saslReauthTimer = null
+		}
+	}
+
+	private scheduleSaslReauthentication(sessionLifetimeMs?: bigint): void {
+		this.clearSaslReauthTimer()
+
+		if (!this.saslConfig || sessionLifetimeMs === undefined) {
+			return
+		}
+
+		if (sessionLifetimeMs <= 0n) {
+			return
+		}
+
+		if (sessionLifetimeMs > BigInt(Number.MAX_SAFE_INTEGER)) {
+			this.logger.warn('sasl sessionLifetimeMs too large to schedule reauthentication', {
+				sessionLifetimeMs: sessionLifetimeMs.toString(),
+			})
+			return
+		}
+
+		const thresholdMs = this.saslConfig.reauthenticationThresholdMs ?? 10_000
+		const lifetimeMs = Number(sessionLifetimeMs)
+		const delayMs = Math.max(0, lifetimeMs - thresholdMs)
+
+		this.saslReauthTimer = setTimeout(() => {
+			if (!this.isConnected) {
+				return
+			}
+			this.startSaslReauthentication().catch(error => {
+				const err = error instanceof Error ? error : new Error(String(error))
+				this.emit('error', err)
+				this.socket?.destroy()
+			})
+		}, delayMs)
+	}
+
+	private startSaslReauthentication(): Promise<void> {
+		if (!this.saslConfig) {
+			return Promise.resolve()
+		}
+		if (this.saslReauthPromise) {
+			return this.saslReauthPromise
+		}
+
+		this.saslReauthPromise = this.doSaslReauthentication().finally(() => {
+			this.saslReauthPromise = null
+		})
+		return this.saslReauthPromise
+	}
+
+	private async doSaslReauthentication(): Promise<void> {
+		if (!this.saslConfig) {
+			return
+		}
+
+		const mechanism: SaslMechanism = createSaslMechanism(this.saslConfig, {
+			host: this.host,
+			port: this.port,
+			clientId: this.clientId,
+		})
+
+		const version = 1
+		const authGenerator = mechanism.authenticate()
+		let result = await authGenerator.next()
+
+		let sessionLifetimeMs: bigint | undefined
+
+		while (!result.done) {
+			const authBytes = result.value
+
+			const responseBuffer = await this.send(
+				ApiKey.SaslAuthenticate,
+				version,
+				encoder => encodeSaslAuthenticateRequest(encoder, version, { authBytes }),
+				Connection.AUTH_TIMEOUT_MS
+			)
+
+			const decoder = new Decoder(responseBuffer)
+			decodeResponseHeader(decoder, ApiKey.SaslAuthenticate, version)
+			const response = decodeSaslAuthenticateResponse(decoder, version)
+
+			if (response.errorCode !== ErrorCode.None) {
+				if (response.errorCode === ErrorCode.IllegalSaslState) {
+					throw new IllegalSaslStateError(
+						response.errorMessage ?? `Illegal SASL state during ${mechanism.name} authentication`
+					)
+				}
+
+				if (response.errorCode === ErrorCode.UnsupportedSaslMechanism) {
+					throw new UnsupportedSaslMechanismError(mechanism.name, [])
+				}
+
+				if (response.errorCode === ErrorCode.SaslAuthenticationFailed) {
+					throw new SaslAuthenticationError(mechanism.name, response.errorMessage ?? undefined)
+				}
+
+				throw new KafkaProtocolError(
+					response.errorCode,
+					`${mechanism.name} authentication failed${response.errorMessage ? `: ${response.errorMessage}` : ''}`
+				)
+			}
+
+			sessionLifetimeMs = response.sessionLifetimeMs
+			result = await authGenerator.next(response.authBytes)
+		}
+
+		this.scheduleSaslReauthentication(sessionLifetimeMs)
 	}
 
 	/** Authentication timeout in milliseconds (default: 30 seconds) */
@@ -278,6 +412,12 @@ export class Connection extends EventEmitter<ConnectionEvents> {
 			throw new ConnectionClosedError('Cannot send on disconnected connection')
 		}
 
+		// Block normal requests while reauthentication is in progress.
+		// Allow the SaslAuthenticate exchange itself to proceed.
+		if (this.saslReauthPromise && apiKey !== ApiKey.SaslAuthenticate) {
+			await this.saslReauthPromise
+		}
+
 		// Build function receives correlation ID from the request queue
 		const buildRequest = (correlationId: number): Buffer => {
 			const encoder = new Encoder()
@@ -353,6 +493,8 @@ export class Connection extends EventEmitter<ConnectionEvents> {
 		const wasConnected = this._state === 'connected'
 		this._state = 'disconnected'
 
+		this.clearSaslReauthTimer()
+
 		this.logger.debug('connection closed', { hadError, pendingRequests: this.requestQueue.totalPending })
 
 		this.requestQueue.rejectAll(new ConnectionClosedError())
@@ -376,6 +518,7 @@ export class Connection extends EventEmitter<ConnectionEvents> {
 		}
 
 		this._state = 'closing'
+		this.clearSaslReauthTimer()
 		this.logger.debug('closing connection', { waitForPending, pendingRequests: this.requestQueue.totalPending })
 
 		if (waitForPending && this.requestQueue.totalPending > 0) {
