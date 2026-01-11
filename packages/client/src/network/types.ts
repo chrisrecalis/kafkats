@@ -28,14 +28,54 @@ export interface TlsConfig {
 /**
  * SASL authentication configuration
  */
-export interface SaslConfig {
-	/** SASL mechanism to use */
-	mechanism: 'PLAIN' | 'SCRAM-SHA-256' | 'SCRAM-SHA-512'
-	/** Username for authentication */
+export interface OAuthBearerProviderContext {
+	host: string
+	port: number
+	clientId: string
+}
+
+export interface OAuthBearerToken {
+	/** The OAuth bearer access token (without the "Bearer " prefix). */
+	value: string
+	/** Optional key/value extensions sent with the initial client response. */
+	extensions?: Record<string, string>
+}
+
+export type OAuthBearerProvider = (context: OAuthBearerProviderContext) => OAuthBearerToken | Promise<OAuthBearerToken>
+
+export interface SaslPlainConfig {
+	mechanism: 'PLAIN'
 	username: string
-	/** Password for authentication */
 	password: string
 }
+
+export interface SaslScramSha256Config {
+	mechanism: 'SCRAM-SHA-256'
+	username: string
+	password: string
+}
+
+export interface SaslScramSha512Config {
+	mechanism: 'SCRAM-SHA-512'
+	username: string
+	password: string
+}
+
+export interface SaslOAuthBearerConfig {
+	mechanism: 'OAUTHBEARER'
+	oauthBearerProvider: OAuthBearerProvider
+}
+
+export interface SaslReauthenticationConfig {
+	/**
+	 * How long before the broker session expires to proactively reauthenticate (ms).
+	 * If omitted, a sensible default is used.
+	 */
+	reauthenticationThresholdMs?: number
+}
+
+export type SaslConfig = (SaslPlainConfig | SaslScramSha256Config | SaslScramSha512Config | SaslOAuthBearerConfig) &
+	SaslReauthenticationConfig
 
 /**
  * Socket configuration options

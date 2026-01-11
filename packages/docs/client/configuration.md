@@ -18,6 +18,26 @@ const client = new KafkaClient({
 })
 ```
 
+SASL is configured based on `mechanism` (for example, `OAUTHBEARER` uses an async provider):
+
+```typescript
+const client = new KafkaClient({
+	clientId: 'my-app',
+	brokers: ['broker1:9093'],
+	tls: { enabled: true },
+	sasl: {
+		mechanism: 'OAUTHBEARER',
+		oauthBearerProvider: async () => {
+			// For Amazon MSK IAM, install:
+			//   pnpm add aws-msk-iam-sasl-signer-js
+			const { generateAuthToken } = await import('aws-msk-iam-sasl-signer-js')
+			const { token } = await generateAuthToken({ region: process.env.AWS_REGION! })
+			return { value: token }
+		},
+	},
+})
+```
+
 ### Options Reference
 
 | Option                      | Type                                     | Default  | Description                                      |
@@ -32,6 +52,11 @@ const client = new KafkaClient({
 | `sasl`                      | `SaslConfig`                             | -        | SASL authentication configuration                |
 | `logger`                    | `Logger`                                 | -        | Custom logger implementation                     |
 | `logLevel`                  | `'debug' \| 'info' \| 'warn' \| 'error'` | `'info'` | Log level for the built-in logger                |
+
+### SASL Reauthentication
+
+If the broker enables periodic SASL reauthentication (`connections.max.reauth.ms`), kafkats will reauthenticate automatically.
+You can tune how early it refreshes via `sasl.reauthenticationThresholdMs` (default: `10000`).
 
 ## Producer Configuration
 
@@ -135,12 +160,23 @@ const client = new KafkaClient({
 	clientId: process.env.KAFKA_CLIENT_ID || 'my-app',
 	brokers: (process.env.KAFKA_BROKERS || 'localhost:9092').split(','),
 	tls: process.env.KAFKA_TLS_ENABLED === 'true' ? { enabled: true } : undefined,
-	sasl: process.env.KAFKA_SASL_USERNAME
-		? {
-				mechanism: (process.env.KAFKA_SASL_MECHANISM || 'SCRAM-SHA-256') as 'SCRAM-SHA-256',
-				username: process.env.KAFKA_SASL_USERNAME,
-				password: process.env.KAFKA_SASL_PASSWORD!,
-			}
-		: undefined,
+	sasl:
+		process.env.KAFKA_SASL_MECHANISM === 'OAUTHBEARER'
+			? {
+					mechanism: 'OAUTHBEARER',
+					oauthBearerProvider: async () => {
+						// For Amazon MSK IAM, see the "Authentication" docs for required dependency + setup.
+						const { generateAuthToken } = await import('aws-msk-iam-sasl-signer-js')
+						const { token } = await generateAuthToken({ region: process.env.AWS_REGION! })
+						return { value: token }
+					},
+				}
+			: process.env.KAFKA_SASL_USERNAME
+				? {
+						mechanism: (process.env.KAFKA_SASL_MECHANISM || 'SCRAM-SHA-256') as 'SCRAM-SHA-256',
+						username: process.env.KAFKA_SASL_USERNAME,
+						password: process.env.KAFKA_SASL_PASSWORD!,
+					}
+				: undefined,
 })
 ```

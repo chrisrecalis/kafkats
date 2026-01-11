@@ -5,6 +5,8 @@ import type * as net from 'node:net'
 import { Connection } from '@/network/connection.js'
 import { ConnectionClosedError } from '@/network/errors.js'
 import { ApiKey } from '@/protocol/messages/api-keys.js'
+import { ErrorCode } from '@/protocol/messages/error-codes.js'
+import { Encoder } from '@/protocol/primitives/encoder.js'
 
 /**
  * Mock socket that emulates net.Socket behavior
@@ -285,6 +287,67 @@ describe('Connection', () => {
 			expect(() => {
 				mockSocket.simulateResponse(unknownCorrelationId, responsePayload)
 			}).not.toThrow()
+		})
+	})
+
+	describe('SASL reauthentication', () => {
+		it('refreshes OAUTHBEARER session before expiry', async () => {
+			const oauthBearerProvider = vi.fn().mockResolvedValue({ value: 'token-1' })
+
+			const connection = new Connection({
+				host: 'localhost',
+				port: 9092,
+				clientId: 'test-client',
+				sasl: {
+					mechanism: 'OAUTHBEARER',
+					oauthBearerProvider,
+					reauthenticationThresholdMs: 0,
+				},
+			})
+
+			const internalSocket = mockSocket as unknown as net.Socket
+			;(connection as unknown as { _state: string })._state = 'connected'
+			;(connection as unknown as { socket: net.Socket }).socket = internalSocket
+
+			const requestQueue = (
+				connection as unknown as { requestQueue: { setSendFunction: (fn: (data: Buffer) => void) => void } }
+			).requestQueue
+			requestQueue.setSendFunction((data: Buffer) => {
+				mockSocket.write(data)
+			})
+
+			const handleData = (connection as unknown as { handleData: (data: Buffer) => void }).handleData.bind(
+				connection
+			)
+			mockSocket.on('data', handleData)
+
+			// Schedule reauth soon.
+			;(
+				connection as unknown as { scheduleSaslReauthentication: (ms: bigint) => void }
+			).scheduleSaslReauthentication(5n)
+
+			await vi.advanceTimersByTimeAsync(5)
+
+			const request = mockSocket.writtenData[mockSocket.writtenData.length - 1]!
+			expect(request.readInt16BE(4)).toBe(ApiKey.SaslAuthenticate)
+
+			const correlationId = mockSocket.getLastCorrelationId()!
+
+			const encoder = new Encoder()
+			encoder.writeInt16(ErrorCode.None)
+			encoder.writeNullableString(null)
+			encoder.writeBytes(Buffer.alloc(0))
+			encoder.writeInt64(0n) // no further reauth scheduling
+
+			const reauthPromise = (connection as unknown as { saslReauthPromise: Promise<void> | null })
+				.saslReauthPromise
+			expect(reauthPromise).not.toBeNull()
+
+			mockSocket.simulateResponse(correlationId, encoder.toBuffer())
+
+			await reauthPromise
+
+			expect(oauthBearerProvider).toHaveBeenCalledTimes(1)
 		})
 	})
 
