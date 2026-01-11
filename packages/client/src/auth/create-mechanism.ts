@@ -5,7 +5,7 @@ import { ScramSha256Mechanism, ScramSha512Mechanism } from './scram.js'
 import { OAuthBearerMechanism } from './oauthbearer.js'
 import { SaslAuthenticationError } from '@/client/errors.js'
 
-export interface SaslMechanismContext extends OAuthBearerProviderContext {}
+export type SaslMechanismContext = OAuthBearerProviderContext
 
 export function createSaslMechanism(config: SaslConfig, context: SaslMechanismContext): SaslMechanism {
 	switch (config.mechanism) {
@@ -23,4 +23,3 @@ export function createSaslMechanism(config: SaslConfig, context: SaslMechanismCo
 		}
 	}
 }
-

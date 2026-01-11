@@ -322,7 +322,9 @@ describe('Connection', () => {
 			mockSocket.on('data', handleData)
 
 			// Schedule reauth soon.
-			;(connection as unknown as { scheduleSaslReauthentication: (ms: bigint) => void }).scheduleSaslReauthentication(5n)
+			;(
+				connection as unknown as { scheduleSaslReauthentication: (ms: bigint) => void }
+			).scheduleSaslReauthentication(5n)
 
 			await vi.advanceTimersByTimeAsync(5)
 
@@ -337,7 +339,8 @@ describe('Connection', () => {
 			encoder.writeBytes(Buffer.alloc(0))
 			encoder.writeInt64(0n) // no further reauth scheduling
 
-			const reauthPromise = (connection as unknown as { saslReauthPromise: Promise<void> | null }).saslReauthPromise
+			const reauthPromise = (connection as unknown as { saslReauthPromise: Promise<void> | null })
+				.saslReauthPromise
 			expect(reauthPromise).not.toBeNull()
 
 			mockSocket.simulateResponse(correlationId, encoder.toBuffer())

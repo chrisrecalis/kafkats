@@ -65,4 +65,3 @@ export class OAuthBearerMechanism implements SaslMechanism {
 		yield authBytes
 	}
 }
-

@@ -17,19 +17,19 @@ SASL config is a discriminated union keyed by `mechanism`.
 
 ### PLAIN / SCRAM
 
-| Option      | Type                                 | Required | Description         |
-| ----------- | ------------------------------------ | -------- | ------------------- |
+| Option      | Type                                            | Required | Description         |
+| ----------- | ----------------------------------------------- | -------- | ------------------- |
 | `mechanism` | `'PLAIN' \| 'SCRAM-SHA-256' \| 'SCRAM-SHA-512'` | Yes      | SASL mechanism name |
-| `username`  | `string`                             | Yes      | SASL username       |
-| `password`  | `string`                             | Yes      | SASL password       |
+| `username`  | `string`                                        | Yes      | SASL username       |
+| `password`  | `string`                                        | Yes      | SASL password       |
 
 ### OAUTHBEARER
 
-| Option                | Type                                                                      | Required | Description |
-| --------------------- | ------------------------------------------------------------------------- | -------- | ----------- |
-| `mechanism`           | `'OAUTHBEARER'`                                                           | Yes      | SASL mechanism name |
-| `oauthBearerProvider` | `(context) => ({ value, extensions? })`                                   | Yes      | Returns the bearer token (and optional extensions) for the broker |
-| `reauthenticationThresholdMs` | `number`                                                           | No       | Reauthenticate when this many milliseconds remain of broker session lifetime (default: `10000`) |
+| Option                        | Type                                    | Required | Description                                                                                     |
+| ----------------------------- | --------------------------------------- | -------- | ----------------------------------------------------------------------------------------------- |
+| `mechanism`                   | `'OAUTHBEARER'`                         | Yes      | SASL mechanism name                                                                             |
+| `oauthBearerProvider`         | `(context) => ({ value, extensions? })` | Yes      | Returns the bearer token (and optional extensions) for the broker                               |
+| `reauthenticationThresholdMs` | `number`                                | No       | Reauthenticate when this many milliseconds remain of broker session lifetime (default: `10000`) |
 
 `context` includes `{ host, port, clientId }`.
 

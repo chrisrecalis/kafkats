@@ -74,12 +74,8 @@ export interface SaslReauthenticationConfig {
 	reauthenticationThresholdMs?: number
 }
 
-export type SaslConfig = (
-	| SaslPlainConfig
-	| SaslScramSha256Config
-	| SaslScramSha512Config
-	| SaslOAuthBearerConfig
-) & SaslReauthenticationConfig
+export type SaslConfig = (SaslPlainConfig | SaslScramSha256Config | SaslScramSha512Config | SaslOAuthBearerConfig) &
+	SaslReauthenticationConfig
 
 /**
  * Socket configuration options
