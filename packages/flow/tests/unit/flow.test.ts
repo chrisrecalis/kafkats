@@ -125,8 +125,13 @@ describe('flow', () => {
 		type Enriched = { id: string; total: number; large: boolean }
 
 		app.stream('orders', { value: codec.json<Order>() })
-			.mapValues(order => ({ ...order, large: order.total > 100 }) satisfies Enriched)
-			.filter((_key, value) => value.large)
+			.mapValues(order => {
+				if (order === null) {
+					throw new Error('unexpected tombstone in mapValues() test')
+				}
+				return { ...order, large: order.total > 100 } satisfies Enriched
+			})
+			.filter((_key, value) => Boolean(value?.large))
 			.to('large-orders', { value: codec.json<Enriched>() })
 
 		await app.start()
@@ -166,8 +171,8 @@ describe('flow', () => {
 		const { app, consumers, producers } = createTestApp()
 
 		const branches = app.stream('events', { value: codec.json<{ type: string }>() }).branch(
-			(_key, value) => value.type === 'a',
-			(_key, value) => value.type === 'b'
+			(_key, value) => value?.type === 'a',
+			(_key, value) => value?.type === 'b'
 		)
 
 		branches[0]!.to('topic-a', { value: codec.json() })
@@ -283,6 +288,9 @@ describe('stream-table joins', () => {
 				userTier: user.tier,
 			}))
 			.peek((_key, value) => {
+				if (value === null) {
+					throw new Error('unexpected tombstone in stream-table join result')
+				}
 				results.push(value)
 			})
 
@@ -343,6 +351,9 @@ describe('stream-table joins', () => {
 				userName: user?.name ?? null,
 			}))
 			.peek((_key, value) => {
+				if (value === null) {
+					throw new Error('unexpected tombstone in stream-table leftJoin result')
+				}
 				results.push(value)
 			})
 
@@ -381,6 +392,9 @@ describe('stream-table joins', () => {
 				score: user.score,
 			}))
 			.peek((_key, value) => {
+				if (value === null) {
+					throw new Error('unexpected tombstone in stream-table join result')
+				}
 				results.push(value)
 			})
 
@@ -430,6 +444,9 @@ describe('stream-stream joins', () => {
 				{ within: TimeWindows.of('5s') }
 			)
 			.peek((key, value) => {
+				if (key === null || value === null) {
+					throw new Error('unexpected tombstone in stream-stream join result')
+				}
 				results.push({ key, value })
 			})
 
@@ -485,6 +502,9 @@ describe('stream-stream joins', () => {
 				{ within: TimeWindows.of('5s') }
 			)
 			.peek((key, value) => {
+				if (key === null || value === null) {
+					throw new Error('unexpected tombstone in stream-stream leftJoin result')
+				}
 				results.push({ key, value })
 			})
 
@@ -540,6 +560,9 @@ describe('stream-stream joins', () => {
 				{ within: TimeWindows.of('5s') }
 			)
 			.peek((key, value) => {
+				if (key === null || value === null) {
+					throw new Error('unexpected tombstone in stream-stream outerJoin result')
+				}
 				results.push({ key, value })
 			})
 
@@ -587,6 +610,9 @@ describe('table-table joins', () => {
 			}))
 			.toStream()
 			.peek((key, value) => {
+				if (key === null || value === null) {
+					throw new Error('unexpected tombstone in table-table join result')
+				}
 				results.push({ key, value })
 			})
 
@@ -633,6 +659,9 @@ describe('table-table joins', () => {
 			}))
 			.toStream()
 			.peek((key, value) => {
+				if (key === null || value === null) {
+					throw new Error('unexpected tombstone in table-table leftJoin result')
+				}
 				results.push({ key, value })
 			})
 
@@ -671,6 +700,9 @@ describe('table-table joins', () => {
 			}))
 			.toStream()
 			.peek((key, value) => {
+				if (key === null || value === null) {
+					throw new Error('unexpected tombstone in table-table outerJoin result')
+				}
 				results.push({ key, value })
 			})
 
@@ -709,6 +741,9 @@ describe('table aggregations (KGroupedTable)', () => {
 			.count()
 			.toStream()
 			.peek((key, count) => {
+				if (key === null || count === null) {
+					throw new Error('unexpected tombstone in KGroupedTable.count() result')
+				}
 				results.push({ key, count })
 			})
 
@@ -760,6 +795,9 @@ describe('table aggregations (KGroupedTable)', () => {
 			)
 			.toStream()
 			.peek((key, stats) => {
+				if (key === null || stats === null) {
+					throw new Error('unexpected tombstone in KGroupedTable.aggregate() result')
+				}
 				results.push({ key, stats })
 			})
 
@@ -802,6 +840,9 @@ describe('aggregations', () => {
 			.count()
 			.toStream()
 			.peek((key, count) => {
+				if (key === null || count === null) {
+					throw new Error('Unexpected null key/value in count() results')
+				}
 				results.push({ key, count })
 			})
 
@@ -835,6 +876,9 @@ describe('aggregations', () => {
 			.reduce((agg, value) => ({ amount: agg.amount + value.amount }))
 			.toStream()
 			.peek((key, total) => {
+				if (key === null || total === null) {
+					throw new Error('Unexpected null key/value in reduce() results')
+				}
 				results.push({ key, total })
 			})
 
@@ -874,6 +918,9 @@ describe('aggregations', () => {
 			)
 			.toStream()
 			.peek((key, stats) => {
+				if (key === null || stats === null) {
+					throw new Error('Unexpected null key/value in aggregate() results')
+				}
 				results.push({ key, stats })
 			})
 
@@ -899,10 +946,21 @@ describe('aggregations', () => {
 		const results: Array<{ key: string; count: number }> = []
 
 		app.stream('events', { key: codec.string(), value: codec.json<Event>() })
-			.groupBy((_key, value) => value.category, { key: codec.string() })
+			.groupBy(
+				(_key, value) => {
+					if (value === null) {
+						throw new Error('Unexpected tombstone in groupBy()')
+					}
+					return value.category
+				},
+				{ key: codec.string() }
+			)
 			.count()
 			.toStream()
 			.peek((key, count) => {
+				if (key === null || count === null) {
+					throw new Error('Unexpected null key/value in count() results')
+				}
 				results.push({ key, count })
 			})
 
@@ -943,6 +1001,9 @@ describe('aggregations', () => {
 			.count()
 			.toStream()
 			.peek((key, count) => {
+				if (key === null || count === null) {
+					throw new Error('Unexpected null key/value in count() results')
+				}
 				results.push({ key, count })
 			})
 

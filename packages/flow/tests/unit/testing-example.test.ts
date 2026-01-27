@@ -33,8 +33,13 @@ describe('TestDriver basics', () => {
 		// Define topology - much cleaner than the old way
 		driver
 			.input('orders', { value: codec.json<Order>() })
-			.mapValues(order => ({ ...order, large: order.total > 100 }))
-			.filter((_, value) => value.large)
+			.mapValues(order => {
+				if (order === null) {
+					throw new Error('unexpected tombstone in mapValues() test')
+				}
+				return { ...order, large: order.total > 100 }
+			})
+			.filter((_, value) => Boolean(value?.large))
 			.to('large-orders', { value: codec.json() })
 
 		// Run test with automatic lifecycle management
@@ -113,8 +118,13 @@ describe('before and after comparison', () => {
 
 		driver
 			.input('orders', { value: codec.json<Order>() })
-			.mapValues(order => ({ ...order, large: order.total > 100 }))
-			.filter((_, value) => value.large)
+			.mapValues(order => {
+				if (order === null) {
+					throw new Error('unexpected tombstone in mapValues() test')
+				}
+				return { ...order, large: order.total > 100 }
+			})
+			.filter((_, value) => Boolean(value?.large))
 			.to('large-orders', { value: codec.json() })
 
 		await driver.run(async ({ send, output }) => {
@@ -233,7 +243,15 @@ describe('factories and sequences', () => {
 
 		driver
 			.input('orders', { key: codec.string(), value: codec.json<Order>() })
-			.groupBy((_, v) => v.customer, { key: codec.string() })
+			.groupBy(
+				(_, v) => {
+					if (v === null) {
+						throw new Error('unexpected tombstone in groupBy() test')
+					}
+					return v.customer
+				},
+				{ key: codec.string() }
+			)
 			.count()
 			.toStream()
 			.peek(results.collector())
@@ -282,7 +300,12 @@ describe('quickTest helper', () => {
 			type Event = { type: string }
 
 			input('in', { value: codec.json<Event>() })
-				.mapValues(e => ({ ...e, processed: true }))
+				.mapValues(e => {
+					if (e === null) {
+						throw new Error('unexpected tombstone in quickTest mapValues()')
+					}
+					return { ...e, processed: true }
+				})
 				.to('out', { value: codec.json() })
 
 			await send('in', { type: 'click' })
@@ -303,7 +326,12 @@ describe('exactly_once processing', () => {
 
 		driver
 			.input('events', { value: codec.json<{ id: string }>() })
-			.mapValues(v => ({ ...v, handled: true }))
+			.mapValues(v => {
+				if (v === null) {
+					throw new Error('unexpected tombstone in mapValues() test')
+				}
+				return { ...v, handled: true }
+			})
 			.to('out', { value: codec.json() })
 
 		await driver.run(async ({ send }) => {
@@ -385,8 +413,8 @@ describe('branching with TestDriver', () => {
 		type Event = { type: string }
 
 		const branches = driver.input('events', { value: codec.json<Event>() }).branch(
-			(_, v) => v.type === 'a',
-			(_, v) => v.type === 'b'
+			(_, v) => v !== null && v.type === 'a',
+			(_, v) => v !== null && v.type === 'b'
 		)
 
 		branches[0]!.to('topic-a', { value: codec.json() })
@@ -415,7 +443,12 @@ describe('merging streams', () => {
 		const right = driver.input('right', { value: codec.json<Item>() })
 
 		left.merge(right)
-			.mapValues(v => ({ ...v, merged: true }))
+			.mapValues(v => {
+				if (v === null) {
+					throw new Error('Unexpected tombstone in merge()')
+				}
+				return { ...v, merged: true }
+			})
 			.to('merged', { value: codec.json() })
 
 		await driver.run(async ({ send, output }) => {
@@ -424,7 +457,14 @@ describe('merging streams', () => {
 
 			const results = output('merged', { value: codec.json<{ id: string; merged: boolean }>() })
 			expect(results).toHaveLength(2)
-			expect(results.map(r => r.value.id)).toEqual(['l1', 'r1'])
+			expect(
+				results.map(r => {
+					if (r.value === null) {
+						throw new Error('Unexpected tombstone in output')
+					}
+					return r.value.id
+				})
+			).toEqual(['l1', 'r1'])
 		})
 	})
 })
