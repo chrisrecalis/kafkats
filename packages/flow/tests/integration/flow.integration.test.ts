@@ -96,7 +96,7 @@ describe('KStream operators', () => {
 	type MergedValue = { source: 'a' | 'b'; n: number }
 	const mergedCodec = codec.json<MergedValue>()
 
-	const peeked: Array<{ key: string | null; value: InputEvent }> = []
+	const peeked: Array<{ key: string | null; value: InputEvent | null }> = []
 
 	const appId = `flow-it-ops-${Date.now()}`
 	let app: ReturnType<typeof flow>
@@ -115,28 +115,40 @@ describe('KStream operators', () => {
 
 		// map
 		streamA
-			.map((key, value) => [`${key}`.toUpperCase(), { key: `${key}`, n: value.n, mapped: true }])
+			.map((key, value) => {
+				if (value === null) {
+					throw new Error('unexpected tombstone in map() test')
+				}
+				return [`${key}`.toUpperCase(), { key: `${key}`, n: value.n, mapped: true }]
+			})
 			.to(outMap, {
 				key: stringCodec,
 				value: mapCodec,
 			})
 
 		// mapValues
-		streamA.mapValues(v => ({ nPlus1: v.n + 1, type: v.type })).to(outMapValues, { value: mapValuesCodec })
+		streamA
+			.mapValues(v => {
+				if (v === null) {
+					throw new Error('unexpected tombstone in mapValues() test')
+				}
+				return { nPlus1: v.n + 1, type: v.type }
+			})
+			.to(outMapValues, { value: mapValuesCodec })
 
 		// flatMapValues
-		streamA.flatMapValues(v => [v.n, v.n + 1]).to(outFlat, { value: numberCodec })
+		streamA.flatMapValues(v => (v === null ? [] : [v.n, v.n + 1])).to(outFlat, { value: numberCodec })
 
 		// filter
-		streamA.filter((_k, v) => v.n > 0).to(outFilter)
+		streamA.filter((_k, v) => (v?.n ?? 0) > 0).to(outFilter)
 
 		// selectKey
-		streamA.selectKey((v, _k) => v.type).to(outSelectKey, { key: stringCodec })
+		streamA.selectKey((v, _k) => v?.type ?? 'unknown').to(outSelectKey, { key: stringCodec })
 
 		// branch
 		const branches = streamA.branch(
-			(_k, v) => v.type === 'a',
-			(_k, v) => v.type === 'b'
+			(_k, v) => v?.type === 'a',
+			(_k, v) => v?.type === 'b'
 		)
 		const branchA = branches[0]!
 		const branchB = branches[1]!
@@ -146,25 +158,42 @@ describe('KStream operators', () => {
 		// through
 		streamA
 			.through(throughTopic)
-			.mapValues(v => ({ ...v, through: true as const }))
+			.mapValues(v => {
+				if (v === null) {
+					throw new Error('unexpected tombstone in through().mapValues() test')
+				}
+				return { ...v, through: true as const }
+			})
 			.to(outThrough, { value: throughCodec })
 
 		// merge
 		streamA
-			.mapValues<MergedValue>(v => ({ source: 'a', n: v.n }))
-			.merge(streamB.mapValues<MergedValue>(v => ({ source: 'b', n: v.n })))
+			.mapValues<MergedValue>(v => {
+				if (v === null) {
+					throw new Error('unexpected tombstone in merge() test')
+				}
+				return { source: 'a', n: v.n }
+			})
+			.merge(
+				streamB.mapValues<MergedValue>(v => {
+					if (v === null) {
+						throw new Error('unexpected tombstone in merge() test')
+					}
+					return { source: 'b', n: v.n }
+				})
+			)
 			.to(outMerged, { value: mergedCodec })
 
 		// custom partitioner
 		streamA.to(outPartitioned, {
-			partitioner: (_k, v, partitionCount) => (partitionCount === 0 ? 0 : v.n % partitionCount),
+			partitioner: (_k, v, partitionCount) => (partitionCount === 0 ? 0 : (v?.n ?? 0) % partitionCount),
 		})
 
 		// peek
 		streamA.peek((k, v) => peeked.push({ key: k, value: v })).to(outPeek)
 
 		// null key propagation
-		streamA.mapValues(v => v.n).to(outNullKey, { value: numberCodec })
+		streamA.mapValues(v => v?.n ?? 0).to(outNullKey, { value: numberCodec })
 
 		output = new MultiTopicCollector({
 			client,
@@ -297,7 +326,7 @@ describe('KStream operators', () => {
 		await producer.send(inputA, { key: 'pk', value: jsonCodec.encode({ n: 9, type: 'x' }) })
 		await output.waitFor(outPeek, m => m.key === 'pk')
 
-		expect(peeked.some(r => r.key === 'pk' && r.value.n === 9)).toBe(true)
+		expect(peeked.some(r => r.key === 'pk' && r.value?.n === 9)).toBe(true)
 	})
 
 	it('null keys can flow through stateless operations', async () => {
@@ -430,7 +459,15 @@ describe('grouping and aggregations', () => {
 
 		const parityStream = app.stream(parityInput, { key: stringCodec, value: numberCodec })
 		parityStream
-			.groupBy((_k, v) => (v % 2 === 0 ? 'even' : 'odd'), { key: stringCodec, value: numberCodec })
+			.groupBy(
+				(_k, v) => {
+					if (v === null) {
+						throw new Error('unexpected tombstone in groupBy() test')
+					}
+					return v % 2 === 0 ? 'even' : 'odd'
+				},
+				{ key: stringCodec, value: numberCodec }
+			)
 			.count({ storeName: 'parity', key: stringCodec, value: numberCodec, changelog: false })
 			.toStream()
 			.to(outGroupCount)

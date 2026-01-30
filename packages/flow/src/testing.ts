@@ -37,7 +37,7 @@ export type TestMessage<K = Buffer, V = Buffer> = Message<V> & { key: K | null }
 export interface TestRecord<K = unknown, V = unknown> {
 	topic: string
 	key: K | null
-	value: V
+	value: V | null
 	partition?: number
 	timestamp?: bigint
 	headers?: Record<string, Buffer>
@@ -121,15 +121,15 @@ export class MockConsumer extends EventEmitter {
  * Mock producer that captures all produced messages
  */
 export class MockProducer {
-	readonly messages: TestRecord<Buffer, Buffer>[] = []
+	readonly messages: Array<TestRecord<Buffer, Buffer>> = []
 	readonly transactions: Array<{
-		messages: TestRecord<Buffer, Buffer>[]
+		messages: Array<TestRecord<Buffer, Buffer>>
 		offsets: Array<{ topic: string; partition: number; offset: bigint }>
 	}> = []
 
-	private currentTxMessages: TestRecord<Buffer, Buffer>[] = []
+	private currentTxMessages: Array<TestRecord<Buffer, Buffer>> = []
 
-	send(topic: string, message: { key?: Buffer | null; value: Buffer; partition?: number }): Promise<void> {
+	send(topic: string, message: { key?: Buffer | null; value: Buffer | null; partition?: number }): Promise<void> {
 		const record: TestRecord<Buffer, Buffer> = {
 			topic,
 			key: message.key ?? null,
@@ -143,7 +143,10 @@ export class MockProducer {
 
 	async transaction(
 		fn: (tx: {
-			send: (topic: string, message: { key?: Buffer | null; value: Buffer; partition?: number }) => Promise<void>
+			send: (
+				topic: string,
+				message: { key?: Buffer | null; value: Buffer | null; partition?: number }
+			) => Promise<void>
 			sendOffsets: (params: {
 				groupId?: string
 				consumerGroupMetadata?: {
@@ -175,7 +178,7 @@ export class MockProducer {
 	/**
 	 * Get messages for a specific topic
 	 */
-	messagesFor(topic: string): TestRecord<Buffer, Buffer>[] {
+	messagesFor(topic: string): Array<TestRecord<Buffer, Buffer>> {
 		return this.messages.filter(m => m.topic === topic)
 	}
 
@@ -444,7 +447,7 @@ export interface WaitOptions<K, V> extends OutputOptions<K, V> {
 export interface DecodedRecord<K, V> {
 	topic: string
 	key: K | null
-	value: V
+	value: V | null
 	partition?: number
 }
 
@@ -540,11 +543,13 @@ class TestContextImpl implements TestContextApi {
 			key = options.key ? options.key.decode(record.key) : (record.key as unknown as K)
 		}
 
-		let value: V
-		if (options.value) {
-			value = options.value.decode(record.value)
-		} else {
-			value = record.value as unknown as V
+		let value: V | null = null
+		if (record.value !== null) {
+			if (options.value) {
+				value = options.value.decode(record.value)
+			} else {
+				value = record.value as unknown as V
+			}
 		}
 
 		return {
@@ -587,8 +592,13 @@ export class ResultCollector<K, V> {
 	/**
 	 * Get a collector function to use with .peek()
 	 */
-	collector(): (key: K, value: V) => void {
+	collector(): (key: K | null, value: V | null) => void {
 		return (key, value) => {
+			if (key === null || value === null) {
+				throw new Error(
+					'ResultCollector received a null key/value. Use ResultCollector<K | null, V | null> if desired.'
+				)
+			}
 			this.items.push({ key, value })
 		}
 	}
@@ -945,8 +955,11 @@ export async function quickTest(
 				const messages = producer.messagesFor(topic)
 				return messages.map(m => ({
 					topic: m.topic,
-					key: (options?.key ? options.key.decode(m.key!) : m.key) as K | null,
-					value: (options?.value ? options.value.decode(m.value) : m.value) as V,
+					key: m.key === null ? null : ((options?.key ? options.key.decode(m.key) : m.key) as K | null),
+					value:
+						m.value === null
+							? null
+							: ((options?.value ? options.value.decode(m.value) : m.value) as V | null),
 					partition: m.partition,
 				}))
 			},
