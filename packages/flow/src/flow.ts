@@ -512,6 +512,10 @@ class FlowAppImpl implements FlowApp {
 		return this.lastError
 	}
 
+	isExactlyOnce(): boolean {
+		return this.eosEnabled
+	}
+
 	async sendToTopic<K, V>(
 		worker: WorkerContext,
 		topic: string,

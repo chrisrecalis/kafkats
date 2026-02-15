@@ -14,6 +14,9 @@ import {
 	TableDeltaCountNode,
 	TableDeltaReduceNode,
 	TableDeltaAggregateNode,
+	TableGroupedComputeCountNode,
+	TableGroupedComputeReduceNode,
+	TableGroupedComputeAggregateNode,
 	type GroupedTableMapping,
 } from '@/processors/table.js'
 import { TimeWindows, SessionWindows, SlidingWindows } from '@/windows.js'
@@ -419,7 +422,14 @@ export class KGroupedTableImpl<K, V> implements KGroupedTable<K, V> {
 		)
 		const storeRef = { store }
 
-		const countNode = new TableDeltaCountNode<K, V>(storeName, storeRef)
+		const countNode = this.app.isExactlyOnce()
+			? new TableDeltaCountNode<K, V>(storeName, storeRef)
+			: new TableGroupedComputeCountNode<unknown, K, V>(
+					storeName,
+					storeRef,
+					this.keyMappingStoreRef,
+					this.groupedKeyCodec
+				)
 		this.node.connect(countNode)
 
 		return new KTableImpl<K, number>(this.app, countNode, { keyCodec, valueCodec }, storeRef)
@@ -451,7 +461,15 @@ export class KGroupedTableImpl<K, V> implements KGroupedTable<K, V> {
 		)
 		const storeRef = { store }
 
-		const reduceNode = new TableDeltaReduceNode<K, V>(storeName, storeRef, adder, subtractor)
+		const reduceNode = this.app.isExactlyOnce()
+			? new TableDeltaReduceNode<K, V>(storeName, storeRef, adder, subtractor)
+			: new TableGroupedComputeReduceNode<unknown, K, V>(
+					storeName,
+					storeRef,
+					this.keyMappingStoreRef,
+					this.groupedKeyCodec,
+					adder
+				)
 		this.node.connect(reduceNode)
 
 		return new KTableImpl<K, V>(this.app, reduceNode, { keyCodec, valueCodec }, storeRef)
@@ -484,7 +502,16 @@ export class KGroupedTableImpl<K, V> implements KGroupedTable<K, V> {
 		)
 		const storeRef = { store }
 
-		const aggregateNode = new TableDeltaAggregateNode<K, V, A>(storeName, storeRef, initializer, adder, subtractor)
+		const aggregateNode = this.app.isExactlyOnce()
+			? new TableDeltaAggregateNode<K, V, A>(storeName, storeRef, initializer, adder, subtractor)
+			: new TableGroupedComputeAggregateNode<unknown, K, V, A>(
+					storeName,
+					storeRef,
+					this.keyMappingStoreRef,
+					this.groupedKeyCodec,
+					initializer,
+					adder
+				)
 		this.node.connect(aggregateNode)
 
 		return new KTableImpl<K, A>(this.app, aggregateNode, { keyCodec, valueCodec }, storeRef)

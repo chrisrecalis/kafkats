@@ -1,8 +1,8 @@
 ---
 '@kafkats/flow': minor
-'@kafkats/client': patch
-'@kafkats/codec-zod': patch
-'@kafkats/flow-state-lmdb': patch
+'@kafkats/client': minor
+'@kafkats/codec-zod': minor
+'@kafkats/flow-state-lmdb': minor
 ---
 
 Fix flow integrity for KGroupedTable aggregations

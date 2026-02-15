@@ -41,6 +41,8 @@ export interface FlowAppInterface {
 		options: Produced<K, V> | undefined,
 		format: StreamFormat<K, V>
 	): Promise<void>
+	/** True when processingGuarantee is exactly_once. */
+	isExactlyOnce(): boolean
 }
 
 export class KTableImpl<K, V> implements KTable<K, V> {

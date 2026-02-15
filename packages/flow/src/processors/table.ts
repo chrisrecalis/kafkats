@@ -124,19 +124,24 @@ export class TableGroupByNode<K, V, K2> extends Processor<K, V, K2, V> {
 		// Handle tombstone: source row deleted
 		if (record.value === null) {
 			if (previousMapping !== undefined) {
-				// Emit SUB for old grouped key with old value
+				await store.delete(sourceKey)
+				// Emit SUB for old grouped key with old value after mapping deletion.
+				// Recompute nodes rely on mapping store as source of truth.
 				await this.forward({
 					...record,
 					key: previousMapping.groupedKey,
 					value: previousMapping.value,
 					headers: { ...record.headers, [DELTA_OP_HEADER]: DELTA_SUB },
 				})
-				await store.delete(sourceKey)
 			}
 			return
 		}
 
 		const [newGroupedKey, newValue] = this.fn(sourceKey, record.value)
+
+		// Store new mapping before forwarding deltas.
+		// Recompute nodes rely on mapping store as source of truth.
+		await store.put(sourceKey, { groupedKey: newGroupedKey, value: newValue })
 
 		// Retract old mapping if it exists
 		if (previousMapping !== undefined) {
@@ -147,9 +152,6 @@ export class TableGroupByNode<K, V, K2> extends Processor<K, V, K2, V> {
 				headers: { ...record.headers, [DELTA_OP_HEADER]: DELTA_SUB },
 			})
 		}
-
-		// Store new mapping
-		await store.put(sourceKey, { groupedKey: newGroupedKey, value: newValue })
 
 		// Emit ADD for the new value
 		await this.forward({
@@ -288,16 +290,259 @@ export class TableDeltaAggregateNode<K, V, A> extends Processor<K, V, K, A> {
 		const key = record.key
 		if (key === null || record.value === null) return
 
-		const current = (await store.get(key)) ?? this.initializer()
+		const current = await store.get(key)
 
 		let newAggregate: A
 		if (isDeltaSub(record)) {
+			if (current === undefined) return
 			newAggregate = this.subtractor(key, record.value, current)
 		} else {
-			newAggregate = this.aggregator(key, record.value, current)
+			const aggregate = current ?? this.initializer()
+			newAggregate = this.aggregator(key, record.value, aggregate)
 		}
 
 		await store.put(key, newAggregate)
 		await this.forward({ ...record, key, value: newAggregate, headers: {} })
+	}
+}
+
+/**
+ * Recompute count from mapping store for at_least_once safety.
+ * This avoids subtractor drift after crash/replay by rebuilding grouped state from source mappings.
+ */
+export class TableGroupedComputeCountNode<KSrc, K, V> extends Processor<K, V, K, number> {
+	private readonly inflightByKey: Map<string, Promise<void>>
+
+	constructor(
+		private readonly storeName: string,
+		private readonly storeRef: { store: KeyValueStore<K, number> | null },
+		private readonly keyMappingStoreRef: { store: KeyValueStore<KSrc, GroupedTableMapping<K, V>> | null },
+		private readonly groupedKeyCodec: Codec<K>,
+		inflightByKey?: Map<string, Promise<void>>
+	) {
+		super()
+		this.inflightByKey = inflightByKey ?? new Map()
+	}
+
+	clone(worker: WorkerContext): Processor<K, V, K, number> {
+		void worker
+		return new TableGroupedComputeCountNode<KSrc, K, V>(
+			this.storeName,
+			this.storeRef,
+			this.keyMappingStoreRef,
+			this.groupedKeyCodec,
+			this.inflightByKey
+		)
+	}
+
+	async process(record: StreamRecord<K, V>): Promise<void> {
+		const store = this.storeRef.store
+		const keyMappingStore = this.keyMappingStoreRef.store
+		if (!store) {
+			throw new Error(`State store '${this.storeName}' not initialized`)
+		}
+		if (!keyMappingStore) {
+			throw new Error('Key mapping store not initialized for grouped-table recomputation')
+		}
+
+		const key = record.key
+		if (key === null) return
+
+		const encodedKey = this.groupedKeyCodec.encode(key).toString('hex')
+		const previous = this.inflightByKey.get(encodedKey) ?? Promise.resolve()
+		const current = previous.catch(() => {}).then(async () => {
+			const targetBytes = this.groupedKeyCodec.encode(key)
+			let count = 0
+
+			for await (const [, mapping] of keyMappingStore.all()) {
+				const mappingKeyBytes = this.groupedKeyCodec.encode(mapping.groupedKey)
+				if (mappingKeyBytes.equals(targetBytes)) {
+					count += 1
+				}
+			}
+
+			if (count <= 0) {
+				await store.delete(key)
+				await this.forward({ ...record, key, value: null as unknown as number, headers: {} })
+				return
+			}
+
+			await store.put(key, count)
+			await this.forward({ ...record, key, value: count, headers: {} })
+		})
+
+		this.inflightByKey.set(encodedKey, current)
+		try {
+			await current
+		} finally {
+			if (this.inflightByKey.get(encodedKey) === current) {
+				this.inflightByKey.delete(encodedKey)
+			}
+		}
+	}
+}
+
+/**
+ * Recompute reduce from mapping store for at_least_once safety.
+ */
+export class TableGroupedComputeReduceNode<KSrc, K, V> extends Processor<K, V, K, V> {
+	private readonly inflightByKey: Map<string, Promise<void>>
+
+	constructor(
+		private readonly storeName: string,
+		private readonly storeRef: { store: KeyValueStore<K, V> | null },
+		private readonly keyMappingStoreRef: { store: KeyValueStore<KSrc, GroupedTableMapping<K, V>> | null },
+		private readonly groupedKeyCodec: Codec<K>,
+		private readonly reducer: (aggregate: V, value: V) => V,
+		inflightByKey?: Map<string, Promise<void>>
+	) {
+		super()
+		this.inflightByKey = inflightByKey ?? new Map()
+	}
+
+	clone(worker: WorkerContext): Processor<K, V, K, V> {
+		void worker
+		return new TableGroupedComputeReduceNode<KSrc, K, V>(
+			this.storeName,
+			this.storeRef,
+			this.keyMappingStoreRef,
+			this.groupedKeyCodec,
+			this.reducer,
+			this.inflightByKey
+		)
+	}
+
+	async process(record: StreamRecord<K, V>): Promise<void> {
+		const store = this.storeRef.store
+		const keyMappingStore = this.keyMappingStoreRef.store
+		if (!store) {
+			throw new Error(`State store '${this.storeName}' not initialized`)
+		}
+		if (!keyMappingStore) {
+			throw new Error('Key mapping store not initialized for grouped-table recomputation')
+		}
+
+		const key = record.key
+		if (key === null) return
+
+		const encodedKey = this.groupedKeyCodec.encode(key).toString('hex')
+		const previous = this.inflightByKey.get(encodedKey) ?? Promise.resolve()
+		const current = previous.catch(() => {}).then(async () => {
+			const targetBytes = this.groupedKeyCodec.encode(key)
+
+			let hasAggregate = false
+			let aggregate: V | undefined
+
+			for await (const [, mapping] of keyMappingStore.all()) {
+				const mappingKeyBytes = this.groupedKeyCodec.encode(mapping.groupedKey)
+				if (!mappingKeyBytes.equals(targetBytes)) continue
+				if (!hasAggregate) {
+					aggregate = mapping.value
+					hasAggregate = true
+				} else {
+					aggregate = this.reducer(aggregate as V, mapping.value)
+				}
+			}
+
+			if (!hasAggregate || aggregate === undefined) {
+				await store.delete(key)
+				await this.forward({ ...record, key, value: null as unknown as V, headers: {} })
+				return
+			}
+
+			await store.put(key, aggregate)
+			await this.forward({ ...record, key, value: aggregate, headers: {} })
+		})
+
+		this.inflightByKey.set(encodedKey, current)
+		try {
+			await current
+		} finally {
+			if (this.inflightByKey.get(encodedKey) === current) {
+				this.inflightByKey.delete(encodedKey)
+			}
+		}
+	}
+}
+
+/**
+ * Recompute aggregate from mapping store for at_least_once safety.
+ */
+export class TableGroupedComputeAggregateNode<KSrc, K, V, A> extends Processor<K, V, K, A> {
+	private readonly inflightByKey: Map<string, Promise<void>>
+
+	constructor(
+		private readonly storeName: string,
+		private readonly storeRef: { store: KeyValueStore<K, A> | null },
+		private readonly keyMappingStoreRef: { store: KeyValueStore<KSrc, GroupedTableMapping<K, V>> | null },
+		private readonly groupedKeyCodec: Codec<K>,
+		private readonly initializer: () => A,
+		private readonly aggregator: (key: K, value: V, aggregate: A) => A,
+		inflightByKey?: Map<string, Promise<void>>
+	) {
+		super()
+		this.inflightByKey = inflightByKey ?? new Map()
+	}
+
+	clone(worker: WorkerContext): Processor<K, V, K, A> {
+		void worker
+		return new TableGroupedComputeAggregateNode<KSrc, K, V, A>(
+			this.storeName,
+			this.storeRef,
+			this.keyMappingStoreRef,
+			this.groupedKeyCodec,
+			this.initializer,
+			this.aggregator,
+			this.inflightByKey
+		)
+	}
+
+	async process(record: StreamRecord<K, V>): Promise<void> {
+		const store = this.storeRef.store
+		const keyMappingStore = this.keyMappingStoreRef.store
+		if (!store) {
+			throw new Error(`State store '${this.storeName}' not initialized`)
+		}
+		if (!keyMappingStore) {
+			throw new Error('Key mapping store not initialized for grouped-table recomputation')
+		}
+
+		const key = record.key
+		if (key === null) return
+
+		const encodedKey = this.groupedKeyCodec.encode(key).toString('hex')
+		const previous = this.inflightByKey.get(encodedKey) ?? Promise.resolve()
+		const current = previous.catch(() => {}).then(async () => {
+			const targetBytes = this.groupedKeyCodec.encode(key)
+			let hasValues = false
+			let aggregate = this.initializer()
+
+			for await (const [, mapping] of keyMappingStore.all()) {
+				const mappingKeyBytes = this.groupedKeyCodec.encode(mapping.groupedKey)
+				if (!mappingKeyBytes.equals(targetBytes)) continue
+				hasValues = true
+				aggregate = this.aggregator(key, mapping.value, aggregate)
+			}
+
+			if (!hasValues) {
+				// Keep aggregate semantics aligned with delta/subtractor behavior:
+				// no members means initializer value.
+				await store.put(key, aggregate)
+				await this.forward({ ...record, key, value: aggregate, headers: {} })
+				return
+			}
+
+			await store.put(key, aggregate)
+			await this.forward({ ...record, key, value: aggregate, headers: {} })
+		})
+
+		this.inflightByKey.set(encodedKey, current)
+		try {
+			await current
+		} finally {
+			if (this.inflightByKey.get(encodedKey) === current) {
+				this.inflightByKey.delete(encodedKey)
+			}
+		}
 	}
 }

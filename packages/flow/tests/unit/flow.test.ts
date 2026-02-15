@@ -3,7 +3,7 @@ import { describe, expect, it, vi, afterEach } from 'vitest'
 import { KafkaClient, type Message } from '@kafkats/client'
 import { codec, flow, TimeWindows } from '../../src/index.js'
 
-type TestMessage = Message<Buffer>
+type TestMessage = Omit<Message<Buffer>, 'value'> & { value: Buffer | null }
 type TestContext = { signal: AbortSignal; topic: string; partition: number; offset: bigint }
 type TestHandler = (message: TestMessage, ctx: TestContext) => Promise<void>
 
@@ -28,7 +28,7 @@ class TestConsumer extends EventEmitter {
 		this.stopResolve = null
 	}
 
-	async emitMessage(topic: string, value: Buffer, key?: Buffer | null, timestamp?: bigint): Promise<void> {
+	async emitMessage(topic: string, value: Buffer | null, key?: Buffer | null, timestamp?: bigint): Promise<void> {
 		if (!this.handler) {
 			throw new Error('consumer not started')
 		}
@@ -911,12 +911,10 @@ describe('table aggregations (KGroupedTable)', () => {
 		expect(results.filter(r => r.key === 'books' && r.count === 2)).toHaveLength(1)
 
 		// Delete item1 (tombstone) - count should go from 2 to 1
-		// We need to emit a tombstone on the source topic for item1
-		// The TestConsumer emits value as provided; for tombstone we need null value
-		// but currently emitMessage requires a Buffer value. Let's send a message
-		// directly to simulate tombstone handling via the table state node.
-		// Actually the table's source topic processes tombstones via value=null.
-		// We need to modify TestConsumer to support null values.
+		await consumer.emitMessage('items', null, Buffer.from('item1'))
+
+		const booksAfterDelete = results.filter(r => r.key === 'books').at(-1)
+		expect(booksAfterDelete).toEqual({ key: 'books', count: 1 })
 
 		await app.close()
 	})
