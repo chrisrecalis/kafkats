@@ -83,8 +83,7 @@ export class SourceTopicNotFoundError extends Error {
 	) {
 		super(
 			`Source topic "${topic}" does not exist. Cannot determine partition count for ` +
-				`changelog topic of store "${storeName}". Create the source topic first or ` +
-				`explicitly set changelog.partitions in the Materialized options.`
+				`changelog topic of store "${storeName}". Create the source topic first.`
 		)
 	}
 }
@@ -138,6 +137,11 @@ export interface ChangelogTopicSpec {
 	skipRestoration: boolean
 	/** Source topics that feed into this state store. Used to infer partition count. */
 	sourceTopics: Set<string>
+	/**
+	 * If true, restoration is restricted to partitions currently assigned from source topics.
+	 * Use false for stores that are re-keyed and no longer have source-partition affinity.
+	 */
+	restrictRestorationToSourcePartitions?: boolean
 	/** If true, only validate existing topics, don't create new ones. */
 	validateOnly: boolean
 }

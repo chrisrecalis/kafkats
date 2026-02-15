@@ -119,7 +119,8 @@ class FlowAppImpl implements FlowApp {
 		keyCodec: Codec<K>,
 		valueCodec: Codec<V>,
 		changelog?: boolean | ChangelogConfig,
-		sourceTopics?: Set<string>
+		sourceTopics?: Set<string>,
+		restrictRestorationToSourcePartitions = true
 	): KeyValueStore<K, V> {
 		const storeName = name ?? `store-${this.nextStoreId()}`
 		let store = this.stateStores.get(storeName)
@@ -148,6 +149,7 @@ class FlowAppImpl implements FlowApp {
 					valueCodec: valueCodec as Codec<unknown>,
 					skipRestoration: changelogConfig.skipRestoration ?? false,
 					sourceTopics: sourceTopics ?? new Set(),
+					restrictRestorationToSourcePartitions,
 					validateOnly: this.config.changelog?.autoCreate === false,
 				}
 				this.changelogTopics.set(storeName, spec)
@@ -707,9 +709,14 @@ class FlowAppImpl implements FlowApp {
 				continue
 			}
 
-			const partitions = spec.sourceTopics.size
-				? [...new Set(assignedPartitions.filter(tp => spec.sourceTopics.has(tp.topic)).map(tp => tp.partition))]
-				: undefined
+			const partitions =
+				spec.restrictRestorationToSourcePartitions !== false && spec.sourceTopics.size
+					? [
+							...new Set(
+								assignedPartitions.filter(tp => spec.sourceTopics.has(tp.topic)).map(tp => tp.partition)
+							),
+						]
+					: undefined
 			if (partitions?.length === 0) {
 				continue
 			}
@@ -1030,8 +1037,9 @@ class FlowAppImpl implements FlowApp {
 		}
 
 		for (const checkpoint of worker.pendingChangelogOffsets.values()) {
-			const offset = this.eosEnabled ? checkpoint.offset + 1n : checkpoint.offset
-			await this.changelogCheckpointStore.set(checkpoint.topic, checkpoint.partition, offset).catch(() => {})
+			await this.changelogCheckpointStore
+				.set(checkpoint.topic, checkpoint.partition, checkpoint.offset)
+				.catch(() => {})
 		}
 	}
 

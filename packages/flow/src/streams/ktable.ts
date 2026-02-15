@@ -10,7 +10,7 @@ import {
 	type WorkerContext,
 	type OutputProcessor,
 } from '@/processors/index.js'
-import { TableGroupByNode } from '@/processors/table.js'
+import { TableGroupByNode, type GroupedTableMapping, groupedTableMappingCodec } from '@/processors/table.js'
 import { TableTableJoinNode, TableTableLeftJoinNode, TableTableOuterJoinRightNode } from '@/processors/joins/index.js'
 import { KGroupedTableImpl } from '@/streams/grouped.js'
 // Note: Circular import with kstream.ts - ESM handles this at runtime
@@ -24,7 +24,8 @@ export interface FlowAppInterface {
 		keyCodec: Codec<K>,
 		valueCodec: Codec<V>,
 		changelog?: boolean | import('@/changelog.js').ChangelogConfig,
-		sourceTopics?: Set<string>
+		sourceTopics?: Set<string>,
+		restrictRestorationToSourcePartitions?: boolean
 	): KeyValueStore<K, V>
 	/** Get the next store counter value and increment */
 	nextStoreId(): number
@@ -81,21 +82,29 @@ export class KTableImpl<K, V> implements KTable<K, V> {
 		if (!groupedKeyCodec) {
 			throw new Error('KTable.groupBy() requires a grouped key codec in options')
 		}
+		if (!valueCodec) {
+			throw new Error('KTable.groupBy() requires a value codec.')
+		}
 
-		// Create a key mapping store to track source key -> grouped key
+		// Create a key mapping store to track source key -> grouped key + source value.
 		const mappingStoreName = `groupby-mapping-${this.app.nextStoreId()}`
-		const mappingStore = this.app.getOrCreateStore<K, K2>(mappingStoreName, sourceKeyCodec, groupedKeyCodec)
+		const mappingStore = this.app.getOrCreateStore<K, GroupedTableMapping<K2, V>>(
+			mappingStoreName,
+			sourceKeyCodec,
+			groupedTableMappingCodec(groupedKeyCodec, valueCodec)
+		)
 		const mappingStoreRef = { store: mappingStore }
 
 		// Use TableGroupByNode to properly handle retractions
-		const groupByNode = new TableGroupByNode<K, V, K2>(fn, mappingStoreRef, sourceKeyCodec, groupedKeyCodec)
+		const groupByNode = new TableGroupByNode<K, V, K2>(fn, mappingStoreRef, groupedKeyCodec)
 		this.node.connect(groupByNode)
 
-		return new KGroupedTableImpl(
+		return new KGroupedTableImpl<K2, V>(
 			this.app,
 			groupByNode,
 			{ keyCodec: groupedKeyCodec, valueCodec },
-			this.storeRef as { store: KeyValueStore<K, V> | null }
+			mappingStoreRef as { store: KeyValueStore<unknown, GroupedTableMapping<K2, V>> | null },
+			groupedKeyCodec
 		)
 	}
 

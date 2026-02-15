@@ -142,14 +142,16 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 		const keyCodec = options?.key
 		const valueCodec = options?.value ?? this.format.valueCodec
 
-		return new KGroupedStreamImpl(this.app, selectNode, { keyCodec, valueCodec }, this.sourceTopics)
+		// Re-keyed: don't restrict changelog restoration to source partitions
+		return new KGroupedStreamImpl(this.app, selectNode, { keyCodec, valueCodec }, this.sourceTopics, false)
 	}
 
 	groupByKey(options?: Grouped<K, V>): KGroupedStream<K, V> {
 		const keyCodec = options?.key ?? this.format.keyCodec
 		const valueCodec = options?.value ?? this.format.valueCodec
 
-		return new KGroupedStreamImpl(this.app, this.node, { keyCodec, valueCodec }, this.sourceTopics)
+		// Same key: restrict changelog restoration to source partitions
+		return new KGroupedStreamImpl(this.app, this.node, { keyCodec, valueCodec }, this.sourceTopics, true)
 	}
 
 	join<V2, VR>(
