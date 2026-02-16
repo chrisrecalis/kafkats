@@ -3,7 +3,7 @@ import { describe, expect, it, vi, afterEach } from 'vitest'
 import { KafkaClient, type Message } from '@kafkats/client'
 import { codec, flow, TimeWindows } from '../../src/index.js'
 
-type TestMessage = Message<Buffer>
+type TestMessage = Omit<Message<Buffer>, 'value'> & { value: Buffer | null }
 type TestContext = { signal: AbortSignal; topic: string; partition: number; offset: bigint }
 type TestHandler = (message: TestMessage, ctx: TestContext) => Promise<void>
 
@@ -28,7 +28,7 @@ class TestConsumer extends EventEmitter {
 		this.stopResolve = null
 	}
 
-	async emitMessage(topic: string, value: Buffer, key?: Buffer | null, timestamp?: bigint): Promise<void> {
+	async emitMessage(topic: string, value: Buffer | null, key?: Buffer | null, timestamp?: bigint): Promise<void> {
 		if (!this.handler) {
 			throw new Error('consumer not started')
 		}
@@ -791,6 +791,10 @@ describe('table aggregations (KGroupedTable)', () => {
 					total: agg.total + value.amount,
 					count: agg.count + 1,
 				}),
+				(_key, value, agg) => ({
+					total: agg.total - value.amount,
+					count: agg.count - 1,
+				}),
 				{ value: codec.json<Stats>() }
 			)
 			.toStream()
@@ -824,6 +828,204 @@ describe('table aggregations (KGroupedTable)', () => {
 		expect(results[0]).toEqual({ key: 'US', stats: { total: 100, count: 1 } })
 		expect(results[1]).toEqual({ key: 'EU', stats: { total: 200, count: 1 } })
 		expect(results[2]).toEqual({ key: 'US', stats: { total: 250, count: 2 } })
+
+		await app.close()
+	})
+
+	it('retracts counts when grouped key changes', async () => {
+		const { app, consumers } = createTestApp()
+
+		type Item = { category: string; name: string }
+
+		const results: Array<{ key: string; count: number | null }> = []
+
+		app.table('items', { key: codec.string(), value: codec.json<Item>() })
+			.groupBy((_key, value) => [value.category, value] as const, { key: codec.string() })
+			.count()
+			.toStream()
+			.peek((key, count) => {
+				if (key === null) return
+				results.push({ key, count })
+			})
+
+		await app.start()
+		const consumer = consumers[0]!
+
+		// Add item1 in 'books' category
+		await consumer.emitMessage(
+			'items',
+			Buffer.from(JSON.stringify({ category: 'books', name: 'Book 1' })),
+			Buffer.from('item1')
+		)
+		expect(results).toHaveLength(1)
+		expect(results[0]).toEqual({ key: 'books', count: 1 })
+
+		// Change item1 from 'books' to 'electronics'
+		// Should emit: SUB for books (count → 0 → tombstone), ADD for electronics (count → 1)
+		await consumer.emitMessage(
+			'items',
+			Buffer.from(JSON.stringify({ category: 'electronics', name: 'Book 1' })),
+			Buffer.from('item1')
+		)
+
+		// books count goes to 0 (tombstone emitted as null), electronics count becomes 1
+		const booksRetraction = results.find(r => r.key === 'books' && r.count === null)
+		expect(booksRetraction).toBeDefined()
+
+		const electronicsAdd = results.find(r => r.key === 'electronics' && r.count === 1)
+		expect(electronicsAdd).toBeDefined()
+
+		await app.close()
+	})
+
+	it('retracts counts on source tombstones', async () => {
+		const { app, consumers } = createTestApp()
+
+		type Item = { category: string; name: string }
+
+		const results: Array<{ key: string; count: number | null }> = []
+
+		app.table('items', { key: codec.string(), value: codec.json<Item>() })
+			.groupBy((_key, value) => [value.category, value] as const, { key: codec.string() })
+			.count()
+			.toStream()
+			.peek((key, count) => {
+				if (key === null) return
+				results.push({ key, count })
+			})
+
+		await app.start()
+		const consumer = consumers[0]!
+
+		// Add two items in 'books'
+		await consumer.emitMessage(
+			'items',
+			Buffer.from(JSON.stringify({ category: 'books', name: 'Book 1' })),
+			Buffer.from('item1')
+		)
+		await consumer.emitMessage(
+			'items',
+			Buffer.from(JSON.stringify({ category: 'books', name: 'Book 2' })),
+			Buffer.from('item2')
+		)
+		expect(results.filter(r => r.key === 'books' && r.count === 2)).toHaveLength(1)
+
+		// Delete item1 (tombstone) - count should go from 2 to 1
+		await consumer.emitMessage('items', null, Buffer.from('item1'))
+
+		const booksAfterDelete = results.filter(r => r.key === 'books').at(-1)
+		expect(booksAfterDelete).toEqual({ key: 'books', count: 1 })
+
+		await app.close()
+	})
+
+	it('retracts aggregate values when grouped key changes', async () => {
+		const { app, consumers } = createTestApp()
+
+		type Order = { region: string; amount: number }
+		type Stats = { total: number; count: number }
+
+		const results: Array<{ key: string; stats: Stats }> = []
+
+		app.table('orders', { key: codec.string(), value: codec.json<Order>() })
+			.groupBy((_key, value) => [value.region, value] as const, { key: codec.string() })
+			.aggregate<Stats>(
+				() => ({ total: 0, count: 0 }),
+				(_key, value, agg) => ({
+					total: agg.total + value.amount,
+					count: agg.count + 1,
+				}),
+				(_key, value, agg) => ({
+					total: agg.total - value.amount,
+					count: agg.count - 1,
+				}),
+				{ value: codec.json<Stats>() }
+			)
+			.toStream()
+			.peek((key, stats) => {
+				if (key === null || stats === null) return
+				results.push({ key, stats })
+			})
+
+		await app.start()
+		const consumer = consumers[0]!
+
+		// Add order o1 in US for $100
+		await consumer.emitMessage(
+			'orders',
+			Buffer.from(JSON.stringify({ region: 'US', amount: 100 })),
+			Buffer.from('o1')
+		)
+		expect(results[results.length - 1]).toEqual({ key: 'US', stats: { total: 100, count: 1 } })
+
+		// Move order o1 from US to EU
+		// Should: subtract $100 from US, add $100 to EU
+		await consumer.emitMessage(
+			'orders',
+			Buffer.from(JSON.stringify({ region: 'EU', amount: 100 })),
+			Buffer.from('o1')
+		)
+
+		const usRetraction = results.find(r => r.key === 'US' && r.stats.total === 0)
+		expect(usRetraction).toBeDefined()
+
+		const euAdd = results.find(r => r.key === 'EU' && r.stats.total === 100)
+		expect(euAdd).toBeDefined()
+
+		await app.close()
+	})
+
+	it('reduces with adder and subtractor for table groupBy', async () => {
+		const { app, consumers } = createTestApp()
+
+		type Item = { category: string; price: number }
+
+		const results: Array<{ key: string; total: Item }> = []
+
+		app.table('items', { key: codec.string(), value: codec.json<Item>() })
+			.groupBy((_key, value) => [value.category, value] as const, {
+				key: codec.string(),
+				value: codec.json<Item>(),
+			})
+			.reduce(
+				(agg, value) => ({ ...agg, price: agg.price + value.price }),
+				(agg, value) => ({ ...agg, price: agg.price - value.price })
+			)
+			.toStream()
+			.peek((key, total) => {
+				if (key === null || total === null) return
+				results.push({ key, total })
+			})
+
+		await app.start()
+		const consumer = consumers[0]!
+
+		// Add item1 in 'books' for $10
+		await consumer.emitMessage(
+			'items',
+			Buffer.from(JSON.stringify({ category: 'books', price: 10 })),
+			Buffer.from('item1')
+		)
+		// Add item2 in 'books' for $20
+		await consumer.emitMessage(
+			'items',
+			Buffer.from(JSON.stringify({ category: 'books', price: 20 })),
+			Buffer.from('item2')
+		)
+
+		expect(results[results.length - 1]?.total.price).toBe(30)
+
+		// Update item1 price from $10 to $15
+		// Should: subtract old $10, add new $15 → total becomes 20 + 15 = 35... wait:
+		// sub(30, {category: 'books', price: 10}) → price: 20
+		// add(20, {category: 'books', price: 15}) → price: 35
+		await consumer.emitMessage(
+			'items',
+			Buffer.from(JSON.stringify({ category: 'books', price: 15 })),
+			Buffer.from('item1')
+		)
+
+		expect(results[results.length - 1]?.total.price).toBe(35)
 
 		await app.close()
 	})

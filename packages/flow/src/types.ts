@@ -173,10 +173,15 @@ export interface KGroupedStream<K, V> {
 
 export interface KGroupedTable<K, V> {
 	count(options?: Materialized<K, number>): KTable<K, number>
-	reduce(reducer: (aggregate: V, value: V) => V, options?: Materialized<K, V>): KTable<K, V>
+	reduce(
+		adder: (aggregate: V, value: V) => V,
+		subtractor: (aggregate: V, value: V) => V,
+		options?: Materialized<K, V>
+	): KTable<K, V>
 	aggregate<A>(
 		initializer: () => A,
-		aggregator: (key: K, value: V, aggregate: A) => A,
+		adder: (key: K, value: V, aggregate: A) => A,
+		subtractor: (key: K, value: V, aggregate: A) => A,
 		options?: Materialized<K, A>
 	): KTable<K, A>
 }

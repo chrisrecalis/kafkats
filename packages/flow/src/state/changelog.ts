@@ -27,13 +27,13 @@ export class ChangelogBackedKeyValueStore<K, V> implements KeyValueStore<K, V> {
 	}
 
 	async put(key: K, value: V): Promise<void> {
-		await this.innerStore.put(key, value)
 		await this.writer.write(key, value)
+		await this.innerStore.put(key, value)
 	}
 
 	async delete(key: K): Promise<void> {
-		await this.innerStore.delete(key)
 		await this.writer.writeTombstone(key)
+		await this.innerStore.delete(key)
 	}
 
 	all(): AsyncIterable<[K, V]> {
@@ -79,13 +79,13 @@ export class ChangelogBackedWindowStore<K, V> implements WindowStore<K, V> {
 	}
 
 	async put(key: WindowedKey<K>, value: V): Promise<void> {
-		await this.inner.put(key, value)
 		await this.writer.write(key, value)
+		await this.inner.put(key, value)
 	}
 
 	async delete(key: WindowedKey<K>): Promise<void> {
-		await this.inner.delete(key)
 		await this.writer.writeTombstone(key)
+		await this.inner.delete(key)
 	}
 
 	all(): AsyncIterable<[WindowedKey<K>, V]> {
@@ -149,13 +149,13 @@ export class ChangelogBackedSessionStore<K, V> implements SessionStore<K, V> {
 	}
 
 	async put(key: WindowedKey<K>, value: V): Promise<void> {
-		await this.inner.put(key, value)
 		await this.writer.write(key, value)
+		await this.inner.put(key, value)
 	}
 
 	async delete(key: WindowedKey<K>): Promise<void> {
-		await this.inner.delete(key)
 		await this.writer.writeTombstone(key)
+		await this.inner.delete(key)
 	}
 
 	all(): AsyncIterable<[WindowedKey<K>, V]> {
