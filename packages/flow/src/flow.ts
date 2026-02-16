@@ -1041,8 +1041,12 @@ class FlowAppImpl implements FlowApp {
 		}
 
 		for (const checkpoint of worker.pendingChangelogOffsets.values()) {
+			// In exactly_once mode, each committed transaction appends a control marker
+			// after the last data record on every touched partition.
+			// Advance checkpoint past that marker so restoration can start at the true log end.
+			const checkpointOffset = checkpoint.offset + 1n
 			await this.changelogCheckpointStore
-				.set(checkpoint.topic, checkpoint.partition, checkpoint.offset)
+				.set(checkpoint.topic, checkpoint.partition, checkpointOffset)
 				.catch(() => {})
 		}
 	}

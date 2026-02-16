@@ -321,7 +321,7 @@ export class TableGroupedComputeCountNode<KSrc, K, V> extends Processor<K, V, K,
 		inflightByKey?: Map<string, Promise<void>>
 	) {
 		super()
-		this.inflightByKey = inflightByKey ?? new Map()
+		this.inflightByKey = inflightByKey ?? new Map<string, Promise<void>>()
 	}
 
 	clone(worker: WorkerContext): Processor<K, V, K, number> {
@@ -350,26 +350,28 @@ export class TableGroupedComputeCountNode<KSrc, K, V> extends Processor<K, V, K,
 
 		const encodedKey = this.groupedKeyCodec.encode(key).toString('hex')
 		const previous = this.inflightByKey.get(encodedKey) ?? Promise.resolve()
-		const current = previous.catch(() => {}).then(async () => {
-			const targetBytes = this.groupedKeyCodec.encode(key)
-			let count = 0
+		const current = previous
+			.catch(() => {})
+			.then(async () => {
+				const targetBytes = this.groupedKeyCodec.encode(key)
+				let count = 0
 
-			for await (const [, mapping] of keyMappingStore.all()) {
-				const mappingKeyBytes = this.groupedKeyCodec.encode(mapping.groupedKey)
-				if (mappingKeyBytes.equals(targetBytes)) {
-					count += 1
+				for await (const [, mapping] of keyMappingStore.all()) {
+					const mappingKeyBytes = this.groupedKeyCodec.encode(mapping.groupedKey)
+					if (mappingKeyBytes.equals(targetBytes)) {
+						count += 1
+					}
 				}
-			}
 
-			if (count <= 0) {
-				await store.delete(key)
-				await this.forward({ ...record, key, value: null as unknown as number, headers: {} })
-				return
-			}
+				if (count <= 0) {
+					await store.delete(key)
+					await this.forward({ ...record, key, value: null as unknown as number, headers: {} })
+					return
+				}
 
-			await store.put(key, count)
-			await this.forward({ ...record, key, value: count, headers: {} })
-		})
+				await store.put(key, count)
+				await this.forward({ ...record, key, value: count, headers: {} })
+			})
 
 		this.inflightByKey.set(encodedKey, current)
 		try {
@@ -397,7 +399,7 @@ export class TableGroupedComputeReduceNode<KSrc, K, V> extends Processor<K, V, K
 		inflightByKey?: Map<string, Promise<void>>
 	) {
 		super()
-		this.inflightByKey = inflightByKey ?? new Map()
+		this.inflightByKey = inflightByKey ?? new Map<string, Promise<void>>()
 	}
 
 	clone(worker: WorkerContext): Processor<K, V, K, V> {
@@ -427,32 +429,34 @@ export class TableGroupedComputeReduceNode<KSrc, K, V> extends Processor<K, V, K
 
 		const encodedKey = this.groupedKeyCodec.encode(key).toString('hex')
 		const previous = this.inflightByKey.get(encodedKey) ?? Promise.resolve()
-		const current = previous.catch(() => {}).then(async () => {
-			const targetBytes = this.groupedKeyCodec.encode(key)
+		const current = previous
+			.catch(() => {})
+			.then(async () => {
+				const targetBytes = this.groupedKeyCodec.encode(key)
 
-			let hasAggregate = false
-			let aggregate: V | undefined
+				let hasAggregate = false
+				let aggregate: V | undefined
 
-			for await (const [, mapping] of keyMappingStore.all()) {
-				const mappingKeyBytes = this.groupedKeyCodec.encode(mapping.groupedKey)
-				if (!mappingKeyBytes.equals(targetBytes)) continue
-				if (!hasAggregate) {
-					aggregate = mapping.value
-					hasAggregate = true
-				} else {
-					aggregate = this.reducer(aggregate as V, mapping.value)
+				for await (const [, mapping] of keyMappingStore.all()) {
+					const mappingKeyBytes = this.groupedKeyCodec.encode(mapping.groupedKey)
+					if (!mappingKeyBytes.equals(targetBytes)) continue
+					if (!hasAggregate) {
+						aggregate = mapping.value
+						hasAggregate = true
+					} else {
+						aggregate = this.reducer(aggregate as V, mapping.value)
+					}
 				}
-			}
 
-			if (!hasAggregate || aggregate === undefined) {
-				await store.delete(key)
-				await this.forward({ ...record, key, value: null as unknown as V, headers: {} })
-				return
-			}
+				if (!hasAggregate || aggregate === undefined) {
+					await store.delete(key)
+					await this.forward({ ...record, key, value: null as unknown as V, headers: {} })
+					return
+				}
 
-			await store.put(key, aggregate)
-			await this.forward({ ...record, key, value: aggregate, headers: {} })
-		})
+				await store.put(key, aggregate)
+				await this.forward({ ...record, key, value: aggregate, headers: {} })
+			})
 
 		this.inflightByKey.set(encodedKey, current)
 		try {
@@ -481,7 +485,7 @@ export class TableGroupedComputeAggregateNode<KSrc, K, V, A> extends Processor<K
 		inflightByKey?: Map<string, Promise<void>>
 	) {
 		super()
-		this.inflightByKey = inflightByKey ?? new Map()
+		this.inflightByKey = inflightByKey ?? new Map<string, Promise<void>>()
 	}
 
 	clone(worker: WorkerContext): Processor<K, V, K, A> {
@@ -512,29 +516,31 @@ export class TableGroupedComputeAggregateNode<KSrc, K, V, A> extends Processor<K
 
 		const encodedKey = this.groupedKeyCodec.encode(key).toString('hex')
 		const previous = this.inflightByKey.get(encodedKey) ?? Promise.resolve()
-		const current = previous.catch(() => {}).then(async () => {
-			const targetBytes = this.groupedKeyCodec.encode(key)
-			let hasValues = false
-			let aggregate = this.initializer()
+		const current = previous
+			.catch(() => {})
+			.then(async () => {
+				const targetBytes = this.groupedKeyCodec.encode(key)
+				let hasValues = false
+				let aggregate = this.initializer()
 
-			for await (const [, mapping] of keyMappingStore.all()) {
-				const mappingKeyBytes = this.groupedKeyCodec.encode(mapping.groupedKey)
-				if (!mappingKeyBytes.equals(targetBytes)) continue
-				hasValues = true
-				aggregate = this.aggregator(key, mapping.value, aggregate)
-			}
+				for await (const [, mapping] of keyMappingStore.all()) {
+					const mappingKeyBytes = this.groupedKeyCodec.encode(mapping.groupedKey)
+					if (!mappingKeyBytes.equals(targetBytes)) continue
+					hasValues = true
+					aggregate = this.aggregator(key, mapping.value, aggregate)
+				}
 
-			if (!hasValues) {
-				// Keep aggregate semantics aligned with delta/subtractor behavior:
-				// no members means initializer value.
+				if (!hasValues) {
+					// Keep aggregate semantics aligned with delta/subtractor behavior:
+					// no members means initializer value.
+					await store.put(key, aggregate)
+					await this.forward({ ...record, key, value: aggregate, headers: {} })
+					return
+				}
+
 				await store.put(key, aggregate)
 				await this.forward({ ...record, key, value: aggregate, headers: {} })
-				return
-			}
-
-			await store.put(key, aggregate)
-			await this.forward({ ...record, key, value: aggregate, headers: {} })
-		})
+			})
 
 		this.inflightByKey.set(encodedKey, current)
 		try {
