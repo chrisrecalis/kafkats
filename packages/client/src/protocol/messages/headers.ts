@@ -74,7 +74,11 @@ export function encodeRequestHeader(encoder: IEncoder, header: RequestHeader): v
 export function decodeResponseHeader(decoder: IDecoder, apiKey: ApiKey, apiVersion: number): ResponseHeader {
 	const correlationId = decoder.readInt32()
 
-	const flexible = isFlexibleVersion(apiKey, apiVersion)
+	// ApiVersions is the one exception: even when the request uses a flexible
+	// version (>= 3), the response header is still v0 with no tagged fields.
+	// This is per the Kafka protocol so older clients can always parse the
+	// version-negotiation response, regardless of the version they requested.
+	const flexible = apiKey !== ApiKey.ApiVersions && isFlexibleVersion(apiKey, apiVersion)
 	if (flexible) {
 		// Header v1: includes tagged fields
 		decoder.skipTaggedFields()
