@@ -248,6 +248,11 @@ export class ChangelogRestorer<K, V> {
 		const consumer = client.consumer({
 			groupId: uniqueGroupId,
 			autoOffsetReset: 'earliest',
+			// Match the isolation level used to fetch endOffsets above. Without
+			// this, the restorer reads aborted transactional records (default
+			// is read_uncommitted) and applies them to local state — silent
+			// state corruption when restoring from an EOS-written changelog.
+			isolationLevel: 'read_committed',
 			...(options?.consumerMaxWaitMs !== undefined ? { maxWaitMs: options.consumerMaxWaitMs } : {}),
 		})
 
