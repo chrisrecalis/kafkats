@@ -167,8 +167,14 @@ export class WindowedKGroupedStreamImpl<K, V> implements WindowedKGroupedStream<
 			// windows assign records to multiple overlapping windows.
 			this.advanceMs = windows.advance ? parseWindowDuration(windows.advance) : this.windowSizeMs
 		} else if (windows instanceof SlidingWindows) {
-			this.windowSizeMs = parseWindowDuration(windows.size)
-			this.advanceMs = this.windowSizeMs
+			// SlidingWindows is recognized by the type system but has no
+			// dedicated processor implementation — silently treating it as
+			// tumbling produces wrong results. Throw a clear error until a
+			// real implementation exists, rather than silently misbehaving.
+			throw new Error(
+				'SlidingWindows is not yet implemented. Use TimeWindows.of(size).advanceBy(advance) for hopping ' +
+					'windows, or SessionWindows for session-based aggregation.'
+			)
 		} else {
 			// SessionWindows - use gap as approximate window size
 			this.windowSizeMs = parseWindowDuration(windows.gap)
