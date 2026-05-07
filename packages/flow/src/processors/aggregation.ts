@@ -40,7 +40,15 @@ export class AggregateNode<K, V, A> extends Processor<K, V, K, A> {
 			return
 		}
 
-		// Get current aggregate or initialize
+		// NOTE on idempotence: this read-modify-write is atomic *within* the
+		// processor invocation but NOT across input-offset commits. Under the
+		// at-least-once processing guarantee, a redelivery of the same input
+		// record (e.g. after a crash before its offset was committed) will
+		// re-apply the aggregator and double-count. This matches Kafka Streams
+		// at_least_once semantics. For exactly-once aggregation, configure the
+		// flow with processing-guarantee=exactly_once, which scopes state
+		// writes + offset commits + downstream produce into a single
+		// transactional batch (see flow.ts commitTransactionBatch).
 		const storedAggregate = await store.get(key)
 		const aggregate: A = storedAggregate !== undefined ? storedAggregate : this.initializer()
 
