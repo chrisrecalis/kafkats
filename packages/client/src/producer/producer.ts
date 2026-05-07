@@ -914,7 +914,21 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	 */
 	async flush(): Promise<void> {
 		this.accumulator.flush()
-		await Promise.all(this.inflight)
+
+		// accumulator.flush() emits batchReady events synchronously, but the
+		// drain that turns those into in-flight send promises runs in a
+		// queueMicrotask. There's also a re-queue path: when multiple batches
+		// for the same partition are present, drain only dispatches the first
+		// and pushes the rest back into pendingBatches with another
+		// scheduleDrain. Loop until both pendingBatches and inflight are empty.
+		while (this.pendingBatches.length > 0 || this.drainScheduled || this.inflight.size > 0) {
+			if (this.pendingBatches.length > 0 || this.drainScheduled) {
+				// Yield to the microtask queue so the drain runs.
+				await new Promise<void>(resolve => queueMicrotask(() => resolve()))
+			} else {
+				await Promise.all([...this.inflight])
+			}
+		}
 	}
 
 	/**
