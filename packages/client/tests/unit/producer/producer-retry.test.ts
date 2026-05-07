@@ -13,7 +13,6 @@ describe('Producer retry behavior', () => {
 	beforeEach(() => {
 		mockCluster = createMockCluster()
 		mockBroker = createMockBroker(1)
-		mockCluster.setMockBroker(1, mockBroker)
 		mockCluster.getLeaderForPartition.mockResolvedValue(mockBroker)
 	})
 

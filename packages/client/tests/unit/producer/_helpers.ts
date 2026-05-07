@@ -1,76 +1,40 @@
-import { vi } from 'vitest'
+import { mockDeep, type DeepMockProxy } from 'vitest-mock-extended'
 
-import { Cluster } from '@/client/cluster.js'
-import { Broker } from '@/client/broker.js'
+import type { Cluster } from '@/client/cluster.js'
+import type { Broker } from '@/client/broker.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import type { ProduceResponse } from '@/protocol/messages/responses/produce.js'
 
-export function createMockCluster(opts: { partitionCount?: number } = {}) {
-	const partitionCount = opts.partitionCount ?? 1
-	const mockBrokers = new Map<number, ReturnType<typeof createMockBroker>>()
+export type MockCluster = DeepMockProxy<Cluster>
+export type MockBroker = DeepMockProxy<Broker>
 
+export function createMockCluster(opts: { partitionCount?: number } = {}): MockCluster {
+	const partitionCount = opts.partitionCount ?? 1
 	const partitions = new Map(
 		Array.from({ length: partitionCount }, (_, i) => [i, { partitionIndex: i, leaderId: 1 }])
 	)
 
-	const mockCluster = {
-		getLeaderForPartition: vi.fn(),
-		refreshMetadata: vi.fn().mockResolvedValue({
-			clusterId: 'test',
-			controllerId: 1,
-			brokers: new Map([[1, { nodeId: 1, host: 'localhost', port: 9092, rack: null }]]),
-			topics: new Map([['test-topic', { name: 'test-topic', partitions }]]),
-			updatedAt: Date.now(),
-		}),
-		getCoordinator: vi.fn(),
-		invalidateCoordinator: vi.fn(),
-		getAnyBroker: vi.fn(),
-		getLogger: vi.fn().mockReturnValue({
-			child: () => ({
-				debug: vi.fn(),
-				info: vi.fn(),
-				warn: vi.fn(),
-				error: vi.fn(),
-			}),
-			debug: vi.fn(),
-			info: vi.fn(),
-			warn: vi.fn(),
-			error: vi.fn(),
-		}),
-		getMockBroker: (nodeId: number) => mockBrokers.get(nodeId),
-		setMockBroker: (nodeId: number, broker: ReturnType<typeof createMockBroker>) => {
-			mockBrokers.set(nodeId, broker)
-		},
-	}
-
-	return mockCluster as unknown as Cluster & {
-		getLeaderForPartition: ReturnType<typeof vi.fn>
-		refreshMetadata: ReturnType<typeof vi.fn>
-		getCoordinator: ReturnType<typeof vi.fn>
-		invalidateCoordinator: ReturnType<typeof vi.fn>
-		getAnyBroker: ReturnType<typeof vi.fn>
-		getMockBroker: (nodeId: number) => ReturnType<typeof createMockBroker> | undefined
-		setMockBroker: (nodeId: number, broker: ReturnType<typeof createMockBroker>) => void
-	}
+	const cluster = mockDeep<Cluster>()
+	cluster.refreshMetadata.mockResolvedValue({
+		clusterId: 'test',
+		controllerId: 1,
+		brokers: new Map([[1, { nodeId: 1, host: 'localhost', port: 9092, rack: null }]]),
+		topics: new Map([['test-topic', { name: 'test-topic', partitions }]]),
+		updatedAt: Date.now(),
+	})
+	return cluster
 }
 
-export function createMockBroker(nodeId: number) {
-	return {
+export function createMockBroker(nodeId: number): MockBroker {
+	const broker = mockDeep<Broker>()
+	Object.assign(broker, {
 		nodeId,
 		host: `broker-${nodeId}.test`,
 		port: 9092,
 		isConnected: true,
-		produce: vi.fn(),
-		initProducerId: vi.fn(),
-		addPartitionsToTxn: vi.fn(),
-		endTxn: vi.fn(),
-		getApiVersion: vi.fn().mockReturnValue(9),
-	} as unknown as Broker & {
-		produce: ReturnType<typeof vi.fn>
-		initProducerId: ReturnType<typeof vi.fn>
-		addPartitionsToTxn: ReturnType<typeof vi.fn>
-		endTxn: ReturnType<typeof vi.fn>
-	}
+	})
+	broker.getApiVersion.mockReturnValue(9)
+	return broker
 }
 
 export function buildProduceResponse(
