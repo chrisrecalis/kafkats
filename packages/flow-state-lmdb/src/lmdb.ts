@@ -543,6 +543,14 @@ class LMDBChangelogCheckpointStore implements ChangelogCheckpointStore {
 		const value = Buffer.alloc(8)
 		value.writeBigInt64BE(offset, 0)
 		await this.db.put(key, value)
+		// Wait for fsync so the checkpoint is durable on disk before this
+		// promise resolves. Without it, a hard crash can advance the
+		// in-memory checkpoint past data that hasn't yet been flushed for
+		// the data store, and restoration will skip needed changelog
+		// records on restart (silent state corruption). With it, the worst
+		// case after a crash is the checkpoint trailing the data store —
+		// harmless re-replay of already-applied records.
+		await this.db.flushed
 	}
 
 	private encodeKey(topic: string, partition: number): Buffer {
