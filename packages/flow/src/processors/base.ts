@@ -53,6 +53,11 @@ export type WorkerContext = {
 	transactionActive: boolean
 	commitTimer: ReturnType<typeof setTimeout> | null
 	lastCommitTime: number
+	// Set by the rebalance handler to the in-flight EOS commit promise.
+	// The next message processed must await this so a fresh transaction
+	// doesn't start before the prior one finishes (the rebalance handler
+	// itself can't block the consumer's protocol).
+	pendingRebalanceCommit?: Promise<void> | null
 }
 
 // Forward declaration for WorkerContext type

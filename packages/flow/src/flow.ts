@@ -874,6 +874,15 @@ class FlowAppImpl implements FlowApp {
 		}
 
 		try {
+			// If a rebalance triggered an in-flight EOS commit, wait for it to
+			// finish before starting a fresh transaction. The rebalance handler
+			// can't block the consumer's protocol, but we can serialize against
+			// the commit here to avoid running two transactions concurrently.
+			if (worker.pendingRebalanceCommit) {
+				await worker.pendingRebalanceCommit
+				worker.pendingRebalanceCommit = null
+			}
+
 			// Start a new transaction if one isn't active
 			if (!worker.transactionActive) {
 				await this.beginTransaction(worker)
@@ -1136,14 +1145,22 @@ class FlowAppImpl implements FlowApp {
 	private attachConsumerEvents(consumer: Consumer, worker: WorkerContext): void {
 		consumer.on('rebalance', () => {
 			this.currentState = 'REBALANCING'
-			// Commit any pending transactions before rebalance completes
-			// This is done synchronously in the event handler to ensure
-			// offsets are committed before partitions are reassigned
+			// Best-effort commit of any pending EOS transaction. EventEmitter
+			// listeners cannot be awaited by the emitter, so we cannot block
+			// the consumer's rebalance protocol on this commit completing —
+			// the Kafka group coordinator will reassign partitions whether
+			// or not we finish here. We track the in-flight commit on the
+			// worker so the next message processed waits for it before
+			// starting a fresh transaction (preventing two transactions from
+			// running concurrently).
 			if (this.eosEnabled && worker.transactionActive) {
-				this.enqueueEosTask(worker, () => this.commitTransactionBatch(worker)).catch(err => {
-					this.lastError = err as Error
-					this.currentState = 'ERROR'
-				})
+				const commitPromise = this.enqueueEosTask(worker, () => this.commitTransactionBatch(worker)).catch(
+					err => {
+						this.lastError = err as Error
+						this.currentState = 'ERROR'
+					}
+				)
+				worker.pendingRebalanceCommit = commitPromise
 			}
 		})
 		consumer.on('partitionsAssigned', partitions => {
