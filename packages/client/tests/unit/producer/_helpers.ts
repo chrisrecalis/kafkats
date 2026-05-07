@@ -5,8 +5,13 @@ import { Broker } from '@/client/broker.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import type { ProduceResponse } from '@/protocol/messages/responses/produce.js'
 
-export function createMockCluster() {
+export function createMockCluster(opts: { partitionCount?: number } = {}) {
+	const partitionCount = opts.partitionCount ?? 1
 	const mockBrokers = new Map<number, ReturnType<typeof createMockBroker>>()
+
+	const partitions = new Map(
+		Array.from({ length: partitionCount }, (_, i) => [i, { partitionIndex: i, leaderId: 1 }])
+	)
 
 	const mockCluster = {
 		getLeaderForPartition: vi.fn(),
@@ -14,18 +19,11 @@ export function createMockCluster() {
 			clusterId: 'test',
 			controllerId: 1,
 			brokers: new Map([[1, { nodeId: 1, host: 'localhost', port: 9092, rack: null }]]),
-			topics: new Map([
-				[
-					'test-topic',
-					{
-						name: 'test-topic',
-						partitions: new Map([[0, { partitionIndex: 0, leaderId: 1 }]]),
-					},
-				],
-			]),
+			topics: new Map([['test-topic', { name: 'test-topic', partitions }]]),
 			updatedAt: Date.now(),
 		}),
 		getCoordinator: vi.fn(),
+		invalidateCoordinator: vi.fn(),
 		getAnyBroker: vi.fn(),
 		getLogger: vi.fn().mockReturnValue({
 			child: () => ({
@@ -49,6 +47,7 @@ export function createMockCluster() {
 		getLeaderForPartition: ReturnType<typeof vi.fn>
 		refreshMetadata: ReturnType<typeof vi.fn>
 		getCoordinator: ReturnType<typeof vi.fn>
+		invalidateCoordinator: ReturnType<typeof vi.fn>
 		getAnyBroker: ReturnType<typeof vi.fn>
 		getMockBroker: (nodeId: number) => ReturnType<typeof createMockBroker> | undefined
 		setMockBroker: (nodeId: number, broker: ReturnType<typeof createMockBroker>) => void
@@ -63,8 +62,15 @@ export function createMockBroker(nodeId: number) {
 		isConnected: true,
 		produce: vi.fn(),
 		initProducerId: vi.fn(),
+		addPartitionsToTxn: vi.fn(),
+		endTxn: vi.fn(),
 		getApiVersion: vi.fn().mockReturnValue(9),
-	} as unknown as Broker & { produce: ReturnType<typeof vi.fn>; initProducerId: ReturnType<typeof vi.fn> }
+	} as unknown as Broker & {
+		produce: ReturnType<typeof vi.fn>
+		initProducerId: ReturnType<typeof vi.fn>
+		addPartitionsToTxn: ReturnType<typeof vi.fn>
+		endTxn: ReturnType<typeof vi.fn>
+	}
 }
 
 export function buildProduceResponse(
