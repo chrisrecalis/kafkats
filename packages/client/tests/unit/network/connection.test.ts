@@ -291,6 +291,40 @@ describe('Connection', () => {
 	})
 
 	describe('SASL reauthentication', () => {
+		it('clamps reauth delay to 2^31-1 ms (Node setTimeout limit)', () => {
+			const oauthBearerProvider = vi.fn().mockResolvedValue({ value: 'token-1' })
+
+			const connection = new Connection({
+				host: 'localhost',
+				port: 9092,
+				clientId: 'test-client',
+				sasl: {
+					mechanism: 'OAUTHBEARER',
+					oauthBearerProvider,
+					reauthenticationThresholdMs: 0,
+				},
+			})
+			;(connection as unknown as { _state: string })._state = 'connected'
+
+			// Spy on setTimeout to inspect the delay argument
+			const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout')
+			setTimeoutSpy.mockClear()
+
+			// Session lifetime well above Node's setTimeout cap (2^31-1 ms ≈ 24.86 days).
+			// Without clamping, Node silently sets the delay to 1 and reauth fires immediately.
+			const hugeLifetimeMs = BigInt(2 ** 33)
+			;(
+				connection as unknown as { scheduleSaslReauthentication: (ms: bigint) => void }
+			).scheduleSaslReauthentication(hugeLifetimeMs)
+
+			expect(setTimeoutSpy).toHaveBeenCalledOnce()
+			const delayArg = setTimeoutSpy.mock.calls[0]?.[1] ?? 0
+			expect(delayArg).toBeLessThanOrEqual(2 ** 31 - 1)
+			expect(delayArg).toBeGreaterThan(0)
+
+			setTimeoutSpy.mockRestore()
+		})
+
 		it('refreshes OAUTHBEARER session before expiry', async () => {
 			const oauthBearerProvider = vi.fn().mockResolvedValue({ value: 'token-1' })
 
