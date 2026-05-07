@@ -151,6 +151,7 @@ export class KGroupedStreamImpl<K, V> implements KGroupedStream<K, V> {
 
 export class WindowedKGroupedStreamImpl<K, V> implements WindowedKGroupedStream<K, V> {
 	private readonly windowSizeMs: number
+	private readonly advanceMs: number
 
 	constructor(
 		private readonly app: FlowAppInterface,
@@ -162,11 +163,16 @@ export class WindowedKGroupedStreamImpl<K, V> implements WindowedKGroupedStream<
 	) {
 		if (windows instanceof TimeWindows) {
 			this.windowSizeMs = parseWindowDuration(windows.size)
+			// Honour TimeWindows.advanceBy() — when advance < size, hopping
+			// windows assign records to multiple overlapping windows.
+			this.advanceMs = windows.advance ? parseWindowDuration(windows.advance) : this.windowSizeMs
 		} else if (windows instanceof SlidingWindows) {
 			this.windowSizeMs = parseWindowDuration(windows.size)
+			this.advanceMs = this.windowSizeMs
 		} else {
 			// SessionWindows - use gap as approximate window size
 			this.windowSizeMs = parseWindowDuration(windows.gap)
+			this.advanceMs = this.windowSizeMs
 		}
 	}
 
@@ -223,7 +229,8 @@ export class WindowedKGroupedStreamImpl<K, V> implements WindowedKGroupedStream<
 				storeRef,
 				() => 0,
 				(_key, _value, aggregate) => aggregate + 1,
-				this.windowSizeMs
+				this.windowSizeMs,
+				this.advanceMs
 			)
 		}
 
@@ -291,7 +298,7 @@ export class WindowedKGroupedStreamImpl<K, V> implements WindowedKGroupedStream<
 			this.app.stateStores.set(storeName, store as KeyValueStore<unknown, unknown>)
 			const storeRef = { store }
 
-			aggregateNode = new WindowedReduceNode<K, V>(storeName, storeRef, reducer, this.windowSizeMs)
+			aggregateNode = new WindowedReduceNode<K, V>(storeName, storeRef, reducer, this.windowSizeMs, this.advanceMs)
 		}
 
 		this.node.connect(aggregateNode)
@@ -354,7 +361,8 @@ export class WindowedKGroupedStreamImpl<K, V> implements WindowedKGroupedStream<
 			storeRef,
 			initializer,
 			aggregator,
-			this.windowSizeMs
+			this.windowSizeMs,
+			this.advanceMs
 		)
 
 		this.node.connect(aggregateNode)

@@ -117,20 +117,34 @@ export class ReduceNode<K, V> extends Processor<K, V, K, V> {
 
 /**
  * Processor node for windowed reduce operations.
+ *
+ * Honours TimeWindows.advanceBy(): when advanceMs < windowSizeMs (hopping
+ * windows), each record is reduced into every overlapping window and one
+ * forward is emitted per window.
  */
 export class WindowedReduceNode<K, V> extends Processor<K, V, Windowed<K>, V> {
+	private readonly advanceMs: number
+
 	constructor(
 		private readonly storeName: string,
 		private readonly storeRef: { store: WindowStore<K, V> | null },
 		private readonly reducer: (aggregate: V, value: V) => V,
-		private readonly windowSizeMs: number
+		private readonly windowSizeMs: number,
+		advanceMs: number = 0
 	) {
 		super()
+		this.advanceMs = advanceMs > 0 ? advanceMs : windowSizeMs
+		if (this.advanceMs > this.windowSizeMs) {
+			throw new Error(
+				`TimeWindows.advanceBy must be <= window size (got advance=${this.advanceMs}, size=${this.windowSizeMs}). ` +
+					'Larger advance values would silently drop records that fall in the gaps between windows.'
+			)
+		}
 	}
 
 	clone(worker: WorkerContext): Processor<K, V, Windowed<K>, V> {
 		void worker
-		return new WindowedReduceNode<K, V>(this.storeName, this.storeRef, this.reducer, this.windowSizeMs)
+		return new WindowedReduceNode<K, V>(this.storeName, this.storeRef, this.reducer, this.windowSizeMs, this.advanceMs)
 	}
 
 	async process(record: StreamRecord<K, V>): Promise<void> {
@@ -146,18 +160,23 @@ export class WindowedReduceNode<K, V> extends Processor<K, V, Windowed<K>, V> {
 		if (value === null) return
 
 		const timestamp = Number(record.timestamp)
-		const windowStart = Math.floor(timestamp / this.windowSizeMs) * this.windowSizeMs
-		const windowEnd = windowStart + this.windowSizeMs
+		const firstWindowStart =
+			Math.floor((timestamp - this.windowSizeMs + this.advanceMs) / this.advanceMs) * this.advanceMs
+		const lastWindowStart = Math.floor(timestamp / this.advanceMs) * this.advanceMs
 
-		const windowedKey: WindowedKey<K> = { key, windowStart, windowEnd }
+		for (let windowStart = firstWindowStart; windowStart <= lastWindowStart; windowStart += this.advanceMs) {
+			if (windowStart < 0) continue
+			const windowEnd = windowStart + this.windowSizeMs
+			const windowedKey: WindowedKey<K> = { key, windowStart, windowEnd }
 
-		const storedAggregate = await store.get(windowedKey)
-		const newAggregate = storedAggregate === undefined ? value : this.reducer(storedAggregate, value)
-		await store.put(windowedKey, newAggregate)
+			const storedAggregate = await store.get(windowedKey)
+			const newAggregate = storedAggregate === undefined ? value : this.reducer(storedAggregate, value)
+			await store.put(windowedKey, newAggregate)
 
-		const windowedResult: Windowed<K> = { key, window: { start: windowStart, end: windowEnd } }
-		const next: StreamRecord<Windowed<K>, V> = { ...record, key: windowedResult, value: newAggregate }
-		await this.forward(next)
+			const windowedResult: Windowed<K> = { key, window: { start: windowStart, end: windowEnd } }
+			const next: StreamRecord<Windowed<K>, V> = { ...record, key: windowedResult, value: newAggregate }
+			await this.forward(next)
+		}
 	}
 }
 
@@ -227,10 +246,16 @@ type CleanupState = { lastCleanupStreamTimeMs: number; streamTimeMs: number }
 
 /**
  * Processor node for windowed aggregations.
+ *
+ * Honours TimeWindows.advanceBy(): when advanceMs < windowSizeMs (hopping
+ * windows), each record is aggregated into every overlapping window and one
+ * forward is emitted per window. When advanceMs == windowSizeMs (tumbling),
+ * each record is assigned to exactly one window.
  */
 export class WindowedAggregateNode<K, V, A> extends Processor<K, V, Windowed<K>, A> {
 	private static readonly CLEANUP_INTERVAL_MS = 60_000
 	private readonly cleanupState: CleanupState
+	private readonly advanceMs: number
 
 	constructor(
 		private readonly storeName: string,
@@ -238,9 +263,17 @@ export class WindowedAggregateNode<K, V, A> extends Processor<K, V, Windowed<K>,
 		private readonly initializer: () => A,
 		private readonly aggregator: (key: K, value: V, aggregate: A) => A,
 		private readonly windowSizeMs: number,
+		advanceMs: number = 0,
 		cleanupState?: CleanupState
 	) {
 		super()
+		this.advanceMs = advanceMs > 0 ? advanceMs : windowSizeMs
+		if (this.advanceMs > this.windowSizeMs) {
+			throw new Error(
+				`TimeWindows.advanceBy must be <= window size (got advance=${this.advanceMs}, size=${this.windowSizeMs}). ` +
+					'Larger advance values would silently drop records that fall in the gaps between windows.'
+			)
+		}
 		this.cleanupState = cleanupState ?? { lastCleanupStreamTimeMs: 0, streamTimeMs: 0 }
 	}
 
@@ -252,6 +285,7 @@ export class WindowedAggregateNode<K, V, A> extends Processor<K, V, Windowed<K>,
 			this.initializer,
 			this.aggregator,
 			this.windowSizeMs,
+			this.advanceMs,
 			this.cleanupState
 		)
 	}
@@ -271,26 +305,27 @@ export class WindowedAggregateNode<K, V, A> extends Processor<K, V, Windowed<K>,
 			return
 		}
 
-		// Calculate window for this record based on timestamp
+		// Compute the range of window starts containing the record timestamp.
+		// For tumbling windows (advance == size) there's exactly one window.
+		// For hopping windows (advance < size) every window with
+		// windowStart <= timestamp < windowStart + size receives an update.
 		const timestamp = Number(record.timestamp)
-		const windowStart = Math.floor(timestamp / this.windowSizeMs) * this.windowSizeMs
-		const windowEnd = windowStart + this.windowSizeMs
+		const firstWindowStart =
+			Math.floor((timestamp - this.windowSizeMs + this.advanceMs) / this.advanceMs) * this.advanceMs
+		const lastWindowStart = Math.floor(timestamp / this.advanceMs) * this.advanceMs
 
-		const windowedKey: WindowedKey<K> = {
-			key,
-			windowStart,
-			windowEnd,
+		const newAggregates: Array<{ key: WindowedKey<K>; value: A; window: { start: number; end: number } }> = []
+		for (let windowStart = firstWindowStart; windowStart <= lastWindowStart; windowStart += this.advanceMs) {
+			if (windowStart < 0) continue
+			const windowEnd = windowStart + this.windowSizeMs
+			const windowedKey: WindowedKey<K> = { key, windowStart, windowEnd }
+
+			const storedAggregate = await store.get(windowedKey)
+			const aggregate: A = storedAggregate !== undefined ? storedAggregate : this.initializer()
+			const newAggregate = this.aggregator(key, record.value, aggregate)
+			await store.put(windowedKey, newAggregate)
+			newAggregates.push({ key: windowedKey, value: newAggregate, window: { start: windowStart, end: windowEnd } })
 		}
-
-		// Get current aggregate or initialize
-		const storedAggregate = await store.get(windowedKey)
-		const aggregate: A = storedAggregate !== undefined ? storedAggregate : this.initializer()
-
-		// Apply aggregation
-		const newAggregate = this.aggregator(key, record.value, aggregate)
-
-		// Store updated aggregate
-		await store.put(windowedKey, newAggregate)
 
 		// Stream time (max record timestamp), not wall clock — so backfill/replay expires identically to live processing.
 		this.cleanupState.streamTimeMs = Math.max(this.cleanupState.streamTimeMs, timestamp)
@@ -302,18 +337,12 @@ export class WindowedAggregateNode<K, V, A> extends Processor<K, V, Windowed<K>,
 			await store.expireOldWindows(this.cleanupState.streamTimeMs)
 		}
 
-		// Forward the windowed result
-		const windowedResult: Windowed<K> = {
-			key,
-			window: { start: windowStart, end: windowEnd },
+		// Forward one result per window the record landed in.
+		for (const entry of newAggregates) {
+			const windowedResult: Windowed<K> = { key, window: entry.window }
+			const next: StreamRecord<Windowed<K>, A> = { ...record, key: windowedResult, value: entry.value }
+			await this.forward(next)
 		}
-
-		const next: StreamRecord<Windowed<K>, A> = {
-			...record,
-			key: windowedResult,
-			value: newAggregate,
-		}
-		await this.forward(next)
 	}
 }
 
