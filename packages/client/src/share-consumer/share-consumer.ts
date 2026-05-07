@@ -1026,6 +1026,16 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 			})
 		}
 
+		const implicitRelease = (message: ShareMessage<unknown, unknown>) => {
+			void message.release().catch(error => {
+				const err = error instanceof Error ? error : new Error(String(error))
+				if (err.message.includes('already handled')) {
+					return
+				}
+				this.emitError(err)
+			})
+		}
+
 		try {
 			const { subscriptions, topics: rawTopics } = this.getSubscriptionsAndTopics(subscription)
 			const topics = [...new Set(rawTopics)].sort()
@@ -1080,8 +1090,14 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 				}
 			}
 		} finally {
+			// Release (NOT ack) the last yielded message on iterator exit. We
+			// can't tell whether the consumer exited because it processed the
+			// message successfully then broke out, OR because the user's
+			// processing threw — so we default to release. The next iteration
+			// path acks the previous message before yielding the next, which is
+			// the only point at which we know the user has handled it.
 			if (previousMessage) {
-				implicitAck(previousMessage)
+				implicitRelease(previousMessage)
 				previousMessage = null
 			}
 
