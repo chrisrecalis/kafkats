@@ -166,6 +166,10 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			useConsumerGroup ? this.config.groupInstanceId : undefined,
 			logger
 		)
+		// Wire auto-commit failures back to the consumer so generation/coordinator
+		// errors are surfaced as 'error' events and trigger a rejoin instead of
+		// silently looping with an ever-growing consumedOffsets map.
+		this.offsetManager.setCommitErrorHandler(error => this.handleAutoCommitError(error))
 		this.fetchManager = new FetchManager(
 			this.cluster,
 			this.offsetManager,
@@ -784,6 +788,33 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		this.partitionProvider = null
 		this.abortController = null
 		this.runPromiseReject = null
+	}
+
+	private handleAutoCommitError(error: Error): void {
+		// Surface the failure to the user (always — they need visibility) and
+		// trigger a rebalance/rejoin if the error indicates we lost our group
+		// generation. Without this, the auto-commit loop kept logging and
+		// retrying with a stale generationId forever, and consumedOffsets
+		// grew unboundedly.
+		this.emitError(error)
+
+		const code = error instanceof KafkaProtocolError ? error.errorCode : null
+		if (
+			code === ErrorCode.IllegalGeneration ||
+			code === ErrorCode.UnknownMemberId ||
+			code === ErrorCode.RebalanceInProgress
+		) {
+			this.logger.warn('auto-commit hit fatal generation error — triggering rejoin', {
+				errorCode: code,
+			})
+			// Clear pending offsets that we can no longer commit with this
+			// generation. The new generation will resume from the last
+			// successfully committed offset on the broker.
+			this.offsetManager?.clearConsumedOffsets()
+			// Best-effort rejoin via the consumerGroup; partitionProvider will
+			// observe the new state on its next loop.
+			this.consumerGroup?.emit('rebalance')
+		}
 	}
 
 	private emitError(error: unknown): void {
