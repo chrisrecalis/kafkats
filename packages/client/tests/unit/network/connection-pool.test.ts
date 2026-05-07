@@ -52,7 +52,10 @@ describe('ConnectionPool', () => {
 	})
 
 	it('hands distinct connections to concurrent acquirers (no race)', async () => {
-		const pool = new ConnectionPool({ host: 'localhost', port: 9092 }, { clientId: 'test', minConnections: 0, maxConnections: 5 })
+		const pool = new ConnectionPool(
+			{ host: 'localhost', port: 9092 },
+			{ clientId: 'test', minConnections: 0, maxConnections: 5 }
+		)
 		await pool.initialize()
 
 		// Three concurrent acquires before any connection exists.
@@ -74,7 +77,10 @@ describe('ConnectionPool', () => {
 		// Reproduces the narrower race: caller A awaits createConnection(),
 		// the entry is pushed but not yet marked inUse. Caller B enters acquire()
 		// in that gap, runs the find() at the top, and would grab the same entry.
-		const pool = new ConnectionPool({ host: 'localhost', port: 9092 }, { clientId: 'test', minConnections: 0, maxConnections: 5 })
+		const pool = new ConnectionPool(
+			{ host: 'localhost', port: 9092 },
+			{ clientId: 'test', minConnections: 0, maxConnections: 5 }
+		)
 		await pool.initialize()
 
 		// Two concurrent acquires will trigger this scenario.
