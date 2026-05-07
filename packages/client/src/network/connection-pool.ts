@@ -81,7 +81,7 @@ export class ConnectionPool {
 		)
 		this.idleCleanupInterval.unref()
 
-		const promises: Promise<void>[] = []
+		const promises: Promise<PooledConnection>[] = []
 		for (let i = 0; i < this.minConnections; i++) {
 			promises.push(this.createConnection())
 		}
@@ -108,13 +108,16 @@ export class ConnectionPool {
 
 		if (this.connections.length < this.maxConnections) {
 			try {
-				await this.createConnection()
-				const newConn = this.connections[this.connections.length - 1]
-				if (newConn && newConn.connection.isConnected) {
-					newConn.inUse = true
+				// Pass forImmediateUse so the new entry is marked inUse atomically with
+				// the push — otherwise a second acquirer could enter the find() at the
+				// top of acquire() in the gap and grab this entry.
+				const newConn = await this.createConnection(true)
+				if (newConn.connection.isConnected) {
 					newConn.lastUsed = Date.now()
 					return newConn.connection
 				}
+				// connection died between push and isConnected check — release reservation
+				newConn.inUse = false
 			} catch {
 				// Fall through to wait queue
 			}
@@ -210,9 +213,14 @@ export class ConnectionPool {
 	}
 
 	/**
-	 * Create a new connection and add to pool
+	 * Create a new connection and add to pool. Returns the pooled entry so
+	 * concurrent acquirers don't race to grab `connections[length-1]`.
+	 *
+	 * @param forImmediateUse - if true, the entry is marked `inUse=true` atomically
+	 *   with the push so that a concurrent acquirer cannot pick it up via the
+	 *   available-connection lookup before the original caller sets `inUse`.
 	 */
-	private async createConnection(): Promise<void> {
+	private async createConnection(forImmediateUse = false): Promise<PooledConnection> {
 		const options: ConnectionOptions = {
 			host: this.address.host,
 			port: this.address.port,
@@ -241,12 +249,14 @@ export class ConnectionPool {
 
 		await connection.connect()
 
-		this.connections.push({
+		const pooled: PooledConnection = {
 			connection,
-			inUse: false,
+			inUse: forImmediateUse,
 			lastUsed: Date.now(),
 			createdAt: Date.now(),
-		})
+		}
+		this.connections.push(pooled)
+		return pooled
 	}
 
 	/**
