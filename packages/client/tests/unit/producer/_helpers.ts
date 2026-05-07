@@ -11,7 +11,10 @@ export type MockBroker = DeepMockProxy<Broker>
 export function createMockCluster(opts: { partitionCount?: number } = {}): MockCluster {
 	const partitionCount = opts.partitionCount ?? 1
 	const partitions = new Map(
-		Array.from({ length: partitionCount }, (_, i) => [i, { partitionIndex: i, leaderId: 1 }])
+		Array.from({ length: partitionCount }, (_, i) => [
+			i,
+			{ partitionIndex: i, leaderId: 1, leaderEpoch: 0, replicaNodes: [1], isrNodes: [1], offlineReplicas: [] },
+		])
 	)
 
 	const cluster = mockDeep<Cluster>()
@@ -19,7 +22,7 @@ export function createMockCluster(opts: { partitionCount?: number } = {}): MockC
 		clusterId: 'test',
 		controllerId: 1,
 		brokers: new Map([[1, { nodeId: 1, host: 'localhost', port: 9092, rack: null }]]),
-		topics: new Map([['test-topic', { name: 'test-topic', partitions }]]),
+		topics: new Map([['test-topic', { name: 'test-topic', topicId: 'test-id', isInternal: false, partitions }]]),
 		updatedAt: Date.now(),
 	})
 	return cluster

@@ -28,6 +28,7 @@ describe('Transactional producer with round-robin partitioner', () => {
 		})
 		mockTxnCoordinator.addPartitionsToTxn.mockResolvedValue({
 			throttleTimeMs: 0,
+			errorCode: ErrorCode.None,
 			results: [
 				{
 					name: TOPIC,
