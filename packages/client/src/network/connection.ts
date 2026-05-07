@@ -221,7 +221,11 @@ export class Connection extends EventEmitter<ConnectionEvents> {
 
 		const thresholdMs = this.saslConfig.reauthenticationThresholdMs ?? 10_000
 		const lifetimeMs = Number(sessionLifetimeMs)
-		const delayMs = Math.max(0, lifetimeMs - thresholdMs)
+		// Clamp to Node's setTimeout maximum (2^31-1 ms ≈ 24.86 days). Without
+		// this, Node silently coerces overflowing delays to 1 ms and reauth
+		// fires immediately on long-lived sessions.
+		const MAX_TIMER_MS = 0x7fffffff
+		const delayMs = Math.min(MAX_TIMER_MS, Math.max(0, lifetimeMs - thresholdMs))
 
 		this.saslReauthTimer = setTimeout(() => {
 			if (!this.isConnected) {
