@@ -65,7 +65,14 @@ export class LMDBKeyValueStore<K, V> implements KeyValueStore<K, V> {
 		const fromBytes = this.keyCodec.encode(from)
 		const toBytes = this.keyCodec.encode(to)
 
-		for (const { key, value } of this.db.getRange({ start: fromBytes, end: toBytes })) {
+		// lmdb-js's getRange end bound is EXCLUSIVE, but the KeyValueStore.range
+		// contract is inclusive (matching the in-memory provider). Construct a
+		// strictly-greater end bound by appending a zero byte — any key
+		// lexicographically following toBytes (including toBytes itself) sorts
+		// before this synthetic key, so toBytes is included.
+		const inclusiveEnd = Buffer.concat([toBytes, Buffer.from([0])])
+
+		for (const { key, value } of this.db.getRange({ start: fromBytes, end: inclusiveEnd })) {
 			yield [this.keyCodec.decode(key), this.valueCodec.decode(value)]
 		}
 	}
