@@ -643,8 +643,14 @@ export class FetchManager {
 	private async fetchFromBrokerToBuffer(broker: Broker, partitions: PartitionState[]): Promise<void> {
 		if (!this.fetchBuffer) return
 
-		// Track fetch offsets for filtering
+		// Track fetch offsets and the PartitionState identity per key. After
+		// the await on broker.fetch, partitionStates may have been mutated by a
+		// rebalance: the same key could now point to a fresh PartitionState
+		// (revoke + reassign during cooperative rebalance). We must NOT apply
+		// records from a stale fetch to that fresh state — its offset would be
+		// clobbered with stale data.
 		const fetchOffsetByKey = new Map<string, bigint>()
+		const inflightStateByKey = new Map<string, PartitionState>()
 
 		// Build topics array
 		const topicsMap = new Map<string, Array<{ state: PartitionState }>>()
@@ -653,7 +659,9 @@ export class FetchManager {
 				topicsMap.set(state.topic, [])
 			}
 			topicsMap.get(state.topic)!.push({ state })
-			fetchOffsetByKey.set(tpKey(state.topic, state.partition), state.offset)
+			const key = tpKey(state.topic, state.partition)
+			fetchOffsetByKey.set(key, state.offset)
+			inflightStateByKey.set(key, state)
 		}
 
 		const topics = Array.from(topicsMap.entries()).map(([topic, parts]) => ({
@@ -685,6 +693,17 @@ export class FetchManager {
 				const state = this.partitionStates.get(key)
 				if (!state) continue
 
+				// Fence: only apply this response to the SAME PartitionState the
+				// fetch was issued against. If the entry was replaced during the
+				// await (revoke + reassign), drop the stale records.
+				if (state !== inflightStateByKey.get(key)) {
+					this.logger.debug('dropping fetch response for replaced partition state', {
+						topic: topicResponse.topic,
+						partition: partitionResponse.partitionIndex,
+					})
+					continue
+				}
+
 				// Handle errors
 				if (partitionResponse.errorCode !== ErrorCode.None) {
 					await this.handleFetchError(state, partitionResponse.errorCode)
@@ -699,6 +718,18 @@ export class FetchManager {
 						partitionResponse.lastStableOffset
 					)
 					let records = decodeResult instanceof Promise ? await decodeResult : decodeResult
+
+					// decodeRecords can await (compressed records / async codecs),
+					// during which the partition state may have been replaced again.
+					// Re-check identity before applying records to avoid clobbering
+					// the new state with offsets from the stale fetch.
+					if (this.partitionStates.get(key) !== state) {
+						this.logger.debug('dropping fetch response after decode for replaced partition state', {
+							topic: topicResponse.topic,
+							partition: partitionResponse.partitionIndex,
+						})
+						continue
+					}
 
 					const fetchOffset = fetchOffsetByKey.get(key)
 					if (fetchOffset !== undefined) {
