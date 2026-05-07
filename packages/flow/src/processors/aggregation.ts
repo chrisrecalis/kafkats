@@ -227,10 +227,10 @@ export class SessionReduceNode<K, V> extends Processor<K, V, Windowed<K>, V> {
  * Processor node for windowed aggregations.
  */
 export class WindowedAggregateNode<K, V, A> extends Processor<K, V, Windowed<K>, A> {
-	// Cleanup interval: run expiration every 60 seconds
+	// Cleanup interval: run expiration every N input records' worth of stream time.
 	private static readonly CLEANUP_INTERVAL_MS = 60_000
-	// Shared state for last cleanup time across clones
-	private readonly cleanupState: { lastCleanupTime: number }
+	// Shared state for stream-time-based cleanup across clones
+	private readonly cleanupState: { lastCleanupStreamTimeMs: number; streamTimeMs: number }
 
 	constructor(
 		private readonly storeName: string,
@@ -238,10 +238,10 @@ export class WindowedAggregateNode<K, V, A> extends Processor<K, V, Windowed<K>,
 		private readonly initializer: () => A,
 		private readonly aggregator: (key: K, value: V, aggregate: A) => A,
 		private readonly windowSizeMs: number,
-		cleanupState?: { lastCleanupTime: number }
+		cleanupState?: { lastCleanupStreamTimeMs: number; streamTimeMs: number }
 	) {
 		super()
-		this.cleanupState = cleanupState ?? { lastCleanupTime: 0 }
+		this.cleanupState = cleanupState ?? { lastCleanupStreamTimeMs: 0, streamTimeMs: 0 }
 	}
 
 	clone(worker: WorkerContext): Processor<K, V, Windowed<K>, A> {
@@ -292,11 +292,19 @@ export class WindowedAggregateNode<K, V, A> extends Processor<K, V, Windowed<K>,
 		// Store updated aggregate
 		await store.put(windowedKey, newAggregate)
 
-		// Periodically enforce retention by expiring old windows
-		const now = Date.now()
-		if (now - this.cleanupState.lastCleanupTime > WindowedAggregateNode.CLEANUP_INTERVAL_MS) {
-			this.cleanupState.lastCleanupTime = now
-			await store.expireOldWindows(now)
+		// Periodically enforce retention by expiring old windows. Use stream
+		// time (the max record timestamp seen) rather than wall clock so
+		// replay/backfill scenarios behave the same way as live processing.
+		// With wall clock, replaying a 1-day-old record could spuriously
+		// expire current windows, and a slow producer with old timestamps
+		// could trigger no expiry at all.
+		this.cleanupState.streamTimeMs = Math.max(this.cleanupState.streamTimeMs, timestamp)
+		if (
+			this.cleanupState.streamTimeMs - this.cleanupState.lastCleanupStreamTimeMs >
+			WindowedAggregateNode.CLEANUP_INTERVAL_MS
+		) {
+			this.cleanupState.lastCleanupStreamTimeMs = this.cleanupState.streamTimeMs
+			await store.expireOldWindows(this.cleanupState.streamTimeMs)
 		}
 
 		// Forward the windowed result
