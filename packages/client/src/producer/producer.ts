@@ -672,7 +672,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	}): void {
 		const { batch, baseSequence, recordCount, batchId, messagesToSend } = prepared
 
-		this.logger.error('out of order sequence number', {
+		this.logger.error('out of order sequence number — fencing producer for re-init', {
 			topic: batch.topic,
 			partition: batch.partition,
 			baseSequence,
@@ -682,6 +682,16 @@ export class Producer extends EventEmitter<ProducerEvents> {
 
 		this.rollbackSequence(batch.topic, batch.partition, recordCount)
 		this.inflightBatches.delete(batchId)
+
+		// OOO is a fatal-per-partition condition: a prior batch was lost/dropped,
+		// so all subsequent in-flight batches will also fail. Without resetting,
+		// every following send to this partition keeps reserving sequences against
+		// the wrong base and the partition is effectively stuck until the
+		// producer process restarts. Mark the producer as fenced so the next
+		// send triggers re-initialization (fresh producerId/epoch + zeroed
+		// sequences), which is how the Java client recovers from OOO.
+		this.idempotentState = 'fenced'
+		this.accumulator.setFenced(true)
 
 		const error = new Error(
 			`Out of order sequence for ${batch.topic}-${batch.partition}: baseSequence=${baseSequence}`
