@@ -1382,14 +1382,22 @@ export class Producer extends EventEmitter<ProducerEvents> {
 				})),
 			})
 
-			// Check for errors - collect all partition errors
-			let hasError = false
+			// Check for errors - collect first failure (also classify as
+			// coordinator vs other-retriable so we can refresh the coordinator
+			// in the right path).
+			let firstError: { topic: string; partition: number; errorCode: ErrorCode } | null = null
 			let coordinatorError: ErrorCode | null = null
 
 			for (const topic of response.topics) {
 				for (const partition of topic.partitions) {
 					if (partition.errorCode !== ErrorCode.None) {
-						hasError = true
+						if (firstError === null) {
+							firstError = {
+								topic: topic.name,
+								partition: partition.partitionIndex,
+								errorCode: partition.errorCode,
+							}
+						}
 						if (
 							partition.errorCode === ErrorCode.NotCoordinator ||
 							partition.errorCode === ErrorCode.CoordinatorNotAvailable
@@ -1400,11 +1408,11 @@ export class Producer extends EventEmitter<ProducerEvents> {
 				}
 			}
 
-			if (!hasError) {
+			if (firstError === null) {
 				return // Success
 			}
 
-			// Handle coordinator move - invalidate cache and re-fetch
+			// Coordinator move — invalidate cache and re-fetch before retrying.
 			if (coordinatorError !== null) {
 				this.cluster.invalidateCoordinator('GROUP', groupId)
 				groupCoordinator = await this.cluster.getCoordinator('GROUP', groupId)
@@ -1413,19 +1421,27 @@ export class Producer extends EventEmitter<ProducerEvents> {
 					await this.sleep(strategy.nextDelay())
 					continue
 				}
-			}
-
-			// Throw first error found
-			for (const topic of response.topics) {
-				for (const partition of topic.partitions) {
-					if (partition.errorCode !== ErrorCode.None) {
-						throw new KafkaProtocolError(
-							partition.errorCode,
-							`TxnOffsetCommit failed for ${topic.name}-${partition.partitionIndex}`
-						)
-					}
+			} else if (
+				isRetriableError(firstError.errorCode) ||
+				// RebalanceInProgress is not globally retriable, but for
+				// TxnOffsetCommit it means the consumer group is rebalancing —
+				// wait and retry per the Kafka protocol.
+				firstError.errorCode === ErrorCode.RebalanceInProgress
+			) {
+				// Other retriable errors (CoordinatorLoadInProgress,
+				// RequestTimedOut, RebalanceInProgress, etc.) — wait and retry
+				// without flipping the coordinator.
+				strategy.recordFailure()
+				if (strategy.shouldReconnect()) {
+					await this.sleep(strategy.nextDelay())
+					continue
 				}
 			}
+
+			throw new KafkaProtocolError(
+				firstError.errorCode,
+				`TxnOffsetCommit failed for ${firstError.topic}-${firstError.partition}`
+			)
 		}
 	}
 
