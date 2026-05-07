@@ -914,7 +914,15 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	 */
 	async flush(): Promise<void> {
 		this.accumulator.flush()
-		await Promise.all(this.inflight)
+
+		// Drains run in queueMicrotask and may re-queue partition batches via
+		// scheduleDrain; loop until both pendingBatches and inflight are empty.
+		while (this.pendingBatches.length > 0 || this.drainScheduled || this.inflight.size > 0) {
+			while (this.pendingBatches.length > 0 || this.drainScheduled) {
+				await new Promise<void>(resolve => queueMicrotask(resolve))
+			}
+			await Promise.all(this.inflight)
+		}
 	}
 
 	/**
