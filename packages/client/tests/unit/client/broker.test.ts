@@ -39,11 +39,13 @@ function createMockConnection() {
 			),
 		sendNoResponse: vi
 			.fn()
-			.mockImplementation(async (_apiKey: ApiKey, _apiVersion: number, _encodePayload: (encoder: Encoder) => void) => {
-				if (!isConnected) {
-					throw new ConnectionClosedError('Connection closed')
+			.mockImplementation(
+				async (_apiKey: ApiKey, _apiVersion: number, _encodePayload: (encoder: Encoder) => void) => {
+					if (!isConnected) {
+						throw new ConnectionClosedError('Connection closed')
+					}
 				}
-			}),
+			),
 		setSendHandler(handler: (apiKey: ApiKey, apiVersion: number) => Promise<Buffer>) {
 			sendHandler = handler
 		},
