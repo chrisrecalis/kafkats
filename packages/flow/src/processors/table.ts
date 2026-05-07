@@ -139,8 +139,13 @@ export class TableGroupByNode<K, V, K2> extends Processor<K, V, K2, V> {
 
 		const [newGroupedKey, newValue] = this.fn(sourceKey, record.value)
 
-		// Store new mapping before forwarding deltas.
-		// Recompute nodes rely on mapping store as source of truth.
+		// Store new mapping before forwarding deltas. The downstream recompute
+		// nodes (TableGroupedComputeCountNode etc.) re-derive aggregates from
+		// the mapping store as the source of truth — they need the new
+		// mapping to be visible by the time SUB/ADD arrive. Reordering this
+		// (e.g. SUB-then-put) breaks at-least-once recompute semantics; see
+		// flow.test.ts "retracts counts when grouped key changes" which
+		// regresses if put is moved after SUB.
 		await store.put(sourceKey, { groupedKey: newGroupedKey, value: newValue })
 
 		// Retract old mapping if it exists
