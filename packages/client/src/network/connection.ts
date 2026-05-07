@@ -452,6 +452,47 @@ export class Connection extends EventEmitter<ConnectionEvents> {
 	}
 
 	/**
+	 * Send a request without waiting for a response.
+	 *
+	 * Used for fire-and-forget requests like Produce with acks=0, where the
+	 * broker sends no response. We allocate a correlation ID for framing
+	 * consistency but do not register the request in the pending map, so no
+	 * promise hangs waiting for a reply that will never arrive.
+	 *
+	 * Resolves once the request bytes have been handed to the socket.
+	 */
+	async sendNoResponse(apiKey: ApiKey, apiVersion: number, encodePayload: (encoder: Encoder) => void): Promise<void> {
+		if (!this.isConnected) {
+			throw new ConnectionClosedError('Cannot send on disconnected connection')
+		}
+
+		// Block normal requests while reauthentication is in progress.
+		if (this.saslReauthPromise && apiKey !== ApiKey.SaslAuthenticate) {
+			await this.saslReauthPromise
+		}
+
+		const correlationId = this.requestQueue.nextCorrelationId()
+
+		const encoder = new Encoder()
+		encoder.writeInt32(0) // Placeholder length prefix
+		encodeRequestHeader(encoder, {
+			apiKey,
+			apiVersion,
+			correlationId,
+			clientId: this.clientId,
+		})
+		encodePayload(encoder)
+
+		const buffer = encoder.toBuffer()
+		buffer.writeInt32BE(buffer.length - 4, 0)
+
+		if (!this.socket) {
+			throw new ConnectionClosedError('Socket is not connected')
+		}
+		this.socket.write(buffer)
+	}
+
+	/**
 	 * Handle incoming data from socket
 	 *
 	 * Kafka uses a simple framing protocol:

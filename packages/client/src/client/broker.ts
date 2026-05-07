@@ -373,6 +373,33 @@ export class Broker {
 		const startTime = Date.now()
 		this.logger.debug('sending request', { api: 'Produce', version, acks: request.acks })
 
+		// acks=0 (fire-and-forget): the broker sends no response. We must not
+		// await connection.send (which expects a correlated response), or the
+		// promise hangs until request timeout.
+		if (request.acks === 0) {
+			await this.connection.sendNoResponse(ApiKey.Produce, version, encoder => {
+				encodeProduceRequest(encoder, version, request)
+			})
+			const synthesized: ProduceResponse = {
+				topics: request.topics.map(t => ({
+					name: t.name,
+					partitions: t.partitions.map(p => ({
+						partitionIndex: p.partitionIndex,
+						errorCode: 0,
+						baseOffset: -1n,
+						logAppendTimeMs: -1n,
+						logStartOffset: -1n,
+						recordErrors: [],
+						errorMessage: null,
+					})),
+				})),
+				throttleTimeMs: 0,
+			}
+			const durationMs = Date.now() - startTime
+			this.logger.debug('fire-and-forget produce (acks=0)', { api: 'Produce', version, durationMs })
+			return synthesized
+		}
+
 		const responseBuffer = await this.connection.send(ApiKey.Produce, version, encoder => {
 			encodeProduceRequest(encoder, version, request)
 		})

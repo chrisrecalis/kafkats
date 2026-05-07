@@ -37,6 +37,13 @@ function createMockConnection() {
 					throw new Error('No send handler configured')
 				}
 			),
+		sendNoResponse: vi
+			.fn()
+			.mockImplementation(async (_apiKey: ApiKey, _apiVersion: number, _encodePayload: (encoder: Encoder) => void) => {
+				if (!isConnected) {
+					throw new ConnectionClosedError('Connection closed')
+				}
+			}),
 		setSendHandler(handler: (apiKey: ApiKey, apiVersion: number) => Promise<Buffer>) {
 			sendHandler = handler
 		},
@@ -393,6 +400,62 @@ describe('Broker', () => {
 
 			// Verify fetch used fetchConnection
 			expect(fetchConnection.send).toHaveBeenCalled()
+		})
+	})
+
+	describe('produce with acks=0', () => {
+		it('returns immediately when acks=0 (broker sends no response)', async () => {
+			const controlConnection = createMockConnection()
+			const fetchConnection = createMockConnection()
+
+			const broker = new Broker({
+				host: 'localhost',
+				port: 9092,
+				nodeId: 1,
+				clientId: 'test-client',
+			})
+			;(broker as unknown as { connection: typeof controlConnection }).connection = controlConnection
+			;(broker as unknown as { fetchConnection: typeof fetchConnection }).fetchConnection = fetchConnection
+
+			// ApiVersions during connect; after that, send should NEVER be awaited for produce
+			// because acks=0 means the broker sends no response.
+			controlConnection.setSendHandler(async apiKey => {
+				if (apiKey === ApiKey.ApiVersions) {
+					return buildApiVersionsResponse([
+						{ apiKey: ApiKey.ApiVersions, minVersion: 0, maxVersion: 3 },
+						{ apiKey: ApiKey.Metadata, minVersion: 0, maxVersion: 12 },
+						{ apiKey: ApiKey.Produce, minVersion: 0, maxVersion: 9 },
+					])
+				}
+				if (apiKey === ApiKey.Produce) {
+					// Simulate the real broker: never resolve. If broker.produce
+					// awaits this, the test will hang/timeout.
+					return new Promise<Buffer>(() => {})
+				}
+				throw new Error(`Unexpected API key: ${apiKey}`)
+			})
+
+			await broker.connect()
+
+			const produceCall = broker.produce({
+				transactionalId: null,
+				acks: 0,
+				timeoutMs: 30000,
+				topics: [
+					{
+						name: 'test-topic',
+						partitions: [{ partitionIndex: 0, records: Buffer.alloc(0) }],
+					},
+				],
+			})
+
+			const result = await Promise.race([
+				produceCall,
+				new Promise<'TIMEOUT'>(resolve => setTimeout(() => resolve('TIMEOUT'), 100)),
+			])
+			expect(result).not.toBe('TIMEOUT')
+			// Synthesized response: empty topics array is acceptable; no errors
+			expect(typeof result).toBe('object')
 		})
 	})
 })
