@@ -86,6 +86,9 @@ export class Decoder implements IDecoder {
 			byte = this.buffer[this.position++]!
 			value |= (byte & 0x7f) << shift
 			shift += 7
+			if (shift > 28 && (byte & 0x80) !== 0) {
+				throw new Error('VARINT is too long for 32-bit integer')
+			}
 		} while ((byte & 0x80) !== 0)
 
 		return zigZagDecode32(value)
@@ -120,6 +123,9 @@ export class Decoder implements IDecoder {
 			byte = this.buffer[this.position++]!
 			value |= (byte & 0x7f) << shift
 			shift += 7
+			if (shift > 28 && (byte & 0x80) !== 0) {
+				throw new Error('UVARINT is too long for 32-bit integer')
+			}
 		} while ((byte & 0x80) !== 0)
 
 		return value
