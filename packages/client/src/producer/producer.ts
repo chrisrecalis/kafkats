@@ -1069,30 +1069,38 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		topicDef: TopicDefinition<V, K>,
 		messages: ProducerMessage<V, K> | ProducerMessage<V, K>[]
 	): Promise<SendResult | SendResult[]> {
+		const isSingle = !Array.isArray(messages)
 		const msgArray = Array.isArray(messages) ? messages : [messages]
 
 		const { encodeKey, encodeValue } = this.resolveEncoders(topicDef)
 
-		// Determine partitions that will be used
+		// Determine partitions and freeze them on each message before passing to
+		// internalSend. Calling the partitioner twice is unsafe for stateful
+		// partitioners like round-robin: the counter advances and the partitions
+		// registered with the transaction coordinator no longer match the
+		// partitions that internalSend ends up writing to. Records would land
+		// outside the transaction.
 		const partitionCount = await this.getPartitionCount(topicDef.topic)
 		const partitionsToAdd = new Set<number>()
-
-		for (const msg of msgArray) {
-			let partition = msg.partition
-			if (partition === undefined) {
-				const valueBuffer = msg.value === null ? null : encodeValue(msg.value)
-				const partitionValue = valueBuffer ?? EMPTY_BUFFER
-				const keyBuffer = encodeKey(msg.key)
-
-				partition = this.config.partitioner(topicDef.topic, keyBuffer, partitionValue, partitionCount)
-				if (partition === -1) {
-					partition = this.getStickyPartition(topicDef.topic, partitionCount)
-				}
+		const resolvedMessages = msgArray.map(msg => {
+			if (msg.partition !== undefined) {
+				return msg
 			}
+			const valueBuffer = msg.value === null ? null : encodeValue(msg.value)
+			const partitionValue = valueBuffer ?? EMPTY_BUFFER
+			const keyBuffer = encodeKey(msg.key)
 
-			const key = `${topicDef.topic}:${partition}`
+			let partition = this.config.partitioner(topicDef.topic, keyBuffer, partitionValue, partitionCount)
+			if (partition === -1) {
+				partition = this.getStickyPartition(topicDef.topic, partitionCount)
+			}
+			return { ...msg, partition }
+		})
+
+		for (const msg of resolvedMessages) {
+			const key = `${topicDef.topic}:${msg.partition}`
 			if (!this.partitionsInTransaction.has(key)) {
-				partitionsToAdd.add(partition)
+				partitionsToAdd.add(msg.partition!)
 			}
 		}
 
@@ -1101,8 +1109,9 @@ export class Producer extends EventEmitter<ProducerEvents> {
 			await this.addPartitionsToTransaction(topicDef.topic, Array.from(partitionsToAdd))
 		}
 
-		// Now do the actual send (uses internal send to bypass transactional check)
-		return this.internalSend(topicDef, messages)
+		// Now do the actual send. internalSend won't re-invoke the partitioner
+		// because msg.partition is now set on every message.
+		return this.internalSend(topicDef, isSingle ? resolvedMessages[0]! : resolvedMessages)
 	}
 
 	/**
