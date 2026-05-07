@@ -234,14 +234,20 @@ export class LMDBWindowStore<K, V> implements WindowStore<K, V> {
 		await Promise.resolve()
 		const keyBytes = this.keyCodec.encode(key)
 
-		// Scan the time range and filter by key
+		// Encoding sorts by windowStart first, then windowEnd, then key bytes.
+		// We want windows whose START is in [timeFrom, timeTo]. The previous
+		// upper bound (timeTo, timeTo+1) MISSED records where
+		// windowStart == timeTo but windowEnd > timeTo+1, because those sort
+		// after that synthetic key.
 		const fromBytes = Buffer.alloc(16)
 		fromBytes.writeBigInt64BE(BigInt(timeFrom), 0)
-		fromBytes.writeBigInt64BE(BigInt(timeFrom), 8)
+		fromBytes.writeBigInt64BE(BigInt(0), 8)
 
+		// Strict upper bound: any windowStart > timeTo is excluded; everything
+		// with windowStart <= timeTo (regardless of windowEnd) is included.
 		const toBytes = Buffer.alloc(16)
-		toBytes.writeBigInt64BE(BigInt(timeTo), 0)
-		toBytes.writeBigInt64BE(BigInt(timeTo + 1), 8) // Inclusive upper bound
+		toBytes.writeBigInt64BE(BigInt(timeTo + 1), 0)
+		toBytes.writeBigInt64BE(BigInt(0), 8)
 
 		for (const { key: storedKey, value } of this.db.getRange({ start: fromBytes, end: toBytes })) {
 			const windowedKey = this.windowedCodec.decode(storedKey)
@@ -255,13 +261,14 @@ export class LMDBWindowStore<K, V> implements WindowStore<K, V> {
 
 	async *fetchAll(timeFrom: number, timeTo: number): AsyncIterable<[WindowedKey<K>, V]> {
 		await Promise.resolve()
+		// See fetch() for bound rationale.
 		const fromBytes = Buffer.alloc(16)
 		fromBytes.writeBigInt64BE(BigInt(timeFrom), 0)
-		fromBytes.writeBigInt64BE(BigInt(timeFrom), 8)
+		fromBytes.writeBigInt64BE(BigInt(0), 8)
 
 		const toBytes = Buffer.alloc(16)
-		toBytes.writeBigInt64BE(BigInt(timeTo), 0)
-		toBytes.writeBigInt64BE(BigInt(timeTo + 1), 8)
+		toBytes.writeBigInt64BE(BigInt(timeTo + 1), 0)
+		toBytes.writeBigInt64BE(BigInt(0), 8)
 
 		for (const { key, value } of this.db.getRange({ start: fromBytes, end: toBytes })) {
 			yield [this.windowedCodec.decode(key), this.valueCodec.decode(value)]
@@ -305,12 +312,22 @@ export class LMDBWindowStore<K, V> implements WindowStore<K, V> {
 		const cutoff = currentTime - this.retentionMs
 		const toDelete: Buffer[] = []
 
+		// Encoding sorts by windowStart first. The previous bound
+		// (0, cutoff) selected only records with windowStart < 0 — none —
+		// so expiry NEVER fired and the store grew unboundedly.
+		// Correct: scan records whose windowStart < cutoff, then drop those
+		// whose windowEnd is also < cutoff. (A window whose windowStart <
+		// cutoff but windowEnd >= cutoff is still partially within retention
+		// and shouldn't be removed.)
 		const cutoffBytes = Buffer.alloc(16)
-		cutoffBytes.writeBigInt64BE(BigInt(0), 0)
-		cutoffBytes.writeBigInt64BE(BigInt(cutoff), 8)
+		cutoffBytes.writeBigInt64BE(BigInt(cutoff), 0)
+		cutoffBytes.writeBigInt64BE(BigInt(0), 8)
 
 		for (const { key } of this.db.getRange({ end: cutoffBytes })) {
-			toDelete.push(key)
+			const windowedKey = this.windowedCodec.decode(key)
+			if (windowedKey.windowEnd < cutoff) {
+				toDelete.push(key)
+			}
 		}
 
 		for (const key of toDelete) {
