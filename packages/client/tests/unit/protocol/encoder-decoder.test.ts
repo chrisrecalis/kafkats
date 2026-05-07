@@ -149,4 +149,18 @@ describe('Encoder/Decoder roundtrip', () => {
 		expect(() => decoder.seek(4)).toThrow('Invalid seek position')
 		expect(() => decoder.skip(4)).toThrow('Buffer underflow')
 	})
+
+	it('throws on UVARINT longer than 5 bytes (shift overflow guard)', () => {
+		// Six continuation bytes — a malformed varint that exceeds 32 bits.
+		// Without a shift-overflow guard, JS shifts wrap mod 32 and produce silently-wrong values.
+		const buffer = Buffer.from([0xff, 0xff, 0xff, 0xff, 0xff, 0x7f])
+		const decoder = new Decoder(buffer)
+		expect(() => decoder.readUVarInt()).toThrow(/UVARINT/i)
+	})
+
+	it('throws on VARINT longer than 5 bytes (shift overflow guard)', () => {
+		const buffer = Buffer.from([0xff, 0xff, 0xff, 0xff, 0xff, 0x7f])
+		const decoder = new Decoder(buffer)
+		expect(() => decoder.readVarInt()).toThrow(/VARINT/i)
+	})
 })
