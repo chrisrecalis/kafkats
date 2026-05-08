@@ -1032,6 +1032,51 @@ describe('changelog topics and restoration', () => {
 		expect(await checkpoint.get(changelogTopic, 0)).toBe(endOffsets.get(0))
 	}, 60_000)
 
+	// Restorer must use read_committed so aborted records never enter state. See F7 in CORRECTNESS-FOLLOWUPS.md.
+	it('ChangelogRestorer skips aborted-transaction records', async () => {
+		const changelogTopic = uniqueTopicName('flow-it-changelog-aborted-txn')
+		await createTopics(client, [{ name: changelogTopic, partitions: 1 }])
+
+		const txProducer = client.producer({
+			transactionalId: uniqueTopicName('flow-it-restorer-aborted-tx'),
+			idempotent: true,
+		})
+		try {
+			await expect(
+				txProducer.transaction(async tx => {
+					await tx.send(changelogTopic, { key: 'aborted-key', value: numberCodec.encode(999) })
+					throw new Error('intentional abort')
+				})
+			).rejects.toThrow()
+
+			await txProducer.transaction(async tx => {
+				await tx.send(changelogTopic, { key: 'committed-key', value: numberCodec.encode(42) })
+			})
+		} finally {
+			await txProducer.disconnect()
+		}
+
+		const store = new InMemoryKeyValueStore<string, number>('aborted-txn-store', {
+			keyCodec: stringCodec,
+			valueCodec: numberCodec,
+		})
+		await store.init()
+
+		const restorer = new ChangelogRestorer(changelogTopic, stringCodec, numberCodec, store)
+		// Under read_committed the LSO sits past the COMMIT control batch, so the offset+1≥endOffset
+		// fast-path in restoration never triggers; idle-after-progress completes gracefully (F7b fix).
+		const restored = await restorer.restore(client, {
+			idleTimeoutMs: 2_000,
+			initialIdleTimeoutMs: 10_000,
+			checkIntervalMs: 200,
+			consumerMaxWaitMs: 200,
+		})
+
+		expect(restored).toBe(1)
+		expect(await store.get('committed-key')).toBe(42)
+		expect(await store.get('aborted-key')).toBeUndefined()
+	}, 60_000)
+
 	it('writes changelog checkpoints when checkpoint store is available', async () => {
 		const input = uniqueTopicName('flow-it-checkpoint-src')
 		const outputTopic = uniqueTopicName('flow-it-checkpoint-out')
