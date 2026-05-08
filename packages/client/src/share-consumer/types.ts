@@ -1,17 +1,19 @@
 /**
- * Share consumer types and interfaces
+ * Share consumer types and interfaces.
  *
- * @experimental
+ * Implements Kafka Share Groups (KIP-932), generally available since Kafka 4.2.
+ * Supports ShareFetch/ShareAcknowledge v1 (Kafka 4.1+) and v2 (Kafka 4.2+).
  */
 
 import type { TopicDefinition, DecoderLike } from '@/topic.js'
 
 // ==================== Subscription Types ====================
 
+/** Acquire mode for ShareFetch (KIP-1206, Kafka 4.2+). */
+export type ShareConsumerAcquireMode = 'batch_optimized' | 'record_limit'
+
 /**
  * Topic subscription configuration
- *
- * @experimental
  */
 export interface TopicSubscription<V = Buffer, K = Buffer> {
 	topic: string
@@ -70,21 +72,13 @@ export function toTopicSubscription<V, K>(
 
 // ==================== Message Types ====================
 
-/**
- * Topic-partition assignment
- *
- * @experimental
- */
+/** Topic-partition assignment */
 export interface TopicPartition {
 	topic: string
 	partition: number
 }
 
-/**
- * Context provided to message handlers
- *
- * @experimental
- */
+/** Context provided to message handlers */
 export interface ConsumeContext {
 	signal: AbortSignal
 	topic: string
@@ -92,11 +86,7 @@ export interface ConsumeContext {
 	offset: bigint
 }
 
-/**
- * Share consumer configuration
- *
- * @experimental
- */
+/** Share consumer configuration */
 export interface ShareConsumerConfig {
 	/**
 	 * Share group ID (Kafka share group == group.id)
@@ -126,13 +116,15 @@ export interface ShareConsumerConfig {
 	 * Suggested batch size for acquired records / acknowledgements (ShareFetch v1+)
 	 */
 	batchSize?: number
+	/**
+	 * Acquire mode (KIP-1206, ShareFetch v2+, Kafka 4.2+).
+	 * - `batch_optimized` (default): broker may return more than `maxRecords` to align batch boundaries.
+	 * - `record_limit`: broker strictly caps the response at `maxRecords`. Requires v2; throws on older brokers.
+	 */
+	acquireMode?: ShareConsumerAcquireMode
 }
 
-/**
- * A consumed share message with decoded value
- *
- * @experimental
- */
+/** A consumed share message with decoded value */
 export interface ShareMessage<V = Buffer, K = Buffer> {
 	topic: string
 	partition: number
@@ -160,13 +152,19 @@ export interface ShareMessage<V = Buffer, K = Buffer> {
 	 * Reject this record and do not make it eligible for redelivery (REJECT).
 	 */
 	reject(): Promise<void>
+	/**
+	 * Renew the acquisition lock (KIP-1222, Kafka 4.2+).
+	 *
+	 * Use for long-running handlers that need more time than the broker's lock timeout.
+	 * The message remains in-flight after `renew()`; the handler must still call `ack`/`release`/`reject`
+	 * (or `runEach()` will auto-ack on success). Multiple renews per message are allowed.
+	 *
+	 * Throws if the broker does not support ShareAcknowledge v2.
+	 */
+	renew(): Promise<void>
 }
 
-/**
- * Handler for ShareConsumer message processing
- *
- * @experimental
- */
+/** Handler for ShareConsumer message processing */
 export type ShareMessageHandler<V = Buffer, K = Buffer> = (
 	message: ShareMessage<V, K>,
 	ctx: ConsumeContext
@@ -176,8 +174,6 @@ export type ShareMessageHandler<V = Buffer, K = Buffer> = (
  * Subscription input for ShareConsumer.
  *
  * Supports the same subscription shapes as `Consumer`.
- *
- * @experimental
  */
 /* eslint-disable @typescript-eslint/no-explicit-any */
 export type ShareSubscriptionInput =
@@ -206,11 +202,7 @@ export type ShareKeyOf<S> = S extends string
 				: never
 /* eslint-enable @typescript-eslint/no-explicit-any */
 
-/**
- * Options for runEach() - single message processing
- *
- * @experimental
- */
+/** Options for runEach() - single message processing */
 export interface ShareRunEachOptions {
 	/**
 	 * Maximum number of records to process concurrently.
@@ -229,11 +221,7 @@ export interface ShareRunEachOptions {
 	idleBackoffMs?: number
 }
 
-/**
- * Share consumer events
- *
- * @experimental
- */
+/** Share consumer events */
 export interface ShareConsumerEvents {
 	running: []
 	stopped: []
@@ -243,13 +231,14 @@ export interface ShareConsumerEvents {
 }
 
 export const DEFAULT_SHARE_CONSUMER_CONFIG: Required<
-	Pick<ShareConsumerConfig, 'maxWaitMs' | 'minBytes' | 'maxBytes' | 'maxRecords' | 'batchSize'>
+	Pick<ShareConsumerConfig, 'maxWaitMs' | 'minBytes' | 'maxBytes' | 'maxRecords' | 'batchSize' | 'acquireMode'>
 > = {
 	maxWaitMs: 5000,
 	minBytes: 1,
 	maxBytes: 1048576,
 	maxRecords: 500,
 	batchSize: 100,
+	acquireMode: 'batch_optimized',
 }
 
 export const DEFAULT_SHARE_RUN_EACH_OPTIONS: Required<Pick<ShareRunEachOptions, 'concurrency'>> &

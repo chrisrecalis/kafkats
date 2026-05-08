@@ -7,7 +7,11 @@ import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import { encodeShareGroupHeartbeatRequest } from '@/protocol/messages/requests/share-group-heartbeat.js'
 import { decodeShareGroupHeartbeatResponse } from '@/protocol/messages/responses/share-group-heartbeat.js'
 
-import { encodeShareFetchRequest } from '@/protocol/messages/requests/share-fetch.js'
+import {
+	encodeShareFetchRequest,
+	SHARE_ACQUIRE_MODE_BATCH_OPTIMIZED,
+	SHARE_ACQUIRE_MODE_RECORD_LIMIT,
+} from '@/protocol/messages/requests/share-fetch.js'
 import { decodeShareFetchResponse } from '@/protocol/messages/responses/share-fetch.js'
 
 import { encodeShareAcknowledgeRequest } from '@/protocol/messages/requests/share-acknowledge.js'
@@ -292,5 +296,283 @@ describe('share protocol codecs', () => {
 		expect(res.errorCode).toBe(ErrorCode.None)
 		expect(res.topics[0]?.topicId).toBe('00000000-0000-0000-0000-000000000001')
 		expect(res.topics[0]?.partitions[0]?.errorCode).toBe(ErrorCode.None)
+	})
+
+	// ── ShareFetch v2 tests ─────────────────────────────────────────────────
+
+	it('encodes ShareFetchRequest v2 with acquireMode=batch_optimized and no renew acks', () => {
+		const enc = new Encoder()
+		encodeShareFetchRequest(enc, 2, {
+			groupId: 'g1',
+			memberId: 'm1',
+			shareSessionEpoch: 0,
+			maxWaitMs: 5000,
+			minBytes: 1,
+			maxBytes: 1024,
+			maxRecords: 500,
+			batchSize: 100,
+			// acquireMode and isRenewAck left undefined — should default to 0 / false
+			topics: [
+				{
+					topicId: '00000000-0000-0000-0000-000000000001',
+					partitions: [{ partitionIndex: 0, acknowledgementBatches: [] }],
+				},
+			],
+			forgottenTopicsData: [],
+		})
+
+		const dec = new Decoder(enc.toBuffer())
+		// Skip header fields up to batchSize
+		dec.readCompactNullableString() // groupId
+		dec.readCompactNullableString() // memberId
+		dec.readInt32() // shareSessionEpoch
+		dec.readInt32() // maxWaitMs
+		dec.readInt32() // minBytes
+		dec.readInt32() // maxBytes
+		dec.readInt32() // maxRecords
+		dec.readInt32() // batchSize
+
+		// v2 extra fields
+		expect(dec.readInt8()).toBe(SHARE_ACQUIRE_MODE_BATCH_OPTIMIZED) // acquireMode = 0
+		expect(dec.readInt8()).toBe(0) // isRenewAck = false (written as bool → byte 0)
+
+		// Topics array should still decode correctly
+		const topics = dec.readCompactArray(d => {
+			const topicId = d.readUUID()
+			const partitions = d.readCompactArray(pd => {
+				const partitionIndex = pd.readInt32()
+				pd.readCompactArray(ad => {
+					ad.readInt64()
+					ad.readInt64()
+					ad.readCompactArray(td => td.readInt8())
+					ad.skipTaggedFields()
+				})
+				pd.skipTaggedFields()
+				return { partitionIndex }
+			})
+			d.skipTaggedFields()
+			return { topicId, partitions }
+		})
+		expect(topics[0]?.topicId).toBe('00000000-0000-0000-0000-000000000001')
+		expect(topics[0]?.partitions[0]?.partitionIndex).toBe(0)
+	})
+
+	it('encodes ShareFetchRequest v2 with acquireMode=record_limit and isRenewAck=true', () => {
+		const enc = new Encoder()
+		encodeShareFetchRequest(enc, 2, {
+			groupId: 'g1',
+			memberId: 'm1',
+			shareSessionEpoch: 0,
+			maxWaitMs: 5000,
+			minBytes: 1,
+			maxBytes: 1024,
+			maxRecords: 500,
+			batchSize: 100,
+			acquireMode: SHARE_ACQUIRE_MODE_RECORD_LIMIT,
+			isRenewAck: true,
+			topics: [],
+			forgottenTopicsData: [],
+		})
+
+		const dec = new Decoder(enc.toBuffer())
+		dec.readCompactNullableString() // groupId
+		dec.readCompactNullableString() // memberId
+		dec.readInt32() // shareSessionEpoch
+		dec.readInt32() // maxWaitMs
+		dec.readInt32() // minBytes
+		dec.readInt32() // maxBytes
+		dec.readInt32() // maxRecords
+		dec.readInt32() // batchSize
+
+		expect(dec.readInt8()).toBe(SHARE_ACQUIRE_MODE_RECORD_LIMIT) // acquireMode = 1
+		expect(dec.readInt8()).toBe(1) // isRenewAck = true (written as bool → byte 1)
+	})
+
+	it('ShareFetchRequest v1 rejects acquireMode=record_limit', () => {
+		const enc = new Encoder()
+		expect(() =>
+			encodeShareFetchRequest(enc, 1, {
+				groupId: 'g1',
+				memberId: 'm1',
+				shareSessionEpoch: 0,
+				maxWaitMs: 5000,
+				minBytes: 1,
+				maxBytes: 1024,
+				maxRecords: 500,
+				batchSize: 100,
+				acquireMode: SHARE_ACQUIRE_MODE_RECORD_LIMIT,
+				topics: [],
+				forgottenTopicsData: [],
+			})
+		).toThrow()
+	})
+
+	it('ShareFetchRequest v1 rejects isRenewAck=true', () => {
+		const enc = new Encoder()
+		expect(() =>
+			encodeShareFetchRequest(enc, 1, {
+				groupId: 'g1',
+				memberId: 'm1',
+				shareSessionEpoch: 0,
+				maxWaitMs: 5000,
+				minBytes: 1,
+				maxBytes: 1024,
+				maxRecords: 500,
+				batchSize: 100,
+				isRenewAck: true,
+				topics: [],
+				forgottenTopicsData: [],
+			})
+		).toThrow()
+	})
+
+	// ── ShareAcknowledge v2 tests ───────────────────────────────────────────
+
+	it('encodes ShareAcknowledgeRequest v2 with isRenewAck=true', () => {
+		const enc = new Encoder()
+		encodeShareAcknowledgeRequest(enc, 2, {
+			groupId: 'g1',
+			memberId: 'm1',
+			shareSessionEpoch: 0,
+			isRenewAck: true,
+			topics: [
+				{
+					topicId: '00000000-0000-0000-0000-000000000001',
+					partitions: [
+						{
+							partitionIndex: 0,
+							acknowledgementBatches: [{ firstOffset: 0n, lastOffset: 0n, acknowledgeTypes: [4] }],
+						},
+					],
+				},
+			],
+		})
+
+		const dec = new Decoder(enc.toBuffer())
+		dec.readCompactNullableString() // groupId
+		dec.readCompactNullableString() // memberId
+		dec.readInt32() // shareSessionEpoch
+
+		// v2: isRenewAck comes before topics
+		expect(dec.readInt8()).toBe(1) // isRenewAck = true → byte 1
+
+		// Topics should still decode correctly
+		const topics = dec.readCompactArray(d => {
+			const topicId = d.readUUID()
+			const partitions = d.readCompactArray(pd => {
+				const partitionIndex = pd.readInt32()
+				const batches = pd.readCompactArray(bd => {
+					bd.readInt64()
+					bd.readInt64()
+					const types = bd.readCompactArray(td => td.readInt8())
+					bd.skipTaggedFields()
+					return { types }
+				})
+				pd.skipTaggedFields()
+				return { partitionIndex, batches }
+			})
+			d.skipTaggedFields()
+			return { topicId, partitions }
+		})
+		expect(topics[0]?.topicId).toBe('00000000-0000-0000-0000-000000000001')
+		expect(topics[0]?.partitions[0]?.batches[0]?.types).toEqual([4])
+	})
+
+	it('ShareAcknowledgeRequest v1 rejects isRenewAck=true', () => {
+		const enc = new Encoder()
+		expect(() =>
+			encodeShareAcknowledgeRequest(enc, 1, {
+				groupId: 'g1',
+				memberId: 'm1',
+				shareSessionEpoch: 0,
+				isRenewAck: true,
+				topics: [],
+			})
+		).toThrow()
+	})
+
+	it('decodes ShareAcknowledgeResponse v2 with acquisitionLockTimeoutMs', () => {
+		const enc = new Encoder()
+		enc.writeInt32(0) // throttleTimeMs
+		enc.writeInt16(ErrorCode.None)
+		enc.writeCompactNullableString(null) // errorMessage
+		enc.writeInt32(30000) // acquisitionLockTimeoutMs (v2+)
+		enc.writeCompactArray(
+			[
+				{
+					topicId: '00000000-0000-0000-0000-000000000001',
+					partitions: [
+						{
+							partitionIndex: 0,
+							errorCode: ErrorCode.None,
+							errorMessage: null,
+							leaderId: 1,
+							leaderEpoch: 0,
+						},
+					],
+				},
+			],
+			(t, te) => {
+				te.writeUUID(t.topicId)
+				te.writeCompactArray(t.partitions, (p, pe) => {
+					pe.writeInt32(p.partitionIndex)
+					pe.writeInt16(p.errorCode)
+					pe.writeCompactNullableString(p.errorMessage)
+					pe.writeInt32(p.leaderId)
+					pe.writeInt32(p.leaderEpoch)
+					pe.writeEmptyTaggedFields() // currentLeader tagged fields
+					pe.writeEmptyTaggedFields()
+				})
+				te.writeEmptyTaggedFields()
+			}
+		)
+		enc.writeCompactArray([], () => {}) // nodeEndpoints
+		enc.writeEmptyTaggedFields()
+
+		const res = decodeShareAcknowledgeResponse(new Decoder(enc.toBuffer()), 2)
+		expect(res.acquisitionLockTimeoutMs).toBe(30000)
+		expect(res.errorCode).toBe(ErrorCode.None)
+	})
+
+	it('decodes ShareAcknowledgeResponse v1 defaults acquisitionLockTimeoutMs to 0', () => {
+		const enc = new Encoder()
+		enc.writeInt32(0) // throttleTimeMs
+		enc.writeInt16(ErrorCode.None)
+		enc.writeCompactNullableString(null) // errorMessage
+		// No acquisitionLockTimeoutMs field in v1
+		enc.writeCompactArray(
+			[
+				{
+					topicId: '00000000-0000-0000-0000-000000000001',
+					partitions: [
+						{
+							partitionIndex: 0,
+							errorCode: ErrorCode.None,
+							errorMessage: null,
+							leaderId: 1,
+							leaderEpoch: 0,
+						},
+					],
+				},
+			],
+			(t, te) => {
+				te.writeUUID(t.topicId)
+				te.writeCompactArray(t.partitions, (p, pe) => {
+					pe.writeInt32(p.partitionIndex)
+					pe.writeInt16(p.errorCode)
+					pe.writeCompactNullableString(p.errorMessage)
+					pe.writeInt32(p.leaderId)
+					pe.writeInt32(p.leaderEpoch)
+					pe.writeEmptyTaggedFields() // currentLeader tagged fields
+					pe.writeEmptyTaggedFields()
+				})
+				te.writeEmptyTaggedFields()
+			}
+		)
+		enc.writeCompactArray([], () => {}) // nodeEndpoints
+		enc.writeEmptyTaggedFields()
+
+		const res = decodeShareAcknowledgeResponse(new Decoder(enc.toBuffer()), 1)
+		expect(res.acquisitionLockTimeoutMs).toBe(0)
 	})
 })

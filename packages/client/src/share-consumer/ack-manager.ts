@@ -12,8 +12,10 @@ import type { Logger } from '@/logger.js'
 export const ACK_ACCEPT = 1
 export const ACK_RELEASE = 2
 export const ACK_REJECT = 3
+/** RENEW (KIP-1222, ShareAcknowledge/ShareFetch v2+) extends the acquisition lock without finalizing delivery. */
+export const ACK_RENEW = 4
 
-export type AcknowledgeType = typeof ACK_ACCEPT | typeof ACK_RELEASE | typeof ACK_REJECT
+export type AcknowledgeType = typeof ACK_ACCEPT | typeof ACK_RELEASE | typeof ACK_REJECT | typeof ACK_RENEW
 
 type PendingAckEntry = {
 	offset: bigint
@@ -32,6 +34,44 @@ type PendingPartitionAcks = {
 }
 
 /**
+ * Pick a single entry per offset. A finalizing ack (ACCEPT/RELEASE/REJECT) supersedes
+ * any RENEW for the same offset; multiple RENEWs collapse to one. Dropped entries' promises
+ * resolve/reject together with the kept entry so callers don't observe a stalled renew().
+ */
+function dedupePendingAckEntries(entries: PendingAckEntry[]): PendingAckEntry[] {
+	const byOffset = new Map<bigint, PendingAckEntry[]>()
+	for (const e of entries) {
+		const list = byOffset.get(e.offset)
+		if (list) list.push(e)
+		else byOffset.set(e.offset, [e])
+	}
+
+	const result: PendingAckEntry[] = []
+	for (const list of byOffset.values()) {
+		if (list.length === 1) {
+			result.push(list[0]!)
+			continue
+		}
+		const finalizer = list.find(e => e.type !== ACK_RENEW)
+		const kept = finalizer ?? list[0]!
+		const shadows = list.filter(e => e !== kept)
+		result.push({
+			offset: kept.offset,
+			type: kept.type,
+			resolve: () => {
+				kept.resolve()
+				for (const s of shadows) s.resolve()
+			},
+			reject: err => {
+				kept.reject(err)
+				for (const s of shadows) s.reject(err)
+			},
+		})
+	}
+	return result
+}
+
+/**
  * Coalesce sorted ack entries into ranges where consecutive offsets have the same type.
  * This reduces the number of acknowledgement batches sent to the broker.
  */
@@ -43,8 +83,8 @@ function coalesceAckEntries(entries: PendingAckEntry[]): {
 		return { batches: [], entriesByBatch: [] }
 	}
 
-	// Sort by offset
-	const sorted = [...entries].sort((a, b) => (a.offset < b.offset ? -1 : a.offset > b.offset ? 1 : 0))
+	const deduped = dedupePendingAckEntries(entries)
+	const sorted = deduped.sort((a, b) => (a.offset < b.offset ? -1 : a.offset > b.offset ? 1 : 0))
 
 	const batches: ShareAcknowledgeRequestPartition['acknowledgementBatches'] = []
 	const entriesByBatch: PendingAckEntry[][] = []
@@ -309,8 +349,17 @@ export class AckManager {
 					const broker = items[0]!.broker
 
 					const topicMap = new Map<string, ShareAcknowledgeRequest['topics'][number]>()
+					let hasRenewAck = false
 					for (const { partition } of items) {
 						const { batches } = coalesceAckEntries(partition.entries)
+						if (!hasRenewAck) {
+							for (const b of batches) {
+								if (b.acknowledgeTypes.includes(ACK_RENEW)) {
+									hasRenewAck = true
+									break
+								}
+							}
+						}
 
 						const topicEntry = topicMap.get(partition.topicId) ?? {
 							topicId: partition.topicId,
@@ -328,6 +377,7 @@ export class AckManager {
 					const request: ShareAcknowledgeRequestWithoutEpoch = {
 						groupId: this.groupId,
 						memberId: this.getMemberId(),
+						isRenewAck: hasRenewAck,
 						topics,
 					}
 

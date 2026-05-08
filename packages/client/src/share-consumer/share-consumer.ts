@@ -1,12 +1,10 @@
 /**
- * @experimental
- *
- * ShareConsumer implements Kafka Share Groups (KIP-932).
+ * ShareConsumer implements Kafka Share Groups (KIP-932), GA in Kafka 4.2.
  *
  * This is a separate consumer from the classic Consumer group implementation and uses:
  * - ShareGroupHeartbeat for membership
- * - ShareFetch for record acquisition
- * - ShareAcknowledge for per-record acknowledgements
+ * - ShareFetch for record acquisition (v1 = Kafka 4.1, v2 = Kafka 4.2 adds acquireMode and renew)
+ * - ShareAcknowledge for per-record acknowledgements (v1 = Kafka 4.1, v2 = Kafka 4.2 adds renew)
  */
 
 import { EventEmitter } from 'node:events'
@@ -54,7 +52,12 @@ import { sleep } from '@/utils/sleep.js'
 import { Decoder } from '@/protocol/primitives/decoder.js'
 
 import type { ShareAcknowledgeRequestWithoutEpoch } from './ack-manager.js'
-import { AckManager, ACK_ACCEPT, ACK_RELEASE, ACK_REJECT } from './ack-manager.js'
+import { AckManager, ACK_ACCEPT, ACK_RELEASE, ACK_REJECT, ACK_RENEW } from './ack-manager.js'
+import {
+	SHARE_ACQUIRE_MODE_BATCH_OPTIMIZED,
+	SHARE_ACQUIRE_MODE_RECORD_LIMIT,
+	type ShareAcquireMode,
+} from '@/protocol/messages/requests/share-fetch.js'
 import {
 	convertHeaders,
 	isControlBatch,
@@ -87,9 +90,6 @@ type ShareFetchWorkItem = {
 	keyDecoder: (b: Buffer) => unknown
 }
 
-/**
- * @experimental
- */
 export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 	private readonly cluster: Cluster
 	private readonly logger: Logger
@@ -97,6 +97,7 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 		Pick<ShareConsumerConfig, 'groupId' | 'maxWaitMs' | 'minBytes' | 'maxBytes' | 'maxRecords' | 'batchSize'>
 	> &
 		Pick<ShareConsumerConfig, 'rackId'>
+	private readonly acquireModeWire: ShareAcquireMode
 
 	private state: ShareConsumerState = 'idle'
 	private abortController: AbortController | null = null
@@ -129,6 +130,9 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 			maxRecords: config.maxRecords ?? DEFAULT_SHARE_CONSUMER_CONFIG.maxRecords,
 			batchSize: config.batchSize ?? DEFAULT_SHARE_CONSUMER_CONFIG.batchSize,
 		}
+		const acquireMode = config.acquireMode ?? DEFAULT_SHARE_CONSUMER_CONFIG.acquireMode
+		this.acquireModeWire =
+			acquireMode === 'record_limit' ? SHARE_ACQUIRE_MODE_RECORD_LIMIT : SHARE_ACQUIRE_MODE_BATCH_OPTIMIZED
 	}
 
 	get isRunning(): boolean {
@@ -290,6 +294,7 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 				maxBytes: this.config.maxBytes,
 				maxRecords: this.config.maxRecords,
 				batchSize: this.config.batchSize,
+				acquireMode: this.acquireModeWire,
 				topics: topicPartitions.map(tp => ({
 					topicId: tp.topicId,
 					partitions: tp.partitions.map(p => ({
@@ -787,6 +792,13 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 				}
 				handled = 3
 				await ackManager.enqueue(topicName, topicId, partitionIndex, record.offset, ACK_REJECT)
+			},
+			renew: async () => {
+				if (handled !== 0) {
+					throw new ShareMessageAlreadyHandledError(topicName, partitionIndex, record.offset)
+				}
+				// Renew does not transition `handled`; the caller still owes a final ack/release/reject.
+				await ackManager.enqueue(topicName, topicId, partitionIndex, record.offset, ACK_RENEW)
 			},
 		}
 
