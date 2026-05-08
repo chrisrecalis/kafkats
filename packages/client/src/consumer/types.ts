@@ -263,6 +263,13 @@ export interface ConsumerConfig {
 	 * Intended for diagnostics only and may be omitted in production usage.
 	 */
 	trace?: ConsumerTraceFn
+	/**
+	 * Awaited at the start of every rebalance, before any partition is revoked.
+	 * Use for transactional commits (e.g. EOS pipelines) that must complete
+	 * while the consumer still owns its in-flight assignment. The rebalance
+	 * protocol blocks on this promise; throwing rejects the rebalance.
+	 */
+	onBeforeRebalance?: () => Promise<void>
 }
 
 /**
@@ -281,6 +288,7 @@ export interface ResolvedConsumerConfig {
 	autoOffsetReset: AutoOffsetReset
 	isolationLevel: IsolationLevel
 	partitionAssignmentStrategy: PartitionAssignmentStrategy
+	onBeforeRebalance?: () => Promise<void>
 }
 
 export type ConsumerTraceStage = 'fetch_request' | 'decode_records' | 'handler'
