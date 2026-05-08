@@ -874,15 +874,6 @@ class FlowAppImpl implements FlowApp {
 		}
 
 		try {
-			// If a rebalance triggered an in-flight EOS commit, wait for it to
-			// finish before starting a fresh transaction. The rebalance handler
-			// can't block the consumer's protocol, but we can serialize against
-			// the commit here to avoid running two transactions concurrently.
-			if (worker.pendingRebalanceCommit) {
-				await worker.pendingRebalanceCommit
-				worker.pendingRebalanceCommit = null
-			}
-
 			// Start a new transaction if one isn't active
 			if (!worker.transactionActive) {
 				await this.beginTransaction(worker)
@@ -1145,22 +1136,16 @@ class FlowAppImpl implements FlowApp {
 	private attachConsumerEvents(consumer: Consumer, worker: WorkerContext): void {
 		consumer.on('rebalance', () => {
 			this.currentState = 'REBALANCING'
-			// Best-effort commit of any pending EOS transaction. EventEmitter
-			// listeners cannot be awaited by the emitter, so we cannot block
-			// the consumer's rebalance protocol on this commit completing —
-			// the Kafka group coordinator will reassign partitions whether
-			// or not we finish here. We track the in-flight commit on the
-			// worker so the next message processed waits for it before
-			// starting a fresh transaction (preventing two transactions from
-			// running concurrently).
+			// Best-effort commit: EventEmitter listeners can't be awaited, so we can't block
+			// the consumer's rebalance protocol here. Serialization against the next message's
+			// transaction is provided by worker.eosQueue, which both this commit and the next
+			// processInTransaction enqueue against. The real EOS gap (offsets may not commit
+			// before the group rejoins) needs an awaitable rebalance hook — out of scope here.
 			if (this.eosEnabled && worker.transactionActive) {
-				const commitPromise = this.enqueueEosTask(worker, () => this.commitTransactionBatch(worker)).catch(
-					err => {
-						this.lastError = err as Error
-						this.currentState = 'ERROR'
-					}
-				)
-				worker.pendingRebalanceCommit = commitPromise
+				this.enqueueEosTask(worker, () => this.commitTransactionBatch(worker)).catch(err => {
+					this.lastError = err as Error
+					this.currentState = 'ERROR'
+				})
 			}
 		})
 		consumer.on('partitionsAssigned', partitions => {
