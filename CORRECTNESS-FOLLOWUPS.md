@@ -12,7 +12,7 @@
 - ⏸ F9 — `ShareConsumer.stream()` test coverage → **lower priority** (share consumer is `@experimental`, requires integration scaffolding with broker)
 
 ### Newly-introduced follow-ups
-- **F5b** — LMDB time-key encoding doesn't preserve signed-integer order. `writeBigInt64BE(-1)` sorts after `0` in lex-byte order, breaking range scans on negative-start windows (and `expireOldWindows` correctness for negative cutoffs reachable in test scenarios). Fix: bias by `2^63` and use `writeBigUInt64BE`, or XOR the sign bit on encode/decode. Affects `LMDBWindowStore.fetch/fetchAll/expireOldWindows` and `LMDBSessionStore.expireOldSessions`.
+- ~~**F5b** — LMDB time-key encoding doesn't preserve signed-integer order~~ → fixed in PR (this branch). Bias signed times by `2^63` before encoding so unsigned-byte lex order matches signed numeric order. Bounds in `findSessions`/`remove` now use 0x00 / 0xff fill for the lex-min / lex-max biased times instead of literal `0` / `MAX_SAFE_INTEGER`.
 - ~~**F7b** — ChangelogRestorer always pays idleTimeoutMs on transactional changelog topics~~ → fixed in PR #75 alongside F7. The CI failure on the F7 test surfaced this immediately. The fix is in `changelog.ts` `checkIdle`: when the idle threshold fires AND we've consumed at least one message, abort with `restoreCompleteReason` (graceful) instead of throwing. Restoration of EOS/transactional topics no longer hard-errors on the LSO-vs-last-user-offset gap.
 
 
