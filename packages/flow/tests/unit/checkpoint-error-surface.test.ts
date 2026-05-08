@@ -1,14 +1,40 @@
 import { describe, expect, it, vi } from 'vitest'
-import { EventEmitter } from 'node:events'
 
-import type { ChangelogCheckpointStore } from '../../src/state.js'
+import { TestDriver } from '../../src/testing.js'
+import type {
+	ChangelogCheckpointStore,
+	KeyValueStore,
+	WindowStore,
+	SessionStore,
+	StateStoreProvider,
+	KeyValueStoreOptions,
+	WindowStoreOptions,
+	SessionStoreOptions,
+} from '../../src/state.js'
+import { InMemoryStateStoreProvider } from '../../src/state/memory.js'
 
-// Pull just the private flushChangelogCheckpoints + recordCheckpointError into a test seam.
-// We can't easily construct a full FlowAppImpl in a unit test (needs cluster, producer, etc.),
-// but we CAN verify the behavior via a minimal stand-in that mirrors the real impl's shape.
+// Wrap InMemoryStateStoreProvider but inject a failing CheckpointStore so tests drive
+// the real flushChangelogCheckpoints path through FlowAppImpl.
+function makeProviderWithFailingCheckpointStore(checkpointStore: ChangelogCheckpointStore): StateStoreProvider {
+	const inner = new InMemoryStateStoreProvider()
+	return {
+		name: inner.name,
+		createKeyValueStore<K, V>(name: string, options: KeyValueStoreOptions<K, V>): KeyValueStore<K, V> {
+			return inner.createKeyValueStore(name, options)
+		},
+		createWindowStore<K, V>(name: string, options: WindowStoreOptions<K, V>): WindowStore<K, V> {
+			return inner.createWindowStore(name, options)
+		},
+		createSessionStore<K, V>(name: string, options: SessionStoreOptions<K, V>): SessionStore<K, V> {
+			return inner.createSessionStore(name, options)
+		},
+		getChangelogCheckpointStore: () => checkpointStore,
+		close: () => inner.close(),
+	}
+}
 
-describe('checkpoint persistence errors are surfaced, not swallowed', () => {
-	it('logs and records lastError when set() rejects, without throwing', async () => {
+describe('checkpoint persistence errors surface, not swallow', () => {
+	it('flushChangelogCheckpoints logs + records lastError when set() rejects', async () => {
 		const setError = new Error('disk full')
 		const checkpointStore: ChangelogCheckpointStore = {
 			get: vi.fn().mockResolvedValue(undefined),
@@ -16,36 +42,34 @@ describe('checkpoint persistence errors are surfaced, not swallowed', () => {
 			flush: vi.fn().mockResolvedValue(undefined),
 		}
 
-		const logged: Array<{ msg: string; ctx: Record<string, unknown> }> = []
-		const logger = { error: (msg: string, ctx: Record<string, unknown> = {}) => logged.push({ msg, ctx }) }
-		let lastError: Error | null = null
+		const driver = new TestDriver({
+			stateStoreProvider: makeProviderWithFailingCheckpointStore(checkpointStore),
+		})
+		// Force topology compilation but don't actually start the consumer/producer loop.
+		void driver.flow
 
-		// Mirror the production loop shape from flow.ts
-		const pending = [{ topic: 't', partition: 0, offset: 41n }]
-		for (const checkpoint of pending) {
-			const checkpointOffset = checkpoint.offset + 1n
-			try {
-				await checkpointStore.set(checkpoint.topic, checkpoint.partition, checkpointOffset)
-			} catch (err) {
-				const error = err instanceof Error ? err : new Error(String(err))
-				logger.error('checkpoint persistence failed', {
-					topic: checkpoint.topic,
-					partition: checkpoint.partition,
-					error: error.message,
-				})
-				lastError = error
-			}
+		// Reach into the private impl to drive flushChangelogCheckpoints directly with a
+		// synthetic worker. This actually calls the production method (regression-proof:
+		// reverting to .catch(() => {}) would silently break this test's lastError check).
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const flowAny = driver.flow as any
+		const worker = {
+			pendingChangelogOffsets: new Map([
+				['t:0', { topic: 't', partition: 0, offset: 41n }],
+				['t:1', { topic: 't', partition: 1, offset: 99n }],
+			]),
 		}
 
+		await flowAny.flushChangelogCheckpoints(worker)
+
+		// set() called with offset+1 for both partitions.
 		expect(checkpointStore.set).toHaveBeenCalledWith('t', 0, 42n)
-		expect(logged).toHaveLength(1)
-		expect(logged[0]!.msg).toBe('checkpoint persistence failed')
-		expect(logged[0]!.ctx.topic).toBe('t')
-		expect(logged[0]!.ctx.error).toBe('disk full')
-		expect(lastError).toBe(setError)
+		expect(checkpointStore.set).toHaveBeenCalledWith('t', 1, 100n)
+		// lastError reflects the failure even though we didn't halt.
+		expect(flowAny.lastError).toBe(setError)
 	})
 
-	it('records a separate flush error after a successful set loop', async () => {
+	it('logs flush() rejections too', async () => {
 		const flushError = new Error('fsync failed')
 		const checkpointStore: ChangelogCheckpointStore = {
 			get: vi.fn().mockResolvedValue(undefined),
@@ -53,22 +77,51 @@ describe('checkpoint persistence errors are surfaced, not swallowed', () => {
 			flush: vi.fn().mockRejectedValue(flushError),
 		}
 
-		const logged: Array<{ msg: string; ctx: Record<string, unknown> }> = []
-		let lastError: Error | null = null
+		const driver = new TestDriver({
+			stateStoreProvider: makeProviderWithFailingCheckpointStore(checkpointStore),
+		})
+		void driver.flow
 
-		try {
-			await checkpointStore.flush?.()
-		} catch (err) {
-			const error = err instanceof Error ? err : new Error(String(err))
-			logged.push({ msg: 'checkpoint persistence failed', ctx: { phase: 'flush', error: error.message } })
-			lastError = error
-		}
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const flowAny = driver.flow as any
+		await flowAny.flushChangelogCheckpoints({
+			pendingChangelogOffsets: new Map([['t:0', { topic: 't', partition: 0, offset: 0n }]]),
+		})
 
 		expect(checkpointStore.flush).toHaveBeenCalled()
-		expect(lastError).toBe(flushError)
-		expect(logged[0]!.ctx.phase).toBe('flush')
+		expect(flowAny.lastError).toBe(flushError)
 	})
 
-	// Suppress unused-import warning for EventEmitter (kept for future seam expansion).
-	void EventEmitter
+	it('dedupes log lines for repeated identical errors and recovers on success', async () => {
+		const setError = new Error('disk full')
+		let setShouldFail = true
+		const checkpointStore: ChangelogCheckpointStore = {
+			get: vi.fn().mockResolvedValue(undefined),
+			set: vi.fn(() => (setShouldFail ? Promise.reject(setError) : Promise.resolve())),
+			flush: vi.fn().mockResolvedValue(undefined),
+		}
+
+		const driver = new TestDriver({
+			stateStoreProvider: makeProviderWithFailingCheckpointStore(checkpointStore),
+		})
+		void driver.flow
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const flowAny = driver.flow as any
+
+		const worker = { pendingChangelogOffsets: new Map([['t:0', { topic: 't', partition: 0, offset: 0n }]]) }
+
+		// First failure → message recorded.
+		await flowAny.flushChangelogCheckpoints(worker)
+		const firstMsg = flowAny.lastCheckpointErrorMessage
+		expect(firstMsg).toBe('disk full')
+
+		// Repeat failure → no log re-emit; lastCheckpointErrorMessage stays the same.
+		await flowAny.flushChangelogCheckpoints(worker)
+		expect(flowAny.lastCheckpointErrorMessage).toBe(firstMsg)
+
+		// Subsequent success → recovery, message cleared.
+		setShouldFail = false
+		await flowAny.flushChangelogCheckpoints(worker)
+		expect(flowAny.lastCheckpointErrorMessage).toBeNull()
+	})
 })

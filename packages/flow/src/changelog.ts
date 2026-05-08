@@ -401,15 +401,27 @@ export class ChangelogRestorer<K, V> {
 		}
 
 		if (checkpointStore) {
+			const logger = client.cluster.getLogger()
 			await Promise.all(
 				assigned.map(async partition => {
 					const endOffset = endOffsets.get(partition)
 					if (endOffset === undefined) {
 						return
 					}
-					await checkpointStore.set(this.topicName, partition, endOffset)
+					try {
+						await checkpointStore.set(this.topicName, partition, endOffset)
+					} catch (err) {
+						// Restored state is in memory regardless; failing to record this means a future restart
+						// will re-restore (idempotent but wasteful). Log so a stuck checkpoint store is visible.
+						const error = err instanceof Error ? err : new Error(String(err))
+						logger.error('post-restore checkpoint persistence failed', {
+							topic: this.topicName,
+							partition,
+							error: error.message,
+						})
+					}
 				})
-			).catch(() => {})
+			)
 		}
 
 		return restoredCount

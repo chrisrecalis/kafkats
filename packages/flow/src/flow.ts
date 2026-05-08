@@ -85,6 +85,7 @@ class FlowAppImpl implements FlowApp {
 	private readonly changelogTopics = new Map<string, ChangelogTopicSpec>()
 	private readonly changelogWriters = new Map<string, ChangelogWriter<unknown, unknown>>()
 	private readonly logger: Logger
+	private lastCheckpointErrorMessage: string | null = null
 	private currentState: StreamState = 'CREATED'
 	private workers: WorkerContext[] = []
 	private runPromises: Promise<void>[] = []
@@ -114,7 +115,7 @@ class FlowAppImpl implements FlowApp {
 		}
 		this.stateStoreProvider = config.stateStoreProvider ?? new InMemoryStateStoreProvider()
 		this.changelogCheckpointStore = this.stateStoreProvider.getChangelogCheckpointStore?.() ?? null
-		this.logger = this.client.cluster.getLogger()
+		this.logger = this.client.cluster.getLogger().child({ component: 'flow', applicationId: config.applicationId })
 	}
 
 	getOrCreateStore<K, V>(
@@ -195,9 +196,11 @@ class FlowAppImpl implements FlowApp {
 							return
 						}
 
-						await this.changelogCheckpointStore
-							.set(result.topic, result.partition, result.offset + 1n)
-							.catch(() => {})
+						try {
+							await this.changelogCheckpointStore.set(result.topic, result.partition, result.offset + 1n)
+						} catch (err) {
+							this.recordCheckpointError(err, { topic: result.topic, partition: result.partition })
+						}
 					}
 				)
 				this.changelogWriters.set(storeName, writer as ChangelogWriter<unknown, unknown>)
@@ -1067,17 +1070,14 @@ class FlowAppImpl implements FlowApp {
 			return
 		}
 
+		// Data is already durable post-EOS-commit; surface failures so a stuck checkpoint store doesn't silently cause restore-time over-replay.
+		let anyFailure = false
 		for (const checkpoint of worker.pendingChangelogOffsets.values()) {
-			// In exactly_once mode, each committed transaction appends a control marker
-			// after the last data record on every touched partition.
-			// Advance checkpoint past that marker so restoration can start at the true log end.
 			const checkpointOffset = checkpoint.offset + 1n
 			try {
 				await this.changelogCheckpointStore.set(checkpoint.topic, checkpoint.partition, checkpointOffset)
 			} catch (err) {
-				// Don't halt the worker — the data is already durable in the changelog/output topics
-				// (this runs after the EOS commit). Surface so the user can see it: a persistent failure
-				// means the in-memory checkpoint silently lags reality and restore-time will over-replay.
+				anyFailure = true
 				this.recordCheckpointError(err, { topic: checkpoint.topic, partition: checkpoint.partition })
 			}
 		}
@@ -1085,14 +1085,23 @@ class FlowAppImpl implements FlowApp {
 		try {
 			await this.changelogCheckpointStore.flush?.()
 		} catch (err) {
+			anyFailure = true
 			this.recordCheckpointError(err, { phase: 'flush' })
+		}
+		if (!anyFailure && this.lastCheckpointErrorMessage !== null) {
+			this.logger.info('checkpoint persistence recovered')
+			this.lastCheckpointErrorMessage = null
 		}
 	}
 
 	private recordCheckpointError(err: unknown, context: Record<string, unknown>): void {
 		const error = err instanceof Error ? err : new Error(String(err))
-		this.logger.error('checkpoint persistence failed', { ...context, error: error.message })
 		this.lastError = error
+		// Dedupe log lines: persistent disk-full would otherwise emit per-partition every commit interval.
+		if (this.lastCheckpointErrorMessage !== error.message) {
+			this.lastCheckpointErrorMessage = error.message
+			this.logger.error('checkpoint persistence failed', { ...context, error: error.message })
+		}
 	}
 
 	/**
