@@ -9,8 +9,12 @@ import {
 	ChangelogPartitionMismatchError,
 	SourceTopicNotFoundError,
 } from '@/changelog.js'
-import { ChangelogBackedKeyValueStore } from '@/state/changelog.js'
-import { InMemoryKeyValueStore } from '@/state/memory.js'
+import {
+	ChangelogBackedKeyValueStore,
+	ChangelogBackedWindowStore,
+	ChangelogBackedSessionStore,
+} from '@/state/changelog.js'
+import { InMemoryKeyValueStore, InMemoryWindowStore, InMemorySessionStore } from '@/state/memory.js'
 import { codec } from '@/codec.js'
 import type { WindowedKey } from '@/state.js'
 
@@ -314,6 +318,115 @@ describe('changelog', () => {
 		it('delegates name to inner store', () => {
 			const store = new ChangelogBackedKeyValueStore(innerStore, mockWriter)
 			expect(store.name).toBe('test-store')
+		})
+	})
+
+	// Parity coverage for the put-then-changelog ordering fix that landed in PR #57.
+	// The KV-store variant has it; window/session inherited the same fix in source but had no tests.
+	describe('ChangelogBackedWindowStore — put-then-changelog ordering', () => {
+		let innerStore: InMemoryWindowStore<string, number>
+		let writeSpy: ReturnType<typeof vi.fn>
+		let tombstoneSpy: ReturnType<typeof vi.fn>
+		let mockWriter: ChangelogWriter<WindowedKey<string>, number>
+
+		beforeEach(() => {
+			innerStore = new InMemoryWindowStore('test-window-store', {
+				keyCodec: codec.string(),
+				valueCodec: codec.json<number>(),
+				windowSizeMs: 1000,
+				retentionMs: 60_000,
+			})
+			writeSpy = vi.fn().mockResolvedValue(undefined)
+			tombstoneSpy = vi.fn().mockResolvedValue(undefined)
+			mockWriter = {
+				write: writeSpy,
+				writeTombstone: tombstoneSpy,
+			} as unknown as ChangelogWriter<WindowedKey<string>, number>
+		})
+
+		it('writes to inner store BEFORE changelog (local-first ordering)', async () => {
+			const order: string[] = []
+			const innerSpy = vi.spyOn(innerStore, 'put').mockImplementation(async () => {
+				order.push('inner.put')
+			})
+			writeSpy.mockImplementation(async () => {
+				order.push('writer.write')
+			})
+			const store = new ChangelogBackedWindowStore(innerStore, mockWriter)
+
+			await store.put({ key: 'k', windowStart: 0, windowEnd: 1000 }, 1)
+
+			expect(order).toEqual(['inner.put', 'writer.write'])
+			innerSpy.mockRestore()
+		})
+
+		it('deletes inner store BEFORE writing tombstone', async () => {
+			const order: string[] = []
+			const innerSpy = vi.spyOn(innerStore, 'delete').mockImplementation(async () => {
+				order.push('inner.delete')
+			})
+			tombstoneSpy.mockImplementation(async () => {
+				order.push('writer.writeTombstone')
+			})
+			const store = new ChangelogBackedWindowStore(innerStore, mockWriter)
+
+			await store.delete({ key: 'k', windowStart: 0, windowEnd: 1000 })
+
+			expect(order).toEqual(['inner.delete', 'writer.writeTombstone'])
+			innerSpy.mockRestore()
+		})
+	})
+
+	describe('ChangelogBackedSessionStore — put-then-changelog ordering', () => {
+		let innerStore: InMemorySessionStore<string, number>
+		let writeSpy: ReturnType<typeof vi.fn>
+		let tombstoneSpy: ReturnType<typeof vi.fn>
+		let mockWriter: ChangelogWriter<WindowedKey<string>, number>
+
+		beforeEach(() => {
+			innerStore = new InMemorySessionStore('test-session-store', {
+				keyCodec: codec.string(),
+				valueCodec: codec.json<number>(),
+				retentionMs: 60_000,
+			})
+			writeSpy = vi.fn().mockResolvedValue(undefined)
+			tombstoneSpy = vi.fn().mockResolvedValue(undefined)
+			mockWriter = {
+				write: writeSpy,
+				writeTombstone: tombstoneSpy,
+			} as unknown as ChangelogWriter<WindowedKey<string>, number>
+		})
+
+		it('writes to inner store BEFORE changelog (local-first ordering)', async () => {
+			const order: string[] = []
+			const innerSpy = vi.spyOn(innerStore, 'put').mockImplementation(async () => {
+				order.push('inner.put')
+			})
+			writeSpy.mockImplementation(async () => {
+				order.push('writer.write')
+			})
+			const store = new ChangelogBackedSessionStore(innerStore, mockWriter)
+
+			await store.put({ key: 'k', windowStart: 0, windowEnd: 1000 }, 1)
+
+			expect(order).toEqual(['inner.put', 'writer.write'])
+			innerSpy.mockRestore()
+		})
+
+		it('deletes inner store BEFORE writing tombstone', async () => {
+			const order: string[] = []
+			const innerSpy = vi.spyOn(innerStore, 'delete').mockImplementation(async () => {
+				order.push('inner.delete')
+			})
+			tombstoneSpy.mockImplementation(async () => {
+				order.push('writer.writeTombstone')
+			})
+			const store = new ChangelogBackedSessionStore(innerStore, mockWriter)
+
+			await store.delete({ key: 'k', windowStart: 0, windowEnd: 1000 })
+
+			expect(order).toEqual(['inner.delete', 'writer.writeTombstone'])
+			innerSpy.mockRestore()
 		})
 	})
 
