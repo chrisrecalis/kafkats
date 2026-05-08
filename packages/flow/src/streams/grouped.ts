@@ -298,7 +298,13 @@ export class WindowedKGroupedStreamImpl<K, V> implements WindowedKGroupedStream<
 			this.app.stateStores.set(storeName, store as KeyValueStore<unknown, unknown>)
 			const storeRef = { store }
 
-			aggregateNode = new WindowedReduceNode<K, V>(storeName, storeRef, reducer, this.windowSizeMs, this.advanceMs)
+			aggregateNode = new WindowedReduceNode<K, V>(
+				storeName,
+				storeRef,
+				reducer,
+				this.windowSizeMs,
+				this.advanceMs
+			)
 		}
 
 		this.node.connect(aggregateNode)

@@ -103,9 +103,9 @@ describe('hopping windows', () => {
 				)
 		).toThrow(/advanceBy must be <= window size/)
 
-		expect(
-			() => new WindowedReduceNode<string, number>('s', { store }, (a, b) => a + b, 1000, 2000)
-		).toThrow(/advanceBy must be <= window size/)
+		expect(() => new WindowedReduceNode<string, number>('s', { store }, (a, b) => a + b, 1000, 2000)).toThrow(
+			/advanceBy must be <= window size/
+		)
 	})
 
 	it('tumbling windows (advance == size) still produce exactly one update per record', async () => {
