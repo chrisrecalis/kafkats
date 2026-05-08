@@ -27,13 +27,15 @@ export class ChangelogBackedKeyValueStore<K, V> implements KeyValueStore<K, V> {
 	}
 
 	async put(key: K, value: V): Promise<void> {
-		await this.writer.write(key, value)
+		// Local-first: a crash between the two must leave local stale (replayed on restart),
+		// not the changelog ahead (downstream forwards aggregates that disagree with the durable log).
 		await this.innerStore.put(key, value)
+		await this.writer.write(key, value)
 	}
 
 	async delete(key: K): Promise<void> {
-		await this.writer.writeTombstone(key)
 		await this.innerStore.delete(key)
+		await this.writer.writeTombstone(key)
 	}
 
 	all(): AsyncIterable<[K, V]> {
@@ -79,13 +81,14 @@ export class ChangelogBackedWindowStore<K, V> implements WindowStore<K, V> {
 	}
 
 	async put(key: WindowedKey<K>, value: V): Promise<void> {
-		await this.writer.write(key, value)
+		// Local-first; see ChangelogBackedKeyValueStore.put for rationale.
 		await this.inner.put(key, value)
+		await this.writer.write(key, value)
 	}
 
 	async delete(key: WindowedKey<K>): Promise<void> {
-		await this.writer.writeTombstone(key)
 		await this.inner.delete(key)
+		await this.writer.writeTombstone(key)
 	}
 
 	all(): AsyncIterable<[WindowedKey<K>, V]> {
@@ -149,13 +152,14 @@ export class ChangelogBackedSessionStore<K, V> implements SessionStore<K, V> {
 	}
 
 	async put(key: WindowedKey<K>, value: V): Promise<void> {
-		await this.writer.write(key, value)
+		// Local-first; see ChangelogBackedKeyValueStore.put for rationale.
 		await this.inner.put(key, value)
+		await this.writer.write(key, value)
 	}
 
 	async delete(key: WindowedKey<K>): Promise<void> {
-		await this.writer.writeTombstone(key)
 		await this.inner.delete(key)
+		await this.writer.writeTombstone(key)
 	}
 
 	all(): AsyncIterable<[WindowedKey<K>, V]> {

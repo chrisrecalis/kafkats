@@ -264,6 +264,40 @@ describe('changelog', () => {
 			expect(store.innerStore).toBe(innerStore)
 		})
 
+		it('writes to inner store BEFORE changelog (local-first ordering)', async () => {
+			const order: string[] = []
+			const innerSpy = vi.spyOn(innerStore, 'put').mockImplementation(async (key, value) => {
+				order.push(`inner.put(${key},${value})`)
+			})
+			writeSpy.mockImplementation(async (key, value) => {
+				order.push(`writer.write(${key},${value})`)
+			})
+			const store = new ChangelogBackedKeyValueStore(innerStore, mockWriter)
+
+			await store.put('k', 1)
+
+			expect(order).toEqual(['inner.put(k,1)', 'writer.write(k,1)'])
+
+			innerSpy.mockRestore()
+		})
+
+		it('deletes inner store BEFORE writing tombstone', async () => {
+			const order: string[] = []
+			const innerSpy = vi.spyOn(innerStore, 'delete').mockImplementation(async key => {
+				order.push(`inner.delete(${key})`)
+			})
+			tombstoneSpy.mockImplementation(async key => {
+				order.push(`writer.writeTombstone(${key})`)
+			})
+			const store = new ChangelogBackedKeyValueStore(innerStore, mockWriter)
+
+			await store.delete('k')
+
+			expect(order).toEqual(['inner.delete(k)', 'writer.writeTombstone(k)'])
+
+			innerSpy.mockRestore()
+		})
+
 		it('delegates all() to inner store', async () => {
 			await innerStore.put('a', 1)
 			await innerStore.put('b', 2)
