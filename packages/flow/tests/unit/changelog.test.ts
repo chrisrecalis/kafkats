@@ -321,8 +321,7 @@ describe('changelog', () => {
 		})
 	})
 
-	// Parity coverage for the put-then-changelog ordering fix that landed in PR #57.
-	// The KV-store variant has it; window/session inherited the same fix in source but had no tests.
+	// Mirrors ChangelogBackedKeyValueStore ordering tests above for the Window/Session variants.
 	describe('ChangelogBackedWindowStore — put-then-changelog ordering', () => {
 		let innerStore: InMemoryWindowStore<string, number>
 		let writeSpy: ReturnType<typeof vi.fn>
