@@ -964,8 +964,25 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		this.state = 'stopping'
 		this.logger.info('disconnecting producer')
 
-		await this.flush()
-		this.accumulator.clear()
+		try {
+			await this.flush()
+		} catch (error) {
+			this.logger.warn('flush() failed during disconnect', {
+				error: error instanceof Error ? error.message : String(error),
+			})
+		}
+
+		// If flush() threw, batches may still be in pendingBatches / inflightBatches /
+		// the accumulator. Reject everything so caller promises don't hang.
+		const disconnectError = new Error('Producer disconnected')
+		for (const batch of this.pendingBatches) {
+			for (const msg of batch.messages) {
+				msg.reject(disconnectError)
+			}
+		}
+		this.pendingBatches.length = 0
+		this.failAllInflightBatches(disconnectError)
+		this.accumulator.clearWithRejection(disconnectError)
 
 		this.state = 'idle'
 		this.logger.info('producer disconnected')
