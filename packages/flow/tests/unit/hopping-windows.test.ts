@@ -137,4 +137,43 @@ describe('hopping windows', () => {
 
 		expect(forwards).toEqual([{ start: 0, end: 1000 }])
 	})
+
+	it('emits negative-start windows for records near the unix epoch (no silent drop)', async () => {
+		// Pre-fix: windowStartsFor had `if (start < 0) continue` which dropped legitimate
+		// negative-start windows. With size=1000 advance=200 and t=100, the record belongs
+		// to windows [-800, 200), [-600, 400), [-400, 600), [-200, 800), [0, 1000) — five
+		// in total. The pre-fix code silently emitted only [0, 1000), dropping 4.
+		const store = makeStubStore<string, number>()
+		const node = new WindowedAggregateNode<string, number, number>(
+			's',
+			{ store },
+			() => 0,
+			(_k, v, agg) => agg + v,
+			1000,
+			200
+		)
+		const forwards: Array<{ start: number; end: number }> = []
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		;(node as any).forward = async (record: any) => {
+			forwards.push({ start: record.key.window.start, end: record.key.window.end })
+		}
+
+		await node.process({
+			key: 'a',
+			value: 1,
+			timestamp: 100n,
+			topic: 't',
+			partition: 0,
+			offset: 0n,
+			headers: {},
+		})
+
+		expect(forwards).toEqual([
+			{ start: -800, end: 200 },
+			{ start: -600, end: 400 },
+			{ start: -400, end: 600 },
+			{ start: -200, end: 800 },
+			{ start: 0, end: 1000 },
+		])
+	})
 })

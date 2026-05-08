@@ -142,7 +142,10 @@ async function maybeExpire(state: CleanupState, timestamp: number, expire: (cuto
 	}
 }
 
-// Half-open windows [start, start+size); negative starts are skipped — only matters for timestamps near epoch.
+// Yields half-open windows [start, start+size) that contain the timestamp. Window starts can be
+// negative for records near the unix epoch with size > timestamp; the store encodes them via
+// signed BigInt64BE and downstream fetchAll handles them — silently skipping them used to drop
+// records from windows they logically belonged to.
 function* windowStartsFor(
 	timestamp: number,
 	sizeMs: number,
@@ -151,7 +154,6 @@ function* windowStartsFor(
 	const first = Math.floor((timestamp - sizeMs + advanceMs) / advanceMs) * advanceMs
 	const last = Math.floor(timestamp / advanceMs) * advanceMs
 	for (let start = first; start <= last; start += advanceMs) {
-		if (start < 0) continue
 		yield { start, end: start + sizeMs }
 	}
 }
