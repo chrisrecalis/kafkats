@@ -643,17 +643,16 @@ export class FetchManager {
 	private async fetchFromBrokerToBuffer(broker: Broker, partitions: PartitionState[]): Promise<void> {
 		if (!this.fetchBuffer) return
 
-		// Track fetch offsets for filtering
-		const fetchOffsetByKey = new Map<string, bigint>()
-
-		// Build topics array
+		// Map response entries back to the in-flight state we issued the fetch
+		// against. Used to fence stale responses via state.abortController.
+		const inflightStateByKey = new Map<string, PartitionState>()
 		const topicsMap = new Map<string, Array<{ state: PartitionState }>>()
 		for (const state of partitions) {
 			if (!topicsMap.has(state.topic)) {
 				topicsMap.set(state.topic, [])
 			}
 			topicsMap.get(state.topic)!.push({ state })
-			fetchOffsetByKey.set(tpKey(state.topic, state.partition), state.offset)
+			inflightStateByKey.set(tpKey(state.topic, state.partition), state)
 		}
 
 		const topics = Array.from(topicsMap.entries()).map(([topic, parts]) => ({
@@ -678,21 +677,20 @@ export class FetchManager {
 			topics,
 		})
 
-		// Process response for each partition
 		for (const topicResponse of response.topics) {
 			for (const partitionResponse of topicResponse.partitions) {
 				const key = tpKey(topicResponse.topic, partitionResponse.partitionIndex)
-				const state = this.partitionStates.get(key)
-				if (!state) continue
+				const state = inflightStateByKey.get(key)
+				// Fence: state was revoked while the fetch was in flight.
+				if (!state || state.abortController.signal.aborted) continue
 
-				// Handle errors
 				if (partitionResponse.errorCode !== ErrorCode.None) {
 					await this.handleFetchError(state, partitionResponse.errorCode)
 					continue
 				}
 
-				// Decode records
 				if (partitionResponse.recordsData && partitionResponse.recordsData.length > 0) {
+					const fetchOffset = state.offset
 					const decodeResult = this.decodeRecords(
 						partitionResponse.recordsData,
 						partitionResponse.abortedTransactions,
@@ -700,10 +698,10 @@ export class FetchManager {
 					)
 					let records = decodeResult instanceof Promise ? await decodeResult : decodeResult
 
-					const fetchOffset = fetchOffsetByKey.get(key)
-					if (fetchOffset !== undefined) {
-						records = filterRecordsFromOffset(records, fetchOffset)
-					}
+					// decodeRecords may have awaited; re-fence.
+					if (state.abortController.signal.aborted) continue
+
+					records = filterRecordsFromOffset(records, fetchOffset)
 
 					if (records.length > 0) {
 						// Advance offset for next fetch
