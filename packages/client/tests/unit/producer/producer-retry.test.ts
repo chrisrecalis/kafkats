@@ -13,7 +13,6 @@ describe('Producer retry behavior', () => {
 	beforeEach(() => {
 		mockCluster = createMockCluster()
 		mockBroker = createMockBroker(1)
-		mockCluster.setMockBroker(1, mockBroker)
 		mockCluster.getLeaderForPartition.mockResolvedValue(mockBroker)
 	})
 
@@ -246,6 +245,7 @@ describe('Producer retry behavior', () => {
 		it('handles PRODUCER_FENCED by failing with ProducerFencedError', async () => {
 			mockCluster.getAnyBroker.mockResolvedValue(mockBroker)
 			mockBroker.initProducerId.mockResolvedValue({
+				throttleTimeMs: 0,
 				errorCode: ErrorCode.None,
 				producerId: 1000n,
 				producerEpoch: 1,
@@ -291,6 +291,7 @@ describe('Producer retry behavior', () => {
 		it('handles INVALID_PRODUCER_EPOCH as fencing', async () => {
 			mockCluster.getAnyBroker.mockResolvedValue(mockBroker)
 			mockBroker.initProducerId.mockResolvedValue({
+				throttleTimeMs: 0,
 				errorCode: ErrorCode.None,
 				producerId: 1001n,
 				producerEpoch: 1,
@@ -336,6 +337,7 @@ describe('Producer retry behavior', () => {
 		it('treats DUPLICATE_SEQUENCE_NUMBER as success', async () => {
 			mockCluster.getAnyBroker.mockResolvedValue(mockBroker)
 			mockBroker.initProducerId.mockResolvedValue({
+				throttleTimeMs: 0,
 				errorCode: ErrorCode.None,
 				producerId: 1002n,
 				producerEpoch: 1,
@@ -373,6 +375,7 @@ describe('Producer retry behavior', () => {
 		it('fails on OUT_OF_ORDER_SEQUENCE_NUMBER', async () => {
 			mockCluster.getAnyBroker.mockResolvedValue(mockBroker)
 			mockBroker.initProducerId.mockResolvedValue({
+				throttleTimeMs: 0,
 				errorCode: ErrorCode.None,
 				producerId: 1003n,
 				producerEpoch: 1,
