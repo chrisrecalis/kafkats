@@ -20,7 +20,7 @@ import {
 	type GroupedTableMapping,
 } from '@/processors/table.js'
 import { TimeWindows, SessionWindows, SlidingWindows } from '@/windows.js'
-import { parseWindowDuration } from '@/helpers.js'
+import { parseWindowDuration, SLIDING_WINDOWS_NOT_IMPLEMENTED } from '@/helpers.js'
 import { KTableImpl, type FlowAppInterface } from '@/streams/ktable.js'
 
 export class KGroupedStreamImpl<K, V> implements KGroupedStream<K, V> {
@@ -167,8 +167,8 @@ export class WindowedKGroupedStreamImpl<K, V> implements WindowedKGroupedStream<
 			// windows assign records to multiple overlapping windows.
 			this.advanceMs = windows.advance ? parseWindowDuration(windows.advance) : this.windowSizeMs
 		} else if (windows instanceof SlidingWindows) {
-			this.windowSizeMs = parseWindowDuration(windows.size)
-			this.advanceMs = this.windowSizeMs
+			// No dedicated processor yet; treating as tumbling silently produces wrong aggregates.
+			throw new Error(SLIDING_WINDOWS_NOT_IMPLEMENTED)
 		} else {
 			// SessionWindows - use gap as approximate window size
 			this.windowSizeMs = parseWindowDuration(windows.gap)

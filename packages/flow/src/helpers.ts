@@ -1,4 +1,18 @@
 import type { WindowDuration } from '@/types.js'
+import { TimeWindows, SlidingWindows, type SessionWindows } from '@/windows.js'
+
+export const SLIDING_WINDOWS_NOT_IMPLEMENTED =
+	'SlidingWindows is not yet implemented. Use TimeWindows.of(size).advanceBy(advance) for hopping windows, ' +
+	'or SessionWindows for session-based aggregation.'
+
+export function joinWindowMs(joinWindow: TimeWindows | SlidingWindows | SessionWindows): number {
+	if (joinWindow instanceof SlidingWindows) {
+		throw new Error(SLIDING_WINDOWS_NOT_IMPLEMENTED)
+	}
+	return joinWindow instanceof TimeWindows
+		? parseWindowDuration(joinWindow.size)
+		: parseWindowDuration(joinWindow.gap)
+}
 
 /**
  * Parse a WindowDuration to milliseconds.
