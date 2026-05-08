@@ -643,25 +643,16 @@ export class FetchManager {
 	private async fetchFromBrokerToBuffer(broker: Broker, partitions: PartitionState[]): Promise<void> {
 		if (!this.fetchBuffer) return
 
-		// Track fetch offsets and the PartitionState identity per key. After
-		// the await on broker.fetch, partitionStates may have been mutated by a
-		// rebalance: the same key could now point to a fresh PartitionState
-		// (revoke + reassign during cooperative rebalance). We must NOT apply
-		// records from a stale fetch to that fresh state — its offset would be
-		// clobbered with stale data.
-		const fetchOffsetByKey = new Map<string, bigint>()
+		// Map response entries back to the in-flight state we issued the fetch
+		// against. Used to fence stale responses via state.abortController.
 		const inflightStateByKey = new Map<string, PartitionState>()
-
-		// Build topics array
 		const topicsMap = new Map<string, Array<{ state: PartitionState }>>()
 		for (const state of partitions) {
 			if (!topicsMap.has(state.topic)) {
 				topicsMap.set(state.topic, [])
 			}
 			topicsMap.get(state.topic)!.push({ state })
-			const key = tpKey(state.topic, state.partition)
-			fetchOffsetByKey.set(key, state.offset)
-			inflightStateByKey.set(key, state)
+			inflightStateByKey.set(tpKey(state.topic, state.partition), state)
 		}
 
 		const topics = Array.from(topicsMap.entries()).map(([topic, parts]) => ({
@@ -686,32 +677,20 @@ export class FetchManager {
 			topics,
 		})
 
-		// Process response for each partition
 		for (const topicResponse of response.topics) {
 			for (const partitionResponse of topicResponse.partitions) {
 				const key = tpKey(topicResponse.topic, partitionResponse.partitionIndex)
-				const state = this.partitionStates.get(key)
-				if (!state) continue
+				const state = inflightStateByKey.get(key)
+				// Fence: state was revoked while the fetch was in flight.
+				if (!state || state.abortController.signal.aborted) continue
 
-				// Fence: only apply this response to the SAME PartitionState the
-				// fetch was issued against. If the entry was replaced during the
-				// await (revoke + reassign), drop the stale records.
-				if (state !== inflightStateByKey.get(key)) {
-					this.logger.debug('dropping fetch response for replaced partition state', {
-						topic: topicResponse.topic,
-						partition: partitionResponse.partitionIndex,
-					})
-					continue
-				}
-
-				// Handle errors
 				if (partitionResponse.errorCode !== ErrorCode.None) {
 					await this.handleFetchError(state, partitionResponse.errorCode)
 					continue
 				}
 
-				// Decode records
 				if (partitionResponse.recordsData && partitionResponse.recordsData.length > 0) {
+					const fetchOffset = state.offset
 					const decodeResult = this.decodeRecords(
 						partitionResponse.recordsData,
 						partitionResponse.abortedTransactions,
@@ -719,22 +698,10 @@ export class FetchManager {
 					)
 					let records = decodeResult instanceof Promise ? await decodeResult : decodeResult
 
-					// decodeRecords can await (compressed records / async codecs),
-					// during which the partition state may have been replaced again.
-					// Re-check identity before applying records to avoid clobbering
-					// the new state with offsets from the stale fetch.
-					if (this.partitionStates.get(key) !== state) {
-						this.logger.debug('dropping fetch response after decode for replaced partition state', {
-							topic: topicResponse.topic,
-							partition: partitionResponse.partitionIndex,
-						})
-						continue
-					}
+					// decodeRecords may have awaited; re-fence.
+					if (state.abortController.signal.aborted) continue
 
-					const fetchOffset = fetchOffsetByKey.get(key)
-					if (fetchOffset !== undefined) {
-						records = filterRecordsFromOffset(records, fetchOffset)
-					}
+					records = filterRecordsFromOffset(records, fetchOffset)
 
 					if (records.length > 0) {
 						// Advance offset for next fetch
