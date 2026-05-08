@@ -157,6 +157,11 @@ const RETRIABLE_ERRORS = new Set<ErrorCode>([
 	ErrorCode.UnstableOffsetCommit,
 	ErrorCode.ThrottlingQuotaExceeded,
 	ErrorCode.ConcurrentTransactions,
+	// RebalanceInProgress is returned by TxnOffsetCommit / OffsetCommit / Heartbeat
+	// when the consumer group is mid-rebalance — the right response is to wait
+	// and retry. Consumer-group code paths handle it via explicit case branches
+	// and are not affected by this set.
+	ErrorCode.RebalanceInProgress,
 ])
 
 /**

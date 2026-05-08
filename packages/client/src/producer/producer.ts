@@ -1365,68 +1365,43 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		// TxnOffsetCommit goes to the GROUP coordinator (not transaction coordinator)
 		let groupCoordinator = await this.cluster.getCoordinator('GROUP', groupId)
 
-		const strategy = new ReconnectionStrategy(createRetryStrategyOptions(this.config))
+		await retry(
+			async () => {
+				const response = await groupCoordinator.txnOffsetCommit({
+					transactionalId: this.config.transactionalId!,
+					groupId,
+					producerId: this.producerId,
+					producerEpoch: this.producerEpoch,
+					generationId,
+					memberId,
+					groupInstanceId,
+					topics: Array.from(topicMap.entries()).map(([name, partitions]) => ({
+						name,
+						partitions,
+					})),
+				})
 
-		while (strategy.shouldReconnect()) {
-			const response = await groupCoordinator.txnOffsetCommit({
-				transactionalId: this.config.transactionalId!,
-				groupId,
-				producerId: this.producerId,
-				producerEpoch: this.producerEpoch,
-				generationId,
-				memberId,
-				groupInstanceId,
-				topics: Array.from(topicMap.entries()).map(([name, partitions]) => ({
-					name,
-					partitions,
-				})),
-			})
+				for (const topic of response.topics) {
+					for (const partition of topic.partitions) {
+						if (partition.errorCode === ErrorCode.None) continue
 
-			// Check for errors - collect all partition errors
-			let hasError = false
-			let coordinatorError: ErrorCode | null = null
-
-			for (const topic of response.topics) {
-				for (const partition of topic.partitions) {
-					if (partition.errorCode !== ErrorCode.None) {
-						hasError = true
-						if (
-							partition.errorCode === ErrorCode.NotCoordinator ||
-							partition.errorCode === ErrorCode.CoordinatorNotAvailable
-						) {
-							coordinatorError = partition.errorCode
+						if (isCoordinatorErrorCode(partition.errorCode)) {
+							this.cluster.invalidateCoordinator('GROUP', groupId)
+							groupCoordinator = await this.cluster.getCoordinator('GROUP', groupId)
 						}
-					}
-				}
-			}
 
-			if (!hasError) {
-				return // Success
-			}
-
-			// Handle coordinator move - invalidate cache and re-fetch
-			if (coordinatorError !== null) {
-				this.cluster.invalidateCoordinator('GROUP', groupId)
-				groupCoordinator = await this.cluster.getCoordinator('GROUP', groupId)
-				strategy.recordFailure()
-				if (strategy.shouldReconnect()) {
-					await this.sleep(strategy.nextDelay())
-					continue
-				}
-			}
-
-			// Throw first error found
-			for (const topic of response.topics) {
-				for (const partition of topic.partitions) {
-					if (partition.errorCode !== ErrorCode.None) {
 						throw new KafkaProtocolError(
 							partition.errorCode,
 							`TxnOffsetCommit failed for ${topic.name}-${partition.partitionIndex}`
 						)
 					}
 				}
+			},
+			{
+				...createRetryStrategyOptions(this.config),
+				shouldRetry: error => error instanceof KafkaProtocolError && error.retriable,
 			}
-		}
+		)
 	}
 
 	/**
