@@ -13,10 +13,7 @@ interface MappingEntry<K, V> {
 }
 
 describe('TableGroupByNode mapping ordering', () => {
-	it('forwards SUB with old mapping BEFORE persisting new mapping', async () => {
-		// Track the order of operations: forward(SUB) must precede store.put(newMapping)
-		// so that on crash + replay, the previous mapping is still old when the
-		// SUB re-fires (idempotent under EOS).
+	it('persists new mapping BEFORE forwarding SUB/ADD deltas', async () => {
 		const order: string[] = []
 
 		const data = new Map<string, MappingEntry<string, number>>()
@@ -52,7 +49,6 @@ describe('TableGroupByNode mapping ordering', () => {
 			storeRef as unknown as { store: KeyValueStore<string, MappingEntry<string, number>> | null },
 			codec
 		)
-		// Capture forwards
 		const forwards: Array<{ key: string | null; value: number | null; headers: Record<string, Buffer> }> = []
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		;(node as any).forward = async (record: any) => {
@@ -72,11 +68,6 @@ describe('TableGroupByNode mapping ordering', () => {
 			headers: {},
 		})
 
-		// Original (intentional) ordering: put first so recompute nodes see the
-		// new mapping when SUB/ADD arrive, then SUB with old, then ADD with new.
-		// An earlier review proposed SUB-before-put for crash-recovery reasons;
-		// it was rejected because it breaks the at-least-once recompute path.
-		// See flow.test.ts "retracts counts when grouped key changes".
 		const subIdx = order.findIndex(s => s.startsWith(`forward(${DELTA_SUB_VALUE}`))
 		const putIdx = order.findIndex(s => s.startsWith('put('))
 		const addIdx = order.findIndex(s => s.startsWith(`forward(${DELTA_ADD_VALUE}`))
@@ -85,7 +76,6 @@ describe('TableGroupByNode mapping ordering', () => {
 		expect(subIdx).toBeGreaterThan(putIdx)
 		expect(addIdx).toBeGreaterThan(subIdx)
 
-		// And the SUB must carry the OLD grouped key/value.
 		const subForward = forwards.find(f => {
 			const op = f.headers[DELTA_OP_HEADER]
 			return Buffer.isBuffer(op) ? op.toString() === DELTA_SUB_VALUE : false

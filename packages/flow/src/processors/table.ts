@@ -124,9 +124,8 @@ export class TableGroupByNode<K, V, K2> extends Processor<K, V, K2, V> {
 		// Handle tombstone: source row deleted
 		if (record.value === null) {
 			if (previousMapping !== undefined) {
+				// Mutate mapping before forwarding (see put-then-deltas comment below).
 				await store.delete(sourceKey)
-				// Emit SUB for old grouped key with old value after mapping deletion.
-				// Recompute nodes rely on mapping store as source of truth.
 				await this.forward({
 					...record,
 					key: previousMapping.groupedKey,
@@ -139,13 +138,9 @@ export class TableGroupByNode<K, V, K2> extends Processor<K, V, K2, V> {
 
 		const [newGroupedKey, newValue] = this.fn(sourceKey, record.value)
 
-		// Store new mapping before forwarding deltas. The downstream recompute
-		// nodes (TableGroupedComputeCountNode etc.) re-derive aggregates from
-		// the mapping store as the source of truth — they need the new
-		// mapping to be visible by the time SUB/ADD arrive. Reordering this
-		// (e.g. SUB-then-put) breaks at-least-once recompute semantics; see
-		// flow.test.ts "retracts counts when grouped key changes" which
-		// regresses if put is moved after SUB.
+		// Persist mapping before forwarding deltas: TableGroupedCompute* nodes recompute by re-scanning the
+		// mapping store, so they need the new mapping visible when SUB/ADD arrive. Pinned by
+		// flow.test.ts "retracts counts when grouped key changes" + table-groupby-ordering.test.ts.
 		await store.put(sourceKey, { groupedKey: newGroupedKey, value: newValue })
 
 		// Retract old mapping if it exists
