@@ -543,13 +543,12 @@ class LMDBChangelogCheckpointStore implements ChangelogCheckpointStore {
 		const value = Buffer.alloc(8)
 		value.writeBigInt64BE(offset, 0)
 		await this.db.put(key, value)
-		// Wait for fsync so the checkpoint is durable on disk before this
-		// promise resolves. Without it, a hard crash can advance the
-		// in-memory checkpoint past data that hasn't yet been flushed for
-		// the data store, and restoration will skip needed changelog
-		// records on restart (silent state corruption). With it, the worst
-		// case after a crash is the checkpoint trailing the data store —
-		// harmless re-replay of already-applied records.
+	}
+
+	// fsync after the put-loop, not per-write: lmdb-js's overlappingSync (default on linux/macos) resolves
+	// db.put at visibility, not durability — without flushed(), a crash could advance the in-memory
+	// checkpoint past data the data store hasn't synced yet (silent state corruption on restart).
+	async flush(): Promise<void> {
 		await this.db.flushed
 	}
 

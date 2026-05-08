@@ -173,6 +173,13 @@ export interface ChangelogCheckpointStore {
 	 * The offset should be the "next" offset (i.e. last-applied offset + 1).
 	 */
 	set(topic: string, partition: number, offset: bigint): Promise<void>
+
+	/**
+	 * Flush all prior set() writes to durable storage. Implementations that
+	 * already block in set() can no-op. Callers that batch many set()s should
+	 * call flush() once at the end to amortize fsync overhead.
+	 */
+	flush?(): Promise<void>
 }
 
 /**
