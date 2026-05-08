@@ -16,12 +16,28 @@ import type {
 const KEY_TERMINATOR = Buffer.from([0])
 const inclusiveEnd = (b: Buffer): Buffer => Buffer.concat([b, KEY_TERMINATOR])
 
-// WindowStore keys encode as 16 BE bytes [windowStart][windowEnd]; padding the second half with 0 yields
-// the lex-smallest key for a given windowStart, so half-open [timeBound(from), timeBound(to+1)) selects
-// all records whose windowStart is in [from, to] regardless of windowEnd.
+// Order-preserving signed-i64 encoding for time keys. lmdb-js compares keys as unsigned bytes,
+// but timestamps can be signed (e.g. windowStart < 0 for records near the unix epoch with size > t,
+// or `currentTime - retentionMs` < 0 in expiry math). Raw writeBigInt64BE puts negatives at 0xFF…FF
+// so they sort AFTER positives — range scans crossing zero would be broken. Bias by 2^63 before
+// encoding so signed numeric order matches unsigned-byte lex order: -2^63→0x00…00, 0→0x80…00, +max→0xFF…FE.
+const SIGNED_BIAS = 1n << 63n
+
+function writeSignedTime(buf: Buffer, value: number, offset: number): void {
+	buf.writeBigUInt64BE(BigInt(value) + SIGNED_BIAS, offset)
+}
+
+function readSignedTime(buf: Buffer, offset: number): number {
+	return Number(buf.readBigUInt64BE(offset) - SIGNED_BIAS)
+}
+
+// WindowStore keys encode as 16 BE bytes [biasedStart][biasedEnd]; padding the second half with 0
+// (= biased value 0 = -2^63 = lex-smallest possible end) yields the lex-smallest key for a given
+// windowStart, so half-open [timeBound(from), timeBound(to+1)) selects all records whose
+// windowStart is in [from, to] regardless of windowEnd.
 const timeBound = (t: number): Buffer => {
 	const b = Buffer.alloc(16)
-	b.writeBigInt64BE(BigInt(t), 0)
+	writeSignedTime(b, t, 0)
 	return b
 }
 
@@ -111,8 +127,8 @@ export class LMDBKeyValueStore<K, V> implements KeyValueStore<K, V> {
 function encodeWindowedKey<K>(key: WindowedKey<K>, keyCodec: Codec<K>): Buffer {
 	const keyBytes = keyCodec.encode(key.key)
 	const buf = Buffer.alloc(16 + keyBytes.length)
-	buf.writeBigInt64BE(BigInt(key.windowStart), 0)
-	buf.writeBigInt64BE(BigInt(key.windowEnd), 8)
+	writeSignedTime(buf, key.windowStart, 0)
+	writeSignedTime(buf, key.windowEnd, 8)
 	keyBytes.copy(buf, 16)
 	return buf
 }
@@ -121,8 +137,8 @@ function encodeWindowedKey<K>(key: WindowedKey<K>, keyCodec: Codec<K>): Buffer {
  * Decodes a windowed key from a buffer.
  */
 function decodeWindowedKey<K>(buf: Buffer, keyCodec: Codec<K>): WindowedKey<K> {
-	const windowStart = Number(buf.readBigInt64BE(0))
-	const windowEnd = Number(buf.readBigInt64BE(8))
+	const windowStart = readSignedTime(buf, 0)
+	const windowEnd = readSignedTime(buf, 8)
 	const keyBytes = buf.subarray(16)
 	return {
 		key: keyCodec.decode(keyBytes),
@@ -149,8 +165,8 @@ function encodeSessionKey<K>(key: WindowedKey<K>, keyCodec: Codec<K>): Buffer {
 	const keyBytes = keyCodec.encode(key.key)
 	const buf = Buffer.alloc(keyBytes.length + 16)
 	keyBytes.copy(buf, 0)
-	buf.writeBigInt64BE(BigInt(key.windowStart), keyBytes.length)
-	buf.writeBigInt64BE(BigInt(key.windowEnd), keyBytes.length + 8)
+	writeSignedTime(buf, key.windowStart, keyBytes.length)
+	writeSignedTime(buf, key.windowEnd, keyBytes.length + 8)
 	return buf
 }
 
@@ -159,8 +175,8 @@ function encodeSessionKey<K>(key: WindowedKey<K>, keyCodec: Codec<K>): Buffer {
  */
 function decodeSessionKey<K>(buf: Buffer, keyCodec: Codec<K>): WindowedKey<K> {
 	const keyBytes = buf.subarray(0, buf.length - 16)
-	const windowStart = Number(buf.readBigInt64BE(buf.length - 16))
-	const windowEnd = Number(buf.readBigInt64BE(buf.length - 8))
+	const windowStart = readSignedTime(buf, buf.length - 16)
+	const windowEnd = readSignedTime(buf, buf.length - 8)
 	return {
 		key: keyCodec.decode(keyBytes),
 		windowStart,
@@ -384,16 +400,16 @@ export class LMDBSessionStore<K, V> implements SessionStore<K, V> {
 		await Promise.resolve()
 		const keyBytes = this.keyCodec.encode(key)
 
-		// Create range bounds for the key prefix
+		// Range covers all sessions for this key prefix: [keyBytes, lex-min-time, lex-min-time]
+		// to [keyBytes, lex-max-time, lex-max-time]. Under biased encoding the lex-smallest
+		// 8-byte time is 0x00…00 (= -2^63) and lex-largest is 0xFF…FF (= +2^63-1).
 		const fromBytes = Buffer.alloc(keyBytes.length + 16)
 		keyBytes.copy(fromBytes, 0)
-		fromBytes.writeBigInt64BE(BigInt(0), keyBytes.length)
-		fromBytes.writeBigInt64BE(BigInt(0), keyBytes.length + 8)
+		// fromBytes is already zero-filled by Buffer.alloc — that's the lex-smallest biased time.
 
 		const toBytes = Buffer.alloc(keyBytes.length + 16)
 		keyBytes.copy(toBytes, 0)
-		toBytes.writeBigInt64BE(BigInt(Number.MAX_SAFE_INTEGER), keyBytes.length)
-		toBytes.writeBigInt64BE(BigInt(Number.MAX_SAFE_INTEGER), keyBytes.length + 8)
+		toBytes.fill(0xff, keyBytes.length)
 
 		for (const { key: storedKey, value } of this.db.getRange({ start: fromBytes, end: toBytes })) {
 			const sessionKey = this.sessionCodec.decode(storedKey)
@@ -409,16 +425,16 @@ export class LMDBSessionStore<K, V> implements SessionStore<K, V> {
 		const keyBytes = this.keyCodec.encode(key)
 		const toDelete: Buffer[] = []
 
-		// Create range bounds for the key prefix
+		// Range covers all sessions for this key prefix: [keyBytes, lex-min-time, lex-min-time]
+		// to [keyBytes, lex-max-time, lex-max-time]. Under biased encoding the lex-smallest
+		// 8-byte time is 0x00…00 (= -2^63) and lex-largest is 0xFF…FF (= +2^63-1).
 		const fromBytes = Buffer.alloc(keyBytes.length + 16)
 		keyBytes.copy(fromBytes, 0)
-		fromBytes.writeBigInt64BE(BigInt(0), keyBytes.length)
-		fromBytes.writeBigInt64BE(BigInt(0), keyBytes.length + 8)
+		// fromBytes is already zero-filled by Buffer.alloc — that's the lex-smallest biased time.
 
 		const toBytes = Buffer.alloc(keyBytes.length + 16)
 		keyBytes.copy(toBytes, 0)
-		toBytes.writeBigInt64BE(BigInt(Number.MAX_SAFE_INTEGER), keyBytes.length)
-		toBytes.writeBigInt64BE(BigInt(Number.MAX_SAFE_INTEGER), keyBytes.length + 8)
+		toBytes.fill(0xff, keyBytes.length)
 
 		for (const { key: storedKey } of this.db.getRange({ start: fromBytes, end: toBytes })) {
 			toDelete.push(storedKey)
