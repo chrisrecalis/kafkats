@@ -265,11 +265,6 @@ describe('changelog', () => {
 		})
 
 		it('writes to inner store BEFORE changelog (local-first ordering)', async () => {
-			// Crash-consistency: the changelog must not get ahead of local
-			// state. Track call order — inner.put must be called first so a
-			// crash between the two leaves the local store stale (replayed
-			// on restart) rather than the changelog ahead (forwards stale
-			// aggregates that disagree with the durable changelog).
 			const order: string[] = []
 			const innerSpy = vi.spyOn(innerStore, 'put').mockImplementation(async (key, value) => {
 				order.push(`inner.put(${key},${value})`)

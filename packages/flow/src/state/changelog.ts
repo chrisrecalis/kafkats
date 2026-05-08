@@ -27,11 +27,8 @@ export class ChangelogBackedKeyValueStore<K, V> implements KeyValueStore<K, V> {
 	}
 
 	async put(key: K, value: V): Promise<void> {
-		// Local-store-first ordering: if the local put fails, the changelog
-		// hasn't been written yet, so on restart we replay the input record
-		// and try again. With changelog-first, a crash between the two awaits
-		// leaves the changelog ahead of local state and downstream forwards
-		// see stale aggregates that disagree with the durable changelog.
+		// Local-first: a crash between the two must leave local stale (replayed on restart),
+		// not the changelog ahead (downstream forwards aggregates that disagree with the durable log).
 		await this.innerStore.put(key, value)
 		await this.writer.write(key, value)
 	}
