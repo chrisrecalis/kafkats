@@ -43,11 +43,19 @@ export class OffsetManager {
 	private autoCommitTimer: ReturnType<typeof setTimeout> | null = null
 	private abortController: AbortController | null = null
 
+	// Optional callback so the Consumer can react to commit failures
+	// (e.g. trigger rejoin on IllegalGeneration).
+	private onCommitError: ((error: Error) => void) | null = null
+
 	constructor(cluster: Cluster, groupId: string, groupInstanceId?: string, logger?: Logger) {
 		this.cluster = cluster
 		this.groupId = groupId
 		this.groupInstanceId = groupInstanceId
 		this.logger = logger?.child({ component: 'offset-manager', groupId }) ?? noopLogger
+	}
+
+	setCommitErrorHandler(handler: ((error: Error) => void) | null): void {
+		this.onCommitError = handler
 	}
 
 	/**
@@ -170,8 +178,17 @@ export class OffsetManager {
 				.then(() => {
 					this.logger.debug('auto-commit completed', { success: true })
 				})
-				.catch(error => {
-					this.logger.error('auto-commit failed', { error: (error as Error).message })
+				.catch((error: Error) => {
+					this.logger.error('auto-commit failed', { error: error.message })
+					if (this.onCommitError) {
+						try {
+							this.onCommitError(error)
+						} catch (handlerError) {
+							this.logger.error('auto-commit error handler threw', {
+								error: (handlerError as Error).message,
+							})
+						}
+					}
 				})
 				.finally(() => {
 					// Schedule next commit

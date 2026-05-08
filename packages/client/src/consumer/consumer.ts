@@ -8,7 +8,7 @@
 import { EventEmitter } from 'node:events'
 import type { Cluster } from '@/client/cluster.js'
 import { KafkaProtocolError } from '@/client/errors.js'
-import { ErrorCode } from '@/protocol/messages/error-codes.js'
+import { ErrorCode, isGenerationLostErrorCode } from '@/protocol/messages/error-codes.js'
 import { pmapVoid } from '@/utils/pmap.js'
 import type { DecodedRecord } from '@/protocol/records/index.js'
 import { buildDecoderMaps, decodeRecord } from './message-decoder.js'
@@ -166,6 +166,10 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			useConsumerGroup ? this.config.groupInstanceId : undefined,
 			logger
 		)
+		// Wire auto-commit failures back to the consumer so generation/coordinator
+		// errors are surfaced as 'error' events and trigger a rejoin instead of
+		// silently looping with an ever-growing consumedOffsets map.
+		this.offsetManager.setCommitErrorHandler(error => this.handleAutoCommitError(error))
 		this.fetchManager = new FetchManager(
 			this.cluster,
 			this.offsetManager,
@@ -784,6 +788,28 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		this.partitionProvider = null
 		this.abortController = null
 		this.runPromiseReject = null
+	}
+
+	private handleAutoCommitError(error: Error): void {
+		const code = error instanceof KafkaProtocolError ? error.errorCode : null
+
+		// RebalanceInProgress is expected during a cooperative rebalance — the
+		// next generation will retry. Trigger the rejoin path silently.
+		if (code === ErrorCode.RebalanceInProgress) {
+			this.offsetManager?.clearConsumedOffsets()
+			this.consumerGroup?.emit('rebalance')
+			return
+		}
+
+		this.emitError(error)
+
+		// Generation lost: stale offsets can't be committed under this generation;
+		// drop them and rejoin so the new generation resumes from the broker's
+		// last committed offset (otherwise consumedOffsets grows unboundedly).
+		if (code !== null && isGenerationLostErrorCode(code)) {
+			this.offsetManager?.clearConsumedOffsets()
+			this.consumerGroup?.emit('rebalance')
+		}
 	}
 
 	private emitError(error: unknown): void {
