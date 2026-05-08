@@ -16,25 +16,21 @@ import type {
 const KEY_TERMINATOR = Buffer.from([0])
 const inclusiveEnd = (b: Buffer): Buffer => Buffer.concat([b, KEY_TERMINATOR])
 
-// Order-preserving signed-i64 encoding for time keys. lmdb-js compares keys as unsigned bytes,
-// but timestamps can be signed (e.g. windowStart < 0 for records near the unix epoch with size > t,
-// or `currentTime - retentionMs` < 0 in expiry math). Raw writeBigInt64BE puts negatives at 0xFF…FF
-// so they sort AFTER positives — range scans crossing zero would be broken. Bias by 2^63 before
-// encoding so signed numeric order matches unsigned-byte lex order: -2^63→0x00…00, 0→0x80…00, +max→0xFF…FE.
-const SIGNED_BIAS = 1n << 63n
+// Bias signed times by 2^63 so unsigned-byte lex order matches signed numeric order.
+// Buffer.alloc's zero-fill represents bias(-2^63) = lex-smallest; LEX_MAX_TIME = bias(+2^63-1).
+const SIGNED_BIAS = 0x8000000000000000n
+const LEX_MAX_TIME = 0xff
 
-function writeSignedTime(buf: Buffer, value: number, offset: number): void {
+export function writeSignedTime(buf: Buffer, value: number, offset: number): void {
 	buf.writeBigUInt64BE(BigInt(value) + SIGNED_BIAS, offset)
 }
 
-function readSignedTime(buf: Buffer, offset: number): number {
+export function readSignedTime(buf: Buffer, offset: number): number {
 	return Number(buf.readBigUInt64BE(offset) - SIGNED_BIAS)
 }
 
-// WindowStore keys encode as 16 BE bytes [biasedStart][biasedEnd]; padding the second half with 0
-// (= biased value 0 = -2^63 = lex-smallest possible end) yields the lex-smallest key for a given
-// windowStart, so half-open [timeBound(from), timeBound(to+1)) selects all records whose
-// windowStart is in [from, to] regardless of windowEnd.
+// WindowStore key prefix [biasedStart][biasedEnd]; second half is implicit LEX_MIN_TIME (= -2^63)
+// so half-open [timeBound(from), timeBound(to+1)) selects every windowStart in [from, to].
 const timeBound = (t: number): Buffer => {
 	const b = Buffer.alloc(16)
 	writeSignedTime(b, t, 0)
@@ -399,22 +395,13 @@ export class LMDBSessionStore<K, V> implements SessionStore<K, V> {
 	async *findSessions(key: K, earliestStart: number, latestEnd: number): AsyncIterable<[WindowedKey<K>, V]> {
 		await Promise.resolve()
 		const keyBytes = this.keyCodec.encode(key)
+		const { from, to } = this.sessionPrefixRange(keyBytes)
 
-		// Range covers all sessions for this key prefix: [keyBytes, lex-min-time, lex-min-time]
-		// to [keyBytes, lex-max-time, lex-max-time]. Under biased encoding the lex-smallest
-		// 8-byte time is 0x00…00 (= -2^63) and lex-largest is 0xFF…FF (= +2^63-1).
-		const fromBytes = Buffer.alloc(keyBytes.length + 16)
-		keyBytes.copy(fromBytes, 0)
-		// fromBytes is already zero-filled by Buffer.alloc — that's the lex-smallest biased time.
-
-		const toBytes = Buffer.alloc(keyBytes.length + 16)
-		keyBytes.copy(toBytes, 0)
-		toBytes.fill(0xff, keyBytes.length)
-
-		for (const { key: storedKey, value } of this.db.getRange({ start: fromBytes, end: toBytes })) {
+		for (const { key: storedKey, value } of this.db.getRange({ start: from, end: to })) {
+			// Variable-length keys with shared prefixes can sort inside [from, to) — e.g. stored "ka"
+			// inside a "k" range. Filter to exact key match (length + prefix) before yielding.
+			if (!this.matchesKeyPrefix(storedKey, keyBytes)) continue
 			const sessionKey = this.sessionCodec.decode(storedKey)
-
-			// Check if session overlaps with the time range
 			if (sessionKey.windowStart <= latestEnd && sessionKey.windowEnd >= earliestStart) {
 				yield [sessionKey, this.valueCodec.decode(value)]
 			}
@@ -423,26 +410,33 @@ export class LMDBSessionStore<K, V> implements SessionStore<K, V> {
 
 	async remove(key: K): Promise<void> {
 		const keyBytes = this.keyCodec.encode(key)
+		const { from, to } = this.sessionPrefixRange(keyBytes)
 		const toDelete: Buffer[] = []
 
-		// Range covers all sessions for this key prefix: [keyBytes, lex-min-time, lex-min-time]
-		// to [keyBytes, lex-max-time, lex-max-time]. Under biased encoding the lex-smallest
-		// 8-byte time is 0x00…00 (= -2^63) and lex-largest is 0xFF…FF (= +2^63-1).
-		const fromBytes = Buffer.alloc(keyBytes.length + 16)
-		keyBytes.copy(fromBytes, 0)
-		// fromBytes is already zero-filled by Buffer.alloc — that's the lex-smallest biased time.
-
-		const toBytes = Buffer.alloc(keyBytes.length + 16)
-		keyBytes.copy(toBytes, 0)
-		toBytes.fill(0xff, keyBytes.length)
-
-		for (const { key: storedKey } of this.db.getRange({ start: fromBytes, end: toBytes })) {
+		for (const { key: storedKey } of this.db.getRange({ start: from, end: to })) {
+			// See findSessions: prefix-scan can include longer keys that share the prefix.
+			if (!this.matchesKeyPrefix(storedKey, keyBytes)) continue
 			toDelete.push(storedKey)
 		}
 
 		for (const k of toDelete) {
 			await this.db.remove(k)
 		}
+	}
+
+	private sessionPrefixRange(keyBytes: Buffer): { from: Buffer; to: Buffer } {
+		// Sessions are stored as [keyBytes][biasedStart:8][biasedEnd:8]. Range covers all
+		// time pairs for this key prefix: lex-min biased time = 0x00, lex-max = 0xff.
+		const from = Buffer.alloc(keyBytes.length + 16) // zero-filled = LEX_MIN_TIME
+		keyBytes.copy(from, 0)
+		const to = Buffer.alloc(keyBytes.length + 16)
+		keyBytes.copy(to, 0)
+		to.fill(LEX_MAX_TIME, keyBytes.length)
+		return { from, to }
+	}
+
+	private matchesKeyPrefix(storedKey: Buffer, keyBytes: Buffer): boolean {
+		return storedKey.length === keyBytes.length + 16 && storedKey.subarray(0, keyBytes.length).equals(keyBytes)
 	}
 
 	approximateNumEntries(): Promise<number> {

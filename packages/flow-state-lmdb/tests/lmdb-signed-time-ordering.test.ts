@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { lmdb } from '@/lmdb.js'
+import { lmdb, writeSignedTime, readSignedTime } from '@/lmdb.js'
 
 const stringCodec = {
 	encode: (s: string) => Buffer.from(s, 'utf-8'),
@@ -21,6 +21,28 @@ const numberCodec = {
 // F5b: LMDB time-key encoding must preserve signed-integer order. Pre-fix `writeBigInt64BE`
 // stored negatives as 0xFF…FF which sort AFTER positives in unsigned-byte order, so range
 // scans crossing zero (e.g. fetchAll(-1000, 1000)) would silently return nothing.
+
+describe('writeSignedTime/readSignedTime encoding contract', () => {
+	it('round-trips signed integers exactly', () => {
+		const buf = Buffer.alloc(8)
+		for (const t of [-1_000_000, -1, 0, 1, 1_700_000_000_000]) {
+			writeSignedTime(buf, t, 0)
+			expect(readSignedTime(buf, 0)).toBe(t)
+		}
+	})
+
+	it('produces lex-byte order matching signed numeric order', () => {
+		const sortedTimes = [-1_000_000, -1, 0, 1, 1_000_000]
+		const encoded = sortedTimes.map(t => {
+			const b = Buffer.alloc(8)
+			writeSignedTime(b, t, 0)
+			return b
+		})
+		for (let i = 1; i < encoded.length; i++) {
+			expect(encoded[i - 1]!.compare(encoded[i]!)).toBeLessThan(0)
+		}
+	})
+})
 
 describe('LMDBWindowStore signed-time ordering', () => {
 	let stateDir: string
@@ -185,6 +207,45 @@ describe('LMDBSessionStore signed-time ordering', () => {
 			found.push(value)
 		}
 		expect(found.sort((a, b) => a - b)).toEqual([1, 2])
+
+		await store.close()
+		await provider.close()
+	})
+
+	it('findSessions and remove do NOT bleed into longer keys sharing the prefix', async () => {
+		// Session keys are stored as [keyBytes][biasedStart][biasedEnd] with no delimiter.
+		// A naive "[keyBytes, lex-min, lex-min] to [keyBytes, lex-max, lex-max]" range scan
+		// includes longer keys like "ka" when querying "k" — Codex caught this as a follow-on
+		// of the F5b encoding switch. The fix: post-filter by exact key-bytes + length match.
+		const provider = lmdb({ stateDir })
+		const store = provider.createSessionStore<string, number>('s', {
+			keyCodec: stringCodec,
+			valueCodec: numberCodec,
+			retentionMs: 60_000,
+		})
+		await store.init()
+
+		await store.put({ key: 'k', windowStart: 100, windowEnd: 200 }, 1)
+		await store.put({ key: 'ka', windowStart: 100, windowEnd: 200 }, 99)
+		await store.put({ key: 'k2', windowStart: 100, windowEnd: 200 }, 88)
+
+		// findSessions('k') must NOT see "ka" or "k2" sessions.
+		const found: number[] = []
+		for await (const [, value] of store.findSessions('k', 0, 1000)) {
+			found.push(value)
+		}
+		expect(found).toEqual([1])
+
+		// remove('k') must NOT delete "ka" or "k2" sessions.
+		await store.remove('k')
+		const remaining: number[] = []
+		for await (const [, value] of store.findSessions('ka', 0, 1000)) {
+			remaining.push(value)
+		}
+		for await (const [, value] of store.findSessions('k2', 0, 1000)) {
+			remaining.push(value)
+		}
+		expect(remaining.sort((a, b) => a - b)).toEqual([88, 99])
 
 		await store.close()
 		await provider.close()
