@@ -217,6 +217,10 @@ export class GroupPartitionProvider implements PartitionProvider {
 		} catch (error) {
 			const err = error instanceof Error ? error : new Error(String(error))
 			this.logger.error('rebalance handler failed', { error: err.message })
+			// Stop the group too: if onRebalance (e.g. EOS commit) failed, continuing the
+			// fetch loop on the stale assignment would be unsafe. The error is surfaced via
+			// onError; the run loop sees the stop and exits cleanly.
+			void this.consumerGroup.stop().catch(() => {})
 			this.callbacks.onError(err)
 		}
 	}

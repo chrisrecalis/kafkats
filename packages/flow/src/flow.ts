@@ -325,6 +325,7 @@ class FlowAppImpl implements FlowApp {
 			// resolve to the right WorkerContext without depending on let-binding shadowing.
 			const workerRef: { current: WorkerContext | null } = { current: null }
 
+			const userHook = this.config.consumer?.onBeforeRebalance
 			const consumer = this.client.consumer({
 				groupId: this.config.applicationId,
 				...this.config.consumer,
@@ -332,16 +333,21 @@ class FlowAppImpl implements FlowApp {
 				groupInstanceId,
 				isolationLevel: this.eosEnabled ? 'read_committed' : this.config.consumer?.isolationLevel,
 				// EOS: commit the in-flight transaction inside the awaited rebalance window
-				// so offsets land before the group rejoins. Without this, the new generation
-				// can re-process records the prior generation was about to commit.
-				onBeforeRebalance: this.eosEnabled
-					? async () => {
-							const w = workerRef.current
-							if (w?.transactionActive) {
-								await this.enqueueEosTask(w, () => this.commitTransactionBatch(w))
+				// so offsets land before the group rejoins. Compose with any user-supplied
+				// hook (user runs first; their hook can prep state before the EOS commit).
+				// A commit failure rejects this promise → the rebalance protocol's catch
+				// emits the error and the consumer halts before processing on stale state.
+				onBeforeRebalance:
+					this.eosEnabled || userHook
+						? async () => {
+								if (userHook) await userHook()
+								if (!this.eosEnabled) return
+								const w = workerRef.current
+								if (w?.transactionActive) {
+									await this.enqueueEosTask(w, () => this.commitTransactionBatch(w))
+								}
 							}
-						}
-					: this.config.consumer?.onBeforeRebalance,
+						: undefined,
 			})
 
 			const worker: WorkerContext = {
