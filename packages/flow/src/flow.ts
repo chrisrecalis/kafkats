@@ -7,6 +7,7 @@ import {
 	type Producer,
 	type ProducerConfig,
 	type RunEachOptions,
+	type Logger,
 } from '@kafkats/client'
 import type { Codec } from '@/codec.js'
 import { buffer as bufferCodec } from '@/codec.js'
@@ -83,6 +84,7 @@ class FlowAppImpl implements FlowApp {
 	readonly stateStores = new Map<string, KeyValueStore<unknown, unknown>>()
 	private readonly changelogTopics = new Map<string, ChangelogTopicSpec>()
 	private readonly changelogWriters = new Map<string, ChangelogWriter<unknown, unknown>>()
+	private readonly logger: Logger
 	private currentState: StreamState = 'CREATED'
 	private workers: WorkerContext[] = []
 	private runPromises: Promise<void>[] = []
@@ -112,6 +114,7 @@ class FlowAppImpl implements FlowApp {
 		}
 		this.stateStoreProvider = config.stateStoreProvider ?? new InMemoryStateStoreProvider()
 		this.changelogCheckpointStore = this.stateStoreProvider.getChangelogCheckpointStore?.() ?? null
+		this.logger = this.client.cluster.getLogger()
 	}
 
 	getOrCreateStore<K, V>(
@@ -1069,12 +1072,27 @@ class FlowAppImpl implements FlowApp {
 			// after the last data record on every touched partition.
 			// Advance checkpoint past that marker so restoration can start at the true log end.
 			const checkpointOffset = checkpoint.offset + 1n
-			await this.changelogCheckpointStore
-				.set(checkpoint.topic, checkpoint.partition, checkpointOffset)
-				.catch(() => {})
+			try {
+				await this.changelogCheckpointStore.set(checkpoint.topic, checkpoint.partition, checkpointOffset)
+			} catch (err) {
+				// Don't halt the worker — the data is already durable in the changelog/output topics
+				// (this runs after the EOS commit). Surface so the user can see it: a persistent failure
+				// means the in-memory checkpoint silently lags reality and restore-time will over-replay.
+				this.recordCheckpointError(err, { topic: checkpoint.topic, partition: checkpoint.partition })
+			}
 		}
 		// One fsync covers all the puts above; awaiting per-set would be O(partitions) syscalls per commit.
-		await this.changelogCheckpointStore.flush?.().catch(() => {})
+		try {
+			await this.changelogCheckpointStore.flush?.()
+		} catch (err) {
+			this.recordCheckpointError(err, { phase: 'flush' })
+		}
+	}
+
+	private recordCheckpointError(err: unknown, context: Record<string, unknown>): void {
+		const error = err instanceof Error ? err : new Error(String(err))
+		this.logger.error('checkpoint persistence failed', { ...context, error: error.message })
+		this.lastError = error
 	}
 
 	/**
