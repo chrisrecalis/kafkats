@@ -1365,84 +1365,43 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		// TxnOffsetCommit goes to the GROUP coordinator (not transaction coordinator)
 		let groupCoordinator = await this.cluster.getCoordinator('GROUP', groupId)
 
-		const strategy = new ReconnectionStrategy(createRetryStrategyOptions(this.config))
+		await retry(
+			async () => {
+				const response = await groupCoordinator.txnOffsetCommit({
+					transactionalId: this.config.transactionalId!,
+					groupId,
+					producerId: this.producerId,
+					producerEpoch: this.producerEpoch,
+					generationId,
+					memberId,
+					groupInstanceId,
+					topics: Array.from(topicMap.entries()).map(([name, partitions]) => ({
+						name,
+						partitions,
+					})),
+				})
 
-		while (strategy.shouldReconnect()) {
-			const response = await groupCoordinator.txnOffsetCommit({
-				transactionalId: this.config.transactionalId!,
-				groupId,
-				producerId: this.producerId,
-				producerEpoch: this.producerEpoch,
-				generationId,
-				memberId,
-				groupInstanceId,
-				topics: Array.from(topicMap.entries()).map(([name, partitions]) => ({
-					name,
-					partitions,
-				})),
-			})
+				for (const topic of response.topics) {
+					for (const partition of topic.partitions) {
+						if (partition.errorCode === ErrorCode.None) continue
 
-			// Check for errors - collect first failure (also classify as
-			// coordinator vs other-retriable so we can refresh the coordinator
-			// in the right path).
-			let firstError: { topic: string; partition: number; errorCode: ErrorCode } | null = null
-			let coordinatorError: ErrorCode | null = null
-
-			for (const topic of response.topics) {
-				for (const partition of topic.partitions) {
-					if (partition.errorCode !== ErrorCode.None) {
-						if (firstError === null) {
-							firstError = {
-								topic: topic.name,
-								partition: partition.partitionIndex,
-								errorCode: partition.errorCode,
-							}
+						if (isCoordinatorErrorCode(partition.errorCode)) {
+							this.cluster.invalidateCoordinator('GROUP', groupId)
+							groupCoordinator = await this.cluster.getCoordinator('GROUP', groupId)
 						}
-						if (
-							partition.errorCode === ErrorCode.NotCoordinator ||
-							partition.errorCode === ErrorCode.CoordinatorNotAvailable
-						) {
-							coordinatorError = partition.errorCode
-						}
+
+						throw new KafkaProtocolError(
+							partition.errorCode,
+							`TxnOffsetCommit failed for ${topic.name}-${partition.partitionIndex}`
+						)
 					}
 				}
+			},
+			{
+				...createRetryStrategyOptions(this.config),
+				shouldRetry: error => error instanceof KafkaProtocolError && error.retriable,
 			}
-
-			if (firstError === null) {
-				return // Success
-			}
-
-			// Coordinator move — invalidate cache and re-fetch before retrying.
-			if (coordinatorError !== null) {
-				this.cluster.invalidateCoordinator('GROUP', groupId)
-				groupCoordinator = await this.cluster.getCoordinator('GROUP', groupId)
-				strategy.recordFailure()
-				if (strategy.shouldReconnect()) {
-					await this.sleep(strategy.nextDelay())
-					continue
-				}
-			} else if (
-				isRetriableError(firstError.errorCode) ||
-				// RebalanceInProgress is not globally retriable, but for
-				// TxnOffsetCommit it means the consumer group is rebalancing —
-				// wait and retry per the Kafka protocol.
-				firstError.errorCode === ErrorCode.RebalanceInProgress
-			) {
-				// Other retriable errors (CoordinatorLoadInProgress,
-				// RequestTimedOut, RebalanceInProgress, etc.) — wait and retry
-				// without flipping the coordinator.
-				strategy.recordFailure()
-				if (strategy.shouldReconnect()) {
-					await this.sleep(strategy.nextDelay())
-					continue
-				}
-			}
-
-			throw new KafkaProtocolError(
-				firstError.errorCode,
-				`TxnOffsetCommit failed for ${firstError.topic}-${firstError.partition}`
-			)
-		}
+		)
 	}
 
 	/**
