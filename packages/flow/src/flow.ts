@@ -1049,6 +1049,8 @@ class FlowAppImpl implements FlowApp {
 				.set(checkpoint.topic, checkpoint.partition, checkpointOffset)
 				.catch(() => {})
 		}
+		// One fsync covers all the puts above; awaiting per-set would be O(partitions) syscalls per commit.
+		await this.changelogCheckpointStore.flush?.().catch(() => {})
 	}
 
 	/**

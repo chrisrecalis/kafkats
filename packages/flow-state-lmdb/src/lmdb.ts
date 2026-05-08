@@ -545,6 +545,13 @@ class LMDBChangelogCheckpointStore implements ChangelogCheckpointStore {
 		await this.db.put(key, value)
 	}
 
+	// fsync after the put-loop, not per-write: lmdb-js's overlappingSync (default on linux/macos) resolves
+	// db.put at visibility, not durability — without flushed(), a crash could advance the in-memory
+	// checkpoint past data the data store hasn't synced yet (silent state corruption on restart).
+	async flush(): Promise<void> {
+		await this.db.flushed
+	}
+
 	private encodeKey(topic: string, partition: number): Buffer {
 		return Buffer.from(`${topic}\u0000${partition}`, 'utf8')
 	}
