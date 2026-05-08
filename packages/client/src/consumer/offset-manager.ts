@@ -356,28 +356,33 @@ export class OffsetManager {
 			topics,
 		})
 
+		// Clear successes before throwing — same partial-failure pattern as commitPendingOffsets:
+		// if we throw eagerly on the first error, healthy siblings stay in consumedOffsets and
+		// would be re-sent (under a possibly-stale generation) on the next commit.
+		let firstError: KafkaProtocolError | null = null
+
 		for (const topic of response.topics) {
 			for (const partition of topic.partitions) {
-				if (partition.errorCode !== ErrorCode.None) {
-					this.logger.error('partition offset commit error', {
-						topic: topic.name,
-						partition: partition.partitionIndex,
-						errorCode: partition.errorCode,
-					})
-					throw new KafkaProtocolError(
-						partition.errorCode,
-						`OffsetCommit failed for ${topic.name}-${partition.partitionIndex}`
-					)
+				const key = `${topic.name}:${partition.partitionIndex}`
+				if (partition.errorCode === ErrorCode.None) {
+					this.consumedOffsets.delete(key)
+					continue
 				}
+				this.logger.error('partition offset commit error', {
+					topic: topic.name,
+					partition: partition.partitionIndex,
+					errorCode: partition.errorCode,
+				})
+				firstError ??= new KafkaProtocolError(
+					partition.errorCode,
+					`OffsetCommit failed for ${topic.name}-${partition.partitionIndex}`
+				)
 			}
 		}
 
-		this.logger.debug('partition offsets committed successfully', { count: toCommit.size })
+		if (firstError) throw firstError
 
-		// Remove ONLY committed partitions from consumedOffsets
-		for (const key of toCommit.keys()) {
-			this.consumedOffsets.delete(key)
-		}
+		this.logger.debug('partition offsets committed successfully', { count: toCommit.size })
 	}
 
 	/**

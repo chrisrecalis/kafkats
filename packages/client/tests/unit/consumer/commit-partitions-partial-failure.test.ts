@@ -1,0 +1,50 @@
+import { describe, expect, it, vi } from 'vitest'
+
+import { OffsetManager } from '@/consumer/offset-manager.js'
+import { ErrorCode } from '@/protocol/messages/error-codes.js'
+import type { Cluster } from '@/client/cluster.js'
+
+describe('OffsetManager.commitPartitions partial-failure handling', () => {
+	it('clears successful partitions even if a sibling errored (mirrors commitPendingOffsets)', async () => {
+		const offsetCommit = vi.fn().mockResolvedValue({
+			topics: [
+				{
+					name: 't',
+					partitions: [
+						{ partitionIndex: 0, errorCode: ErrorCode.None },
+						{ partitionIndex: 1, errorCode: ErrorCode.NotCoordinator },
+						{ partitionIndex: 2, errorCode: ErrorCode.None },
+					],
+				},
+			],
+		})
+
+		const cluster = {
+			getCoordinator: vi.fn(),
+			getLogger: () => null,
+		}
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const manager = new OffsetManager(cluster as unknown as Cluster, 'g1') as any
+		manager.coordinator = { offsetCommit }
+		manager.memberId = 'm1'
+		manager.generationId = 5
+
+		manager.consumedOffsets.set('t:0', 10n)
+		manager.consumedOffsets.set('t:1', 20n)
+		manager.consumedOffsets.set('t:2', 30n)
+
+		const partitions = [
+			{ topic: 't', partition: 0 },
+			{ topic: 't', partition: 1 },
+			{ topic: 't', partition: 2 },
+		]
+
+		await expect(manager.commitPartitions(partitions)).rejects.toThrow(/NotCoordinator|OffsetCommit failed/i)
+
+		// errored partition stays for retry
+		expect(manager.consumedOffsets.get('t:1')).toBe(20n)
+		// successful partitions cleared so they aren't re-sent under stale generation
+		expect(manager.consumedOffsets.has('t:0')).toBe(false)
+		expect(manager.consumedOffsets.has('t:2')).toBe(false)
+	})
+})
