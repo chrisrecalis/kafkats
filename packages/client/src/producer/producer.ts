@@ -967,16 +967,13 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		try {
 			await this.flush()
 		} catch (error) {
-			// flush failed (e.g. broker disconnected) — fall through and reject
-			// any leftover state below so callers don't hang forever.
 			this.logger.warn('flush() failed during disconnect', {
 				error: error instanceof Error ? error.message : String(error),
 			})
 		}
 
-		// Defensive cleanup: reject anything still queued. With flush() doing
-		// its job, both should be empty here, but if flush threw we must not
-		// leave caller promises dangling.
+		// If flush() threw, batches may still be in pendingBatches / inflightBatches /
+		// the accumulator. Reject everything so caller promises don't hang.
 		const disconnectError = new Error('Producer disconnected')
 		for (const batch of this.pendingBatches) {
 			for (const msg of batch.messages) {
@@ -984,6 +981,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 			}
 		}
 		this.pendingBatches.length = 0
+		this.failAllInflightBatches(disconnectError)
 		this.accumulator.clearWithRejection(disconnectError)
 
 		this.state = 'idle'
