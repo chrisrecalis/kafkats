@@ -289,15 +289,11 @@ describe('Producer retry behavior', () => {
 		})
 
 		it('OUT_OF_ORDER_SEQUENCE_NUMBER fences the producer for re-init', async () => {
-			// OOO indicates a prior batch was lost and the per-partition sequence
-			// is out of sync. Without fencing, every subsequent send keeps
-			// reserving sequences against the wrong base and the partition is
-			// stuck until the process restarts. After this fix, the producer
-			// transitions to 'fenced' and the next send re-initializes.
 			let initCount = 0
 			mockBroker.initProducerId.mockImplementation(async () => {
 				initCount++
 				return {
+					throttleTimeMs: 0,
 					errorCode: ErrorCode.None,
 					producerId: 2000n + BigInt(initCount),
 					producerEpoch: initCount,
