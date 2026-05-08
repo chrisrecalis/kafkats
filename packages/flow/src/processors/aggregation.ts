@@ -145,17 +145,21 @@ function* windowStartsFor(
  * Processor node for windowed reduce operations. Honours TimeWindows.advanceBy() (hopping windows).
  */
 export class WindowedReduceNode<K, V> extends Processor<K, V, Windowed<K>, V> {
+	private static readonly CLEANUP_INTERVAL_MS = 60_000
 	private readonly advanceMs: number
+	private readonly cleanupState: CleanupState
 
 	constructor(
 		private readonly storeName: string,
 		private readonly storeRef: { store: WindowStore<K, V> | null },
 		private readonly reducer: (aggregate: V, value: V) => V,
 		private readonly windowSizeMs: number,
-		advanceMs: number = 0
+		advanceMs: number = 0,
+		cleanupState?: CleanupState
 	) {
 		super()
 		this.advanceMs = resolveAdvanceMs(windowSizeMs, advanceMs)
+		this.cleanupState = cleanupState ?? { lastCleanupStreamTimeMs: 0, streamTimeMs: 0 }
 	}
 
 	clone(worker: WorkerContext): Processor<K, V, Windowed<K>, V> {
@@ -165,7 +169,8 @@ export class WindowedReduceNode<K, V> extends Processor<K, V, Windowed<K>, V> {
 			this.storeRef,
 			this.reducer,
 			this.windowSizeMs,
-			this.advanceMs
+			this.advanceMs,
+			this.cleanupState
 		)
 	}
 
@@ -193,6 +198,16 @@ export class WindowedReduceNode<K, V> extends Processor<K, V, Windowed<K>, V> {
 			const next: StreamRecord<Windowed<K>, V> = { ...record, key: windowedResult, value: newAggregate }
 			await this.forward(next)
 		}
+
+		// Stream-time-driven retention; mirrors WindowedAggregateNode (was missing here pre-fix → unbounded growth).
+		this.cleanupState.streamTimeMs = Math.max(this.cleanupState.streamTimeMs, timestamp)
+		if (
+			this.cleanupState.streamTimeMs - this.cleanupState.lastCleanupStreamTimeMs >
+			WindowedReduceNode.CLEANUP_INTERVAL_MS
+		) {
+			this.cleanupState.lastCleanupStreamTimeMs = this.cleanupState.streamTimeMs
+			await store.expireOldWindows(this.cleanupState.streamTimeMs)
+		}
 	}
 }
 
@@ -201,18 +216,23 @@ export class WindowedReduceNode<K, V> extends Processor<K, V, Windowed<K>, V> {
  * Sessions are merged when events arrive within the inactivity gap.
  */
 export class SessionReduceNode<K, V> extends Processor<K, V, Windowed<K>, V> {
+	private static readonly CLEANUP_INTERVAL_MS = 60_000
+	private readonly cleanupState: CleanupState
+
 	constructor(
 		private readonly storeName: string,
 		private readonly storeRef: { store: SessionStore<K, V> | null },
 		private readonly reducer: (aggregate: V, value: V) => V,
-		private readonly gapMs: number
+		private readonly gapMs: number,
+		cleanupState?: CleanupState
 	) {
 		super()
+		this.cleanupState = cleanupState ?? { lastCleanupStreamTimeMs: 0, streamTimeMs: 0 }
 	}
 
 	clone(worker: WorkerContext): Processor<K, V, Windowed<K>, V> {
 		void worker
-		return new SessionReduceNode<K, V>(this.storeName, this.storeRef, this.reducer, this.gapMs)
+		return new SessionReduceNode<K, V>(this.storeName, this.storeRef, this.reducer, this.gapMs, this.cleanupState)
 	}
 
 	async process(record: StreamRecord<K, V>): Promise<void> {
@@ -255,6 +275,16 @@ export class SessionReduceNode<K, V> extends Processor<K, V, Windowed<K>, V> {
 		const windowedResult: Windowed<K> = { key, window: { start: mergedStart, end: mergedEnd } }
 		const next: StreamRecord<Windowed<K>, V> = { ...record, key: windowedResult, value: mergedValue }
 		await this.forward(next)
+
+		// Stream-time-driven retention; without this, closed sessions accumulate forever.
+		this.cleanupState.streamTimeMs = Math.max(this.cleanupState.streamTimeMs, timestamp)
+		if (
+			this.cleanupState.streamTimeMs - this.cleanupState.lastCleanupStreamTimeMs >
+			SessionReduceNode.CLEANUP_INTERVAL_MS
+		) {
+			this.cleanupState.lastCleanupStreamTimeMs = this.cleanupState.streamTimeMs
+			await store.expireOldSessions(this.cleanupState.streamTimeMs)
+		}
 	}
 }
 
@@ -341,15 +371,20 @@ export class WindowedAggregateNode<K, V, A> extends Processor<K, V, Windowed<K>,
  * Sessions are merged when events arrive within the inactivity gap.
  */
 export class SessionAggregateNode<K, V, A> extends Processor<K, V, Windowed<K>, A> {
+	private static readonly CLEANUP_INTERVAL_MS = 60_000
+	private readonly cleanupState: CleanupState
+
 	constructor(
 		private readonly storeName: string,
 		private readonly storeRef: { store: SessionStore<K, A> | null },
 		private readonly initializer: () => A,
 		private readonly aggregator: (key: K, value: V, aggregate: A) => A,
 		private readonly merger: (aggregate1: A, aggregate2: A) => A,
-		private readonly gapMs: number
+		private readonly gapMs: number,
+		cleanupState?: CleanupState
 	) {
 		super()
+		this.cleanupState = cleanupState ?? { lastCleanupStreamTimeMs: 0, streamTimeMs: 0 }
 	}
 
 	clone(worker: WorkerContext): Processor<K, V, Windowed<K>, A> {
@@ -360,7 +395,8 @@ export class SessionAggregateNode<K, V, A> extends Processor<K, V, Windowed<K>, 
 			this.initializer,
 			this.aggregator,
 			this.merger,
-			this.gapMs
+			this.gapMs,
+			this.cleanupState
 		)
 	}
 
@@ -433,5 +469,15 @@ export class SessionAggregateNode<K, V, A> extends Processor<K, V, Windowed<K>, 
 			value: mergedValue,
 		}
 		await this.forward(next)
+
+		// Stream-time-driven retention; without this, closed sessions accumulate forever.
+		this.cleanupState.streamTimeMs = Math.max(this.cleanupState.streamTimeMs, timestamp)
+		if (
+			this.cleanupState.streamTimeMs - this.cleanupState.lastCleanupStreamTimeMs >
+			SessionAggregateNode.CLEANUP_INTERVAL_MS
+		) {
+			this.cleanupState.lastCleanupStreamTimeMs = this.cleanupState.streamTimeMs
+			await store.expireOldSessions(this.cleanupState.streamTimeMs)
+		}
 	}
 }

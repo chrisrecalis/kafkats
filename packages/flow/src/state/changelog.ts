@@ -188,6 +188,13 @@ export class ChangelogBackedSessionStore<K, V> implements SessionStore<K, V> {
 		}
 	}
 
+	async expireOldSessions(currentTime: number): Promise<number> {
+		// Local-first: delegate to inner store's retention; the changelog will catch up via
+		// tombstones produced by inner deletes if/when the inner store emits them. For now,
+		// expiry is a local cleanup — restoration replays the changelog from the start anyway.
+		return this.inner.expireOldSessions(currentTime)
+	}
+
 	async approximateNumEntries(): Promise<number> {
 		return this.inner.approximateNumEntries()
 	}

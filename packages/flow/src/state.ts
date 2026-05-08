@@ -152,6 +152,14 @@ export interface SessionStore<K, V> extends KeyValueStore<WindowedKey<K>, V> {
 	 * Remove all sessions for a key.
 	 */
 	remove(key: K): Promise<void>
+
+	/**
+	 * Remove sessions whose end time is older than the cutoff (i.e. inactive
+	 * for at least the configured retention). Returns the number of sessions
+	 * removed. Without this, closed sessions persist forever and the store
+	 * grows unboundedly.
+	 */
+	expireOldSessions(currentTime: number): Promise<number>
 }
 
 /**

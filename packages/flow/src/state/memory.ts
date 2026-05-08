@@ -342,6 +342,20 @@ export class InMemorySessionStore<K, V> implements SessionStore<K, V> {
 		return this.store.approximateNumEntries()
 	}
 
+	async expireOldSessions(currentTime: number): Promise<number> {
+		const cutoff = currentTime - this.retentionMs
+		const toDelete: WindowedKey<K>[] = []
+		for await (const [windowedKey] of this.store.all()) {
+			if (windowedKey.windowEnd < cutoff) {
+				toDelete.push(windowedKey)
+			}
+		}
+		for (const k of toDelete) {
+			await this.store.delete(k)
+		}
+		return toDelete.length
+	}
+
 	async init(): Promise<void> {
 		await this.store.init()
 	}

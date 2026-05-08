@@ -329,6 +329,7 @@ export class LMDBSessionStore<K, V> implements SessionStore<K, V> {
 	private readonly keyCodec: Codec<K>
 	private readonly sessionCodec: Codec<WindowedKey<K>>
 	private readonly valueCodec: Codec<V>
+	private readonly retentionMs: number
 
 	constructor(
 		readonly name: string,
@@ -339,6 +340,7 @@ export class LMDBSessionStore<K, V> implements SessionStore<K, V> {
 		this.keyCodec = options.keyCodec
 		this.sessionCodec = sessionKeyCodec(options.keyCodec)
 		this.valueCodec = options.valueCodec
+		this.retentionMs = options.retentionMs
 	}
 
 	get(key: WindowedKey<K>): Promise<V | undefined> {
@@ -429,6 +431,23 @@ export class LMDBSessionStore<K, V> implements SessionStore<K, V> {
 
 	approximateNumEntries(): Promise<number> {
 		return Promise.resolve(this.db.getKeysCount())
+	}
+
+	async expireOldSessions(currentTime: number): Promise<number> {
+		// Sessions are key-prefix-ordered, not time-ordered, so we can't scan a time prefix —
+		// have to walk the whole store and filter. Cleanup is a cold path (per N records, not per record).
+		const cutoff = currentTime - this.retentionMs
+		const toDelete: Buffer[] = []
+		for (const { key } of this.db.getRange({})) {
+			const sessionKey = this.sessionCodec.decode(key)
+			if (sessionKey.windowEnd < cutoff) {
+				toDelete.push(key)
+			}
+		}
+		for (const k of toDelete) {
+			await this.db.remove(k)
+		}
+		return toDelete.length
 	}
 
 	init(): Promise<void> {
