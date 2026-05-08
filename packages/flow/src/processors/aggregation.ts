@@ -223,14 +223,14 @@ export class SessionReduceNode<K, V> extends Processor<K, V, Windowed<K>, V> {
 	}
 }
 
+type CleanupState = { lastCleanupStreamTimeMs: number; streamTimeMs: number }
+
 /**
  * Processor node for windowed aggregations.
  */
 export class WindowedAggregateNode<K, V, A> extends Processor<K, V, Windowed<K>, A> {
-	// Cleanup interval: run expiration every N input records' worth of stream time.
 	private static readonly CLEANUP_INTERVAL_MS = 60_000
-	// Shared state for stream-time-based cleanup across clones
-	private readonly cleanupState: { lastCleanupStreamTimeMs: number; streamTimeMs: number }
+	private readonly cleanupState: CleanupState
 
 	constructor(
 		private readonly storeName: string,
@@ -238,7 +238,7 @@ export class WindowedAggregateNode<K, V, A> extends Processor<K, V, Windowed<K>,
 		private readonly initializer: () => A,
 		private readonly aggregator: (key: K, value: V, aggregate: A) => A,
 		private readonly windowSizeMs: number,
-		cleanupState?: { lastCleanupStreamTimeMs: number; streamTimeMs: number }
+		cleanupState?: CleanupState
 	) {
 		super()
 		this.cleanupState = cleanupState ?? { lastCleanupStreamTimeMs: 0, streamTimeMs: 0 }
@@ -252,7 +252,7 @@ export class WindowedAggregateNode<K, V, A> extends Processor<K, V, Windowed<K>,
 			this.initializer,
 			this.aggregator,
 			this.windowSizeMs,
-			this.cleanupState // Share cleanup state across clones
+			this.cleanupState
 		)
 	}
 
@@ -292,12 +292,7 @@ export class WindowedAggregateNode<K, V, A> extends Processor<K, V, Windowed<K>,
 		// Store updated aggregate
 		await store.put(windowedKey, newAggregate)
 
-		// Periodically enforce retention by expiring old windows. Use stream
-		// time (the max record timestamp seen) rather than wall clock so
-		// replay/backfill scenarios behave the same way as live processing.
-		// With wall clock, replaying a 1-day-old record could spuriously
-		// expire current windows, and a slow producer with old timestamps
-		// could trigger no expiry at all.
+		// Stream time (max record timestamp), not wall clock — so backfill/replay expires identically to live processing.
 		this.cleanupState.streamTimeMs = Math.max(this.cleanupState.streamTimeMs, timestamp)
 		if (
 			this.cleanupState.streamTimeMs - this.cleanupState.lastCleanupStreamTimeMs >

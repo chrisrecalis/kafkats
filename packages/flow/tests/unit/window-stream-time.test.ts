@@ -31,24 +31,16 @@ describe('WindowedAggregateNode stream-time cleanup', () => {
 
 	it('uses stream time (record timestamp), not wall clock, for expiry checks', async () => {
 		const { store, expireSpy } = makeStubStore<string, number>()
-		const ref = { store }
 		const node = new WindowedAggregateNode<string, number, number>(
 			's',
-			ref,
+			{ store },
 			() => 0,
 			(_k, v, agg) => agg + v,
-			1000 // window size 1s
+			1000
 		)
 
-		// Force forward to no-op
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		;(node as any).forward = async () => {}
+		const baseTime = 1_000_000_000_000
 
-		const baseTime = 1_000_000_000_000 // arbitrary stream time origin
-
-		// Single record at stream time = baseTime; cleanup interval = 60_000ms.
-		// First record advances streamTime to baseTime; lastCleanupStreamTime
-		// starts at 0, so the diff is huge → expire fires with streamTime, not now.
 		await node.process({
 			key: 'a',
 			value: 1,
@@ -60,24 +52,19 @@ describe('WindowedAggregateNode stream-time cleanup', () => {
 		})
 
 		expect(expireSpy).toHaveBeenCalledTimes(1)
-		// The expiry argument must be the stream time (baseTime), not Date.now().
 		expect(expireSpy.mock.calls[0]![0]).toBe(baseTime)
 	})
 
 	it('does NOT trigger expiry when stream time has not advanced past the cleanup threshold', async () => {
 		const { store, expireSpy } = makeStubStore<string, number>()
-		const ref = { store }
 		const node = new WindowedAggregateNode<string, number, number>(
 			's',
-			ref,
+			{ store },
 			() => 0,
 			(_k, v, agg) => agg + v,
 			1000
 		)
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		;(node as any).forward = async () => {}
 
-		// Initialize cleanupState's lastCleanupStreamTimeMs by feeding an early record
 		await node.process({
 			key: 'a',
 			value: 1,
@@ -89,7 +76,6 @@ describe('WindowedAggregateNode stream-time cleanup', () => {
 		})
 		expect(expireSpy).toHaveBeenCalledTimes(1)
 
-		// Second record only 100ms later in stream time — well under the 60s threshold.
 		await node.process({
 			key: 'a',
 			value: 1,
@@ -100,7 +86,6 @@ describe('WindowedAggregateNode stream-time cleanup', () => {
 			headers: {},
 		})
 
-		// Should still be 1 — expiry should NOT have run again.
 		expect(expireSpy).toHaveBeenCalledTimes(1)
 	})
 })
