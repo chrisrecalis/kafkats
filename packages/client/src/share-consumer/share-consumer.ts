@@ -68,6 +68,13 @@ import { pmap } from '@/utils/pmap.js'
 
 const EMPTY_BUFFER = Buffer.alloc(0)
 
+class ShareMessageAlreadyHandledError extends Error {
+	constructor(topic: string, partition: number, offset: bigint) {
+		super(`Share message ${topic}[${partition}]@${offset} already handled`)
+		this.name = 'ShareMessageAlreadyHandledError'
+	}
+}
+
 type ShareConsumerState = 'idle' | 'running' | 'stopping'
 
 type ShareFetchWorkItem = {
@@ -762,21 +769,21 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 			headers: convertHeaders(record.headers),
 			ack: async () => {
 				if (handled !== 0) {
-					throw new Error(`Share message ${topicName}[${partitionIndex}]@${record.offset} already handled`)
+					throw new ShareMessageAlreadyHandledError(topicName, partitionIndex, record.offset)
 				}
 				handled = 1
 				await ackManager.enqueue(topicName, topicId, partitionIndex, record.offset, ACK_ACCEPT)
 			},
 			release: async () => {
 				if (handled !== 0) {
-					throw new Error(`Share message ${topicName}[${partitionIndex}]@${record.offset} already handled`)
+					throw new ShareMessageAlreadyHandledError(topicName, partitionIndex, record.offset)
 				}
 				handled = 2
 				await ackManager.enqueue(topicName, topicId, partitionIndex, record.offset, ACK_RELEASE)
 			},
 			reject: async () => {
 				if (handled !== 0) {
-					throw new Error(`Share message ${topicName}[${partitionIndex}]@${record.offset} already handled`)
+					throw new ShareMessageAlreadyHandledError(topicName, partitionIndex, record.offset)
 				}
 				handled = 3
 				await ackManager.enqueue(topicName, topicId, partitionIndex, record.offset, ACK_REJECT)
@@ -1015,14 +1022,16 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 		let loopError: Error | null = null
 		let previousMessage: ShareMessage<unknown, unknown> | null = null
 
-		const implicitAck = (message: ShareMessage<unknown, unknown>) => {
-			void message.ack().catch(error => {
+		const implicitFinalize = (
+			message: ShareMessage<unknown, unknown>,
+			op: 'ack' | 'release',
+			stopOnError: boolean
+		) => {
+			void message[op]().catch(error => {
+				if (error instanceof ShareMessageAlreadyHandledError) return
 				const err = error instanceof Error ? error : new Error(String(error))
-				if (err.message.includes('already handled')) {
-					return
-				}
 				this.emitError(err)
-				this.stop()
+				if (stopOnError) this.stop()
 			})
 		}
 
@@ -1073,15 +1082,17 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 				while (messageQueue.length > 0) {
 					const item = messageQueue.shift()!
 					if (previousMessage) {
-						implicitAck(previousMessage)
+						implicitFinalize(previousMessage, 'ack', true)
 					}
 					previousMessage = item.message
 					yield item as { message: ShareMessage<ShareMsgOf<S>, ShareKeyOf<S>>; ctx: ConsumeContext }
 				}
 			}
 		} finally {
+			// Iterator exit is ambiguous (clean break vs user throw); release rather than ack
+			// so the message returns to the share group for redelivery instead of being silently consumed.
 			if (previousMessage) {
-				implicitAck(previousMessage)
+				implicitFinalize(previousMessage, 'release', false)
 				previousMessage = null
 			}
 
