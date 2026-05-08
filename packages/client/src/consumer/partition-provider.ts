@@ -21,7 +21,9 @@ import { CoordinatorNotAvailableError, NotCoordinatorError } from '@/client/erro
 export type TopicPartitionOffset = TopicPartition & { offset: bigint }
 
 export interface PartitionProviderCallbacks {
-	onRebalance: () => void
+	// Awaited at the start of the rebalance protocol so transactional consumers can commit
+	// in-flight work before partitions are revoked.
+	onRebalance: () => Promise<void>
 	onPartitionsAssigned: (partitions: TopicPartitionOffset[]) => Promise<void>
 	onPartitionsRevoked: (partitions: TopicPartition[]) => Promise<void>
 	onPartitionsLost: (partitions: TopicPartition[]) => void
@@ -203,8 +205,8 @@ export class GroupPartitionProvider implements PartitionProvider {
 		this.rebalancePending = false
 
 		try {
-			// Notify listeners that rebalance is starting
-			this.callbacks.onRebalance()
+			// Awaited so transactional consumers can commit in-flight work before partitions move.
+			await this.callbacks.onRebalance()
 
 			const previousAssignment = this.consumerGroup.currentAssignment
 			if (this.consumerGroup.currentRebalanceProtocol === 'eager') {
@@ -215,6 +217,10 @@ export class GroupPartitionProvider implements PartitionProvider {
 		} catch (error) {
 			const err = error instanceof Error ? error : new Error(String(error))
 			this.logger.error('rebalance handler failed', { error: err.message })
+			// Stop the group too: if onRebalance (e.g. EOS commit) failed, continuing the
+			// fetch loop on the stale assignment would be unsafe. The error is surfaced via
+			// onError; the run loop sees the stop and exits cleanly.
+			void this.consumerGroup.stop().catch(() => {})
 			this.callbacks.onError(err)
 		}
 	}

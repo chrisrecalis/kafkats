@@ -94,6 +94,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			isolationLevel: config.isolationLevel ?? DEFAULT_CONSUMER_CONFIG.isolationLevel,
 			partitionAssignmentStrategy:
 				config.partitionAssignmentStrategy ?? DEFAULT_CONSUMER_CONFIG.partitionAssignmentStrategy,
+			onBeforeRebalance: config.onBeforeRebalance,
 		}
 	}
 
@@ -187,7 +188,13 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 
 	private createProviderCallbacks(): PartitionProviderCallbacks {
 		return {
-			onRebalance: () => {
+			onRebalance: async () => {
+				// User hook awaited inside the rebalance protocol so transactional pipelines
+				// can commit before partitions are revoked. Synchronous notification fires
+				// after, so listeners see "rebalance starting" only once the hook has run.
+				if (this.config.onBeforeRebalance) {
+					await this.config.onBeforeRebalance()
+				}
 				this.emit('rebalance')
 			},
 			// eslint-disable-next-line @typescript-eslint/require-await

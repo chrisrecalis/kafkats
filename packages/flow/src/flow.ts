@@ -319,12 +319,35 @@ class FlowAppImpl implements FlowApp {
 		for (let id = 0; id < threadCount; id += 1) {
 			const producer = this.client.producer(this.buildProducerConfig(id, threadCount))
 			const groupInstanceId = this.buildGroupInstanceId(id, threadCount)
+
+			// Forward reference: the consumer's onBeforeRebalance hook runs at rebalance time,
+			// long after the worker has been constructed below. A holder lets the closure
+			// resolve to the right WorkerContext without depending on let-binding shadowing.
+			const workerRef: { current: WorkerContext | null } = { current: null }
+
+			const userHook = this.config.consumer?.onBeforeRebalance
 			const consumer = this.client.consumer({
 				groupId: this.config.applicationId,
 				...this.config.consumer,
 				autoOffsetReset: this.resolveOffsetReset(),
 				groupInstanceId,
 				isolationLevel: this.eosEnabled ? 'read_committed' : this.config.consumer?.isolationLevel,
+				// EOS: commit the in-flight transaction inside the awaited rebalance window
+				// so offsets land before the group rejoins. Compose with any user-supplied
+				// hook (user runs first; their hook can prep state before the EOS commit).
+				// A commit failure rejects this promise → the rebalance protocol's catch
+				// emits the error and the consumer halts before processing on stale state.
+				onBeforeRebalance:
+					this.eosEnabled || userHook
+						? async () => {
+								if (userHook) await userHook()
+								if (!this.eosEnabled) return
+								const w = workerRef.current
+								if (w?.transactionActive) {
+									await this.enqueueEosTask(w, () => this.commitTransactionBatch(w))
+								}
+							}
+						: undefined,
 			})
 
 			const worker: WorkerContext = {
@@ -344,6 +367,7 @@ class FlowAppImpl implements FlowApp {
 				commitTimer: null,
 				lastCommitTime: 0,
 			}
+			workerRef.current = worker
 
 			worker.sourcesByTopic = this.buildWorkerSources(worker)
 			this.workers.push(worker)
@@ -1136,19 +1160,10 @@ class FlowAppImpl implements FlowApp {
 	}
 
 	private attachConsumerEvents(consumer: Consumer, worker: WorkerContext): void {
+		// Note: 'rebalance' is a synchronous notification; the actual EOS commit is wired through
+		// onBeforeRebalance (passed to the consumer config) which is awaited by the rebalance protocol.
 		consumer.on('rebalance', () => {
 			this.currentState = 'REBALANCING'
-			// Best-effort commit: EventEmitter listeners can't be awaited, so we can't block
-			// the consumer's rebalance protocol here. Serialization against the next message's
-			// transaction is provided by worker.eosQueue, which both this commit and the next
-			// processInTransaction enqueue against. The real EOS gap (offsets may not commit
-			// before the group rejoins) needs an awaitable rebalance hook — out of scope here.
-			if (this.eosEnabled && worker.transactionActive) {
-				this.enqueueEosTask(worker, () => this.commitTransactionBatch(worker)).catch(err => {
-					this.lastError = err as Error
-					this.currentState = 'ERROR'
-				})
-			}
 		})
 		consumer.on('partitionsAssigned', partitions => {
 			for (const tp of partitions) {
