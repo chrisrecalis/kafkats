@@ -288,6 +288,65 @@ describe('Producer retry behavior', () => {
 			)
 		})
 
+		it('OUT_OF_ORDER_SEQUENCE_NUMBER fences the producer for re-init', async () => {
+			let initCount = 0
+			mockBroker.initProducerId.mockImplementation(async () => {
+				initCount++
+				return {
+					throttleTimeMs: 0,
+					errorCode: ErrorCode.None,
+					producerId: 2000n + BigInt(initCount),
+					producerEpoch: initCount,
+				}
+			})
+			mockCluster.getAnyBroker.mockResolvedValue(mockBroker)
+
+			const producer = new Producer(mockCluster, {
+				lingerMs: 0,
+				retries: 3,
+				idempotent: true,
+			})
+
+			// First send succeeds — initializes producer (initCount == 1).
+			mockBroker.produce.mockResolvedValueOnce(
+				buildProduceResponse([
+					{
+						name: 'test-topic',
+						partitions: [{ partitionIndex: 0, errorCode: ErrorCode.None, baseOffset: 0n }],
+					},
+				])
+			)
+			await producer.send('test-topic', { value: Buffer.from('init') })
+			expect(initCount).toBe(1)
+
+			mockBroker.produce.mockReset()
+
+			// Second send: broker returns OOO.
+			mockBroker.produce.mockResolvedValueOnce(
+				buildProduceResponse([
+					{
+						name: 'test-topic',
+						partitions: [{ partitionIndex: 0, errorCode: ErrorCode.OutOfOrderSequenceNumber }],
+					},
+				])
+			)
+			await expect(producer.send('test-topic', { value: Buffer.from('msg') })).rejects.toThrow(
+				/Out of order sequence/
+			)
+
+			// Third send: must trigger re-initialization (new producerId/epoch).
+			mockBroker.produce.mockResolvedValueOnce(
+				buildProduceResponse([
+					{
+						name: 'test-topic',
+						partitions: [{ partitionIndex: 0, errorCode: ErrorCode.None, baseOffset: 5n }],
+					},
+				])
+			)
+			await producer.send('test-topic', { value: Buffer.from('after-recovery') })
+			expect(initCount).toBe(2)
+		})
+
 		it('handles INVALID_PRODUCER_EPOCH as fencing', async () => {
 			mockCluster.getAnyBroker.mockResolvedValue(mockBroker)
 			mockBroker.initProducerId.mockResolvedValue({

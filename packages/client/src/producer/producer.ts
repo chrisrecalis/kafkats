@@ -501,8 +501,8 @@ export class Producer extends EventEmitter<ProducerEvents> {
 
 						// Handle out-of-order sequence
 						if (this.config.idempotent && errorCode === ErrorCode.OutOfOrderSequenceNumber) {
-							this.handleOutOfOrderSequence(prepared)
-							continue
+							this.handleOutOfOrderSequence(prepared, preparedBatches)
+							return
 						}
 
 						// Handle retriable errors
@@ -662,17 +662,26 @@ export class Producer extends EventEmitter<ProducerEvents> {
 
 	/**
 	 * Handle out-of-order sequence error
+	 *
+	 * OOO means the per-partition sequence is desynced from the broker; recovery
+	 * is the same as a fence — re-init the producer. Matches Java client behavior.
 	 */
-	private handleOutOfOrderSequence(prepared: {
-		batch: PartitionBatch
-		baseSequence: number
-		recordCount: number
-		batchId: symbol
-		messagesToSend: QueuedMessage[]
-	}): void {
-		const { batch, baseSequence, recordCount, batchId, messagesToSend } = prepared
+	private handleOutOfOrderSequence(
+		prepared: {
+			batch: PartitionBatch
+			baseSequence: number
+			messagesToSend: QueuedMessage[]
+		},
+		allPrepared: Array<{
+			batch: PartitionBatch
+			recordCount: number
+			batchId: symbol
+			messagesToSend: QueuedMessage[]
+		}>
+	): void {
+		const { batch, baseSequence } = prepared
 
-		this.logger.error('out of order sequence number', {
+		this.logger.error('out of order sequence number, fencing producer for re-init', {
 			topic: batch.topic,
 			partition: batch.partition,
 			baseSequence,
@@ -680,15 +689,10 @@ export class Producer extends EventEmitter<ProducerEvents> {
 			producerEpoch: this.producerEpoch,
 		})
 
-		this.rollbackSequence(batch.topic, batch.partition, recordCount)
-		this.inflightBatches.delete(batchId)
-
-		const error = new Error(
-			`Out of order sequence for ${batch.topic}-${batch.partition}: baseSequence=${baseSequence}`
+		this.fenceAndReinit(
+			new Error(`Out of order sequence for ${batch.topic}-${batch.partition}: baseSequence=${baseSequence}`),
+			allPrepared
 		)
-		for (const msg of messagesToSend) {
-			msg.reject(error)
-		}
 	}
 
 	/**
@@ -712,27 +716,39 @@ export class Producer extends EventEmitter<ProducerEvents> {
 			producerEpoch: this.producerEpoch,
 		})
 
+		this.fenceAndReinit(new ProducerFencedError(this.producerId, this.producerEpoch), allPrepared)
+	}
+
+	/**
+	 * Mark the producer fenced, reject every in-flight batch with `error`, and
+	 * kick off async re-initialization. Shared by ProducerFenced/InvalidEpoch
+	 * and OutOfOrderSequence — both are unrecoverable without a fresh producerId.
+	 */
+	private fenceAndReinit(
+		error: Error,
+		allPrepared: Array<{
+			batch: PartitionBatch
+			recordCount: number
+			batchId: symbol
+			messagesToSend: QueuedMessage[]
+		}>
+	): void {
 		this.idempotentState = 'fenced'
 		this.accumulator.setFenced(true)
 
-		const fenceError = new ProducerFencedError(this.producerId, this.producerEpoch)
-
-		// Fail all batches in this request
 		for (const p of allPrepared) {
 			for (const msg of p.messagesToSend) {
-				msg.reject(fenceError)
+				msg.reject(error)
 			}
 			this.rollbackSequence(p.batch.topic, p.batch.partition, p.recordCount)
 			this.inflightBatches.delete(p.batchId)
 		}
 
-		// Fail all other in-flight batches
-		this.failAllInflightBatches(fenceError)
-		this.accumulator.clearWithRejection(fenceError)
+		this.failAllInflightBatches(error)
+		this.accumulator.clearWithRejection(error)
 
-		// Trigger re-initialization
-		this.initializeIdempotentProducer().catch((error: Error) => {
-			this.logger.error('failed to re-initialize after fencing', { error: error.message })
+		this.initializeIdempotentProducer().catch((reinitError: Error) => {
+			this.logger.error('failed to re-initialize after fencing', { error: reinitError.message })
 		})
 	}
 
