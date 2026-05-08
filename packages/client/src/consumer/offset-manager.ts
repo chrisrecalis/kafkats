@@ -265,27 +265,32 @@ export class OffsetManager {
 			topics,
 		})
 
+		// Clear successes before throwing so a failed sibling doesn't poison healthy
+		// partitions on the next retry (stale generation → forever-failing commits).
+		let firstError: KafkaProtocolError | null = null
+
 		for (const topic of response.topics) {
 			for (const partition of topic.partitions) {
-				if (partition.errorCode !== ErrorCode.None) {
-					this.logger.error('offset commit error', {
-						topic: topic.name,
-						partition: partition.partitionIndex,
-						errorCode: partition.errorCode,
-					})
-					throw new KafkaProtocolError(
-						partition.errorCode,
-						`OffsetCommit failed for ${topic.name}-${partition.partitionIndex}`
-					)
+				const key = `${topic.name}:${partition.partitionIndex}`
+				if (partition.errorCode === ErrorCode.None) {
+					this.consumedOffsets.delete(key)
+					continue
 				}
+				this.logger.error('offset commit error', {
+					topic: topic.name,
+					partition: partition.partitionIndex,
+					errorCode: partition.errorCode,
+				})
+				firstError ??= new KafkaProtocolError(
+					partition.errorCode,
+					`OffsetCommit failed for ${topic.name}-${partition.partitionIndex}`
+				)
 			}
 		}
 
+		if (firstError) throw firstError
+
 		this.logger.debug('offsets committed successfully')
-		// Only clear the keys that were actually committed
-		for (const key of keysToCommit) {
-			this.consumedOffsets.delete(key)
-		}
 	}
 
 	/**
