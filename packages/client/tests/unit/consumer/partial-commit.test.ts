@@ -38,10 +38,7 @@ describe('OffsetManager.commitPendingOffsets partial-failure handling', () => {
 
 		await expect(manager.commitPendingOffsets()).rejects.toThrow(/NotCoordinator|OffsetCommit failed/i)
 
-		// t:1 (errored) must remain in consumedOffsets to be retried.
 		expect(manager.consumedOffsets.get('t:1')).toBe(20n)
-		// t:0 and t:2 succeeded — they MUST be cleared so we don't re-commit
-		// with a stale generation on the next attempt.
 		expect(manager.consumedOffsets.has('t:0')).toBe(false)
 		expect(manager.consumedOffsets.has('t:2')).toBe(false)
 	})

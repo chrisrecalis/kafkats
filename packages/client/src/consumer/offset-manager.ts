@@ -265,47 +265,30 @@ export class OffsetManager {
 			topics,
 		})
 
-		// Walk the response, separating successes from failures so we can clear
-		// the successes before bubbling the first error. The previous behavior
-		// threw on the first errored partition, leaving successful partitions'
-		// offsets in consumedOffsets — they would be re-sent on the next commit
-		// (with a potentially-stale generation) and could fail forever.
-		const successfulKeys: string[] = []
-		let firstError: { topic: string; partition: number; errorCode: ErrorCode } | null = null
+		// Clear successes before throwing so a failed sibling doesn't poison healthy
+		// partitions on the next retry (stale generation → forever-failing commits).
+		let firstError: KafkaProtocolError | null = null
 
 		for (const topic of response.topics) {
 			for (const partition of topic.partitions) {
 				const key = `${topic.name}:${partition.partitionIndex}`
 				if (partition.errorCode === ErrorCode.None) {
-					successfulKeys.push(key)
-				} else {
-					this.logger.error('offset commit error', {
-						topic: topic.name,
-						partition: partition.partitionIndex,
-						errorCode: partition.errorCode,
-					})
-					if (firstError === null) {
-						firstError = {
-							topic: topic.name,
-							partition: partition.partitionIndex,
-							errorCode: partition.errorCode,
-						}
-					}
+					this.consumedOffsets.delete(key)
+					continue
 				}
+				this.logger.error('offset commit error', {
+					topic: topic.name,
+					partition: partition.partitionIndex,
+					errorCode: partition.errorCode,
+				})
+				firstError ??= new KafkaProtocolError(
+					partition.errorCode,
+					`OffsetCommit failed for ${topic.name}-${partition.partitionIndex}`
+				)
 			}
 		}
 
-		// Clear any partitions we successfully committed, even if others failed.
-		for (const key of successfulKeys) {
-			this.consumedOffsets.delete(key)
-		}
-
-		if (firstError !== null) {
-			throw new KafkaProtocolError(
-				firstError.errorCode,
-				`OffsetCommit failed for ${firstError.topic}-${firstError.partition}`
-			)
-		}
+		if (firstError) throw firstError
 
 		this.logger.debug('offsets committed successfully')
 	}
