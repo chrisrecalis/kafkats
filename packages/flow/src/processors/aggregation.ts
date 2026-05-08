@@ -127,6 +127,21 @@ function resolveAdvanceMs(sizeMs: number, advanceMs: number): number {
 	return advance
 }
 
+type CleanupState = { lastCleanupStreamTimeMs: number; streamTimeMs: number }
+
+const CLEANUP_INTERVAL_MS = 60_000
+
+// Stream-time-driven retention: advance the high-water mark, fire expiry once per CLEANUP_INTERVAL_MS
+// of stream time. Caller passes the store's expire method (windows or sessions); without this, state-
+// store-backed processors leak.
+async function maybeExpire(state: CleanupState, timestamp: number, expire: (cutoff: number) => Promise<unknown>) {
+	state.streamTimeMs = Math.max(state.streamTimeMs, timestamp)
+	if (state.streamTimeMs - state.lastCleanupStreamTimeMs > CLEANUP_INTERVAL_MS) {
+		state.lastCleanupStreamTimeMs = state.streamTimeMs
+		await expire(state.streamTimeMs)
+	}
+}
+
 // Half-open windows [start, start+size); negative starts are skipped — only matters for timestamps near epoch.
 function* windowStartsFor(
 	timestamp: number,
@@ -199,15 +214,7 @@ export class WindowedReduceNode<K, V> extends Processor<K, V, Windowed<K>, V> {
 			await this.forward(next)
 		}
 
-		// Stream-time-driven retention; mirrors WindowedAggregateNode (was missing here pre-fix → unbounded growth).
-		this.cleanupState.streamTimeMs = Math.max(this.cleanupState.streamTimeMs, timestamp)
-		if (
-			this.cleanupState.streamTimeMs - this.cleanupState.lastCleanupStreamTimeMs >
-			WindowedReduceNode.CLEANUP_INTERVAL_MS
-		) {
-			this.cleanupState.lastCleanupStreamTimeMs = this.cleanupState.streamTimeMs
-			await store.expireOldWindows(this.cleanupState.streamTimeMs)
-		}
+		await maybeExpire(this.cleanupState, timestamp, t => store.expireOldWindows(t))
 	}
 }
 
@@ -216,7 +223,6 @@ export class WindowedReduceNode<K, V> extends Processor<K, V, Windowed<K>, V> {
  * Sessions are merged when events arrive within the inactivity gap.
  */
 export class SessionReduceNode<K, V> extends Processor<K, V, Windowed<K>, V> {
-	private static readonly CLEANUP_INTERVAL_MS = 60_000
 	private readonly cleanupState: CleanupState
 
 	constructor(
@@ -276,25 +282,14 @@ export class SessionReduceNode<K, V> extends Processor<K, V, Windowed<K>, V> {
 		const next: StreamRecord<Windowed<K>, V> = { ...record, key: windowedResult, value: mergedValue }
 		await this.forward(next)
 
-		// Stream-time-driven retention; without this, closed sessions accumulate forever.
-		this.cleanupState.streamTimeMs = Math.max(this.cleanupState.streamTimeMs, timestamp)
-		if (
-			this.cleanupState.streamTimeMs - this.cleanupState.lastCleanupStreamTimeMs >
-			SessionReduceNode.CLEANUP_INTERVAL_MS
-		) {
-			this.cleanupState.lastCleanupStreamTimeMs = this.cleanupState.streamTimeMs
-			await store.expireOldSessions(this.cleanupState.streamTimeMs)
-		}
+		await maybeExpire(this.cleanupState, timestamp, t => store.expireOldSessions(t))
 	}
 }
-
-type CleanupState = { lastCleanupStreamTimeMs: number; streamTimeMs: number }
 
 /**
  * Processor node for windowed aggregations. Honours TimeWindows.advanceBy() (hopping windows).
  */
 export class WindowedAggregateNode<K, V, A> extends Processor<K, V, Windowed<K>, A> {
-	private static readonly CLEANUP_INTERVAL_MS = 60_000
 	private readonly cleanupState: CleanupState
 	private readonly advanceMs: number
 
@@ -354,15 +349,8 @@ export class WindowedAggregateNode<K, V, A> extends Processor<K, V, Windowed<K>,
 			await this.forward(next)
 		}
 
-		// Stream time (max record timestamp), not wall clock — so backfill/replay expires identically to live processing.
-		this.cleanupState.streamTimeMs = Math.max(this.cleanupState.streamTimeMs, timestamp)
-		if (
-			this.cleanupState.streamTimeMs - this.cleanupState.lastCleanupStreamTimeMs >
-			WindowedAggregateNode.CLEANUP_INTERVAL_MS
-		) {
-			this.cleanupState.lastCleanupStreamTimeMs = this.cleanupState.streamTimeMs
-			await store.expireOldWindows(this.cleanupState.streamTimeMs)
-		}
+		// Stream-time-driven retention (not wall clock) so backfill/replay matches live processing.
+		await maybeExpire(this.cleanupState, timestamp, t => store.expireOldWindows(t))
 	}
 }
 
@@ -371,7 +359,6 @@ export class WindowedAggregateNode<K, V, A> extends Processor<K, V, Windowed<K>,
  * Sessions are merged when events arrive within the inactivity gap.
  */
 export class SessionAggregateNode<K, V, A> extends Processor<K, V, Windowed<K>, A> {
-	private static readonly CLEANUP_INTERVAL_MS = 60_000
 	private readonly cleanupState: CleanupState
 
 	constructor(
@@ -470,14 +457,6 @@ export class SessionAggregateNode<K, V, A> extends Processor<K, V, Windowed<K>, 
 		}
 		await this.forward(next)
 
-		// Stream-time-driven retention; without this, closed sessions accumulate forever.
-		this.cleanupState.streamTimeMs = Math.max(this.cleanupState.streamTimeMs, timestamp)
-		if (
-			this.cleanupState.streamTimeMs - this.cleanupState.lastCleanupStreamTimeMs >
-			SessionAggregateNode.CLEANUP_INTERVAL_MS
-		) {
-			this.cleanupState.lastCleanupStreamTimeMs = this.cleanupState.streamTimeMs
-			await store.expireOldSessions(this.cleanupState.streamTimeMs)
-		}
+		await maybeExpire(this.cleanupState, timestamp, t => store.expireOldSessions(t))
 	}
 }

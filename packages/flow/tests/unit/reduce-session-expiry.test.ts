@@ -2,6 +2,22 @@ import { describe, expect, it, vi } from 'vitest'
 
 import { WindowedReduceNode, SessionReduceNode, SessionAggregateNode } from '../../src/processors/aggregation.js'
 import type { SessionStore, WindowStore, WindowedKey } from '../../src/state.js'
+import { InMemorySessionStore } from '../../src/state/memory.js'
+import { ChangelogBackedSessionStore } from '../../src/state/changelog.js'
+import type { ChangelogWriter } from '../../src/changelog.js'
+
+const stringCodec = {
+	encode: (s: string) => Buffer.from(s, 'utf-8'),
+	decode: (b: Buffer) => b.toString('utf-8'),
+}
+const numberCodec = {
+	encode: (n: number) => {
+		const b = Buffer.alloc(8)
+		b.writeDoubleLE(n, 0)
+		return b
+	},
+	decode: (b: Buffer) => b.readDoubleLE(0),
+}
 
 describe('windowed/session reduce + session aggregate retention', () => {
 	function makeStubWindowStore<K, V>() {
@@ -113,6 +129,60 @@ describe('windowed/session reduce + session aggregate retention', () => {
 
 		expect(expireSpy).toHaveBeenCalledTimes(1)
 		expect(expireSpy.mock.calls[0]![0]).toBe(baseTime)
+	})
+
+	it('InMemorySessionStore.expireOldSessions actually removes data and returns the keys', async () => {
+		const store = new InMemorySessionStore('s', {
+			keyCodec: stringCodec,
+			valueCodec: numberCodec,
+			retentionMs: 60_000,
+		})
+		await store.init()
+
+		await store.put({ key: 'a', windowStart: 0, windowEnd: 1_000 }, 1)
+		await store.put({ key: 'a', windowStart: 50_000, windowEnd: 60_000 }, 2)
+		await store.put({ key: 'b', windowStart: 70_000, windowEnd: 80_000 }, 3)
+
+		// currentTime - retentionMs = 100_000 - 60_000 = 40_000.
+		// Sessions with windowEnd < 40_000 should be removed: only the (0, 1_000) one.
+		const expired = await store.expireOldSessions(100_000)
+
+		expect(expired.length).toBe(1)
+		expect(expired[0]).toEqual({ key: 'a', windowStart: 0, windowEnd: 1_000 })
+		expect(await store.approximateNumEntries()).toBe(2)
+	})
+
+	it('ChangelogBackedSessionStore.expireOldSessions emits a tombstone for each expired key', async () => {
+		const inner = new InMemorySessionStore<string, number>('s', {
+			keyCodec: stringCodec,
+			valueCodec: numberCodec,
+			retentionMs: 60_000,
+		})
+		await inner.init()
+		await inner.put({ key: 'a', windowStart: 0, windowEnd: 1_000 }, 1)
+		await inner.put({ key: 'a', windowStart: 50_000, windowEnd: 60_000 }, 2)
+
+		const writes: Array<{ tombstone: boolean; key: WindowedKey<string> }> = []
+		const writer = {
+			write: vi.fn(async (key: WindowedKey<string>) => {
+				writes.push({ tombstone: false, key })
+			}),
+			writeTombstone: vi.fn(async (key: WindowedKey<string>) => {
+				writes.push({ tombstone: true, key })
+			}),
+		}
+
+		const wrapped = new ChangelogBackedSessionStore(
+			inner,
+			writer as unknown as ChangelogWriter<WindowedKey<string>, number>
+		)
+		const expired = await wrapped.expireOldSessions(100_000)
+
+		expect(expired.length).toBe(1)
+		expect(writer.writeTombstone).toHaveBeenCalledTimes(1)
+		expect(writes.filter(w => w.tombstone).map(w => w.key)).toEqual([
+			{ key: 'a', windowStart: 0, windowEnd: 1_000 },
+		])
 	})
 
 	it('does NOT trigger expiry when stream time has not advanced past the threshold', async () => {

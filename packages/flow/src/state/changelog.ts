@@ -188,11 +188,15 @@ export class ChangelogBackedSessionStore<K, V> implements SessionStore<K, V> {
 		}
 	}
 
-	async expireOldSessions(currentTime: number): Promise<number> {
-		// Local-first: delegate to inner store's retention; the changelog will catch up via
-		// tombstones produced by inner deletes if/when the inner store emits them. For now,
-		// expiry is a local cleanup — restoration replays the changelog from the start anyway.
-		return this.inner.expireOldSessions(currentTime)
+	async expireOldSessions(currentTime: number): Promise<WindowedKey<K>[]> {
+		// Without per-key tombstones, restoration would replay the original puts and resurrect
+		// expired sessions (changelog's last value per key wins). Mirror remove(): inner deletes
+		// first (local-first), then emit a tombstone for each so the durable log stays consistent.
+		const expired = await this.inner.expireOldSessions(currentTime)
+		for (const k of expired) {
+			await this.writer.writeTombstone(k)
+		}
+		return expired
 	}
 
 	async approximateNumEntries(): Promise<number> {
