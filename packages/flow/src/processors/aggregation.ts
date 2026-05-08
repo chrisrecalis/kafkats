@@ -115,22 +115,58 @@ export class ReduceNode<K, V> extends Processor<K, V, K, V> {
 	}
 }
 
+// Validate and default TimeWindows.advanceBy: 0 ⇒ tumbling (advance == size); advance > size would create gaps that drop records.
+function resolveAdvanceMs(sizeMs: number, advanceMs: number): number {
+	const advance = advanceMs > 0 ? advanceMs : sizeMs
+	if (advance > sizeMs) {
+		throw new Error(
+			`TimeWindows.advanceBy must be <= window size (got advance=${advance}, size=${sizeMs}). ` +
+				'Larger advance values would silently drop records that fall in the gaps between windows.'
+		)
+	}
+	return advance
+}
+
+// Half-open windows [start, start+size); negative starts are skipped — only matters for timestamps near epoch.
+function* windowStartsFor(
+	timestamp: number,
+	sizeMs: number,
+	advanceMs: number
+): Iterable<{ start: number; end: number }> {
+	const first = Math.floor((timestamp - sizeMs + advanceMs) / advanceMs) * advanceMs
+	const last = Math.floor(timestamp / advanceMs) * advanceMs
+	for (let start = first; start <= last; start += advanceMs) {
+		if (start < 0) continue
+		yield { start, end: start + sizeMs }
+	}
+}
+
 /**
- * Processor node for windowed reduce operations.
+ * Processor node for windowed reduce operations. Honours TimeWindows.advanceBy() (hopping windows).
  */
 export class WindowedReduceNode<K, V> extends Processor<K, V, Windowed<K>, V> {
+	private readonly advanceMs: number
+
 	constructor(
 		private readonly storeName: string,
 		private readonly storeRef: { store: WindowStore<K, V> | null },
 		private readonly reducer: (aggregate: V, value: V) => V,
-		private readonly windowSizeMs: number
+		private readonly windowSizeMs: number,
+		advanceMs: number = 0
 	) {
 		super()
+		this.advanceMs = resolveAdvanceMs(windowSizeMs, advanceMs)
 	}
 
 	clone(worker: WorkerContext): Processor<K, V, Windowed<K>, V> {
 		void worker
-		return new WindowedReduceNode<K, V>(this.storeName, this.storeRef, this.reducer, this.windowSizeMs)
+		return new WindowedReduceNode<K, V>(
+			this.storeName,
+			this.storeRef,
+			this.reducer,
+			this.windowSizeMs,
+			this.advanceMs
+		)
 	}
 
 	async process(record: StreamRecord<K, V>): Promise<void> {
@@ -146,18 +182,17 @@ export class WindowedReduceNode<K, V> extends Processor<K, V, Windowed<K>, V> {
 		if (value === null) return
 
 		const timestamp = Number(record.timestamp)
-		const windowStart = Math.floor(timestamp / this.windowSizeMs) * this.windowSizeMs
-		const windowEnd = windowStart + this.windowSizeMs
+		for (const { start, end } of windowStartsFor(timestamp, this.windowSizeMs, this.advanceMs)) {
+			const windowedKey: WindowedKey<K> = { key, windowStart: start, windowEnd: end }
 
-		const windowedKey: WindowedKey<K> = { key, windowStart, windowEnd }
+			const storedAggregate = await store.get(windowedKey)
+			const newAggregate = storedAggregate === undefined ? value : this.reducer(storedAggregate, value)
+			await store.put(windowedKey, newAggregate)
 
-		const storedAggregate = await store.get(windowedKey)
-		const newAggregate = storedAggregate === undefined ? value : this.reducer(storedAggregate, value)
-		await store.put(windowedKey, newAggregate)
-
-		const windowedResult: Windowed<K> = { key, window: { start: windowStart, end: windowEnd } }
-		const next: StreamRecord<Windowed<K>, V> = { ...record, key: windowedResult, value: newAggregate }
-		await this.forward(next)
+			const windowedResult: Windowed<K> = { key, window: { start, end } }
+			const next: StreamRecord<Windowed<K>, V> = { ...record, key: windowedResult, value: newAggregate }
+			await this.forward(next)
+		}
 	}
 }
 
@@ -226,11 +261,12 @@ export class SessionReduceNode<K, V> extends Processor<K, V, Windowed<K>, V> {
 type CleanupState = { lastCleanupStreamTimeMs: number; streamTimeMs: number }
 
 /**
- * Processor node for windowed aggregations.
+ * Processor node for windowed aggregations. Honours TimeWindows.advanceBy() (hopping windows).
  */
 export class WindowedAggregateNode<K, V, A> extends Processor<K, V, Windowed<K>, A> {
 	private static readonly CLEANUP_INTERVAL_MS = 60_000
 	private readonly cleanupState: CleanupState
+	private readonly advanceMs: number
 
 	constructor(
 		private readonly storeName: string,
@@ -238,9 +274,11 @@ export class WindowedAggregateNode<K, V, A> extends Processor<K, V, Windowed<K>,
 		private readonly initializer: () => A,
 		private readonly aggregator: (key: K, value: V, aggregate: A) => A,
 		private readonly windowSizeMs: number,
+		advanceMs: number = 0,
 		cleanupState?: CleanupState
 	) {
 		super()
+		this.advanceMs = resolveAdvanceMs(windowSizeMs, advanceMs)
 		this.cleanupState = cleanupState ?? { lastCleanupStreamTimeMs: 0, streamTimeMs: 0 }
 	}
 
@@ -252,6 +290,7 @@ export class WindowedAggregateNode<K, V, A> extends Processor<K, V, Windowed<K>,
 			this.initializer,
 			this.aggregator,
 			this.windowSizeMs,
+			this.advanceMs,
 			this.cleanupState
 		)
 	}
@@ -271,26 +310,19 @@ export class WindowedAggregateNode<K, V, A> extends Processor<K, V, Windowed<K>,
 			return
 		}
 
-		// Calculate window for this record based on timestamp
 		const timestamp = Number(record.timestamp)
-		const windowStart = Math.floor(timestamp / this.windowSizeMs) * this.windowSizeMs
-		const windowEnd = windowStart + this.windowSizeMs
+		for (const { start, end } of windowStartsFor(timestamp, this.windowSizeMs, this.advanceMs)) {
+			const windowedKey: WindowedKey<K> = { key, windowStart: start, windowEnd: end }
 
-		const windowedKey: WindowedKey<K> = {
-			key,
-			windowStart,
-			windowEnd,
+			const storedAggregate = await store.get(windowedKey)
+			const aggregate: A = storedAggregate !== undefined ? storedAggregate : this.initializer()
+			const newAggregate = this.aggregator(key, record.value, aggregate)
+			await store.put(windowedKey, newAggregate)
+
+			const windowedResult: Windowed<K> = { key, window: { start, end } }
+			const next: StreamRecord<Windowed<K>, A> = { ...record, key: windowedResult, value: newAggregate }
+			await this.forward(next)
 		}
-
-		// Get current aggregate or initialize
-		const storedAggregate = await store.get(windowedKey)
-		const aggregate: A = storedAggregate !== undefined ? storedAggregate : this.initializer()
-
-		// Apply aggregation
-		const newAggregate = this.aggregator(key, record.value, aggregate)
-
-		// Store updated aggregate
-		await store.put(windowedKey, newAggregate)
 
 		// Stream time (max record timestamp), not wall clock — so backfill/replay expires identically to live processing.
 		this.cleanupState.streamTimeMs = Math.max(this.cleanupState.streamTimeMs, timestamp)
@@ -301,19 +333,6 @@ export class WindowedAggregateNode<K, V, A> extends Processor<K, V, Windowed<K>,
 			this.cleanupState.lastCleanupStreamTimeMs = this.cleanupState.streamTimeMs
 			await store.expireOldWindows(this.cleanupState.streamTimeMs)
 		}
-
-		// Forward the windowed result
-		const windowedResult: Windowed<K> = {
-			key,
-			window: { start: windowStart, end: windowEnd },
-		}
-
-		const next: StreamRecord<Windowed<K>, A> = {
-			...record,
-			key: windowedResult,
-			value: newAggregate,
-		}
-		await this.forward(next)
 	}
 }
 
