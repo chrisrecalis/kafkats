@@ -223,14 +223,14 @@ export class SessionReduceNode<K, V> extends Processor<K, V, Windowed<K>, V> {
 	}
 }
 
+type CleanupState = { lastCleanupStreamTimeMs: number; streamTimeMs: number }
+
 /**
  * Processor node for windowed aggregations.
  */
 export class WindowedAggregateNode<K, V, A> extends Processor<K, V, Windowed<K>, A> {
-	// Cleanup interval: run expiration every 60 seconds
 	private static readonly CLEANUP_INTERVAL_MS = 60_000
-	// Shared state for last cleanup time across clones
-	private readonly cleanupState: { lastCleanupTime: number }
+	private readonly cleanupState: CleanupState
 
 	constructor(
 		private readonly storeName: string,
@@ -238,10 +238,10 @@ export class WindowedAggregateNode<K, V, A> extends Processor<K, V, Windowed<K>,
 		private readonly initializer: () => A,
 		private readonly aggregator: (key: K, value: V, aggregate: A) => A,
 		private readonly windowSizeMs: number,
-		cleanupState?: { lastCleanupTime: number }
+		cleanupState?: CleanupState
 	) {
 		super()
-		this.cleanupState = cleanupState ?? { lastCleanupTime: 0 }
+		this.cleanupState = cleanupState ?? { lastCleanupStreamTimeMs: 0, streamTimeMs: 0 }
 	}
 
 	clone(worker: WorkerContext): Processor<K, V, Windowed<K>, A> {
@@ -252,7 +252,7 @@ export class WindowedAggregateNode<K, V, A> extends Processor<K, V, Windowed<K>,
 			this.initializer,
 			this.aggregator,
 			this.windowSizeMs,
-			this.cleanupState // Share cleanup state across clones
+			this.cleanupState
 		)
 	}
 
@@ -292,11 +292,14 @@ export class WindowedAggregateNode<K, V, A> extends Processor<K, V, Windowed<K>,
 		// Store updated aggregate
 		await store.put(windowedKey, newAggregate)
 
-		// Periodically enforce retention by expiring old windows
-		const now = Date.now()
-		if (now - this.cleanupState.lastCleanupTime > WindowedAggregateNode.CLEANUP_INTERVAL_MS) {
-			this.cleanupState.lastCleanupTime = now
-			await store.expireOldWindows(now)
+		// Stream time (max record timestamp), not wall clock — so backfill/replay expires identically to live processing.
+		this.cleanupState.streamTimeMs = Math.max(this.cleanupState.streamTimeMs, timestamp)
+		if (
+			this.cleanupState.streamTimeMs - this.cleanupState.lastCleanupStreamTimeMs >
+			WindowedAggregateNode.CLEANUP_INTERVAL_MS
+		) {
+			this.cleanupState.lastCleanupStreamTimeMs = this.cleanupState.streamTimeMs
+			await store.expireOldWindows(this.cleanupState.streamTimeMs)
 		}
 
 		// Forward the windowed result
