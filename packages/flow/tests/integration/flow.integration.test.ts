@@ -1032,6 +1032,57 @@ describe('changelog topics and restoration', () => {
 		expect(await checkpoint.get(changelogTopic, 0)).toBe(endOffsets.get(0))
 	}, 60_000)
 
+	// Regression guard for the invariant that ChangelogRestorer's consumer reads with
+	// read_committed isolation. Would have caught #62's premise being wrong (it claimed
+	// the default was read_uncommitted; it isn't, but a future drift in DEFAULT_CONSUMER_CONFIG
+	// would silently corrupt restored state by replaying aborted-txn records.)
+	it('ChangelogRestorer skips aborted-transaction records', async () => {
+		const changelogTopic = uniqueTopicName('flow-it-changelog-aborted-txn')
+		await createTopics(client, [{ name: changelogTopic, partitions: 1 }])
+
+		const txProducer = client.producer({
+			transactionalId: `flow-it-restorer-aborted-${Date.now()}`,
+			idempotent: true,
+		})
+		try {
+			// Aborted transaction — record should NOT appear in restored state.
+			await txProducer
+				.transaction(async tx => {
+					await tx.send(changelogTopic, { key: 'aborted-key', value: numberCodec.encode(999) })
+					throw new Error('intentional abort')
+				})
+				.catch(() => {
+					/* expected */
+				})
+
+			// Committed transaction — record SHOULD appear.
+			await txProducer.transaction(async tx => {
+				await tx.send(changelogTopic, { key: 'committed-key', value: numberCodec.encode(42) })
+			})
+		} finally {
+			await txProducer.disconnect()
+		}
+
+		const store = new InMemoryKeyValueStore<string, number>('aborted-txn-store', {
+			keyCodec: stringCodec,
+			valueCodec: numberCodec,
+		})
+		await store.init()
+
+		const restorer = new ChangelogRestorer(changelogTopic, stringCodec, numberCodec, store)
+		const restored = await restorer.restore(client, {
+			idleTimeoutMs: 2_000,
+			initialIdleTimeoutMs: 10_000,
+			checkIntervalMs: 200,
+			consumerMaxWaitMs: 200,
+		})
+
+		expect(restored).toBe(1)
+		expect(await store.get('committed-key')).toBe(42)
+		// Critical invariant: aborted records must NOT survive restoration.
+		expect(await store.get('aborted-key')).toBeUndefined()
+	}, 60_000)
+
 	it('writes changelog checkpoints when checkpoint store is available', async () => {
 		const input = uniqueTopicName('flow-it-checkpoint-src')
 		const outputTopic = uniqueTopicName('flow-it-checkpoint-out')
