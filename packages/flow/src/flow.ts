@@ -1136,9 +1136,11 @@ class FlowAppImpl implements FlowApp {
 	private attachConsumerEvents(consumer: Consumer, worker: WorkerContext): void {
 		consumer.on('rebalance', () => {
 			this.currentState = 'REBALANCING'
-			// Commit any pending transactions before rebalance completes
-			// This is done synchronously in the event handler to ensure
-			// offsets are committed before partitions are reassigned
+			// Best-effort commit: EventEmitter listeners can't be awaited, so we can't block
+			// the consumer's rebalance protocol here. Serialization against the next message's
+			// transaction is provided by worker.eosQueue, which both this commit and the next
+			// processInTransaction enqueue against. The real EOS gap (offsets may not commit
+			// before the group rejoins) needs an awaitable rebalance hook — out of scope here.
 			if (this.eosEnabled && worker.transactionActive) {
 				this.enqueueEosTask(worker, () => this.commitTransactionBatch(worker)).catch(err => {
 					this.lastError = err as Error
