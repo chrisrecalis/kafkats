@@ -320,13 +320,20 @@ export class ChangelogRestorer<K, V> {
 
 			const timeoutMs = hasConsumedMessage ? idleTimeoutMs : initialIdleTimeoutMs
 			if (Date.now() - lastProgressTime > timeoutMs) {
-				abortController.abort(
-					new Error(
-						`Timed out restoring changelog "${this.topicName}" (pending partitions: ${[
-							...pendingPartitions,
-						].join(', ')})`
+				if (hasConsumedMessage) {
+					// Idle after progress = topic drained. On read_committed transactional changelogs the
+					// consumer can't reach endOffset because control markers sit past the last user record
+					// (LSO = lastUserOffset + N). Gracefully complete instead of erroring (F7b).
+					abortController.abort(restoreCompleteReason)
+				} else {
+					abortController.abort(
+						new Error(
+							`Timed out restoring changelog "${this.topicName}" (pending partitions: ${[
+								...pendingPartitions,
+							].join(', ')})`
+						)
 					)
-				)
+				}
 			}
 		}, checkIntervalMs)
 

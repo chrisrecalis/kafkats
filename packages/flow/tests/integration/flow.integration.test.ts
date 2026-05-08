@@ -1063,9 +1063,8 @@ describe('changelog topics and restoration', () => {
 		await store.init()
 
 		const restorer = new ChangelogRestorer(changelogTopic, stringCodec, numberCodec, store)
-		// Note: idleTimeoutMs absorbs the gap between the last delivered user record and the LSO
-		// (which sits past the COMMIT control batch under read_committed). See F-issue noted in
-		// CORRECTNESS-FOLLOWUPS.md re: restoration termination on transactional topics.
+		// Under read_committed the LSO sits past the COMMIT control batch, so the offset+1≥endOffset
+		// fast-path in restoration never triggers; idle-after-progress completes gracefully (F7b fix).
 		const restored = await restorer.restore(client, {
 			idleTimeoutMs: 2_000,
 			initialIdleTimeoutMs: 10_000,
