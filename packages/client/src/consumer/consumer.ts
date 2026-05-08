@@ -8,7 +8,7 @@
 import { EventEmitter } from 'node:events'
 import type { Cluster } from '@/client/cluster.js'
 import { KafkaProtocolError } from '@/client/errors.js'
-import { ErrorCode } from '@/protocol/messages/error-codes.js'
+import { ErrorCode, isGenerationLostErrorCode } from '@/protocol/messages/error-codes.js'
 import { pmapVoid } from '@/utils/pmap.js'
 import type { DecodedRecord } from '@/protocol/records/index.js'
 import { buildDecoderMaps, decodeRecord } from './message-decoder.js'
@@ -791,28 +791,23 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	}
 
 	private handleAutoCommitError(error: Error): void {
-		// Surface the failure to the user (always — they need visibility) and
-		// trigger a rebalance/rejoin if the error indicates we lost our group
-		// generation. Without this, the auto-commit loop kept logging and
-		// retrying with a stale generationId forever, and consumedOffsets
-		// grew unboundedly.
+		const code = error instanceof KafkaProtocolError ? error.errorCode : null
+
+		// RebalanceInProgress is expected during a cooperative rebalance — the
+		// next generation will retry. Trigger the rejoin path silently.
+		if (code === ErrorCode.RebalanceInProgress) {
+			this.offsetManager?.clearConsumedOffsets()
+			this.consumerGroup?.emit('rebalance')
+			return
+		}
+
 		this.emitError(error)
 
-		const code = error instanceof KafkaProtocolError ? error.errorCode : null
-		if (
-			code === ErrorCode.IllegalGeneration ||
-			code === ErrorCode.UnknownMemberId ||
-			code === ErrorCode.RebalanceInProgress
-		) {
-			this.logger.warn('auto-commit hit fatal generation error — triggering rejoin', {
-				errorCode: code,
-			})
-			// Clear pending offsets that we can no longer commit with this
-			// generation. The new generation will resume from the last
-			// successfully committed offset on the broker.
+		// Generation lost: stale offsets can't be committed under this generation;
+		// drop them and rejoin so the new generation resumes from the broker's
+		// last committed offset (otherwise consumedOffsets grows unboundedly).
+		if (code !== null && isGenerationLostErrorCode(code)) {
 			this.offsetManager?.clearConsumedOffsets()
-			// Best-effort rejoin via the consumerGroup; partitionProvider will
-			// observe the new state on its next loop.
 			this.consumerGroup?.emit('rebalance')
 		}
 	}

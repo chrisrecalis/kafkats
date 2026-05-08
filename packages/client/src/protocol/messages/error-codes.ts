@@ -175,6 +175,14 @@ export function isRetriableError(code: ErrorCode): boolean {
 }
 
 /**
+ * Check if an error code indicates the consumer's group generation is no
+ * longer valid and a rejoin is required (vs a transient rebalance window).
+ */
+export function isGenerationLostErrorCode(code: ErrorCode): boolean {
+	return code === ErrorCode.IllegalGeneration || code === ErrorCode.UnknownMemberId
+}
+
+/**
  * Get the human-readable name for an error code
  *
  * @param code - The error code

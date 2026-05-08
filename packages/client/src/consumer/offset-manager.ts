@@ -43,9 +43,8 @@ export class OffsetManager {
 	private autoCommitTimer: ReturnType<typeof setTimeout> | null = null
 	private abortController: AbortController | null = null
 
-	// Optional callback fired when auto-commit fails. Allows the Consumer to
-	// surface fatal errors (e.g. IllegalGeneration → trigger rejoin) instead
-	// of silently swallowing them in the auto-commit loop.
+	// Optional callback so the Consumer can react to commit failures
+	// (e.g. trigger rejoin on IllegalGeneration).
 	private onCommitError: ((error: Error) => void) | null = null
 
 	constructor(cluster: Cluster, groupId: string, groupInstanceId?: string, logger?: Logger) {
@@ -181,10 +180,6 @@ export class OffsetManager {
 				})
 				.catch((error: Error) => {
 					this.logger.error('auto-commit failed', { error: error.message })
-					// Surface to the Consumer so it can react (emit error, trigger
-					// rejoin on IllegalGeneration / UnknownMemberId, etc.).
-					// Without this hook, persistent generation/coordinator errors
-					// were silently logged forever while consumedOffsets accumulated.
 					if (this.onCommitError) {
 						try {
 							this.onCommitError(error)
