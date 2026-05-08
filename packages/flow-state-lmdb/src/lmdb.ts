@@ -16,6 +16,15 @@ import type {
 const KEY_TERMINATOR = Buffer.from([0])
 const inclusiveEnd = (b: Buffer): Buffer => Buffer.concat([b, KEY_TERMINATOR])
 
+// WindowStore keys encode as 16 BE bytes [windowStart][windowEnd]; padding the second half with 0 yields
+// the lex-smallest key for a given windowStart, so half-open [timeBound(from), timeBound(to+1)) selects
+// all records whose windowStart is in [from, to] regardless of windowEnd.
+const timeBound = (t: number): Buffer => {
+	const b = Buffer.alloc(16)
+	b.writeBigInt64BE(BigInt(t), 0)
+	return b
+}
+
 /**
  * LMDB implementation of KeyValueStore.
  *
@@ -234,36 +243,25 @@ export class LMDBWindowStore<K, V> implements WindowStore<K, V> {
 		await Promise.resolve()
 		const keyBytes = this.keyCodec.encode(key)
 
-		// Scan the time range and filter by key
-		const fromBytes = Buffer.alloc(16)
-		fromBytes.writeBigInt64BE(BigInt(timeFrom), 0)
-		fromBytes.writeBigInt64BE(BigInt(timeFrom), 8)
-
-		const toBytes = Buffer.alloc(16)
-		toBytes.writeBigInt64BE(BigInt(timeTo), 0)
-		toBytes.writeBigInt64BE(BigInt(timeTo + 1), 8) // Inclusive upper bound
-
-		for (const { key: storedKey, value } of this.db.getRange({ start: fromBytes, end: toBytes })) {
-			const windowedKey = this.windowedCodec.decode(storedKey)
-			const entryKeyBytes = this.keyCodec.encode(windowedKey.key)
-
-			if (keyBytes.equals(entryKeyBytes)) {
-				yield [windowedKey, this.valueCodec.decode(value)]
+		for (const { key: storedKey, value } of this.db.getRange({
+			start: timeBound(timeFrom),
+			end: timeBound(timeTo + 1),
+		})) {
+			// Compare raw key-suffix bytes (after the 16-byte windowStart/End prefix) instead of
+			// decoding then re-encoding — saves a full codec round-trip per row on the join hot path.
+			if (storedKey.length === 16 + keyBytes.length && storedKey.subarray(16).equals(keyBytes)) {
+				yield [this.windowedCodec.decode(storedKey), this.valueCodec.decode(value)]
 			}
 		}
 	}
 
 	async *fetchAll(timeFrom: number, timeTo: number): AsyncIterable<[WindowedKey<K>, V]> {
 		await Promise.resolve()
-		const fromBytes = Buffer.alloc(16)
-		fromBytes.writeBigInt64BE(BigInt(timeFrom), 0)
-		fromBytes.writeBigInt64BE(BigInt(timeFrom), 8)
 
-		const toBytes = Buffer.alloc(16)
-		toBytes.writeBigInt64BE(BigInt(timeTo), 0)
-		toBytes.writeBigInt64BE(BigInt(timeTo + 1), 8)
-
-		for (const { key, value } of this.db.getRange({ start: fromBytes, end: toBytes })) {
+		for (const { key, value } of this.db.getRange({
+			start: timeBound(timeFrom),
+			end: timeBound(timeTo + 1),
+		})) {
 			yield [this.windowedCodec.decode(key), this.valueCodec.decode(value)]
 		}
 	}
@@ -305,12 +303,12 @@ export class LMDBWindowStore<K, V> implements WindowStore<K, V> {
 		const cutoff = currentTime - this.retentionMs
 		const toDelete: Buffer[] = []
 
-		const cutoffBytes = Buffer.alloc(16)
-		cutoffBytes.writeBigInt64BE(BigInt(0), 0)
-		cutoffBytes.writeBigInt64BE(BigInt(cutoff), 8)
-
-		for (const { key } of this.db.getRange({ end: cutoffBytes })) {
-			toDelete.push(key)
+		// Scan windowStart < cutoff, then drop only those whose windowEnd < cutoff (still-overlapping windows stay).
+		for (const { key } of this.db.getRange({ end: timeBound(cutoff) })) {
+			const windowedKey = this.windowedCodec.decode(key)
+			if (windowedKey.windowEnd < cutoff) {
+				toDelete.push(key)
+			}
 		}
 
 		for (const key of toDelete) {
