@@ -747,25 +747,12 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 
 		this.logger.debug('starting heartbeat loop', { intervalMs: this.config.heartbeatIntervalMs })
 
-		const reschedule = () => {
-			// Only reschedule while still in STABLE and not aborted. State
-			// transitions (e.g. session loss) clear ownedPartitions; rejoin
-			// path will call startHeartbeat() again on success.
-			if (this.state !== ConsumerGroupState.STABLE || this.abortController?.signal.aborted) {
-				return
-			}
-			this.heartbeatTimer = setTimeout(runHeartbeat, this.config.heartbeatIntervalMs)
-		}
-
 		const runHeartbeat = () => {
 			if (this.state !== ConsumerGroupState.STABLE || this.abortController?.signal.aborted) {
 				return
 			}
 
-			// Clear current timer reference before sending — the .then/.catch
-			// callbacks will install a fresh one via reschedule().
 			this.heartbeatTimer = null
-
 			this.logger.debug('sending heartbeat', { generationId: this.generationId })
 
 			this.coordinator!.heartbeat({
@@ -778,30 +765,23 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 					if (response.errorCode === ErrorCode.RebalanceInProgress) {
 						this.logger.debug('heartbeat indicates rebalance in progress')
 						this.emit('rebalance')
-						// Keep heartbeating until rejoin completes — without this,
-						// session timeout can fire while the rejoin path waits.
-						reschedule()
 						return
 					}
-
 					if (response.errorCode !== ErrorCode.None) {
 						this.logger.debug('heartbeat error', { errorCode: response.errorCode })
+						// May flip state to non-STABLE (UnknownMemberId, FencedInstanceId);
+						// the finally guard skips the reschedule in that case.
 						await this.handleHeartbeatError(response.errorCode)
-						// handleHeartbeatError may transition state away from STABLE
-						// (e.g. UnknownMemberId, FencedInstanceId) — reschedule()
-						// is a no-op in that case. Otherwise keep the loop alive.
-						reschedule()
-						return
 					}
-
-					// Schedule next heartbeat
-					reschedule()
 				})
 				.catch(error => {
 					this.logger.error('heartbeat failed', { error: (error as Error).message })
 					this.emit('error', error as Error)
-					// Try to recover
-					reschedule()
+				})
+				.finally(() => {
+					if (this.state === ConsumerGroupState.STABLE && !this.abortController?.signal.aborted) {
+						this.heartbeatTimer = setTimeout(runHeartbeat, this.config.heartbeatIntervalMs)
+					}
 				})
 		}
 

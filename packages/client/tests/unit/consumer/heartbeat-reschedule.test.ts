@@ -19,7 +19,6 @@ describe('ConsumerGroup heartbeat scheduling', () => {
 		for (const r of heartbeatResults) {
 			heartbeatMock.mockResolvedValueOnce(r)
 		}
-		// Default after the queued results — keep returning None to verify continued ticking.
 		heartbeatMock.mockResolvedValue({ errorCode: ErrorCode.None })
 
 		const coordinator = {
