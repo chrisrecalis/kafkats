@@ -1,13 +1,10 @@
-/**
- * ShareConsumer module exports
- *
- * @experimental
- */
+/** ShareConsumer module exports (Kafka Share Groups / KIP-932, GA in Kafka 4.2). */
 
 export { ShareConsumer } from './share-consumer.js'
 
 export type {
 	ConsumeContext,
+	ShareConsumerAcquireMode,
 	ShareConsumerConfig,
 	ShareConsumerEvents,
 	ShareKeyOf,

@@ -113,8 +113,6 @@ export class UnsupportedVersionError extends KafkaError {
 
 /**
  * A Kafka broker supports the protocol, but does not support a specific feature.
- *
- * @experimental
  */
 export class KafkaFeatureUnsupportedError extends KafkaError {
 	readonly feature: string
@@ -132,8 +130,6 @@ export class KafkaFeatureUnsupportedError extends KafkaError {
 
 /**
  * A Kafka feature exists but is disabled at the cluster level (e.g. feature flags).
- *
- * @experimental
  */
 export class KafkaFeatureDisabledError extends KafkaError {
 	readonly feature: string

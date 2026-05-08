@@ -311,9 +311,7 @@ export class KafkaClient {
 	}
 
 	/**
-	 * Create a share consumer (Kafka Share Groups / KIP-932)
-	 *
-	 * @experimental
+	 * Create a share consumer (Kafka Share Groups / KIP-932, GA in Kafka 4.2).
 	 */
 	shareConsumer(config: ShareConsumerConfig): ShareConsumer {
 		return new ShareConsumer(this.cluster, config)

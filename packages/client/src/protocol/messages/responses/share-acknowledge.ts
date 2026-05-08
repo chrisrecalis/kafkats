@@ -30,6 +30,11 @@ export interface ShareAcknowledgeResponse {
 	throttleTimeMs: number
 	errorCode: ErrorCode
 	errorMessage: string | null
+	/**
+	 * Acquisition lock timeout reported by the broker (KIP-1222, ShareAcknowledge v2+).
+	 * 0 when the field is not present (older brokers).
+	 */
+	acquisitionLockTimeoutMs: number
 	topics: ShareAcknowledgeTopicResponse[]
 	nodeEndpoints: ShareAcknowledgeNodeEndpoint[]
 }
@@ -47,6 +52,8 @@ export function decodeShareAcknowledgeResponse(decoder: IDecoder, version: numbe
 	const throttleTimeMs = decoder.readInt32()
 	const errorCode = decoder.readInt16() as ErrorCode
 	const errorMessage = decoder.readCompactNullableString()
+
+	const acquisitionLockTimeoutMs = version >= 2 ? decoder.readInt32() : 0
 
 	const topics = decoder.readCompactArray(d => {
 		const topicId = d.readUUID()
@@ -85,5 +92,5 @@ export function decodeShareAcknowledgeResponse(decoder: IDecoder, version: numbe
 
 	decoder.skipTaggedFields()
 
-	return { throttleTimeMs, errorCode, errorMessage, topics, nodeEndpoints }
+	return { throttleTimeMs, errorCode, errorMessage, acquisitionLockTimeoutMs, topics, nodeEndpoints }
 }

@@ -1,9 +1,12 @@
 /**
  * ShareAcknowledge Request (API Key 79)
  *
- * Used by share consumers to acknowledge (accept/release/reject) acquired records.
+ * Used by share consumers to acknowledge (accept/release/reject/renew) acquired records.
  *
  * Flexible (tagged fields) in all supported versions.
+ *
+ * v1: KIP-932 stable share groups (Kafka 4.1+).
+ * v2: KIP-1222 Renew acknowledgements (Kafka 4.2+).
  */
 
 import type { IEncoder } from '@/protocol/primitives/index.js'
@@ -11,7 +14,7 @@ import { ApiKey, isFlexibleVersion } from '@/protocol/messages/api-keys.js'
 
 export const SHARE_ACKNOWLEDGE_VERSIONS = {
 	min: 1,
-	max: 1,
+	max: 2,
 }
 
 export interface ShareAcknowledgeAcknowledgementBatch {
@@ -34,6 +37,8 @@ export interface ShareAcknowledgeRequest {
 	groupId: string
 	memberId: string
 	shareSessionEpoch: number
+	/** True iff any AcknowledgementBatch contains a Renew (4) entry (v2+). */
+	isRenewAck?: boolean
 	topics: ShareAcknowledgeRequestTopic[]
 }
 
@@ -51,9 +56,17 @@ export function encodeShareAcknowledgeRequest(
 		throw new Error(`ShareAcknowledge v${version} must be flexible`)
 	}
 
+	if (version < 2 && request.isRenewAck) {
+		throw new Error('ShareAcknowledge isRenewAck requires v2 (Kafka 4.2+)')
+	}
+
 	encoder.writeCompactNullableString(request.groupId)
 	encoder.writeCompactNullableString(request.memberId)
 	encoder.writeInt32(request.shareSessionEpoch)
+
+	if (version >= 2) {
+		encoder.writeBoolean(request.isRenewAck ?? false)
+	}
 
 	encoder.writeCompactArray(request.topics, (topic, te) => {
 		te.writeUUID(topic.topicId)
