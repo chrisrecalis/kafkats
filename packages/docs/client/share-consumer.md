@@ -186,16 +186,16 @@ await shareConsumer.runEach(userEvents, async message => {
 
 ## Consumer Config
 
-| Option        | Type                                       | Default            | Description                                                                                                                       |
-| ------------- | ------------------------------------------ | ------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
-| `groupId`     | `string`                                   | required           | Share group identifier                                                                                                            |
-| `rackId`      | `string`                                   | -                  | Rack ID hint for rack-aware assignment                                                                                            |
-| `maxWaitMs`   | `number`                                   | `5000`             | `ShareFetch.max_wait_ms`                                                                                                          |
-| `minBytes`    | `number`                                   | `1`                | `ShareFetch.min_bytes`                                                                                                            |
-| `maxBytes`    | `number`                                   | `1048576`          | `ShareFetch.max_bytes`                                                                                                            |
-| `maxRecords`  | `number`                                   | `500`              | Max records the broker should return per fetch                                                                                    |
-| `batchSize`   | `number`                                   | `100`              | Suggested batch size for acquired records and acknowledgements                                                                    |
-| `acquireMode` | `'batch_optimized' \| 'record_limit'`      | `'batch_optimized'` | KIP-1206, Kafka 4.2+. `record_limit` strictly caps each fetch at `maxRecords`; `batch_optimized` may exceed it for batch alignment |
+| Option        | Type                                  | Default             | Description                                                                                                                        |
+| ------------- | ------------------------------------- | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `groupId`     | `string`                              | required            | Share group identifier                                                                                                             |
+| `rackId`      | `string`                              | -                   | Rack ID hint for rack-aware assignment                                                                                             |
+| `maxWaitMs`   | `number`                              | `5000`              | `ShareFetch.max_wait_ms`                                                                                                           |
+| `minBytes`    | `number`                              | `1`                 | `ShareFetch.min_bytes`                                                                                                             |
+| `maxBytes`    | `number`                              | `1048576`           | `ShareFetch.max_bytes`                                                                                                             |
+| `maxRecords`  | `number`                              | `500`               | Max records the broker should return per fetch                                                                                     |
+| `batchSize`   | `number`                              | `100`               | Suggested batch size for acquired records and acknowledgements                                                                     |
+| `acquireMode` | `'batch_optimized' \| 'record_limit'` | `'batch_optimized'` | KIP-1206, Kafka 4.2+. `record_limit` strictly caps each fetch at `maxRecords`; `batch_optimized` may exceed it for batch alignment |
 
 `acquireMode: 'record_limit'` requires ShareFetch v2 (Kafka 4.2+); against older brokers the consumer throws on the first fetch.
 
