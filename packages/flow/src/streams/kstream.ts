@@ -20,8 +20,7 @@ import {
 	StreamStreamLeftJoinNode,
 	StreamStreamOuterJoinNode,
 } from '@/processors/joins/stream-stream.js'
-import { TimeWindows, SlidingWindows } from '@/windows.js'
-import { parseWindowDuration } from '@/helpers.js'
+import { joinWindowMs as resolveJoinWindowMs } from '@/helpers.js'
 import { KTableImpl, type FlowAppInterface } from '@/streams/ktable.js'
 import { KGroupedStreamImpl } from '@/streams/grouped.js'
 
@@ -184,12 +183,7 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 			throw new Error('Stream-stream join requires a join window. Provide options.within.')
 		}
 
-		const joinWindowMs =
-			joinWindow instanceof TimeWindows
-				? parseWindowDuration(joinWindow.size)
-				: joinWindow instanceof SlidingWindows
-					? parseWindowDuration(joinWindow.size)
-					: parseWindowDuration(joinWindow.gap)
+		const joinWindowMs = resolveJoinWindowMs(joinWindow)
 
 		const keyCodec = this.format.keyCodec
 		const valueCodec = this.format.valueCodec
@@ -277,12 +271,7 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 			throw new Error('Stream-stream left join requires a join window. Provide options.within.')
 		}
 
-		const joinWindowMs =
-			joinWindow instanceof TimeWindows
-				? parseWindowDuration(joinWindow.size)
-				: joinWindow instanceof SlidingWindows
-					? parseWindowDuration(joinWindow.size)
-					: parseWindowDuration(joinWindow.gap)
+		const joinWindowMs = resolveJoinWindowMs(joinWindow)
 
 		const keyCodec = this.format.keyCodec
 		const valueCodec = this.format.valueCodec
@@ -360,12 +349,7 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 			throw new Error('Stream-stream outer join requires a join window. Provide options.within.')
 		}
 
-		const joinWindowMs =
-			joinWindow instanceof TimeWindows
-				? parseWindowDuration(joinWindow.size)
-				: joinWindow instanceof SlidingWindows
-					? parseWindowDuration(joinWindow.size)
-					: parseWindowDuration(joinWindow.gap)
+		const joinWindowMs = resolveJoinWindowMs(joinWindow)
 
 		const keyCodec = this.format.keyCodec
 		const valueCodec = this.format.valueCodec
