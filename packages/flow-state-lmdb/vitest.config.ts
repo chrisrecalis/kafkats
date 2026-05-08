@@ -9,6 +9,7 @@ export default defineConfig({
 	},
 	test: {
 		deps: {
+			// lmdb's native binding fails under Vite's SSR optimizer; load it directly.
 			optimizer: {
 				ssr: {
 					enabled: false,

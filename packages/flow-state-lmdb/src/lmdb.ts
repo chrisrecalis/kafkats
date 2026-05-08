@@ -12,6 +12,10 @@ import type {
 	WindowStoreOptions,
 } from '@kafkats/flow'
 
+// lmdb-js getRange's end is exclusive; the public range() contract is inclusive (matches in-memory provider).
+const KEY_TERMINATOR = Buffer.from([0])
+const inclusiveEnd = (b: Buffer): Buffer => Buffer.concat([b, KEY_TERMINATOR])
+
 /**
  * LMDB implementation of KeyValueStore.
  *
@@ -65,14 +69,7 @@ export class LMDBKeyValueStore<K, V> implements KeyValueStore<K, V> {
 		const fromBytes = this.keyCodec.encode(from)
 		const toBytes = this.keyCodec.encode(to)
 
-		// lmdb-js's getRange end bound is EXCLUSIVE, but the KeyValueStore.range
-		// contract is inclusive (matching the in-memory provider). Construct a
-		// strictly-greater end bound by appending a zero byte — any key
-		// lexicographically following toBytes (including toBytes itself) sorts
-		// before this synthetic key, so toBytes is included.
-		const inclusiveEnd = Buffer.concat([toBytes, Buffer.from([0])])
-
-		for (const { key, value } of this.db.getRange({ start: fromBytes, end: inclusiveEnd })) {
+		for (const { key, value } of this.db.getRange({ start: fromBytes, end: inclusiveEnd(toBytes) })) {
 			yield [this.keyCodec.decode(key), this.valueCodec.decode(value)]
 		}
 	}
@@ -228,7 +225,7 @@ export class LMDBWindowStore<K, V> implements WindowStore<K, V> {
 		const fromBytes = this.windowedCodec.encode(from)
 		const toBytes = this.windowedCodec.encode(to)
 
-		for (const { key, value } of this.db.getRange({ start: fromBytes, end: toBytes })) {
+		for (const { key, value } of this.db.getRange({ start: fromBytes, end: inclusiveEnd(toBytes) })) {
 			yield [this.windowedCodec.decode(key), this.valueCodec.decode(value)]
 		}
 	}
@@ -378,7 +375,7 @@ export class LMDBSessionStore<K, V> implements SessionStore<K, V> {
 		const fromBytes = this.sessionCodec.encode(from)
 		const toBytes = this.sessionCodec.encode(to)
 
-		for (const { key, value } of this.db.getRange({ start: fromBytes, end: toBytes })) {
+		for (const { key, value } of this.db.getRange({ start: fromBytes, end: inclusiveEnd(toBytes) })) {
 			yield [this.sessionCodec.decode(key), this.valueCodec.decode(value)]
 		}
 	}
