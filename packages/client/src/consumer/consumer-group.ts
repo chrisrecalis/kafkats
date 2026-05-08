@@ -752,6 +752,7 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 				return
 			}
 
+			this.heartbeatTimer = null
 			this.logger.debug('sending heartbeat', { generationId: this.generationId })
 
 			this.coordinator!.heartbeat({
@@ -760,26 +761,27 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 				memberId: this.memberId,
 				groupInstanceId: this.config.groupInstanceId ?? null,
 			})
-				.then(response => {
+				.then(async response => {
 					if (response.errorCode === ErrorCode.RebalanceInProgress) {
 						this.logger.debug('heartbeat indicates rebalance in progress')
 						this.emit('rebalance')
 						return
 					}
-
 					if (response.errorCode !== ErrorCode.None) {
 						this.logger.debug('heartbeat error', { errorCode: response.errorCode })
-						return this.handleHeartbeatError(response.errorCode)
+						// May flip state to non-STABLE (UnknownMemberId, FencedInstanceId);
+						// the finally guard skips the reschedule in that case.
+						await this.handleHeartbeatError(response.errorCode)
 					}
-
-					// Schedule next heartbeat
-					this.heartbeatTimer = setTimeout(runHeartbeat, this.config.heartbeatIntervalMs)
 				})
 				.catch(error => {
 					this.logger.error('heartbeat failed', { error: (error as Error).message })
 					this.emit('error', error as Error)
-					// Try to recover
-					this.heartbeatTimer = setTimeout(runHeartbeat, this.config.heartbeatIntervalMs)
+				})
+				.finally(() => {
+					if (this.state === ConsumerGroupState.STABLE && !this.abortController?.signal.aborted) {
+						this.heartbeatTimer = setTimeout(runHeartbeat, this.config.heartbeatIntervalMs)
+					}
 				})
 		}
 
