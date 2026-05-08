@@ -1,3 +1,20 @@
+/**
+ * @file Aggregation processor nodes (count, reduce, aggregate; windowed and session variants).
+ *
+ * Idempotence: every aggregator in this file does a sequential read-modify-write
+ * (`store.get` → apply → `store.put`) per record. The RMW is NOT transactional
+ * across input-offset commits. Under the default `at_least_once` processing
+ * guarantee, a redelivery (e.g. crash before offset commit) re-applies the
+ * aggregator and double-counts. This matches Kafka Streams' at_least_once
+ * semantics. Configure the flow with `processingGuarantee: 'exactly_once'` to
+ * scope state writes + offset commits + downstream produce into a single
+ * transactional batch (see flow.ts `commitTransactionBatch`).
+ *
+ * Session-window variants (SessionReduceNode, SessionAggregateNode) are extra
+ * sensitive: redelivery can cause session deletion + re-merge with new events,
+ * producing structurally different (not just numerically inflated) output.
+ */
+
 import { Processor, type StreamRecord, type WorkerContext } from '@/processors/base.js'
 import type { KeyValueStore, WindowStore, SessionStore, WindowedKey } from '@/state.js'
 import type { Windowed } from '@/types.js'
@@ -40,7 +57,6 @@ export class AggregateNode<K, V, A> extends Processor<K, V, K, A> {
 			return
 		}
 
-		// Get current aggregate or initialize
 		const storedAggregate = await store.get(key)
 		const aggregate: A = storedAggregate !== undefined ? storedAggregate : this.initializer()
 
