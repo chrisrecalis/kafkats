@@ -797,7 +797,6 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 				if (handled !== 0) {
 					throw new ShareMessageAlreadyHandledError(topicName, partitionIndex, record.offset)
 				}
-				// Renew does not transition `handled`; the caller still owes a final ack/release/reject.
 				await ackManager.enqueue(topicName, topicId, partitionIndex, record.offset, ACK_RENEW)
 			},
 		}

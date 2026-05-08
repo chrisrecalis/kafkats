@@ -37,14 +37,26 @@ type PendingPartitionAcks = {
  * Pick a single entry per offset. A finalizing ack (ACCEPT/RELEASE/REJECT) supersedes
  * any RENEW for the same offset; multiple RENEWs collapse to one. Dropped entries' promises
  * resolve/reject together with the kept entry so callers don't observe a stalled renew().
+ *
+ * Returns the original array (no allocation) when every offset is already unique, which is
+ * the common case — duplicates only arise when the user calls `renew()` on a message that
+ * is also being ack'd, or `renew()` more than once on the same message.
  */
 function dedupePendingAckEntries(entries: PendingAckEntry[]): PendingAckEntry[] {
+	if (entries.length < 2) return entries
+
 	const byOffset = new Map<bigint, PendingAckEntry[]>()
+	let hasDuplicates = false
 	for (const e of entries) {
 		const list = byOffset.get(e.offset)
-		if (list) list.push(e)
-		else byOffset.set(e.offset, [e])
+		if (list) {
+			list.push(e)
+			hasDuplicates = true
+		} else {
+			byOffset.set(e.offset, [e])
+		}
 	}
+	if (!hasDuplicates) return entries
 
 	const result: PendingAckEntry[] = []
 	for (const list of byOffset.values()) {
@@ -73,32 +85,38 @@ function dedupePendingAckEntries(entries: PendingAckEntry[]): PendingAckEntry[] 
 
 /**
  * Coalesce sorted ack entries into ranges where consecutive offsets have the same type.
- * This reduces the number of acknowledgement batches sent to the broker.
+ * This reduces the number of acknowledgement batches sent to the broker. Also reports whether
+ * any RENEW (4) entries are present so the caller can set the request's `IsRenewAck` flag
+ * (KIP-1222) without re-walking the batches.
  */
 function coalesceAckEntries(entries: PendingAckEntry[]): {
 	batches: ShareAcknowledgeRequestPartition['acknowledgementBatches']
 	entriesByBatch: PendingAckEntry[][]
+	hasRenew: boolean
 } {
 	if (entries.length === 0) {
-		return { batches: [], entriesByBatch: [] }
+		return { batches: [], entriesByBatch: [], hasRenew: false }
 	}
 
 	const deduped = dedupePendingAckEntries(entries)
-	const sorted = deduped.sort((a, b) => (a.offset < b.offset ? -1 : a.offset > b.offset ? 1 : 0))
+	const sorted = (deduped === entries ? [...deduped] : deduped).sort((a, b) =>
+		a.offset < b.offset ? -1 : a.offset > b.offset ? 1 : 0
+	)
 
 	const batches: ShareAcknowledgeRequestPartition['acknowledgementBatches'] = []
 	const entriesByBatch: PendingAckEntry[][] = []
+	let hasRenew = false
 
 	let currentBatch: (typeof batches)[number] | null = null
 	let currentEntries: PendingAckEntry[] = []
 
 	for (const entry of sorted) {
+		if (entry.type === ACK_RENEW) hasRenew = true
 		if (
 			currentBatch === null ||
 			entry.type !== currentBatch.acknowledgeTypes[0] ||
 			entry.offset !== currentBatch.lastOffset + 1n
 		) {
-			// Start a new batch
 			if (currentBatch !== null) {
 				batches.push(currentBatch)
 				entriesByBatch.push(currentEntries)
@@ -110,7 +128,6 @@ function coalesceAckEntries(entries: PendingAckEntry[]): {
 			}
 			currentEntries = [entry]
 		} else {
-			// Extend current batch
 			currentBatch.lastOffset = entry.offset
 			currentEntries.push(entry)
 		}
@@ -121,7 +138,7 @@ function coalesceAckEntries(entries: PendingAckEntry[]): {
 		entriesByBatch.push(currentEntries)
 	}
 
-	return { batches, entriesByBatch }
+	return { batches, entriesByBatch, hasRenew }
 }
 
 /** Delay before flushing acks to allow batching (ms) */
@@ -351,15 +368,8 @@ export class AckManager {
 					const topicMap = new Map<string, ShareAcknowledgeRequest['topics'][number]>()
 					let hasRenewAck = false
 					for (const { partition } of items) {
-						const { batches } = coalesceAckEntries(partition.entries)
-						if (!hasRenewAck) {
-							for (const b of batches) {
-								if (b.acknowledgeTypes.includes(ACK_RENEW)) {
-									hasRenewAck = true
-									break
-								}
-							}
-						}
+						const { batches, hasRenew } = coalesceAckEntries(partition.entries)
+						if (hasRenew) hasRenewAck = true
 
 						const topicEntry = topicMap.get(partition.topicId) ?? {
 							topicId: partition.topicId,
