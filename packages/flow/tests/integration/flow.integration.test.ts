@@ -1032,30 +1032,23 @@ describe('changelog topics and restoration', () => {
 		expect(await checkpoint.get(changelogTopic, 0)).toBe(endOffsets.get(0))
 	}, 60_000)
 
-	// Regression guard for the invariant that ChangelogRestorer's consumer reads with
-	// read_committed isolation. Would have caught #62's premise being wrong (it claimed
-	// the default was read_uncommitted; it isn't, but a future drift in DEFAULT_CONSUMER_CONFIG
-	// would silently corrupt restored state by replaying aborted-txn records.)
+	// Restorer must use read_committed so aborted records never enter state. See F7 in CORRECTNESS-FOLLOWUPS.md.
 	it('ChangelogRestorer skips aborted-transaction records', async () => {
 		const changelogTopic = uniqueTopicName('flow-it-changelog-aborted-txn')
 		await createTopics(client, [{ name: changelogTopic, partitions: 1 }])
 
 		const txProducer = client.producer({
-			transactionalId: `flow-it-restorer-aborted-${Date.now()}`,
+			transactionalId: uniqueTopicName('flow-it-restorer-aborted-tx'),
 			idempotent: true,
 		})
 		try {
-			// Aborted transaction — record should NOT appear in restored state.
-			await txProducer
-				.transaction(async tx => {
+			await expect(
+				txProducer.transaction(async tx => {
 					await tx.send(changelogTopic, { key: 'aborted-key', value: numberCodec.encode(999) })
 					throw new Error('intentional abort')
 				})
-				.catch(() => {
-					/* expected */
-				})
+			).rejects.toThrow()
 
-			// Committed transaction — record SHOULD appear.
 			await txProducer.transaction(async tx => {
 				await tx.send(changelogTopic, { key: 'committed-key', value: numberCodec.encode(42) })
 			})
@@ -1070,6 +1063,9 @@ describe('changelog topics and restoration', () => {
 		await store.init()
 
 		const restorer = new ChangelogRestorer(changelogTopic, stringCodec, numberCodec, store)
+		// Note: idleTimeoutMs absorbs the gap between the last delivered user record and the LSO
+		// (which sits past the COMMIT control batch under read_committed). See F-issue noted in
+		// CORRECTNESS-FOLLOWUPS.md re: restoration termination on transactional topics.
 		const restored = await restorer.restore(client, {
 			idleTimeoutMs: 2_000,
 			initialIdleTimeoutMs: 10_000,
@@ -1079,7 +1075,6 @@ describe('changelog topics and restoration', () => {
 
 		expect(restored).toBe(1)
 		expect(await store.get('committed-key')).toBe(42)
-		// Critical invariant: aborted records must NOT survive restoration.
 		expect(await store.get('aborted-key')).toBeUndefined()
 	}, 60_000)
 
