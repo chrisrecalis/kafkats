@@ -464,21 +464,10 @@ export class Producer extends EventEmitter<ProducerEvents> {
 				let hasRetriableError = false
 				const batchesToRetry: typeof preparedBatches = []
 
-				const partitionByTopic = new Map<
-					string,
-					Map<number, (typeof response.topics)[number]['partitions'][number]>
-				>()
-				for (const t of response.topics) {
-					const partMap = new Map<number, (typeof t.partitions)[number]>()
-					for (const p of t.partitions) {
-						partMap.set(p.partitionIndex, p)
-					}
-					partitionByTopic.set(t.name, partMap)
-				}
-
 				for (const prepared of preparedBatches) {
 					const { batch, recordCount, batchId, messagesToSend } = prepared
-					const partitionResponse = partitionByTopic.get(batch.topic)?.get(batch.partition)
+					const topicResponse = response.topics.find(t => t.name === batch.topic)
+					const partitionResponse = topicResponse?.partitions.find(p => p.partitionIndex === batch.partition)
 
 					if (!partitionResponse) {
 						const error = new Error(`No response for ${batch.topic}-${batch.partition}`)
