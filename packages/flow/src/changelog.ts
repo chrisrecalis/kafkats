@@ -442,10 +442,11 @@ export function windowedKeyCodec<K>(keyCodec: Codec<K>): Codec<WindowedKey<K>> {
 	return {
 		encode(windowed: WindowedKey<K>): Buffer {
 			const keyBuffer = keyCodec.encode(windowed.key)
-			const windowBuffer = Buffer.alloc(16)
-			windowBuffer.writeBigInt64BE(BigInt(windowed.windowStart), 0)
-			windowBuffer.writeBigInt64BE(BigInt(windowed.windowEnd), 8)
-			return Buffer.concat([keyBuffer, windowBuffer])
+			const out = Buffer.allocUnsafe(keyBuffer.length + 16)
+			keyBuffer.copy(out, 0)
+			out.writeBigInt64BE(BigInt(windowed.windowStart), keyBuffer.length)
+			out.writeBigInt64BE(BigInt(windowed.windowEnd), keyBuffer.length + 8)
+			return out
 		},
 		decode(buffer: Buffer): WindowedKey<K> {
 			const keyBuffer = buffer.subarray(0, buffer.length - 16)

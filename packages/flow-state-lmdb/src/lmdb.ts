@@ -13,8 +13,12 @@ import type {
 } from '@kafkats/flow'
 
 // lmdb-js getRange's end is exclusive; the public range() contract is inclusive (matches in-memory provider).
-const KEY_TERMINATOR = Buffer.from([0])
-const inclusiveEnd = (b: Buffer): Buffer => Buffer.concat([b, KEY_TERMINATOR])
+const inclusiveEnd = (b: Buffer): Buffer => {
+	const out = Buffer.allocUnsafe(b.length + 1)
+	b.copy(out, 0)
+	out[b.length] = 0
+	return out
+}
 
 // Bias signed times by 2^63 so unsigned-byte lex order matches signed numeric order.
 // Buffer.alloc's zero-fill represents bias(-2^63) = lex-smallest; LEX_MAX_TIME = bias(+2^63-1).

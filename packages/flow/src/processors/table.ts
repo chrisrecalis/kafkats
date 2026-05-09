@@ -348,12 +348,12 @@ export class TableGroupedComputeCountNode<KSrc, K, V> extends Processor<K, V, K,
 		const key = record.key
 		if (key === null) return
 
-		const encodedKey = this.groupedKeyCodec.encode(key).toString('hex')
+		const targetBytes = this.groupedKeyCodec.encode(key)
+		const encodedKey = targetBytes.toString('hex')
 		const previous = this.inflightByKey.get(encodedKey) ?? Promise.resolve()
 		const current = previous
 			.catch(() => {})
 			.then(async () => {
-				const targetBytes = this.groupedKeyCodec.encode(key)
 				let count = 0
 
 				for await (const [, mapping] of keyMappingStore.all()) {
@@ -427,13 +427,12 @@ export class TableGroupedComputeReduceNode<KSrc, K, V> extends Processor<K, V, K
 		const key = record.key
 		if (key === null) return
 
-		const encodedKey = this.groupedKeyCodec.encode(key).toString('hex')
+		const targetBytes = this.groupedKeyCodec.encode(key)
+		const encodedKey = targetBytes.toString('hex')
 		const previous = this.inflightByKey.get(encodedKey) ?? Promise.resolve()
 		const current = previous
 			.catch(() => {})
 			.then(async () => {
-				const targetBytes = this.groupedKeyCodec.encode(key)
-
 				let hasAggregate = false
 				let aggregate: V | undefined
 
@@ -514,12 +513,12 @@ export class TableGroupedComputeAggregateNode<KSrc, K, V, A> extends Processor<K
 		const key = record.key
 		if (key === null) return
 
-		const encodedKey = this.groupedKeyCodec.encode(key).toString('hex')
+		const targetBytes = this.groupedKeyCodec.encode(key)
+		const encodedKey = targetBytes.toString('hex')
 		const previous = this.inflightByKey.get(encodedKey) ?? Promise.resolve()
 		const current = previous
 			.catch(() => {})
 			.then(async () => {
-				const targetBytes = this.groupedKeyCodec.encode(key)
 				let hasValues = false
 				let aggregate = this.initializer()
 
