@@ -209,6 +209,12 @@ export function decodeRecord(decoder: IDecoder, baseOffset: bigint, baseTimestam
 
 	// Headers
 	const headerCount = decoder.readVarInt()
+	// headerCount is attacker-controllable; each header is at least one byte, so it can never
+	// exceed the bytes remaining. Guard before allocating to avoid a RangeError (negative) or a
+	// huge pre-allocation from a corrupt count.
+	if (headerCount < 0 || headerCount > decoder.remaining()) {
+		throw new Error(`Invalid record header count ${headerCount} (only ${decoder.remaining()} bytes remain)`)
+	}
 	let headers: RecordHeader[]
 	if (headerCount === 0) {
 		// Fresh array per record: a shared empty array would alias all header-less
@@ -279,6 +285,12 @@ export function decodeRecordInBatch(
 
 	// Headers
 	const headerCount = decoder.readVarInt()
+	// headerCount is attacker-controllable; each header is at least one byte, so it can never
+	// exceed the bytes remaining. Guard before allocating to avoid a RangeError (negative) or a
+	// huge pre-allocation from a corrupt count.
+	if (headerCount < 0 || headerCount > decoder.remaining()) {
+		throw new Error(`Invalid record header count ${headerCount} (only ${decoder.remaining()} bytes remain)`)
+	}
 	let headers: RecordHeader[]
 	if (headerCount === 0) {
 		// Fresh array per record: a shared empty array would alias all header-less
