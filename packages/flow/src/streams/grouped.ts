@@ -146,7 +146,14 @@ export class KGroupedStreamImpl<K, V> implements KGroupedStream<K, V> {
 	}
 
 	windowedBy(windows: TimeWindows | SessionWindows | SlidingWindows): WindowedKGroupedStream<K, V> {
-		return new WindowedKGroupedStreamImpl<K, V>(this.app, this.node, this.format, windows, this.sourceTopics)
+		return new WindowedKGroupedStreamImpl<K, V>(
+			this.app,
+			this.node,
+			this.format,
+			windows,
+			this.sourceTopics,
+			this.restrictRestorationToSourcePartitions
+		)
 	}
 }
 
@@ -160,7 +167,9 @@ export class WindowedKGroupedStreamImpl<K, V> implements WindowedKGroupedStream<
 		private readonly format: StreamFormat<K, V>,
 		private readonly windows: TimeWindows | SessionWindows | SlidingWindows,
 		/** Source topics that feed into this windowed grouped stream. Used for changelog partition inference. */
-		private readonly sourceTopics: Set<string> = new Set()
+		private readonly sourceTopics: Set<string> = new Set(),
+		/** Whether to restrict changelog restoration to source topic partitions. False for re-keyed streams. */
+		private readonly restrictRestorationToSourcePartitions: boolean = true
 	) {
 		if (windows instanceof TimeWindows) {
 			this.windowSizeMs = parseWindowDuration(windows.size)
@@ -198,12 +207,15 @@ export class WindowedKGroupedStreamImpl<K, V> implements WindowedKGroupedStream<
 
 		if (this.windows instanceof SessionWindows) {
 			// Use session store for session windows
-			const sessionStore = this.app.stateStoreProvider.createSessionStore<K, number>(storeName, {
+			const sessionStore = this.app.getOrCreateSessionStore<K, number>(
+				storeName,
 				keyCodec,
 				valueCodec,
-				retentionMs: this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER,
-			})
-			this.app.stateStores.set(storeName, sessionStore as KeyValueStore<unknown, unknown>)
+				{ retentionMs: this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER },
+				options?.changelog,
+				this.sourceTopics,
+				this.restrictRestorationToSourcePartitions
+			)
 			const storeRef = { store: sessionStore }
 
 			aggregateNode = new SessionAggregateNode<K, V, number>(
@@ -216,13 +228,15 @@ export class WindowedKGroupedStreamImpl<K, V> implements WindowedKGroupedStream<
 			)
 		} else {
 			// Use window store for time windows
-			const store = this.app.stateStoreProvider.createWindowStore<K, number>(storeName, {
+			const store = this.app.getOrCreateWindowStore<K, number>(
+				storeName,
 				keyCodec,
 				valueCodec,
-				retentionMs: this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER, // Keep windows for 24x the window size
-				windowSizeMs: this.windowSizeMs,
-			})
-			this.app.stateStores.set(storeName, store as KeyValueStore<unknown, unknown>)
+				{ retentionMs: this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER, windowSizeMs: this.windowSizeMs }, // Keep windows for 24x the window size
+				options?.changelog,
+				this.sourceTopics,
+				this.restrictRestorationToSourcePartitions
+			)
 			const storeRef = { store }
 
 			aggregateNode = new WindowedAggregateNode<K, V, number>(
@@ -279,24 +293,29 @@ export class WindowedKGroupedStreamImpl<K, V> implements WindowedKGroupedStream<
 
 		if (this.windows instanceof SessionWindows) {
 			// Use session store for session windows
-			const sessionStore = this.app.stateStoreProvider.createSessionStore<K, V>(storeName, {
+			const sessionStore = this.app.getOrCreateSessionStore<K, V>(
+				storeName,
 				keyCodec,
 				valueCodec,
-				retentionMs: this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER,
-			})
-			this.app.stateStores.set(storeName, sessionStore as KeyValueStore<unknown, unknown>)
+				{ retentionMs: this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER },
+				options?.changelog,
+				this.sourceTopics,
+				this.restrictRestorationToSourcePartitions
+			)
 			const storeRef = { store: sessionStore }
 
 			aggregateNode = new SessionReduceNode<K, V>(storeName, storeRef, reducer, this.windowSizeMs)
 		} else {
 			// Use window store for time windows
-			const store = this.app.stateStoreProvider.createWindowStore<K, V>(storeName, {
+			const store = this.app.getOrCreateWindowStore<K, V>(
+				storeName,
 				keyCodec,
 				valueCodec,
-				retentionMs: this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER,
-				windowSizeMs: this.windowSizeMs,
-			})
-			this.app.stateStores.set(storeName, store as KeyValueStore<unknown, unknown>)
+				{ retentionMs: this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER, windowSizeMs: this.windowSizeMs },
+				options?.changelog,
+				this.sourceTopics,
+				this.restrictRestorationToSourcePartitions
+			)
 			const storeRef = { store }
 
 			aggregateNode = new WindowedReduceNode<K, V>(
@@ -354,13 +373,15 @@ export class WindowedKGroupedStreamImpl<K, V> implements WindowedKGroupedStream<
 
 		const storeName = options?.storeName ?? `window-aggregate-store-${this.app.nextStoreId()}`
 
-		const store = this.app.stateStoreProvider.createWindowStore<K, A>(storeName, {
+		const store = this.app.getOrCreateWindowStore<K, A>(
+			storeName,
 			keyCodec,
 			valueCodec,
-			retentionMs: this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER,
-			windowSizeMs: this.windowSizeMs,
-		})
-		this.app.stateStores.set(storeName, store as KeyValueStore<unknown, unknown>)
+			{ retentionMs: this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER, windowSizeMs: this.windowSizeMs },
+			options?.changelog,
+			this.sourceTopics,
+			this.restrictRestorationToSourcePartitions
+		)
 		const storeRef = { store }
 
 		const aggregateNode = new WindowedAggregateNode<K, V, A>(

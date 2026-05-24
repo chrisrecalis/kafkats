@@ -11,7 +11,14 @@ import {
 } from '@kafkats/client'
 import type { Codec } from '@/codec.js'
 import { buffer as bufferCodec } from '@/codec.js'
-import type { StateStoreProvider, KeyValueStore, ChangelogCheckpointStore } from '@/state.js'
+import type {
+	StateStoreProvider,
+	KeyValueStore,
+	WindowStore,
+	SessionStore,
+	WindowedKey,
+	ChangelogCheckpointStore,
+} from '@/state.js'
 import { InMemoryStateStoreProvider } from '@/state/memory.js'
 import {
 	type ChangelogConfig,
@@ -23,8 +30,13 @@ import {
 	buildChangelogTopicName,
 	getDefaultTopicConfigs,
 	resolveChangelogConfig,
+	windowedKeyCodec,
 } from '@/changelog.js'
-import { ChangelogBackedKeyValueStore } from '@/state/changelog.js'
+import {
+	ChangelogBackedKeyValueStore,
+	ChangelogBackedWindowStore,
+	ChangelogBackedSessionStore,
+} from '@/state/changelog.js'
 
 // Public types
 import type {
@@ -138,73 +150,14 @@ class FlowAppImpl implements FlowApp {
 			const changelogConfig = resolveChangelogConfig(changelog)
 
 			if (changelogConfig.enabled) {
-				// Create changelog spec
-				const topicName =
-					changelogConfig.topicName ?? buildChangelogTopicName(this.config.applicationId, storeName)
-
-				// Partition count is always inferred from source topics to ensure state locality.
-				// Task N processing partition N must write to changelog partition N.
-				const spec: ChangelogTopicSpec = {
+				const writer = this.setupChangelog<K, V>(
 					storeName,
-					topicName,
-					replicationFactor: changelogConfig.replicationFactor,
-					configs: getDefaultTopicConfigs(changelogConfig.topicConfigs),
-					keyCodec: keyCodec as Codec<unknown>,
-					valueCodec: valueCodec as Codec<unknown>,
-					skipRestoration: changelogConfig.skipRestoration ?? false,
-					sourceTopics: sourceTopics ?? new Set(),
-					restrictRestorationToSourcePartitions,
-					validateOnly: this.config.changelog?.autoCreate === false,
-				}
-				this.changelogTopics.set(storeName, spec)
-
-				// Create changelog writer with callbacks to get producer/transaction from worker context
-				const writer = new ChangelogWriter<K, V>(
-					topicName,
 					keyCodec,
 					valueCodec,
-					() => {
-						const worker = workerContextStorage.getStore()
-						if (!worker) {
-							throw new Error('Changelog write called outside of message processing context')
-						}
-						return worker.producer
-					},
-					() => {
-						const worker = workerContextStorage.getStore()
-						if (!worker || !worker.activeTransaction) {
-							return null
-						}
-						return worker.activeTransaction
-					},
-					async result => {
-						if (!this.changelogCheckpointStore) {
-							return
-						}
-						const worker = workerContextStorage.getStore()
-						if (worker?.activeTransaction) {
-							const key: TopicPartitionKey = `${result.topic}:${result.partition}`
-							const nextOffset = result.offset + 1n
-							const existing = worker.pendingChangelogOffsets.get(key)
-							if (!existing || nextOffset > existing.offset) {
-								worker.pendingChangelogOffsets.set(key, {
-									topic: result.topic,
-									partition: result.partition,
-									offset: nextOffset,
-								})
-							}
-							return
-						}
-
-						try {
-							await this.changelogCheckpointStore.set(result.topic, result.partition, result.offset + 1n)
-						} catch (err) {
-							this.recordCheckpointError(err, { topic: result.topic, partition: result.partition })
-						}
-					}
+					changelogConfig,
+					sourceTopics ?? new Set(),
+					restrictRestorationToSourcePartitions
 				)
-				this.changelogWriters.set(storeName, writer as ChangelogWriter<unknown, unknown>)
-
 				// Wrap with changelog-backed store
 				store = new ChangelogBackedKeyValueStore(innerStore, writer) as KeyValueStore<unknown, unknown>
 			} else {
@@ -214,6 +167,180 @@ class FlowAppImpl implements FlowApp {
 			this.stateStores.set(storeName, store)
 		}
 		return store as KeyValueStore<K, V>
+	}
+
+	/**
+	 * Register a changelog topic spec and writer for a store, returning the writer so the caller
+	 * can wrap the inner store with the matching ChangelogBacked* wrapper.
+	 *
+	 * `changelogKeyCodec` is the codec used to (de)serialize changelog record keys during
+	 * restoration. For windowed/session stores it is `windowedKeyCodec(userKeyCodec)` so the
+	 * WindowedKey round-trips through the changelog.
+	 */
+	private setupChangelog<KK, VV>(
+		storeName: string,
+		changelogKeyCodec: Codec<KK>,
+		valueCodec: Codec<VV>,
+		changelogConfig: ChangelogConfig,
+		sourceTopics: Set<string>,
+		restrictRestorationToSourcePartitions: boolean,
+		windowRetentionMs?: number
+	): ChangelogWriter<KK, VV> {
+		const topicName = changelogConfig.topicName ?? buildChangelogTopicName(this.config.applicationId, storeName)
+
+		// Window/session changelogs use delete+compact with a finite retention tied to the store's
+		// retention, so the broker prunes records for expired windows. Without this the (KV) default
+		// of compact + infinite retention would keep every window forever and resurrect expired
+		// windows on restore. User-supplied topicConfigs still take precedence.
+		const windowConfigOverrides: Record<string, string> =
+			windowRetentionMs !== undefined
+				? { 'cleanup.policy': 'delete,compact', 'retention.ms': String(windowRetentionMs) }
+				: {}
+
+		// Partition count is always inferred from source topics to ensure state locality.
+		// Task N processing partition N must write to changelog partition N.
+		const spec: ChangelogTopicSpec = {
+			storeName,
+			topicName,
+			replicationFactor: changelogConfig.replicationFactor,
+			configs: getDefaultTopicConfigs({ ...windowConfigOverrides, ...changelogConfig.topicConfigs }),
+			keyCodec: changelogKeyCodec as Codec<unknown>,
+			valueCodec: valueCodec as Codec<unknown>,
+			skipRestoration: changelogConfig.skipRestoration ?? false,
+			sourceTopics,
+			restrictRestorationToSourcePartitions,
+			validateOnly: this.config.changelog?.autoCreate === false,
+		}
+		this.changelogTopics.set(storeName, spec)
+
+		// Create changelog writer with callbacks to get producer/transaction from worker context
+		const writer = new ChangelogWriter<KK, VV>(
+			topicName,
+			changelogKeyCodec,
+			valueCodec,
+			() => {
+				const worker = workerContextStorage.getStore()
+				if (!worker) {
+					throw new Error('Changelog write called outside of message processing context')
+				}
+				return worker.producer
+			},
+			() => {
+				const worker = workerContextStorage.getStore()
+				if (!worker || !worker.activeTransaction) {
+					return null
+				}
+				return worker.activeTransaction
+			},
+			async result => {
+				if (!this.changelogCheckpointStore) {
+					return
+				}
+				const worker = workerContextStorage.getStore()
+				if (worker?.activeTransaction) {
+					const key: TopicPartitionKey = `${result.topic}:${result.partition}`
+					const nextOffset = result.offset + 1n
+					const existing = worker.pendingChangelogOffsets.get(key)
+					if (!existing || nextOffset > existing.offset) {
+						worker.pendingChangelogOffsets.set(key, {
+							topic: result.topic,
+							partition: result.partition,
+							offset: nextOffset,
+						})
+					}
+					return
+				}
+
+				try {
+					await this.changelogCheckpointStore.set(result.topic, result.partition, result.offset + 1n)
+				} catch (err) {
+					this.recordCheckpointError(err, { topic: result.topic, partition: result.partition })
+				}
+			}
+		)
+		this.changelogWriters.set(storeName, writer as ChangelogWriter<unknown, unknown>)
+		return writer
+	}
+
+	getOrCreateWindowStore<K, V>(
+		name: string | undefined,
+		keyCodec: Codec<K>,
+		valueCodec: Codec<V>,
+		windowOptions: { retentionMs: number; windowSizeMs: number },
+		changelog?: boolean | ChangelogConfig,
+		sourceTopics?: Set<string>,
+		restrictRestorationToSourcePartitions = true
+	): WindowStore<K, V> {
+		const storeName = name ?? `window-store-${this.nextStoreId()}`
+		const existing = this.stateStores.get(storeName)
+		if (existing) {
+			return existing as unknown as WindowStore<K, V>
+		}
+
+		const inner = this.stateStoreProvider.createWindowStore<K, V>(storeName, {
+			keyCodec,
+			valueCodec,
+			retentionMs: windowOptions.retentionMs,
+			windowSizeMs: windowOptions.windowSizeMs,
+		})
+
+		const changelogConfig = resolveChangelogConfig(changelog)
+		let store: WindowStore<K, V> = inner
+		if (changelogConfig.enabled) {
+			const writer = this.setupChangelog<WindowedKey<K>, V>(
+				storeName,
+				windowedKeyCodec(keyCodec),
+				valueCodec,
+				changelogConfig,
+				sourceTopics ?? new Set(),
+				restrictRestorationToSourcePartitions,
+				windowOptions.retentionMs
+			)
+			store = new ChangelogBackedWindowStore(inner, writer)
+		}
+
+		this.stateStores.set(storeName, store as unknown as KeyValueStore<unknown, unknown>)
+		return store
+	}
+
+	getOrCreateSessionStore<K, V>(
+		name: string | undefined,
+		keyCodec: Codec<K>,
+		valueCodec: Codec<V>,
+		sessionOptions: { retentionMs: number },
+		changelog?: boolean | ChangelogConfig,
+		sourceTopics?: Set<string>,
+		restrictRestorationToSourcePartitions = true
+	): SessionStore<K, V> {
+		const storeName = name ?? `session-store-${this.nextStoreId()}`
+		const existing = this.stateStores.get(storeName)
+		if (existing) {
+			return existing as unknown as SessionStore<K, V>
+		}
+
+		const inner = this.stateStoreProvider.createSessionStore<K, V>(storeName, {
+			keyCodec,
+			valueCodec,
+			retentionMs: sessionOptions.retentionMs,
+		})
+
+		const changelogConfig = resolveChangelogConfig(changelog)
+		let store: SessionStore<K, V> = inner
+		if (changelogConfig.enabled) {
+			const writer = this.setupChangelog<WindowedKey<K>, V>(
+				storeName,
+				windowedKeyCodec(keyCodec),
+				valueCodec,
+				changelogConfig,
+				sourceTopics ?? new Set(),
+				restrictRestorationToSourcePartitions,
+				sessionOptions.retentionMs
+			)
+			store = new ChangelogBackedSessionStore(inner, writer)
+		}
+
+		this.stateStores.set(storeName, store as unknown as KeyValueStore<unknown, unknown>)
+		return store
 	}
 
 	stream<K = Buffer, V = Buffer>(source: string | Topic<K, V>, options?: Consumed<K, V>): KStream<K, V> {
@@ -755,8 +882,16 @@ class FlowAppImpl implements FlowApp {
 				continue
 			}
 
-			// Get the inner store for restoration (unwrap changelog-backed store)
-			const innerStore = store instanceof ChangelogBackedKeyValueStore ? store.innerStore : store
+			// Get the inner store for restoration (unwrap changelog-backed store). Window/session
+			// inner stores are driven as a KeyValueStore<WindowedKey, V>: the restorer decodes each
+			// changelog key with spec.keyCodec (windowedKeyCodec) into a WindowedKey and calls the
+			// inner store's put/delete, which already key on WindowedKey.
+			let innerStore: KeyValueStore<unknown, unknown> = store
+			if (store instanceof ChangelogBackedKeyValueStore) {
+				innerStore = store.innerStore
+			} else if (store instanceof ChangelogBackedWindowStore || store instanceof ChangelogBackedSessionStore) {
+				innerStore = store.innerStore as unknown as KeyValueStore<unknown, unknown>
+			}
 
 			const restorer = new ChangelogRestorer(spec.topicName, spec.keyCodec, spec.valueCodec, innerStore)
 
