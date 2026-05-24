@@ -342,7 +342,11 @@ export function decodeRecordBatchFromSync(
 	// LogAppendTime batches stamp every record with the batch append time (maxTimestamp);
 	// CreateTime leaves it undefined so per-record deltas are used.
 	const logAppendTime = isLogAppendTime(attributes) ? maxTimestamp : undefined
-	if (options.assumeSequentialOffsets) {
+	// The sequential fast path (offset = baseOffset + i) is only valid for a DENSE batch
+	// (recordCount === lastOffsetDelta + 1). A compacted batch has had records removed, so its
+	// survivors carry non-sequential offsetDeltas and recordCount < lastOffsetDelta + 1; assuming
+	// sequential offsets there assigns wrong absolute offsets, so fall back to the real delta.
+	if (options.assumeSequentialOffsets && recordCount === lastOffsetDelta + 1) {
 		const verifyLength = options.verifyRecordLength !== false
 		let offset = baseOffset
 		for (let i = 0; i < recordCount; i++) {
@@ -432,7 +436,11 @@ export async function decodeRecordBatchFrom(
 	// LogAppendTime batches stamp every record with the batch append time (maxTimestamp);
 	// CreateTime leaves it undefined so per-record deltas are used.
 	const logAppendTime = isLogAppendTime(attributes) ? maxTimestamp : undefined
-	if (options.assumeSequentialOffsets) {
+	// The sequential fast path (offset = baseOffset + i) is only valid for a DENSE batch
+	// (recordCount === lastOffsetDelta + 1). A compacted batch has had records removed, so its
+	// survivors carry non-sequential offsetDeltas and recordCount < lastOffsetDelta + 1; assuming
+	// sequential offsets there assigns wrong absolute offsets, so fall back to the real delta.
+	if (options.assumeSequentialOffsets && recordCount === lastOffsetDelta + 1) {
 		const verifyLength = options.verifyRecordLength !== false
 		let offset = baseOffset
 		for (let i = 0; i < recordCount; i++) {

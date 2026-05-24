@@ -10,6 +10,7 @@
 import type { Cluster } from '@/client/cluster.js'
 import type { Broker } from '@/client/broker.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
+import { KafkaProtocolError } from '@/client/errors.js'
 import {
 	decodeRecordBatchFrom,
 	decodeRecordBatchFromSync,
@@ -274,6 +275,21 @@ export const DEFAULT_FETCH_CONFIG: FetchManagerConfig = {
 }
 
 /**
+ * Result of decoding a fetch response's record data.
+ *
+ * `records` are the user-visible records (control batches dropped, aborted-transaction records
+ * filtered for read_committed). `nextOffset` is the offset immediately after the last decoded
+ * batch (max over batches of baseOffset + lastOffsetDelta + 1), or null when no batch decoded.
+ * The caller advances the fetch position to `nextOffset` even when `records` is empty — a batch
+ * that is entirely control records, fully aborted, or empty/compacted yields zero records but
+ * must still advance the position, otherwise the same offset is re-fetched forever.
+ */
+interface DecodedBatchResult {
+	records: DecodedRecord[]
+	nextOffset: bigint | null
+}
+
+/**
  * Fetch manager
  *
  * Uses broker-level fetch batching: groups all ready partitions by their leader broker
@@ -292,6 +308,10 @@ export class FetchManager {
 	// Buffered poll mode fields
 	private fetchBuffer: FetchBuffer | null = null
 	private brokerInFlight: Map<number, boolean> = new Map()
+	// A fatal, non-retriable fetch error (e.g. CORRUPT_MESSAGE) surfaced to the next poll().
+	// The background fetch loop swallows rejected fetches (logs only), so fatal per-partition
+	// errors are stashed here and re-thrown from poll() rather than silently dropping data.
+	private pendingError: Error | null = null
 
 	constructor(
 		cluster: Cluster,
@@ -546,6 +566,17 @@ export class FetchManager {
 				await this.cluster.refreshMetadata([state.topic])
 				break
 
+			case ErrorCode.CorruptMessage:
+				// Re-fetching the same offset yields the same corrupt record, so this is not
+				// retriable. Surface it to the consumer (via the next poll()) instead of logging
+				// and dropping the partition's data; the position is left unchanged so the user can
+				// seek past the bad offset to recover.
+				this.pendingError = new KafkaProtocolError(
+					ErrorCode.CorruptMessage,
+					`${state.topic}-${state.partition} at offset ${state.offset}`
+				)
+				break
+
 			default:
 				this.logger.error('fetch error', {
 					topic: state.topic,
@@ -775,7 +806,8 @@ export class FetchManager {
 						partitionResponse.abortedTransactions,
 						partitionResponse.lastStableOffset
 					)
-					let records = decodeResult instanceof Promise ? await decodeResult : decodeResult
+					const { records: decoded, nextOffset } =
+						decodeResult instanceof Promise ? await decodeResult : decodeResult
 
 					// decodeRecords may have awaited; re-fence (revoked, paused, or seeked mid-decode).
 					if (
@@ -785,12 +817,9 @@ export class FetchManager {
 					)
 						continue
 
-					records = filterRecordsFromOffset(records, fetchOffset)
+					const records = filterRecordsFromOffset(decoded, fetchOffset)
 
 					if (records.length > 0) {
-						// Advance offset for next fetch
-						state.offset = records[records.length - 1]!.offset + 1n
-
 						// Estimate byte size for memory tracking
 						let byteSize = 0
 						for (const record of records) {
@@ -804,6 +833,17 @@ export class FetchManager {
 							records,
 							byteSize,
 						})
+					}
+
+					// Advance the fetch position past the whole decoded batch range, even when no
+					// records survived (all aborted / control-only / empty-compacted) — otherwise the
+					// position never moves and the same offset is re-fetched forever. nextOffset is the
+					// batch-declared end (>= last record offset + 1), which also steps over a compacted
+					// tail. Guarded by `> state.offset` so a stale/overlapping batch can't rewind.
+					const advanceTo =
+						nextOffset ?? (records.length > 0 ? records[records.length - 1]!.offset + 1n : null)
+					if (advanceTo !== null && advanceTo > state.offset) {
+						state.offset = advanceTo
 					}
 				}
 			}
@@ -820,6 +860,10 @@ export class FetchManager {
 	 * so subsequent polls return new records.
 	 */
 	async poll(): Promise<PartitionBatch[]> {
+		// Surface a fatal fetch error (e.g. CORRUPT_MESSAGE) recorded by the background loop.
+		// Cleared once thrown; if the condition persists the next fetch re-records it.
+		this.throwPendingError()
+
 		// Lazy initialization: start background fetch loop on first call
 		if (!this.fetchBuffer) {
 			const maxBufferedBytes = this.config.maxBufferedBytes ?? this.config.maxBytesPerPartition * 10
@@ -838,7 +882,19 @@ export class FetchManager {
 		// Wait for data to arrive (up to maxWaitMs)
 		const hasData = await this.fetchBuffer.waitForData(this.config.maxWaitMs, this.abortController?.signal)
 
+		// A fatal error may have been recorded by the background loop while we waited (it adds no
+		// data, so the waiter isn't signalled). Surface it now rather than returning an empty poll.
+		this.throwPendingError()
+
 		return hasData ? this.drainBuffer() : []
+	}
+
+	/** Throw and clear any fatal fetch error recorded by the background loop. No-op otherwise. */
+	private throwPendingError(): void {
+		if (!this.pendingError) return
+		const error = this.pendingError
+		this.pendingError = null
+		throw error
 	}
 
 	/**
@@ -858,7 +914,7 @@ export class FetchManager {
 		data: Buffer,
 		abortedTransactions: Array<{ producerId: bigint; firstOffset: bigint }>,
 		lastStableOffset: bigint
-	): DecodedRecord[] | Promise<DecodedRecord[]> {
+	): DecodedBatchResult | Promise<DecodedBatchResult> {
 		const decoder = new Decoder(data)
 
 		// Decode all record batches first so we can:
@@ -868,6 +924,7 @@ export class FetchManager {
 			attributes: number
 			producerId: bigint
 			baseOffset: bigint
+			lastOffsetDelta: number
 			records: DecodedRecord[]
 		}> = []
 
@@ -915,12 +972,13 @@ export class FetchManager {
 		data: Buffer,
 		abortedTransactions: Array<{ producerId: bigint; firstOffset: bigint }>,
 		lastStableOffset: bigint
-	): Promise<DecodedRecord[]> {
+	): Promise<DecodedBatchResult> {
 		const decoder = new Decoder(data)
 		const batches: Array<{
 			attributes: number
 			producerId: bigint
 			baseOffset: bigint
+			lastOffsetDelta: number
 			records: DecodedRecord[]
 		}> = []
 
@@ -953,11 +1011,22 @@ export class FetchManager {
 			attributes: number
 			producerId: bigint
 			baseOffset: bigint
+			lastOffsetDelta: number
 			records: DecodedRecord[]
 		}>,
 		abortedTransactions: Array<{ producerId: bigint; firstOffset: bigint }>,
 		lastStableOffset: bigint
-	): DecodedRecord[] {
+	): DecodedBatchResult {
+		// Offset immediately after the last decoded batch, across ALL batches (data, control, and
+		// empty). The caller advances the fetch position here even when no user records survive.
+		let nextOffset: bigint | null = null
+		for (const batch of batches) {
+			const end = batch.baseOffset + BigInt(batch.lastOffsetDelta) + 1n
+			if (nextOffset === null || end > nextOffset) {
+				nextOffset = end
+			}
+		}
+
 		// Pre-compute aborted transaction ranges (exclusive end offset)
 		const abortedRanges: Array<{ producerId: bigint; start: bigint; endExclusive: bigint }> = []
 		if (this.config.isolationLevel === 'read_committed' && abortedTransactions.length > 0) {
@@ -981,7 +1050,7 @@ export class FetchManager {
 		// This is the common case (non-transactional workloads).
 		if (abortedRanges.length === 0) {
 			if (batches.length === 0) {
-				return result
+				return { records: result, nextOffset }
 			}
 
 			// Common case: a single non-control batch.
@@ -989,9 +1058,9 @@ export class FetchManager {
 			if (batches.length === 1) {
 				const batch = batches[0]!
 				if (isControlBatch(batch.attributes)) {
-					return result
+					return { records: result, nextOffset }
 				}
-				return batch.records
+				return { records: batch.records, nextOffset }
 			}
 
 			// Multiple batches: pre-size output to avoid repeated growth.
@@ -1006,7 +1075,7 @@ export class FetchManager {
 			}
 
 			if (totalRecords === 0) {
-				return result
+				return { records: result, nextOffset }
 			}
 
 			const out = new Array<DecodedRecord>(totalRecords)
@@ -1021,7 +1090,7 @@ export class FetchManager {
 					out[outIndex++] = records[i]!
 				}
 			}
-			return out
+			return { records: out, nextOffset }
 		}
 
 		for (const batch of batches) {
@@ -1044,6 +1113,6 @@ export class FetchManager {
 			}
 		}
 
-		return result
+		return { records: result, nextOffset }
 	}
 }
