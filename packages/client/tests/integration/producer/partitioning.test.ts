@@ -76,6 +76,51 @@ describe.concurrent('Producer (integration) - partitioning', () => {
 		await client.disconnect()
 	})
 
+	it('routes negative-hash keys to the Java-compatible partition (toPositive sign-bit masking)', async () => {
+		const client = createClient('it-murmur2-negative')
+		await client.connect()
+
+		const topicName = uniqueName('it-murmur2-negative')
+		const testTopic = topic<string>(topicName, { value: codec.string() })
+
+		// 6 partitions on purpose: 2^31 % 6 !== 0, so the sign-bit handling inside
+		// toPositive is observable end-to-end. A power-of-2 partition count would make
+		// the buggy `hash >>> 0` and the correct `hash & 0x7fffffff` agree and hide it.
+		const partitionCount = 6
+		await client.createTopics([{ name: topicName, numPartitions: partitionCount, replicationFactor: 1 }])
+
+		const producer = client.producer({ lingerMs: 0, partitioner: 'murmur2' })
+
+		// Independent oracle: partition = (murmur2(key) & 0x7fffffff) % partitionCount,
+		// matching Kafka's org.apache.kafka.common.utils.Utils.toPositive. Every key here
+		// has a NEGATIVE murmur2 hash, where the buggy full-unsigned `>>> 0` diverges from
+		// the correct sign-bit-clear `& 0x7fffffff`.
+		const cases: Array<{ key: string; expectedPartition: number; buggyPartition: number }> = [
+			{ key: 'user-2', expectedPartition: 2, buggyPartition: 4 }, // murmur2 -324981792
+			{ key: 'a', expectedPartition: 4, buggyPartition: 0 }, // murmur2 -1563381124
+			{ key: 'b', expectedPartition: 2, buggyPartition: 4 }, // murmur2 -1853091852
+			{ key: 'session-9', expectedPartition: 2, buggyPartition: 4 }, // murmur2 -1117894392
+		]
+
+		const results = await producer.send(
+			testTopic,
+			cases.map(c => ({ key: Buffer.from(c.key, 'utf-8'), value: `v-${c.key}` }))
+		)
+
+		for (let i = 0; i < cases.length; i++) {
+			const { key, expectedPartition, buggyPartition } = cases[i]!
+			// Guard the oracle: each case must actually distinguish the fix from the bug.
+			expect(expectedPartition, `case "${key}" must differ between fix and bug`).not.toBe(buggyPartition)
+			expect(
+				results[i]!.partition,
+				`key "${key}" must route to the Java-compatible partition ${expectedPartition}`
+			).toBe(expectedPartition)
+		}
+
+		await producer.disconnect()
+		await client.disconnect()
+	})
+
 	it('uses sticky partitioning for keyless messages (rotates between batches)', async () => {
 		const client = createClient('it-sticky')
 		await client.connect()

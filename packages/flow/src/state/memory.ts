@@ -109,6 +109,12 @@ export class InMemoryKeyValueStore<K, V> implements KeyValueStore<K, V> {
 	}
 }
 
+// Bias signed times by 2^63 so unsigned-byte lex order matches signed numeric order.
+// range() selects entries by serialized-key byte comparison, so the time component must
+// be order-preserving; plain signed big-endian would sort negative starts after positive
+// ones and break ranges that span the sign boundary. Matches the LMDB store's encoding.
+const SIGNED_TIME_BIAS = 0x8000000000000000n
+
 /**
  * Encodes a windowed key to a buffer for storage.
  * Format: [keyBytes][windowStart:8bytes][windowEnd:8bytes]
@@ -117,8 +123,8 @@ function encodeWindowedKey<K>(key: WindowedKey<K>, keyCodec: Codec<K>): Buffer {
 	const keyBytes = keyCodec.encode(key.key)
 	const buf = Buffer.alloc(keyBytes.length + 16)
 	keyBytes.copy(buf, 0)
-	buf.writeBigInt64BE(BigInt(key.windowStart), keyBytes.length)
-	buf.writeBigInt64BE(BigInt(key.windowEnd), keyBytes.length + 8)
+	buf.writeBigUInt64BE(BigInt(key.windowStart) + SIGNED_TIME_BIAS, keyBytes.length)
+	buf.writeBigUInt64BE(BigInt(key.windowEnd) + SIGNED_TIME_BIAS, keyBytes.length + 8)
 	return buf
 }
 
@@ -127,8 +133,8 @@ function encodeWindowedKey<K>(key: WindowedKey<K>, keyCodec: Codec<K>): Buffer {
  */
 function decodeWindowedKey<K>(buf: Buffer, keyCodec: Codec<K>): WindowedKey<K> {
 	const keyBytes = buf.subarray(0, buf.length - 16)
-	const windowStart = Number(buf.readBigInt64BE(buf.length - 16))
-	const windowEnd = Number(buf.readBigInt64BE(buf.length - 8))
+	const windowStart = Number(buf.readBigUInt64BE(buf.length - 16) - SIGNED_TIME_BIAS)
+	const windowEnd = Number(buf.readBigUInt64BE(buf.length - 8) - SIGNED_TIME_BIAS)
 	return {
 		key: keyCodec.decode(keyBytes),
 		windowStart,

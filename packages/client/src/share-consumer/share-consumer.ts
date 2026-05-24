@@ -71,6 +71,37 @@ import { pmap } from '@/utils/pmap.js'
 
 const EMPTY_BUFFER = Buffer.alloc(0)
 
+function isShareSessionError(code: ErrorCode): boolean {
+	return code === ErrorCode.ShareSessionNotFound || code === ErrorCode.InvalidShareSessionEpoch
+}
+
+/**
+ * Find a share-session-level error (ShareSessionNotFound / InvalidShareSessionEpoch) anywhere in a
+ * ShareFetch/ShareAcknowledge response — at the top level OR in any partition's `errorCode` or
+ * `acknowledgeErrorCode`. Such an error means the broker rejected the request without advancing its
+ * session epoch, so the client must reset rather than advance. A per-partition session error must be
+ * caught here (before advancing) because some callers (e.g. prefetch) discard the response entirely.
+ */
+function findShareSessionError(
+	topLevel: ErrorCode,
+	topics: Array<{ partitions: Array<{ errorCode: ErrorCode; acknowledgeErrorCode?: ErrorCode }> }>
+): ErrorCode | null {
+	if (isShareSessionError(topLevel)) {
+		return topLevel
+	}
+	for (const topic of topics) {
+		for (const partition of topic.partitions) {
+			if (isShareSessionError(partition.errorCode)) {
+				return partition.errorCode
+			}
+			if (partition.acknowledgeErrorCode !== undefined && isShareSessionError(partition.acknowledgeErrorCode)) {
+				return partition.acknowledgeErrorCode
+			}
+		}
+	}
+	return null
+}
+
 class ShareMessageAlreadyHandledError extends Error {
 	constructor(topic: string, partition: number, offset: bigint) {
 		super(`Share message ${topic}[${partition}]@${offset} already handled`)
@@ -109,6 +140,10 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 	private memberId: string = randomKafkaUuid()
 	private memberEpoch: number = 0
 	private shareSessionEpochByBrokerId: Map<number, number> = new Map()
+	// Partitions currently registered in each broker's share session (topicId -> partition set).
+	// Used to compute forgottenTopicsData when partitions leave the assignment, since omitting a
+	// partition from an incremental ShareFetch does NOT remove it from the broker's session.
+	private shareSessionPartitionsByBrokerId: Map<number, Map<string, Set<number>>> = new Map()
 	private shareSessionQueueByBrokerId: Map<number, Promise<void>> = new Map()
 	private heartbeatIntervalMs: number = 1000
 	private assignment: TopicPartition[] = []
@@ -177,6 +212,7 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 		this.memberId = randomKafkaUuid()
 		this.memberEpoch = 0
 		this.shareSessionEpochByBrokerId.clear()
+		this.shareSessionPartitionsByBrokerId.clear()
 		this.shareSessionQueueByBrokerId.clear()
 		this.heartbeatIntervalMs = 1000
 		this.assignment = []
@@ -250,6 +286,9 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 
 	private resetShareSessionEpoch(brokerId: number): void {
 		this.shareSessionEpochByBrokerId.set(brokerId, SHARE_SESSION_INITIAL_EPOCH)
+		// Drop the tracked session partition set: the next fetch (epoch 0) is a full fetch that
+		// re-declares the whole set, so nothing needs to be (or can be) forgotten against the old one.
+		this.shareSessionPartitionsByBrokerId.delete(brokerId)
 	}
 
 	private enqueueShareSessionOp<T>(broker: Broker, op: (epoch: number) => Promise<T>): Promise<T> {
@@ -285,6 +324,18 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 		overrides?: Partial<Pick<ShareFetchRequest, 'maxWaitMs' | 'minBytes'>>
 	): Promise<ShareFetchResponse> {
 		return this.enqueueShareSessionOp(broker, async epoch => {
+			// Current partition set for this broker, keyed by topicId.
+			const currentByTopic = new Map<string, Set<number>>()
+			for (const tp of topicPartitions) {
+				currentByTopic.set(tp.topicId, new Set(tp.partitions))
+			}
+
+			// On an incremental fetch (epoch > 0), any partition that was in the broker's session
+			// but is no longer in the current set must be explicitly forgotten — omitting it does
+			// not remove it from the session. A full fetch (epoch 0) re-declares the whole set.
+			const forgottenTopicsData =
+				epoch === SHARE_SESSION_INITIAL_EPOCH ? [] : this.computeForgottenTopics(broker.nodeId, currentByTopic)
+
 			const request: ShareFetchRequest = {
 				groupId: this.config.groupId,
 				memberId: this.memberId,
@@ -302,7 +353,7 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 						acknowledgementBatches: [],
 					})),
 				})),
-				forgottenTopicsData: [],
+				forgottenTopicsData,
 			}
 
 			let response: ShareFetchResponse
@@ -315,17 +366,75 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 				throw e
 			}
 
-			if (
-				response.errorCode === ErrorCode.ShareSessionNotFound ||
-				response.errorCode === ErrorCode.InvalidShareSessionEpoch
-			) {
+			const sessionError = findShareSessionError(response.errorCode, response.topics)
+			if (sessionError !== null) {
 				this.resetShareSessionEpoch(broker.nodeId)
-				throw new KafkaProtocolError(response.errorCode, response.errorMessage ?? 'ShareFetch failed')
+				throw new KafkaProtocolError(sessionError, response.errorMessage ?? 'ShareFetch failed')
 			}
 
 			this.shareSessionEpochByBrokerId.set(broker.nodeId, nextShareSessionEpoch(epoch))
+			// Record the partition set the broker's session now holds, so the next fetch can
+			// forget any partitions that drop out of the assignment.
+			this.shareSessionPartitionsByBrokerId.set(broker.nodeId, currentByTopic)
 			return response
 		})
+	}
+
+	/**
+	 * Partitions previously registered in the broker's share session that are absent from the
+	 * current request, grouped by topic, so they can be sent in forgottenTopicsData.
+	 */
+	private computeForgottenTopics(
+		brokerId: number,
+		currentByTopic: Map<string, Set<number>>
+	): ShareFetchRequest['forgottenTopicsData'] {
+		const previousByTopic = this.shareSessionPartitionsByBrokerId.get(brokerId)
+		if (!previousByTopic) {
+			return []
+		}
+
+		const forgotten: NonNullable<ShareFetchRequest['forgottenTopicsData']> = []
+		for (const [topicId, previousPartitions] of previousByTopic) {
+			const currentPartitions = currentByTopic.get(topicId)
+			const partitions = [...previousPartitions].filter(p => !currentPartitions?.has(p))
+			if (partitions.length > 0) {
+				forgotten.push({ topicId, partitions })
+			}
+		}
+		return forgotten
+	}
+
+	/**
+	 * Issue a ShareFetch to one leader, swallowing share-session errors (returning null so the
+	 * caller retries with a fresh session). An empty `topicPartitions` produces a forget-only fetch
+	 * (topics: [] plus forgottenTopicsData for the broker's stale partitions) and returns immediately.
+	 */
+	private buildShareFetchTask(
+		leaderId: number,
+		topicPartitions: Array<{ topicId: string; partitions: number[] }>
+	): Promise<{ broker: Broker; response: ShareFetchResponse } | null> {
+		return (async () => {
+			const broker = await this.cluster.getBroker(leaderId)
+			try {
+				const overrides = topicPartitions.length === 0 ? { maxWaitMs: 0, minBytes: 0 } : undefined
+				const response = await this.shareFetch(broker, topicPartitions, overrides)
+				return { broker, response }
+			} catch (error) {
+				if (
+					error instanceof KafkaProtocolError &&
+					(error.errorCode === ErrorCode.ShareSessionNotFound ||
+						error.errorCode === ErrorCode.InvalidShareSessionEpoch)
+				) {
+					this.logger.debug('share session error, retrying with a new session', {
+						leaderId,
+						errorCode: error.errorCode,
+						error: error.message,
+					})
+					return null
+				}
+				throw error
+			}
+		})()
 	}
 
 	private async prefetchAssignedPartitions(partitions: TopicPartition[]): Promise<void> {
@@ -377,12 +486,10 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 				throw e
 			}
 
-			if (
-				response.errorCode === ErrorCode.ShareSessionNotFound ||
-				response.errorCode === ErrorCode.InvalidShareSessionEpoch
-			) {
+			const sessionError = findShareSessionError(response.errorCode, response.topics)
+			if (sessionError !== null) {
 				this.resetShareSessionEpoch(broker.nodeId)
-				throw new KafkaProtocolError(response.errorCode, response.errorMessage ?? 'ShareAcknowledge failed')
+				throw new KafkaProtocolError(sessionError, response.errorMessage ?? 'ShareAcknowledge failed')
 			}
 
 			this.shareSessionEpochByBrokerId.set(broker.nodeId, nextShareSessionEpoch(epoch))
@@ -537,6 +644,7 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 		if (response.memberId && response.memberId !== this.memberId) {
 			this.memberId = response.memberId
 			this.shareSessionEpochByBrokerId.clear()
+			this.shareSessionPartitionsByBrokerId.clear()
 			this.shareSessionQueueByBrokerId.clear()
 		}
 
@@ -612,6 +720,13 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 					needsAsync = true
 					break
 				}
+				// A failure with no batch decoded is genuine corruption (the broker returns
+				// at least one complete batch); surface it instead of silently abandoning
+				// acquired records (which would otherwise stay locked until the lock expires).
+				// A failure after >=1 batch is the expected maxBytes-truncated trailing batch.
+				if (batches.length === 0) {
+					throw new Error(`Failed to decode share-fetch record batch (corrupt data): ${(e as Error).message}`)
+				}
 				break
 			}
 		}
@@ -631,12 +746,19 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 	private async decodeRecordsAsync(data: Buffer): Promise<DecodedRecord[]> {
 		const decoder = new Decoder(data)
 		const out: DecodedRecord[] = []
+		let decoded = 0
 		while (decoder.remaining() > 0) {
 			try {
 				const batch = await decodeRecordBatchFrom(decoder, { assumeSequentialOffsets: true })
+				decoded++
 				if (isControlBatch(batch.attributes)) continue
 				out.push(...batch.records)
-			} catch {
+			} catch (e) {
+				// See decodeRecords: surface genuine corruption (no batch decoded) instead of
+				// silently abandoning acquired records; a later failure is the truncated tail.
+				if (decoded === 0) {
+					throw new Error(`Failed to decode share-fetch record batch (corrupt data): ${(e as Error).message}`)
+				}
 				break
 			}
 		}
@@ -814,7 +936,10 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 
 		if (handled === 0 && autoAckOnSuccess) {
 			handled = 1
-			void ackManager.enqueue(topicName, topicId, partitionIndex, record.offset, ACK_ACCEPT).catch(() => {})
+			// Await (like the explicit ack()) so a failed auto-ack surfaces instead of being
+			// silently swallowed — otherwise the record is redelivered after its acquisition
+			// lock expires with no signal to the application.
+			await ackManager.enqueue(topicName, topicId, partitionIndex, record.offset, ACK_ACCEPT)
 		}
 
 		return 1
@@ -874,11 +999,6 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 
 		try {
 			while (!signal.aborted && this.state === 'running') {
-				if (this.assignment.length === 0) {
-					await sleep(opts.idleBackoffMs, { signal, resolveOnAbort: true })
-					continue
-				}
-
 				const partitionsByLeader = new Map<number, Map<string, number[]>>()
 
 				for (const tp of this.assignment) {
@@ -893,7 +1013,19 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 					partitionsByLeader.set(leader.nodeId, byTopic)
 				}
 
-				if (partitionsByLeader.size === 0) {
+				// Brokers whose share session still holds partitions that are no longer assigned to
+				// them (e.g. the last assigned partition on a broker was revoked or moved away). They
+				// are absent from partitionsByLeader, so without an explicit forget-only ShareFetch the
+				// broker would retain the stale partitions (and their acquisition locks) until the
+				// session times out. Send an empty fetch so forgottenTopicsData drops them now.
+				const forgetOnlyBrokerIds: number[] = []
+				for (const [brokerId, byTopic] of this.shareSessionPartitionsByBrokerId) {
+					if (!partitionsByLeader.has(brokerId) && byTopic.size > 0) {
+						forgetOnlyBrokerIds.push(brokerId)
+					}
+				}
+
+				if (partitionsByLeader.size === 0 && forgetOnlyBrokerIds.length === 0) {
 					await sleep(opts.idleBackoffMs, { signal, resolveOnAbort: true })
 					continue
 				}
@@ -901,35 +1033,16 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 				const fetchTasks: Array<Promise<{ broker: Broker; response: ShareFetchResponse } | null>> = []
 
 				for (const [leaderId, byTopicId] of partitionsByLeader) {
-					fetchTasks.push(
-						(async () => {
-							const broker = await this.cluster.getBroker(leaderId)
+					const topicPartitions = [...byTopicId.entries()].map(([topicId, partitions]) => ({
+						topicId,
+						partitions,
+					}))
+					fetchTasks.push(this.buildShareFetchTask(leaderId, topicPartitions))
+				}
 
-							const topicPartitions = [...byTopicId.entries()].map(([topicId, partitions]) => ({
-								topicId,
-								partitions,
-							}))
-
-							try {
-								const response = await this.shareFetch(broker, topicPartitions)
-								return { broker, response }
-							} catch (error) {
-								if (
-									error instanceof KafkaProtocolError &&
-									(error.errorCode === ErrorCode.ShareSessionNotFound ||
-										error.errorCode === ErrorCode.InvalidShareSessionEpoch)
-								) {
-									this.logger.debug('share session error, retrying with a new session', {
-										leaderId,
-										errorCode: error.errorCode,
-										error: error.message,
-									})
-									return null
-								}
-								throw error
-							}
-						})()
-					)
+				// Empty topicPartitions => topics:[] with forgottenTopicsData listing the stale set.
+				for (const brokerId of forgetOnlyBrokerIds) {
+					fetchTasks.push(this.buildShareFetchTask(brokerId, []))
 				}
 
 				const fetchResults = await Promise.all(fetchTasks)

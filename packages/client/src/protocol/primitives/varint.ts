@@ -94,7 +94,9 @@ export function decodeUVarInt(buffer: Buffer, offset: number = 0): { value: numb
 		}
 	}
 
-	return { value, bytesRead }
+	// `value |= ... << shift` accumulates in a signed int32, so a UVARINT >= 2^31 would
+	// otherwise read back negative. Coerce to unsigned.
+	return { value: value >>> 0, bytesRead }
 }
 
 /**

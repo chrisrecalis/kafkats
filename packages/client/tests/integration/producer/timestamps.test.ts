@@ -102,4 +102,62 @@ describe.concurrent('Producer (integration) - timestamps', () => {
 		await producer.disconnect()
 		await client.disconnect()
 	})
+
+	it('round-trips records whose timestampDelta exceeds 32 bits within one batch', async () => {
+		const client = createClient('it-timestamp-large-delta')
+		await client.connect()
+
+		const topicName = uniqueName('it-timestamp-large-delta')
+		const testTopic = topic<string>(topicName, { value: codec.string() })
+
+		await client.createTopics([{ name: topicName, numPartitions: 1, replicationFactor: 1 }])
+
+		// Both records go in ONE batch (same partition, single send), so the second
+		// record's timestampDelta is measured from the first's timestamp. 30 days in ms
+		// (2_592_000_000) exceeds the 32-bit zigzag range (2^31), which the RecordBatch v2
+		// spec encodes as a VARLONG. Encoding/decoding it as a 32-bit varint throws or
+		// truncates.
+		const baseMs = Date.parse('2025-01-01T00:00:00.000Z')
+		const laterMs = baseMs + 30 * 24 * 60 * 60 * 1000
+		expect(laterMs - baseMs).toBeGreaterThan(0x7fffffff)
+
+		const producer = client.producer({ lingerMs: 0 })
+		const consumer = client.consumer({
+			groupId: uniqueName('it-timestamp-large-delta-group'),
+			autoOffsetReset: 'earliest',
+		})
+
+		await producer.send(testTopic, [
+			{ value: 'base', timestamp: new Date(baseMs), partition: 0 },
+			{ value: 'later', timestamp: new Date(laterMs), partition: 0 },
+		])
+		await producer.flush()
+
+		const received: Array<{ value: string; timestampMs: number }> = []
+		const runPromise = consumer.runEach(
+			testTopic,
+			async message => {
+				received.push({ value: message.value, timestampMs: Number(message.timestamp) })
+				if (received.length >= 2) {
+					consumer.stop()
+				}
+			},
+			{ autoCommit: false }
+		)
+		void runPromise.catch(() => {})
+
+		await new Promise<void>((resolve, reject) => {
+			consumer.once('running', () => resolve())
+			consumer.once('error', err => reject(err))
+		})
+
+		await runPromise
+
+		const byValue = new Map(received.map(r => [r.value, r.timestampMs]))
+		expect(byValue.get('base')).toBe(baseMs)
+		expect(byValue.get('later')).toBe(laterMs)
+
+		await producer.disconnect()
+		await client.disconnect()
+	})
 })
