@@ -26,9 +26,6 @@ export interface RecordHeader {
 	value: Buffer | null
 }
 
-// Shared empty array for records without headers (optimization)
-const EMPTY_HEADERS: RecordHeader[] = []
-
 /**
  * Record within a batch (for encoding)
  * Named KafkaRecord to avoid conflict with TypeScript's built-in Record type
@@ -207,11 +204,13 @@ export function decodeRecord(decoder: IDecoder, baseOffset: bigint, baseTimestam
 	const valueLength = decoder.readVarInt()
 	const value = valueLength < 0 ? null : decoder.readRaw(valueLength)
 
-	// Headers (optimization: use shared empty array for common case)
+	// Headers
 	const headerCount = decoder.readVarInt()
 	let headers: RecordHeader[]
 	if (headerCount === 0) {
-		headers = EMPTY_HEADERS
+		// Fresh array per record: a shared empty array would alias all header-less
+		// records, so mutating one record.headers would corrupt the others.
+		headers = []
 	} else {
 		headers = new Array<RecordHeader>(headerCount)
 		for (let i = 0; i < headerCount; i++) {
@@ -275,11 +274,13 @@ export function decodeRecordInBatch(
 	const valueLength = decoder.readVarInt()
 	const value = valueLength < 0 ? null : decoder.readRaw(valueLength)
 
-	// Headers (optimization: use shared empty array for common case)
+	// Headers
 	const headerCount = decoder.readVarInt()
 	let headers: RecordHeader[]
 	if (headerCount === 0) {
-		headers = EMPTY_HEADERS
+		// Fresh array per record: a shared empty array would alias all header-less
+		// records, so mutating one record.headers would corrupt the others.
+		headers = []
 	} else {
 		headers = new Array<RecordHeader>(headerCount)
 		for (let i = 0; i < headerCount; i++) {
