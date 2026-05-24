@@ -19,6 +19,22 @@ describe('murmur2 partitioner', () => {
 		expect(partition).toBeGreaterThanOrEqual(0)
 		expect(partition).toBeLessThan(5)
 	})
+
+	it('routes negative-hash keys with Kafka toPositive masking (& 0x7fffffff, not >>> 0)', () => {
+		// These keys have NEGATIVE murmur2 hashes, so Kafka's `hash & 0x7fffffff`
+		// diverges from a full-unsigned `hash >>> 0`. partitionCount 6 is non-power-of-2,
+		// so the divergence is observable (2^31 % 6 !== 0).
+		expect(murmur2(Buffer.from('a'))).toBe(-1563381124)
+		expect(murmur2(Buffer.from('b'))).toBe(-1853091852)
+
+		const partitionCount = 6
+		const value = Buffer.alloc(0)
+		// Expected = (murmur2(key) & 0x7fffffff) % 6; the buggy `>>> 0` is shown for contrast.
+		expect(murmur2Partitioner('t', Buffer.from('user-2'), value, partitionCount)).toBe(2) // bug: 4
+		expect(murmur2Partitioner('t', Buffer.from('a'), value, partitionCount)).toBe(4) // bug: 0
+		expect(murmur2Partitioner('t', Buffer.from('b'), value, partitionCount)).toBe(2) // bug: 4
+		expect(murmur2Partitioner('t', Buffer.from('session-9'), value, partitionCount)).toBe(2) // bug: 4
+	})
 })
 
 describe('round robin partitioner', () => {

@@ -127,14 +127,24 @@ function resolveAdvanceMs(sizeMs: number, advanceMs: number): number {
 	return advance
 }
 
-type CleanupState = { lastCleanupStreamTimeMs: number; streamTimeMs: number }
+export type CleanupState = { lastCleanupStreamTimeMs: number; streamTimeMs: number }
 
 const CLEANUP_INTERVAL_MS = 60_000
 
+// Window/session stores retain state for this multiple of the window size / session gap
+// (see grouped.ts store creation). The aggregation nodes reuse the same factor to detect a
+// late record whose window/session has already passed retention, so they don't resurrect it.
+export const WINDOW_STORE_RETENTION_MULTIPLIER = 24
+
 // Stream-time-driven retention: advance the high-water mark, fire expiry once per CLEANUP_INTERVAL_MS
 // of stream time. Caller passes the store's expire method (windows or sessions); without this, state-
-// store-backed processors leak.
-async function maybeExpire(state: CleanupState, timestamp: number, expire: (cutoff: number) => Promise<unknown>) {
+// store-backed processors leak. Shared by the windowed/session aggregation nodes and the
+// stream-stream join nodes.
+export async function maybeExpire(
+	state: CleanupState,
+	timestamp: number,
+	expire: (cutoff: number) => Promise<unknown>
+) {
 	state.streamTimeMs = Math.max(state.streamTimeMs, timestamp)
 	if (state.streamTimeMs - state.lastCleanupStreamTimeMs > CLEANUP_INTERVAL_MS) {
 		state.lastCleanupStreamTimeMs = state.streamTimeMs
@@ -202,7 +212,12 @@ export class WindowedReduceNode<K, V> extends Processor<K, V, Windowed<K>, V> {
 		if (value === null) return
 
 		const timestamp = Number(record.timestamp)
+		const retentionCutoff = this.cleanupState.streamTimeMs - this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER
 		for (const { start, end } of windowStartsFor(timestamp, this.windowSizeMs, this.advanceMs)) {
+			// Drop a late record whose window has already passed retention: re-creating the
+			// window from an empty aggregate emits a wrong partial result that contradicts the
+			// already-finalized (and possibly expired) window.
+			if (end < retentionCutoff) continue
 			const windowedKey: WindowedKey<K> = { key, windowStart: start, windowEnd: end }
 
 			const storedAggregate = await store.get(windowedKey)
@@ -260,6 +275,13 @@ export class SessionReduceNode<K, V> extends Processor<K, V, Windowed<K>, V> {
 		const overlappingSessions: Array<{ windowedKey: WindowedKey<K>; value: V }> = []
 		for await (const [windowedKey, sessionValue] of store.findSessions(key, searchFrom, searchTo)) {
 			overlappingSessions.push({ windowedKey, value: sessionValue })
+		}
+
+		// Drop a late record that has no live session to merge into and whose own session
+		// would already be past retention — otherwise an expired session is resurrected.
+		const retentionCutoff = this.cleanupState.streamTimeMs - this.gapMs * WINDOW_STORE_RETENTION_MULTIPLIER
+		if (overlappingSessions.length === 0 && timestamp < retentionCutoff) {
+			return
 		}
 
 		let mergedStart = timestamp
@@ -336,7 +358,12 @@ export class WindowedAggregateNode<K, V, A> extends Processor<K, V, Windowed<K>,
 		}
 
 		const timestamp = Number(record.timestamp)
+		const retentionCutoff = this.cleanupState.streamTimeMs - this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER
 		for (const { start, end } of windowStartsFor(timestamp, this.windowSizeMs, this.advanceMs)) {
+			// Drop a late record whose window has already passed retention: re-creating the
+			// window from the initializer emits a wrong partial result that contradicts the
+			// already-finalized (and possibly expired) window.
+			if (end < retentionCutoff) continue
 			const windowedKey: WindowedKey<K> = { key, windowStart: start, windowEnd: end }
 
 			const storedAggregate = await store.get(windowedKey)
@@ -412,6 +439,13 @@ export class SessionAggregateNode<K, V, A> extends Processor<K, V, Windowed<K>, 
 		const overlappingSessions: Array<{ windowedKey: WindowedKey<K>; value: A }> = []
 		for await (const [windowedKey, value] of store.findSessions(key, searchFrom, searchTo)) {
 			overlappingSessions.push({ windowedKey, value })
+		}
+
+		// Drop a late record that has no live session to merge into and whose own session
+		// would already be past retention — otherwise an expired session is resurrected.
+		const retentionCutoff = this.cleanupState.streamTimeMs - this.gapMs * WINDOW_STORE_RETENTION_MULTIPLIER
+		if (overlappingSessions.length === 0 && timestamp < retentionCutoff) {
+			return
 		}
 
 		let mergedStart = timestamp

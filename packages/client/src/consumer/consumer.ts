@@ -210,11 +210,16 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 				if (this.partitionTracker) {
 					await this.partitionTracker.revoke(partitions)
 				}
-				this.offsetManager!.removeAssignedPartitions(partitions)
-				this.fetchManager!.removePartitions(partitions)
+				// Commit the final positions BEFORE removing the partitions from the
+				// assigned set. commitPendingOffsets() skips offsets for unassigned
+				// partitions, so removing first would silently drop the last-consumed
+				// offsets of the partitions being revoked and make the next owner
+				// reprocess them.
 				if (this.commitOffsets && !this.sessionLost) {
 					await this.offsetManager!.commitPendingOffsets()
 				}
+				this.offsetManager!.removeAssignedPartitions(partitions)
+				this.fetchManager!.removePartitions(partitions)
 				this.offsetManager!.clearPartitions(partitions)
 				this.emit('partitionsRevoked', partitions)
 			},

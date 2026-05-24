@@ -4,7 +4,7 @@
  * Record format:
  * - length: varint (total record length after this field)
  * - attributes: int8 (currently unused, must be 0)
- * - timestampDelta: varint (relative to batch baseTimestamp)
+ * - timestampDelta: varlong (relative to batch baseTimestamp)
  * - offsetDelta: varint (relative to batch baseOffset)
  * - keyLength: varint (-1 for null)
  * - key: bytes
@@ -16,7 +16,7 @@
 
 import { Encoder } from '@/protocol/primitives/index.js'
 import type { IEncoder, IDecoder } from '@/protocol/primitives/index.js'
-import { varIntSize } from '@/protocol/primitives/varint.js'
+import { varIntSize, varLongSize } from '@/protocol/primitives/varint.js'
 
 /**
  * Record header (key-value pair)
@@ -93,7 +93,10 @@ export function encodeRecordTo(
 
 	encoder.writeVarInt(bodySize)
 	encoder.writeInt8(record.attributes)
-	encoder.writeVarInt(record.timestampDelta)
+	// timestampDelta is a VARLONG per the RecordBatch v2 spec: ms-since-epoch deltas
+	// routinely exceed 32 bits. (offsetDelta stays a varint — offsets within a batch
+	// are bounded by Int32.)
+	encoder.writeVarLong(BigInt(record.timestampDelta))
 	encoder.writeVarInt(record.offsetDelta)
 
 	// Key (varInt length, -1 for null)
@@ -131,7 +134,7 @@ export function encodeRecordTo(
 
 export function sizeOfRecordBody(record: KafkaRecord): number {
 	let bodySize = 1 // attributes (int8)
-	bodySize += varIntSize(record.timestampDelta)
+	bodySize += varLongSize(BigInt(record.timestampDelta)) // timestampDelta: varlong
 	bodySize += varIntSize(record.offsetDelta)
 
 	const key = record.key
@@ -193,7 +196,7 @@ export function decodeRecord(decoder: IDecoder, baseOffset: bigint, baseTimestam
 		// Currently unused, but we accept any value for forward compatibility
 	}
 
-	const timestampDelta = decoder.readVarInt()
+	const timestampDelta = decoder.readVarLong()
 	const offsetDelta = decoder.readVarInt()
 
 	// Key
@@ -232,7 +235,7 @@ export function decodeRecord(decoder: IDecoder, baseOffset: bigint, baseTimestam
 
 	return {
 		offset: baseOffset + BigInt(offsetDelta),
-		timestamp: baseTimestamp + BigInt(timestampDelta),
+		timestamp: baseTimestamp + timestampDelta,
 		key,
 		value,
 		headers,
@@ -262,7 +265,7 @@ export function decodeRecordInBatch(
 	// Attributes (currently unused)
 	decoder.readInt8()
 
-	const timestampDelta = decoder.readVarInt()
+	const timestampDelta = decoder.readVarLong()
 	// Offset delta is still present in the stream; read and discard.
 	decoder.readVarInt()
 
@@ -302,7 +305,7 @@ export function decodeRecordInBatch(
 		}
 	}
 
-	const timestamp = timestampDelta === 0 ? baseTimestamp : baseTimestamp + BigInt(timestampDelta)
+	const timestamp = timestampDelta === 0n ? baseTimestamp : baseTimestamp + timestampDelta
 
 	return {
 		offset,
