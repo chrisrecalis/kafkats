@@ -249,6 +249,15 @@ export class TableDeltaReduceNode<K, V> extends Processor<K, V> {
 			newAggregate = current === undefined ? record.value : this.adder(current, record.value)
 		}
 
+		// A null result means the group is now empty (e.g. the last member was subtracted out).
+		// Delete the entry and forward a tombstone, matching KGroupedTable.reduce semantics. Storing
+		// the null instead would leak it into the next ADD's adder(current, value) call.
+		if (newAggregate === null || newAggregate === undefined) {
+			await store.delete(key)
+			await this.forward({ ...record, key, value: null as unknown as V, headers: {} })
+			return
+		}
+
 		await store.put(key, newAggregate)
 		await this.forward({ ...record, key, value: newAggregate, headers: {} })
 	}
@@ -299,6 +308,15 @@ export class TableDeltaAggregateNode<K, V, A> extends Processor<K, V, K, A> {
 		} else {
 			const aggregate = current ?? this.initializer()
 			newAggregate = this.aggregator(key, record.value, aggregate)
+		}
+
+		// A null result means the group is now empty (e.g. the last member was subtracted out).
+		// Delete the entry and forward a tombstone, matching KGroupedTable.aggregate semantics.
+		// Storing the null instead would leak it into the next ADD via `current ?? initializer()`.
+		if (newAggregate === null || newAggregate === undefined) {
+			await store.delete(key)
+			await this.forward({ ...record, key, value: null as unknown as A, headers: {} })
+			return
 		}
 
 		await store.put(key, newAggregate)

@@ -1183,6 +1183,58 @@ describe('table aggregations (KGroupedTable)', () => {
 
 		await app.close()
 	})
+
+	it('forwards a tombstone when an exactly-once table groupBy reduce empties a group', async () => {
+		// The delta reduce/subtractor node only runs under exactly_once; at_least_once recomputes
+		// from the mapping store and never invokes the subtractor.
+		const { app, consumers } = createTestApp({ processingGuarantee: 'exactly_once' })
+
+		type Item = { category: string; price: number }
+
+		// Capture every emitted record, including tombstones (null values).
+		const emitted: Array<{ key: string | null; value: Item | null }> = []
+
+		app.table('items', { key: codec.string(), value: codec.json<Item>() })
+			.groupBy((_key, value) => [value.category, value] as const, {
+				key: codec.string(),
+				value: codec.json<Item>(),
+			})
+			.reduce(
+				(agg, value) => ({ ...agg, price: agg.price + value.price }),
+				// Returning null signals the group is now empty (KGroupedTable deletion semantics).
+				(agg, value) => {
+					const price = agg.price - value.price
+					return price === 0 ? (null as unknown as Item) : { ...agg, price }
+				}
+			)
+			.toStream()
+			.peek((key, value) => emitted.push({ key, value }))
+
+		await app.start()
+		const consumer = consumers[0]!
+
+		// Single item in 'books'.
+		await consumer.emitMessage(
+			'items',
+			Buffer.from(JSON.stringify({ category: 'books', price: 10 })),
+			Buffer.from('item1')
+		)
+		expect(emitted.at(-1)).toEqual({ key: 'books', value: { category: 'books', price: 10 } })
+
+		// Delete item1 (source tombstone) -> SUB books -> group becomes empty -> tombstone.
+		await consumer.emitMessage('items', null, Buffer.from('item1'))
+		expect(emitted.at(-1)).toEqual({ key: 'books', value: null })
+
+		// Re-add to 'books': must restart from the new value, not aggregate onto a stale null.
+		await consumer.emitMessage(
+			'items',
+			Buffer.from(JSON.stringify({ category: 'books', price: 5 })),
+			Buffer.from('item2')
+		)
+		expect(emitted.at(-1)).toEqual({ key: 'books', value: { category: 'books', price: 5 } })
+
+		await app.close()
+	})
 })
 
 describe('aggregations', () => {
