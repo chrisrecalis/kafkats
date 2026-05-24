@@ -93,4 +93,91 @@ describe('FetchManager response fencing', () => {
 		expect(newState.offset).toBe(100n)
 		expect(addedToBuffer).toEqual([])
 	})
+
+	it('drops records from an in-flight fetch when the partition is paused mid-flight', async () => {
+		let resolveFetch: (resp: unknown) => void = () => {}
+		const fetchResponse = new Promise(resolve => {
+			resolveFetch = resolve
+		})
+
+		const broker = {
+			nodeId: 1,
+			fetch: vi.fn().mockReturnValue(fetchResponse),
+		}
+
+		const cluster = {
+			getLeaderForPartition: vi.fn().mockResolvedValue(broker),
+			getLogger: () => null,
+		}
+
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const offsetManager = new OffsetManager(cluster as any, 'g1')
+		const fm = new FetchManager(
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			cluster as any,
+			offsetManager,
+			'earliest',
+			{
+				maxBytesPerPartition: 1024,
+				minBytes: 1,
+				maxWaitMs: 50,
+				partitionConcurrency: 1,
+				isolationLevel: 'read_uncommitted',
+			}
+		)
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const fmAny = fm as any
+
+		const addedToBuffer: Array<{ topic: string; partition: number }> = []
+		fmAny.fetchBuffer = {
+			add: vi.fn((entry: { topic: string; partition: number }) => {
+				addedToBuffer.push({ topic: entry.topic, partition: entry.partition })
+			}),
+			removePartitions: vi.fn(),
+			isFull: () => false,
+		}
+
+		fmAny.decodeRecords = vi.fn().mockReturnValue([
+			{ offset: 10n, key: null, value: Buffer.from('a'), headers: {}, timestamp: 0n },
+			{ offset: 11n, key: null, value: Buffer.from('b'), headers: {}, timestamp: 0n },
+		])
+
+		fm.addPartitions([{ topic: 't', partition: 0, offset: 10n }])
+		const state = fmAny.partitionStates.get('t:0')
+
+		const inflight: Promise<void> = fmAny.fetchFromBrokerToBuffer(broker, [state])
+
+		// Pause the partition while its fetch is still in flight.
+		fm.pausePartitions([{ topic: 't', partition: 0 }])
+
+		resolveFetch({
+			topics: [
+				{
+					topic: 't',
+					partitions: [
+						{
+							partitionIndex: 0,
+							errorCode: ErrorCode.None,
+							highWatermark: 50n,
+							lastStableOffset: 50n,
+							logStartOffset: 0n,
+							abortedTransactions: null,
+							preferredReadReplica: -1,
+							recordsData: Buffer.from('non-empty'),
+						},
+					],
+				},
+			],
+			throttleTimeMs: 0,
+			errorCode: ErrorCode.None,
+			sessionId: 0,
+		})
+
+		await inflight
+
+		// Paused mid-flight: the records must not be delivered and the fetch offset must
+		// not advance, so they are re-fetched after resume.
+		expect(addedToBuffer).toEqual([])
+		expect(state.offset).toBe(10n)
+	})
 })
