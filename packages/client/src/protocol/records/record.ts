@@ -60,6 +60,11 @@ export interface DecodeRecordInBatchOptions {
 	 * @default true
 	 */
 	verifyLength?: boolean
+	/**
+	 * The batch append timestamp to stamp on every record. Set only for LogAppendTime batches,
+	 * where the per-record timestamp delta is meaningless and all records share the append time.
+	 */
+	logAppendTime?: bigint
 }
 
 /**
@@ -187,7 +192,12 @@ export function sizeOfRecord(record: KafkaRecord): number {
  * @param baseTimestamp - The batch base timestamp
  * @returns The decoded record
  */
-export function decodeRecord(decoder: IDecoder, baseOffset: bigint, baseTimestamp: bigint): DecodedRecord {
+export function decodeRecord(
+	decoder: IDecoder,
+	baseOffset: bigint,
+	baseTimestamp: bigint,
+	logAppendTime?: bigint
+): DecodedRecord {
 	const length = decoder.readVarInt()
 	const recordEnd = decoder.offset() + length
 
@@ -241,7 +251,9 @@ export function decodeRecord(decoder: IDecoder, baseOffset: bigint, baseTimestam
 
 	return {
 		offset: baseOffset + BigInt(offsetDelta),
-		timestamp: baseTimestamp + timestampDelta,
+		// Under LogAppendTime the broker stamps every record with the batch append time; the
+		// per-record delta is meaningless, so use the supplied append timestamp instead.
+		timestamp: logAppendTime !== undefined ? logAppendTime : baseTimestamp + timestampDelta,
 		key,
 		value,
 		headers,
@@ -317,7 +329,13 @@ export function decodeRecordInBatch(
 		}
 	}
 
-	const timestamp = timestampDelta === 0n ? baseTimestamp : baseTimestamp + timestampDelta
+	// Under LogAppendTime every record carries the batch append time; otherwise it's the delta.
+	const timestamp =
+		options.logAppendTime !== undefined
+			? options.logAppendTime
+			: timestampDelta === 0n
+				? baseTimestamp
+				: baseTimestamp + timestampDelta
 
 	return {
 		offset,

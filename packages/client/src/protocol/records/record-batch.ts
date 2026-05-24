@@ -339,16 +339,19 @@ export function decodeRecordBatchFromSync(
 
 	const recordsDecoder = new Decoder(recordsBuffer)
 	const records = new Array<DecodedRecord>(recordCount)
+	// LogAppendTime batches stamp every record with the batch append time (maxTimestamp);
+	// CreateTime leaves it undefined so per-record deltas are used.
+	const logAppendTime = isLogAppendTime(attributes) ? maxTimestamp : undefined
 	if (options.assumeSequentialOffsets) {
 		const verifyLength = options.verifyRecordLength !== false
 		let offset = baseOffset
 		for (let i = 0; i < recordCount; i++) {
-			records[i] = decodeRecordInBatch(recordsDecoder, offset, baseTimestamp, { verifyLength })
+			records[i] = decodeRecordInBatch(recordsDecoder, offset, baseTimestamp, { verifyLength, logAppendTime })
 			offset += 1n
 		}
 	} else {
 		for (let i = 0; i < recordCount; i++) {
-			records[i] = decodeRecord(recordsDecoder, baseOffset, baseTimestamp)
+			records[i] = decodeRecord(recordsDecoder, baseOffset, baseTimestamp, logAppendTime)
 		}
 	}
 
@@ -426,16 +429,19 @@ export async function decodeRecordBatchFrom(
 
 	const recordsDecoder = new Decoder(recordsBuffer)
 	const records = new Array<DecodedRecord>(recordCount)
+	// LogAppendTime batches stamp every record with the batch append time (maxTimestamp);
+	// CreateTime leaves it undefined so per-record deltas are used.
+	const logAppendTime = isLogAppendTime(attributes) ? maxTimestamp : undefined
 	if (options.assumeSequentialOffsets) {
 		const verifyLength = options.verifyRecordLength !== false
 		let offset = baseOffset
 		for (let i = 0; i < recordCount; i++) {
-			records[i] = decodeRecordInBatch(recordsDecoder, offset, baseTimestamp, { verifyLength })
+			records[i] = decodeRecordInBatch(recordsDecoder, offset, baseTimestamp, { verifyLength, logAppendTime })
 			offset += 1n
 		}
 	} else {
 		for (let i = 0; i < recordCount; i++) {
-			records[i] = decodeRecord(recordsDecoder, baseOffset, baseTimestamp)
+			records[i] = decodeRecord(recordsDecoder, baseOffset, baseTimestamp, logAppendTime)
 		}
 	}
 
