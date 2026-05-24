@@ -814,7 +814,10 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 
 		if (handled === 0 && autoAckOnSuccess) {
 			handled = 1
-			void ackManager.enqueue(topicName, topicId, partitionIndex, record.offset, ACK_ACCEPT).catch(() => {})
+			// Await (like the explicit ack()) so a failed auto-ack surfaces instead of being
+			// silently swallowed — otherwise the record is redelivered after its acquisition
+			// lock expires with no signal to the application.
+			await ackManager.enqueue(topicName, topicId, partitionIndex, record.offset, ACK_ACCEPT)
 		}
 
 		return 1
