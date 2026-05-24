@@ -429,4 +429,141 @@ describe('Cluster', () => {
 			expect(callCount).toBe(1)
 		})
 	})
+
+	describe('metadata merge and leader epoch', () => {
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		function wireBroker(cluster: Cluster, mockBroker: any): void {
+			;(cluster as unknown as { bootstrapBrokers: Broker[] }).bootstrapBrokers = [mockBroker as Broker]
+			;(cluster as unknown as { brokers: Map<number, Broker> }).brokers = new Map([[1, mockBroker as Broker]])
+			;(cluster as unknown as { isConnected: boolean }).isConnected = true
+		}
+
+		function topicMeta(
+			name: string,
+			partition: number,
+			leaderId: number,
+			leaderEpoch: number,
+			topicId = '00000000-0000-0000-0000-000000000000'
+		) {
+			return {
+				errorCode: ErrorCode.None,
+				name,
+				topicId,
+				isInternal: false,
+				partitions: [
+					{
+						errorCode: ErrorCode.None,
+						partitionIndex: partition,
+						leaderId,
+						leaderEpoch,
+						replicaNodes: [leaderId],
+						isrNodes: [leaderId],
+						offlineReplicas: [],
+					},
+				],
+			}
+		}
+
+		const brokersList = [{ nodeId: 1, host: 'localhost', port: 9092, rack: null }]
+
+		it('does not drop previously-known topics on a topic-scoped refresh', async () => {
+			const cluster = new Cluster({ clientId: 'c', brokers: ['bootstrap:9092'] })
+			const mockBroker = createMockBroker(1, { isConnected: true })
+			wireBroker(cluster, mockBroker)
+
+			// Full refresh learns topics A and B.
+			mockBroker.metadata.mockResolvedValueOnce({
+				clusterId: 'c',
+				controllerId: 1,
+				brokers: brokersList,
+				topics: [topicMeta('A', 0, 1, 0), topicMeta('B', 0, 1, 0)],
+			})
+			await cluster.refreshMetadata()
+			expect([...cluster.getMetadata()!.topics.keys()].sort()).toEqual(['A', 'B'])
+
+			// Topic-scoped refresh for A only — the response carries just A.
+			mockBroker.metadata.mockResolvedValueOnce({
+				clusterId: 'c',
+				controllerId: 1,
+				brokers: brokersList,
+				topics: [topicMeta('A', 0, 1, 1)],
+			})
+			await cluster.refreshMetadata(['A'])
+
+			// B must survive the scoped refresh.
+			expect([...cluster.getMetadata()!.topics.keys()].sort()).toEqual(['A', 'B'])
+		})
+
+		it('ignores a stale (lower leader-epoch) partition update but accepts a newer one', async () => {
+			const cluster = new Cluster({ clientId: 'c', brokers: ['bootstrap:9092'] })
+			const mockBroker = createMockBroker(1, { isConnected: true })
+			wireBroker(cluster, mockBroker)
+
+			// Learn leader=1 at epoch 5.
+			mockBroker.metadata.mockResolvedValueOnce({
+				clusterId: 'c',
+				controllerId: 1,
+				brokers: brokersList,
+				topics: [topicMeta('A', 0, 1, 5)],
+			})
+			await cluster.refreshMetadata()
+
+			// A stale response (epoch 3) names a different leader — must be ignored.
+			mockBroker.metadata.mockResolvedValueOnce({
+				clusterId: 'c',
+				controllerId: 1,
+				brokers: brokersList,
+				topics: [topicMeta('A', 0, 2, 3)],
+			})
+			await cluster.refreshMetadata()
+			let p = cluster.getMetadata()!.topics.get('A')!.partitions.get(0)!
+			expect(p.leaderEpoch).toBe(5)
+			expect(p.leaderId).toBe(1)
+
+			// A newer response (epoch 7) is applied.
+			mockBroker.metadata.mockResolvedValueOnce({
+				clusterId: 'c',
+				controllerId: 1,
+				brokers: brokersList,
+				topics: [topicMeta('A', 0, 2, 7)],
+			})
+			await cluster.refreshMetadata()
+			p = cluster.getMetadata()!.topics.get('A')!.partitions.get(0)!
+			expect(p.leaderEpoch).toBe(7)
+			expect(p.leaderId).toBe(2)
+		})
+
+		it('does not let the epoch guard retain a stale leader after a topic is recreated (new topic id)', async () => {
+			const cluster = new Cluster({ clientId: 'c', brokers: ['bootstrap:9092'] })
+			const mockBroker = createMockBroker(1, { isConnected: true })
+			wireBroker(cluster, mockBroker)
+
+			const idOld = '11111111-1111-1111-1111-111111111111'
+			const idNew = '22222222-2222-2222-2222-222222222222'
+
+			// Topic A at epoch 5 under its original topic id.
+			mockBroker.metadata.mockResolvedValueOnce({
+				clusterId: 'c',
+				controllerId: 1,
+				brokers: brokersList,
+				topics: [topicMeta('A', 0, 1, 5, idOld)],
+			})
+			await cluster.refreshMetadata()
+
+			// A is deleted and recreated: same name, NEW topic id, epoch reset to 0, new leader.
+			mockBroker.metadata.mockResolvedValueOnce({
+				clusterId: 'c',
+				controllerId: 1,
+				brokers: brokersList,
+				topics: [topicMeta('A', 0, 2, 0, idNew)],
+			})
+			await cluster.refreshMetadata()
+
+			// The recreated topic's metadata must win despite the lower epoch.
+			const topic = cluster.getMetadata()!.topics.get('A')!
+			expect(topic.topicId).toBe(idNew)
+			expect(topic.partitions.get(0)!.leaderId).toBe(2)
+			expect(topic.partitions.get(0)!.leaderEpoch).toBe(0)
+		})
+	})
 })
