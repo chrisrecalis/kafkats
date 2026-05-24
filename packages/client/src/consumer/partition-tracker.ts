@@ -79,11 +79,15 @@ export class PartitionTracker {
 	private readonly assigned = new Set<string>()
 
 	/**
-	 * Partitions with in-flight handler processing.
-	 * The Deferred resolves when endProcessing() is called.
+	 * Partitions with in-flight handler processing, ref-counted: `count` is the number of
+	 * concurrent batches being processed for the partition, and `deferred` resolves only
+	 * once the count drops back to zero. Ref-counting is required because, with
+	 * partitionConcurrency > 1, two batches for the same partition can be in flight at once;
+	 * a single shared Deferred would resolve on the FIRST endProcessing and let revoke()
+	 * complete while the second batch is still running.
 	 * Key: "topic:partition"
 	 */
-	private readonly inFlight = new Map<string, Deferred<void>>()
+	private readonly inFlight = new Map<string, { deferred: Deferred<void>; count: number }>()
 
 	/**
 	 * Partitions that are being revoked (waiting for in-flight to complete).
@@ -155,10 +159,11 @@ export class PartitionTracker {
 			// FetchManager will stop fetching this partition
 			this.assigned.delete(key)
 
-			// If there's in-flight work, we need to wait for it
-			const deferred = this.inFlight.get(key)
-			if (deferred && !deferred.isResolved) {
-				waitPromises.push({ key, promise: deferred.promise })
+			// If there's in-flight work, we need to wait for it (until ALL concurrent
+			// batches for this partition have completed, i.e. the ref count reaches zero).
+			const entry = this.inFlight.get(key)
+			if (entry && !entry.deferred.isResolved) {
+				waitPromises.push({ key, promise: entry.deferred.promise })
 			}
 		}
 
@@ -250,12 +255,15 @@ export class PartitionTracker {
 			return false
 		}
 
-		// Only create new Deferred if not already in-flight
-		// (handles edge case of overlapping batches)
-		if (!this.inFlight.has(key)) {
-			this.inFlight.set(key, new Deferred())
-			this.logger.debug('partition processing started', { topic, partition })
+		// Ref-count concurrent batches for this partition; the Deferred for the first
+		// batch is shared and only resolves once the last batch ends.
+		let entry = this.inFlight.get(key)
+		if (!entry) {
+			entry = { deferred: new Deferred(), count: 0 }
+			this.inFlight.set(key, entry)
 		}
+		entry.count++
+		this.logger.debug('partition processing started', { topic, partition, inFlight: entry.count })
 
 		return true
 	}
@@ -268,12 +276,25 @@ export class PartitionTracker {
 	 */
 	endProcessing(topic: string, partition: number): void {
 		const key = tpKey(topic, partition)
-		const deferred = this.inFlight.get(key)
+		const entry = this.inFlight.get(key)
 
-		if (deferred) {
-			deferred.resolve()
-			this.inFlight.delete(key)
-			this.logger.debug('partition processing ended', { topic, partition })
+		if (entry) {
+			entry.count--
+			// Resolve the revoke wait only once the LAST concurrent batch for this
+			// partition finishes. `<= 0` (not `=== 0`) tolerates the unpaired force-decrement
+			// from onPartitionsLost (consumer.ts), which calls endProcessing without a
+			// matching startProcessing.
+			if (entry.count <= 0) {
+				entry.deferred.resolve()
+				this.inFlight.delete(key)
+				this.logger.debug('partition processing ended', { topic, partition })
+			} else {
+				this.logger.debug('partition batch ended, others still in flight', {
+					topic,
+					partition,
+					inFlight: entry.count,
+				})
+			}
 		}
 	}
 
@@ -282,8 +303,8 @@ export class PartitionTracker {
 	 */
 	isProcessing(topic: string, partition: number): boolean {
 		const key = tpKey(topic, partition)
-		const deferred = this.inFlight.get(key)
-		return deferred !== undefined && !deferred.isResolved
+		const entry = this.inFlight.get(key)
+		return entry !== undefined && !entry.deferred.isResolved
 	}
 
 	/**
@@ -292,8 +313,8 @@ export class PartitionTracker {
 	 */
 	clear(): void {
 		// Resolve any pending waits so revoke() calls don't hang forever
-		for (const deferred of this.inFlight.values()) {
-			deferred.resolve()
+		for (const entry of this.inFlight.values()) {
+			entry.deferred.resolve()
 		}
 
 		this.assigned.clear()
