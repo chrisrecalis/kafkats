@@ -1,5 +1,8 @@
 import { Processor, type StreamRecord, type WorkerContext } from '@/processors/base.js'
+import { maybeExpire, type CleanupState } from '@/processors/aggregation.js'
 import type { WindowStore } from '@/state.js'
+
+const newCleanupState = (): CleanupState => ({ lastCleanupStreamTimeMs: 0, streamTimeMs: 0 })
 
 /**
  * Processor node for Stream-Stream join (inner join).
@@ -10,7 +13,8 @@ export class StreamStreamJoinNode<K, V1, V2, VR> extends Processor<K, V1, K, VR>
 		private readonly myStoreRef: { store: WindowStore<K, V1> | null },
 		private readonly otherStoreRef: { store: WindowStore<K, V2> | null },
 		private readonly joiner: (value: V1, otherValue: V2) => VR,
-		private readonly joinWindowMs: number
+		private readonly joinWindowMs: number,
+		private readonly cleanupState: CleanupState = newCleanupState()
 	) {
 		super()
 	}
@@ -21,7 +25,8 @@ export class StreamStreamJoinNode<K, V1, V2, VR> extends Processor<K, V1, K, VR>
 			this.myStoreRef,
 			this.otherStoreRef,
 			this.joiner,
-			this.joinWindowMs
+			this.joinWindowMs,
+			this.cleanupState
 		)
 	}
 
@@ -53,6 +58,13 @@ export class StreamStreamJoinNode<K, V1, V2, VR> extends Processor<K, V1, K, VR>
 			const next: StreamRecord<K, VR> = { ...record, value: joinedValue }
 			await this.forward(next)
 		}
+
+		// Stream-time-driven retention: expire both stores so neither grows unbounded
+		// (the other stream's node may be idle, so each node expires both).
+		await maybeExpire(this.cleanupState, timestamp, async cutoff => {
+			await myStore.expireOldWindows(cutoff)
+			await otherStore.expireOldWindows(cutoff)
+		})
 	}
 }
 
@@ -64,7 +76,8 @@ export class StreamStreamLeftJoinNode<K, V1, V2, VR> extends Processor<K, V1, K,
 		private readonly myStoreRef: { store: WindowStore<K, V1> | null },
 		private readonly otherStoreRef: { store: WindowStore<K, V2> | null },
 		private readonly joiner: (value: V1, otherValue: V2 | null) => VR,
-		private readonly joinWindowMs: number
+		private readonly joinWindowMs: number,
+		private readonly cleanupState: CleanupState = newCleanupState()
 	) {
 		super()
 	}
@@ -75,7 +88,8 @@ export class StreamStreamLeftJoinNode<K, V1, V2, VR> extends Processor<K, V1, K,
 			this.myStoreRef,
 			this.otherStoreRef,
 			this.joiner,
-			this.joinWindowMs
+			this.joinWindowMs,
+			this.cleanupState
 		)
 	}
 
@@ -115,6 +129,13 @@ export class StreamStreamLeftJoinNode<K, V1, V2, VR> extends Processor<K, V1, K,
 			const next: StreamRecord<K, VR> = { ...record, value: joinedValue }
 			await this.forward(next)
 		}
+
+		// Stream-time-driven retention: expire both stores so neither grows unbounded
+		// (the other stream's node may be idle, so each node expires both).
+		await maybeExpire(this.cleanupState, timestamp, async cutoff => {
+			await myStore.expireOldWindows(cutoff)
+			await otherStore.expireOldWindows(cutoff)
+		})
 	}
 }
 
@@ -126,7 +147,8 @@ export class StreamStreamOuterJoinNode<K, V1, V2, VR> extends Processor<K, V1, K
 		private readonly myStoreRef: { store: WindowStore<K, V1> | null },
 		private readonly otherStoreRef: { store: WindowStore<K, V2> | null },
 		private readonly joiner: (value: V1 | null, otherValue: V2 | null) => VR,
-		private readonly joinWindowMs: number
+		private readonly joinWindowMs: number,
+		private readonly cleanupState: CleanupState = newCleanupState()
 	) {
 		super()
 	}
@@ -137,7 +159,8 @@ export class StreamStreamOuterJoinNode<K, V1, V2, VR> extends Processor<K, V1, K
 			this.myStoreRef,
 			this.otherStoreRef,
 			this.joiner,
-			this.joinWindowMs
+			this.joinWindowMs,
+			this.cleanupState
 		)
 	}
 
@@ -177,5 +200,12 @@ export class StreamStreamOuterJoinNode<K, V1, V2, VR> extends Processor<K, V1, K
 			const next: StreamRecord<K, VR> = { ...record, value: joinedValue }
 			await this.forward(next)
 		}
+
+		// Stream-time-driven retention: expire both stores so neither grows unbounded
+		// (the other stream's node may be idle, so each node expires both).
+		await maybeExpire(this.cleanupState, timestamp, async cutoff => {
+			await myStore.expireOldWindows(cutoff)
+			await otherStore.expireOldWindows(cutoff)
+		})
 	}
 }

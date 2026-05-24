@@ -9,6 +9,7 @@ import {
 	WindowedReduceNode,
 	SessionAggregateNode,
 	SessionReduceNode,
+	WINDOW_STORE_RETENTION_MULTIPLIER,
 } from '@/processors/aggregation.js'
 import {
 	TableDeltaCountNode,
@@ -200,7 +201,7 @@ export class WindowedKGroupedStreamImpl<K, V> implements WindowedKGroupedStream<
 			const sessionStore = this.app.stateStoreProvider.createSessionStore<K, number>(storeName, {
 				keyCodec,
 				valueCodec,
-				retentionMs: this.windowSizeMs * 24,
+				retentionMs: this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER,
 			})
 			this.app.stateStores.set(storeName, sessionStore as KeyValueStore<unknown, unknown>)
 			const storeRef = { store: sessionStore }
@@ -218,7 +219,7 @@ export class WindowedKGroupedStreamImpl<K, V> implements WindowedKGroupedStream<
 			const store = this.app.stateStoreProvider.createWindowStore<K, number>(storeName, {
 				keyCodec,
 				valueCodec,
-				retentionMs: this.windowSizeMs * 24, // Keep windows for 24x the window size
+				retentionMs: this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER, // Keep windows for 24x the window size
 				windowSizeMs: this.windowSizeMs,
 			})
 			this.app.stateStores.set(storeName, store as KeyValueStore<unknown, unknown>)
@@ -281,7 +282,7 @@ export class WindowedKGroupedStreamImpl<K, V> implements WindowedKGroupedStream<
 			const sessionStore = this.app.stateStoreProvider.createSessionStore<K, V>(storeName, {
 				keyCodec,
 				valueCodec,
-				retentionMs: this.windowSizeMs * 24,
+				retentionMs: this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER,
 			})
 			this.app.stateStores.set(storeName, sessionStore as KeyValueStore<unknown, unknown>)
 			const storeRef = { store: sessionStore }
@@ -292,7 +293,7 @@ export class WindowedKGroupedStreamImpl<K, V> implements WindowedKGroupedStream<
 			const store = this.app.stateStoreProvider.createWindowStore<K, V>(storeName, {
 				keyCodec,
 				valueCodec,
-				retentionMs: this.windowSizeMs * 24,
+				retentionMs: this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER,
 				windowSizeMs: this.windowSizeMs,
 			})
 			this.app.stateStores.set(storeName, store as KeyValueStore<unknown, unknown>)
@@ -356,7 +357,7 @@ export class WindowedKGroupedStreamImpl<K, V> implements WindowedKGroupedStream<
 		const store = this.app.stateStoreProvider.createWindowStore<K, A>(storeName, {
 			keyCodec,
 			valueCodec,
-			retentionMs: this.windowSizeMs * 24,
+			retentionMs: this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER,
 			windowSizeMs: this.windowSizeMs,
 		})
 		this.app.stateStores.set(storeName, store as KeyValueStore<unknown, unknown>)

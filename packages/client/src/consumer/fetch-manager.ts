@@ -704,10 +704,16 @@ export class FetchManager {
 			for (const partitionResponse of topicResponse.partitions) {
 				const key = tpKey(topicResponse.topic, partitionResponse.partitionIndex)
 				const state = inflightStateByKey.get(key)
-				// Fence: state was revoked, or a seek changed the fetch position, while the
-				// fetch was in flight. Drop the records without advancing the offset so the
-				// post-seek position is fetched next instead of being clobbered.
-				if (!state || state.abortController.signal.aborted || state.fetchEpoch !== issuedEpochByKey.get(key))
+				// Fence: state was revoked, the partition was paused, or a seek changed the fetch
+				// position while the fetch was in flight. Drop the records without advancing the
+				// offset so they are re-fetched (on resume / from the post-seek position) instead
+				// of being clobbered.
+				if (
+					!state ||
+					state.abortController.signal.aborted ||
+					state.paused ||
+					state.fetchEpoch !== issuedEpochByKey.get(key)
+				)
 					continue
 
 				if (partitionResponse.errorCode !== ErrorCode.None) {
@@ -724,8 +730,13 @@ export class FetchManager {
 					)
 					let records = decodeResult instanceof Promise ? await decodeResult : decodeResult
 
-					// decodeRecords may have awaited; re-fence (revoked or seeked mid-decode).
-					if (state.abortController.signal.aborted || state.fetchEpoch !== issuedEpochByKey.get(key)) continue
+					// decodeRecords may have awaited; re-fence (revoked, paused, or seeked mid-decode).
+					if (
+						state.abortController.signal.aborted ||
+						state.paused ||
+						state.fetchEpoch !== issuedEpochByKey.get(key)
+					)
+						continue
 
 					records = filterRecordsFromOffset(records, fetchOffset)
 
