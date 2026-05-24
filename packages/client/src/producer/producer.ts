@@ -136,6 +136,10 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	// Broker-level batching: collect ready batches and group by broker
 	private pendingBatches: PartitionBatch[] = []
 	private drainScheduled = false
+	// Partitions with an in-flight send. A partition stays muted until its send
+	// settles, so at most one batch per partition is ever in flight (preserves
+	// per-partition ordering for the idempotent producer).
+	private mutedPartitions = new Set<string>()
 
 	// Transaction state (only used when transactionalId is set)
 	private transactionState: TransactionState = 'idle'
@@ -187,44 +191,46 @@ export class Producer extends EventEmitter<ProducerEvents> {
 
 		if (batches.length === 0) return
 
-		// Group batches by topic:partition - only take first batch per partition
-		// to maintain ordering (remaining batches wait for next drain)
-		const batchesByPartition = new Map<string, PartitionBatch[]>()
-		const firstBatchPerPartition: PartitionBatch[] = []
+		// Take at most one batch per partition, and never a partition that already has
+		// an in-flight send (muted). This preserves per-partition ordering for the
+		// idempotent producer: sending a second batch while an earlier one is in flight
+		// would let a retriable failure on the earlier batch reorder sequences, so the
+		// later (higher-sequence) batch reaches the broker first and trips
+		// OutOfOrderSequenceNumber. Deferred batches stay queued and are drained when
+		// their partition's in-flight send settles (see the finally below) — every
+		// deferred batch's partition is muted, so a re-drain is always pending.
+		const pickedPartitions = new Set<string>()
+		const toSend: PartitionBatch[] = []
 
 		for (const batch of batches) {
 			const key = `${batch.topic}:${batch.partition}`
-			const existing = batchesByPartition.get(key)
-			if (!existing) {
-				// First batch for this partition - include in this drain
-				batchesByPartition.set(key, [batch])
-				firstBatchPerPartition.push(batch)
+			if (this.mutedPartitions.has(key) || pickedPartitions.has(key)) {
+				this.pendingBatches.push(batch)
 			} else {
-				// Additional batch for same partition - defer to next drain
-				existing.push(batch)
+				pickedPartitions.add(key)
+				toSend.push(batch)
 			}
 		}
 
-		// Re-queue deferred batches (those after the first for each partition)
-		for (const [, partitionBatches] of batchesByPartition) {
-			for (let i = 1; i < partitionBatches.length; i++) {
-				this.pendingBatches.push(partitionBatches[i]!)
+		if (toSend.length === 0) return
+
+		// Mute the partitions we are about to send so subsequent drains skip them.
+		for (const key of pickedPartitions) {
+			this.mutedPartitions.add(key)
+		}
+
+		const promise = this.sendBatchesGroupedByBroker(toSend)
+		this.inflight.add(promise)
+		promise.finally(() => {
+			this.inflight.delete(promise)
+			for (const key of pickedPartitions) {
+				this.mutedPartitions.delete(key)
 			}
-		}
-
-		// Schedule another drain if there are deferred batches
-		if (this.pendingBatches.length > 0) {
-			this.scheduleDrain()
-		}
-
-		// Now send first batch per partition, grouped by broker
-		if (firstBatchPerPartition.length > 0) {
-			const promise = this.sendBatchesGroupedByBroker(firstBatchPerPartition)
-			this.inflight.add(promise)
-			promise.finally(() => {
-				this.inflight.delete(promise)
-			})
-		}
+			// Now-unmuted partitions may have deferred batches waiting.
+			if (this.pendingBatches.length > 0) {
+				this.scheduleDrain()
+			}
+		})
 	}
 
 	/**
@@ -347,7 +353,11 @@ export class Producer extends EventEmitter<ProducerEvents> {
 							.reduce((sum, m) => sum + (m.value?.length ?? 0) + (m.key?.length ?? 0), 0),
 						createdAt: Date.now(),
 					}
-					this.pendingBatches.push(remainingBatch)
+					// Prepend, not push: this remainder holds the messages that immediately
+					// follow the ones being sent now. It must drain before any later batch
+					// already queued for this partition, or per-partition order would break
+					// (the later batch would get a lower sequence than the remainder).
+					this.pendingBatches.unshift(remainingBatch)
 					this.scheduleDrain()
 					recordCount = reservation.reservedCount
 				}
@@ -931,11 +941,14 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	async flush(): Promise<void> {
 		this.accumulator.flush()
 
-		// Drains run in queueMicrotask and may re-queue partition batches via
-		// scheduleDrain; loop until both pendingBatches and inflight are empty.
+		// Loop until pendingBatches and inflight are both empty. Wait via setImmediate
+		// (a macrotask), NOT queueMicrotask: a partition's deferred batches stay in
+		// pendingBatches until its in-flight send settles (see drainPendingBatches), and
+		// that settlement is an I/O event. An unbounded microtask spin would starve the
+		// event loop's poll phase so the send never completes and flush() would hang.
 		while (this.pendingBatches.length > 0 || this.drainScheduled || this.inflight.size > 0) {
 			while (this.pendingBatches.length > 0 || this.drainScheduled) {
-				await new Promise<void>(resolve => queueMicrotask(resolve))
+				await new Promise<void>(resolve => setImmediate(resolve))
 			}
 			await Promise.all(this.inflight)
 		}

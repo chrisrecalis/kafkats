@@ -131,6 +131,60 @@ export class StickyAssignor implements PartitionAssignor {
 			}
 		}
 
+		// Phase 3: Rebalance toward an even distribution. Phase 1 keeps every owned
+		// partition, so without this a member that owns all partitions would starve a
+		// newly-joined member. The eager protocol revokes all partitions before
+		// reassignment anyway, so balance takes priority over full stickiness.
+		//
+		// Repeatedly move one partition from the most-loaded member to a least-loaded
+		// member that is subscribed to the partition's topic, as long as their counts
+		// differ by >= 2. Each move strictly decreases the sum of squared counts, so the
+		// loop terminates, and it converges to max-min <= 1 when subscriptions are uniform.
+		//
+		// This is a greedy, direct-move balancer: it does not perform relay/transitive
+		// moves across heterogeneous subscriptions (e.g. a owns only topic X and the only
+		// under-loaded member subscribes only to Y), so in those cases an under-loaded
+		// member that cannot directly receive the surplus may remain. That matches Kafka's
+		// own relaxed sticky guarantee (KIP-54). Critically, no subscribed member is ever
+		// starved when partitions are available — which is the bug this addresses.
+		let rebalanced = true
+		while (rebalanced) {
+			rebalanced = false
+
+			const byCount = [...members].sort((a, b) => {
+				const diff = assignments.get(b.memberId)!.size - assignments.get(a.memberId)!.size
+				if (diff !== 0) return diff
+				return a.memberId.localeCompare(b.memberId)
+			})
+
+			for (const donor of byCount) {
+				const donorAssignment = assignments.get(donor.memberId)!
+
+				// Recipients from least-loaded upward.
+				for (const recipient of [...byCount].reverse()) {
+					if (recipient.memberId === donor.memberId) continue
+
+					const recipientAssignment = assignments.get(recipient.memberId)!
+					// Only move when it improves balance (gap of >= 2).
+					if (donorAssignment.size - recipientAssignment.size < 2) continue
+
+					const recipientTopics = memberSubscriptions.get(recipient.memberId)!
+					for (const key of donorAssignment) {
+						const { topic } = parseKey(key)
+						if (!recipientTopics.has(topic)) continue
+						donorAssignment.delete(key)
+						recipientAssignment.add(key)
+						rebalanced = true
+						break
+					}
+
+					if (rebalanced) break
+				}
+
+				if (rebalanced) break
+			}
+		}
+
 		// Convert to MemberAssignment format
 		const result = new Map<string, MemberAssignment>()
 		for (const [memberId, assignedKeys] of assignments) {

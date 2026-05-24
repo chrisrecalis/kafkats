@@ -87,6 +87,18 @@ describe('varint helpers', () => {
 		expect(() => decodeVarLong(bytes)).toThrow('VARLONG is too long for 64-bit integer')
 	})
 
+	it('decodes UVARINT values >= 2^31 as unsigned, not as a negative int32', () => {
+		// 0xFFFFFFFF (4_294_967_295) encodes to these 5 bytes.
+		const maxU32 = Buffer.from([0xff, 0xff, 0xff, 0xff, 0x0f])
+		expect(decodeUVarInt(maxU32).value).toBe(4_294_967_295)
+		expect(new Decoder(maxU32).readUVarInt()).toBe(4_294_967_295)
+
+		// 2^31 exactly (0x80000000) — the boundary where a signed int32 flips negative.
+		const twoPow31 = Buffer.from([0x80, 0x80, 0x80, 0x80, 0x08])
+		expect(decodeUVarInt(twoPow31).value).toBe(2_147_483_648)
+		expect(new Decoder(twoPow31).readUVarInt()).toBe(2_147_483_648)
+	})
+
 	it('Decoder.readVarLong rejects a VARLONG that overflows 64 bits', () => {
 		// 10 continuation bytes never terminate within 64 bits. Without a shift guard the
 		// decoder over-reads past the value (failing later with a misleading underflow);
