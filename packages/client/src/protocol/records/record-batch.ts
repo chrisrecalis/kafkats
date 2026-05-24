@@ -270,6 +270,19 @@ export async function decodeRecordBatch(buffer: Buffer): Promise<DecodedRecordBa
 }
 
 /**
+ * Validate the record count read from a batch header before allocating for it.
+ *
+ * The count is an attacker-controllable int32: a negative value would make `new Array(n)` throw a
+ * raw RangeError, and an oversized value would pre-allocate a huge array. A record is at least one
+ * byte, so the count can never legitimately exceed the size of the record data.
+ */
+function validateRecordCount(recordCount: number, recordDataBytes: number): void {
+	if (recordCount < 0 || recordCount > recordDataBytes) {
+		throw new Error(`Invalid record count ${recordCount} in record batch (record data is ${recordDataBytes} bytes)`)
+	}
+}
+
+/**
  * Decode a RecordBatch from a decoder (synchronous version for no compression)
  *
  * @param decoder - The decoder to read from
@@ -321,6 +334,8 @@ export function decodeRecordBatchFromSync(
 	if (compressionType !== CompressionType.None) {
 		throw new Error('decodeRecordBatchFromSync cannot decode compressed batches')
 	}
+
+	validateRecordCount(recordCount, recordsBuffer.length)
 
 	const recordsDecoder = new Decoder(recordsBuffer)
 	const records = new Array<DecodedRecord>(recordCount)
@@ -406,6 +421,8 @@ export async function decodeRecordBatchFrom(
 		}
 		recordsBuffer = await codec.decompress(recordsBuffer)
 	}
+
+	validateRecordCount(recordCount, recordsBuffer.length)
 
 	const recordsDecoder = new Decoder(recordsBuffer)
 	const records = new Array<DecodedRecord>(recordCount)

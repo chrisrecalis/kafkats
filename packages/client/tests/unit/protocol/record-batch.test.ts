@@ -3,13 +3,22 @@ import { describe, expect, it, vi } from 'vitest'
 import {
 	createRecordBatch,
 	decodeRecordBatch,
+	decodeRecordBatchFromSync,
 	encodeRecordBatch,
+	encodeRecordBatchSync,
 	getCompressionType,
 	isControlBatch,
 	isLogAppendTime,
 	isTransactional,
 } from '@/protocol/records/record-batch.js'
 import { CompressionType } from '@/protocol/records/compression.js'
+import { Decoder } from '@/protocol/primitives/decoder.js'
+
+// Byte offset of the int32 recordCount field within an encoded record batch:
+// baseOffset(8) + batchLength(4) + partitionLeaderEpoch(4) + magic(1) + crc(4) +
+// attributes(2) + lastOffsetDelta(4) + baseTimestamp(8) + maxTimestamp(8) +
+// producerId(8) + producerEpoch(2) + baseSequence(4) = 57
+const RECORD_COUNT_OFFSET = 57
 
 function baseBatch() {
 	return createRecordBatch([
@@ -81,6 +90,27 @@ describe('record batch encoding', () => {
 		// flip a byte near the end
 		tampered[tampered.length - 1]! ^= 0xff
 		await expect(decodeRecordBatch(tampered)).rejects.toThrow('CRC mismatch')
+	})
+
+	it('rejects a negative record count instead of throwing a raw RangeError', () => {
+		const encoded = encodeRecordBatchSync(baseBatch())
+		const tampered = Buffer.from(encoded)
+		tampered.writeInt32BE(-1, RECORD_COUNT_OFFSET)
+
+		// verifyCrc:false so we reach the record-count validation rather than the CRC check.
+		expect(() => decodeRecordBatchFromSync(new Decoder(tampered), { verifyCrc: false })).toThrow(
+			'Invalid record count'
+		)
+	})
+
+	it('rejects an oversized record count that exceeds the record data size', () => {
+		const encoded = encodeRecordBatchSync(baseBatch())
+		const tampered = Buffer.from(encoded)
+		tampered.writeInt32BE(0x7fffffff, RECORD_COUNT_OFFSET)
+
+		expect(() => decodeRecordBatchFromSync(new Decoder(tampered), { verifyCrc: false })).toThrow(
+			'Invalid record count'
+		)
 	})
 
 	it('createRecordBatch uses provided base timestamp', () => {

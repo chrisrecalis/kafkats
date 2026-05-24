@@ -64,4 +64,12 @@ describe('record encoding', () => {
 		const decoded = decodeRecord(new Decoder(encodeRecord(record)), 0n, 0n)
 		expect(decoded.headers).toEqual([{ key: 'h1', value: null }])
 	})
+
+	it('rejects a negative header count instead of throwing a raw RangeError', () => {
+		// A record with no key/value/headers ends with the headerCount varint (0x00). Rewrite it
+		// to 0x01, which zig-zag decodes to -1, simulating a corrupt/hostile header count.
+		const buffer = Buffer.from(encodeRecord(createRecord(null, null)))
+		buffer[buffer.length - 1] = 0x01
+		expect(() => decodeRecord(new Decoder(buffer), 0n, 0n)).toThrow('Invalid record header count')
+	})
 })
