@@ -72,6 +72,11 @@ export class ChangelogBackedWindowStore<K, V> implements WindowStore<K, V> {
 		private readonly writer: ChangelogWriter<WindowedKey<K>, V>
 	) {}
 
+	/** The underlying store (exposed so restoration can replay changelog records into it). */
+	get innerStore(): WindowStore<K, V> {
+		return this.inner
+	}
+
 	get name(): string {
 		return this.inner.name
 	}
@@ -112,8 +117,12 @@ export class ChangelogBackedWindowStore<K, V> implements WindowStore<K, V> {
 	}
 
 	async expireOldWindows(currentTime: number): Promise<number> {
-		// Note: We don't write tombstones for expired windows as they're
-		// automatically cleaned up by Kafka's retention/compaction
+		// No per-window tombstones: the window changelog topic is configured with delete+compact and
+		// a finite retention.ms tied to the store's retention (see FlowAppImpl.setupChangelog), so the
+		// broker prunes records for expired windows — the same approximate, time-based cleanup Kafka
+		// Streams uses for windowed changelogs. It is broker wall-clock based, not stream-time exact,
+		// so restore can briefly replay a window the local store had already expired; such a window is
+		// re-expired once stream time advances far enough after restore.
 		return this.inner.expireOldWindows(currentTime)
 	}
 
@@ -142,6 +151,11 @@ export class ChangelogBackedSessionStore<K, V> implements SessionStore<K, V> {
 		private readonly inner: SessionStore<K, V>,
 		private readonly writer: ChangelogWriter<WindowedKey<K>, V>
 	) {}
+
+	/** The underlying store (exposed so restoration can replay changelog records into it). */
+	get innerStore(): SessionStore<K, V> {
+		return this.inner
+	}
 
 	get name(): string {
 		return this.inner.name

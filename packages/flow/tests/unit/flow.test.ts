@@ -1,7 +1,8 @@
 import { EventEmitter } from 'node:events'
 import { describe, expect, it, vi, afterEach } from 'vitest'
 import { KafkaClient, type Message } from '@kafkats/client'
-import { codec, flow, TimeWindows } from '../../src/index.js'
+import { codec, flow, TimeWindows, SessionWindows } from '../../src/index.js'
+import { ChangelogBackedWindowStore, ChangelogBackedSessionStore } from '../../src/state/changelog.js'
 
 type TestMessage = Omit<Message<Buffer>, 'value'> & { value: Buffer | null }
 type TestContext = { signal: AbortSignal; topic: string; partition: number; offset: bigint }
@@ -1224,5 +1225,70 @@ describe('aggregations', () => {
 		expect(results[1]).toEqual({ key: 'user1', count: 2 })
 
 		await app.close()
+	})
+})
+
+describe('windowed/session store changelog wiring', () => {
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	function internals(app: unknown): { stateStores: Map<string, unknown>; changelogTopics: Map<string, any> } {
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		return app as any
+	}
+
+	it('time-windowed aggregations create a changelog-backed window store with a registered spec', () => {
+		const { app } = createTestApp()
+
+		app.stream('events', { key: codec.string(), value: codec.json<{ type: string }>() })
+			.groupByKey()
+			.windowedBy(TimeWindows.of('10s'))
+			.count({ storeName: 'win-counts' })
+
+		const { stateStores, changelogTopics } = internals(app)
+		expect(stateStores.get('win-counts')).toBeInstanceOf(ChangelogBackedWindowStore)
+
+		const spec = changelogTopics.get('win-counts')
+		expect(spec).toBeDefined()
+		expect(spec.topicName).toBe('test-app-win-counts-changelog')
+		// The changelog key codec round-trips a WindowedKey (so restoration can decode it).
+		const encoded = spec.keyCodec.encode({ key: 'k', windowStart: 1000, windowEnd: 2000 })
+		expect(spec.keyCodec.decode(encoded)).toEqual({ key: 'k', windowStart: 1000, windowEnd: 2000 })
+		// Window changelogs use delete+compact + a finite retention (= the store retention:
+		// 10s window * 24) so the broker prunes records for expired windows, bounding the changelog
+		// and limiting restore to (approximately) live windows.
+		expect(spec.configs['cleanup.policy']).toBe('delete,compact')
+		expect(spec.configs['retention.ms']).toBe(String(10_000 * 24))
+	})
+
+	it('session-windowed aggregations create a changelog-backed session store with a registered spec', () => {
+		const { app } = createTestApp()
+
+		app.stream('events', { key: codec.string(), value: codec.json<{ type: string }>() })
+			.groupByKey()
+			.windowedBy(SessionWindows.withInactivityGap('30s'))
+			.count({ storeName: 'session-counts' })
+
+		const { stateStores, changelogTopics } = internals(app)
+		expect(stateStores.get('session-counts')).toBeInstanceOf(ChangelogBackedSessionStore)
+		expect(changelogTopics.get('session-counts')).toBeDefined()
+	})
+
+	it('threads restrictRestorationToSourcePartitions through windowedBy (re-keyed vs not)', () => {
+		const { app } = createTestApp()
+
+		// groupByKey() keeps the source key -> restoration restricted to source partitions.
+		app.stream('events', { key: codec.string(), value: codec.json<{ region: string }>() })
+			.groupByKey()
+			.windowedBy(TimeWindows.of('10s'))
+			.count({ storeName: 'by-key' })
+
+		// groupBy() re-keys -> restoration must NOT be restricted to source partitions.
+		app.stream('events2', { key: codec.string(), value: codec.json<{ region: string }>() })
+			.groupBy((_key, value) => value!.region, { key: codec.string() })
+			.windowedBy(TimeWindows.of('10s'))
+			.count({ storeName: 'by-region' })
+
+		const { changelogTopics } = internals(app)
+		expect(changelogTopics.get('by-key').restrictRestorationToSourcePartitions).toBe(true)
+		expect(changelogTopics.get('by-region').restrictRestorationToSourcePartitions).toBe(false)
 	})
 })

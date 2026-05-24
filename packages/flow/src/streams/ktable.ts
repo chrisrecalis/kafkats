@@ -1,5 +1,5 @@
 import type { KTable, KStream, KGroupedTable, Grouped, Joined, KeyValue, Produced } from '@/types.js'
-import type { KeyValueStore, StateStoreProvider } from '@/state.js'
+import type { KeyValueStore, SessionStore, StateStoreProvider, WindowStore } from '@/state.js'
 import type { Codec } from '@/codec.js'
 import {
 	PassThroughNode,
@@ -27,6 +27,26 @@ export interface FlowAppInterface {
 		sourceTopics?: Set<string>,
 		restrictRestorationToSourcePartitions?: boolean
 	): KeyValueStore<K, V>
+	/** Create (or fetch) a window store, wiring up its changelog + restoration like getOrCreateStore. */
+	getOrCreateWindowStore<K, V>(
+		name: string | undefined,
+		keyCodec: Codec<K>,
+		valueCodec: Codec<V>,
+		windowOptions: { retentionMs: number; windowSizeMs: number },
+		changelog?: boolean | import('@/changelog.js').ChangelogConfig,
+		sourceTopics?: Set<string>,
+		restrictRestorationToSourcePartitions?: boolean
+	): WindowStore<K, V>
+	/** Create (or fetch) a session store, wiring up its changelog + restoration like getOrCreateStore. */
+	getOrCreateSessionStore<K, V>(
+		name: string | undefined,
+		keyCodec: Codec<K>,
+		valueCodec: Codec<V>,
+		sessionOptions: { retentionMs: number },
+		changelog?: boolean | import('@/changelog.js').ChangelogConfig,
+		sourceTopics?: Set<string>,
+		restrictRestorationToSourcePartitions?: boolean
+	): SessionStore<K, V>
 	/** Get the next store counter value and increment */
 	nextStoreId(): number
 	/** State store provider for creating window and session stores */
