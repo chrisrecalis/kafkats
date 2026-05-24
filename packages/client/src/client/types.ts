@@ -28,6 +28,13 @@ export interface KafkaClientConfig {
 	/** Maximum number of in-flight requests per connection (default: 5) */
 	maxInFlightRequests?: number
 
+	/**
+	 * Maximum size in bytes of a single response frame. A larger declared frame is rejected as a
+	 * corrupt/desynced stream to bound memory use. Default: 1 GiB. Raise it if a single fetch
+	 * response can legitimately exceed that (very high partition counts × maxBytesPerPartition).
+	 */
+	maxFrameSize?: number
+
 	/** TLS configuration (optional) */
 	tls?: TlsConfig
 
@@ -52,6 +59,7 @@ export interface BrokerConfig {
 	connectionTimeoutMs?: number
 	requestTimeoutMs?: number
 	maxInFlightRequests?: number
+	maxFrameSize?: number
 	tls?: TlsConfig
 	sasl?: SaslConfig
 	logger?: Logger
@@ -161,6 +169,9 @@ export interface ClusterConfig {
 
 	/** Maximum in-flight requests per connection */
 	maxInFlightRequests?: number
+
+	/** Maximum size in bytes of a single response frame (default: 1 GiB). */
+	maxFrameSize?: number
 
 	/** TLS configuration */
 	tls?: TlsConfig

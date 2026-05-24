@@ -90,6 +90,7 @@ export class KafkaClient {
 			connectionTimeoutMs: config.connectionTimeoutMs,
 			requestTimeoutMs: config.requestTimeoutMs,
 			maxInFlightRequests: config.maxInFlightRequests,
+			maxFrameSize: config.maxFrameSize,
 			tls: config.tls,
 			sasl: config.sasl,
 			metadataRefreshIntervalMs: config.metadataRefreshIntervalMs,

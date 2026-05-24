@@ -105,6 +105,8 @@ export interface ConnectionConfig extends SocketConfig {
 	requestTimeoutMs?: number
 	/** Maximum number of in-flight requests per connection (default: 5) */
 	maxInFlightRequests?: number
+	/** Maximum size in bytes of a single response frame (default: 1 GiB). */
+	maxFrameSize?: number
 	/** Logger instance */
 	logger?: Logger
 }
