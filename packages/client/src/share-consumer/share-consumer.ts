@@ -612,6 +612,13 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 					needsAsync = true
 					break
 				}
+				// A failure with no batch decoded is genuine corruption (the broker returns
+				// at least one complete batch); surface it instead of silently abandoning
+				// acquired records (which would otherwise stay locked until the lock expires).
+				// A failure after >=1 batch is the expected maxBytes-truncated trailing batch.
+				if (batches.length === 0) {
+					throw new Error(`Failed to decode share-fetch record batch (corrupt data): ${(e as Error).message}`)
+				}
 				break
 			}
 		}
@@ -631,12 +638,19 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 	private async decodeRecordsAsync(data: Buffer): Promise<DecodedRecord[]> {
 		const decoder = new Decoder(data)
 		const out: DecodedRecord[] = []
+		let decoded = 0
 		while (decoder.remaining() > 0) {
 			try {
 				const batch = await decodeRecordBatchFrom(decoder, { assumeSequentialOffsets: true })
+				decoded++
 				if (isControlBatch(batch.attributes)) continue
 				out.push(...batch.records)
-			} catch {
+			} catch (e) {
+				// See decodeRecords: surface genuine corruption (no batch decoded) instead of
+				// silently abandoning acquired records; a later failure is the truncated tail.
+				if (decoded === 0) {
+					throw new Error(`Failed to decode share-fetch record batch (corrupt data): ${(e as Error).message}`)
+				}
 				break
 			}
 		}

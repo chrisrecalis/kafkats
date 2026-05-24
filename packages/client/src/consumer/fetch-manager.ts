@@ -840,7 +840,14 @@ export class FetchManager {
 					needsAsync = true
 					break
 				}
-				// Other errors mean end of valid data
+				// A decode failure AFTER at least one batch is the expected maxBytes-truncated
+				// trailing batch — stop and re-fetch it next round. A failure with NO batch
+				// decoded is genuine corruption (the broker always returns at least one
+				// complete batch), so surface it instead of silently dropping the partition's
+				// records.
+				if (batches.length === 0) {
+					throw new Error(`Failed to decode record batch (corrupt data): ${(e as Error).message}`)
+				}
 				break
 			}
 		}
@@ -878,7 +885,12 @@ export class FetchManager {
 					assumeSequentialOffsets: true,
 				})
 				batches.push(batch)
-			} catch {
+			} catch (e) {
+				// See decodeRecords: a failure with no batch decoded is genuine corruption,
+				// not a truncated trailing batch — surface it rather than dropping records.
+				if (batches.length === 0) {
+					throw new Error(`Failed to decode record batch (corrupt data): ${(e as Error).message}`)
+				}
 				break
 			}
 		}
