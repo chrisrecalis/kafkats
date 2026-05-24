@@ -110,4 +110,24 @@ describe('record encoding', () => {
 			expect(decoded.timestamp).toBe(BigInt(delta))
 		}
 	)
+	it('gives each header-less record its own headers array (no shared-array aliasing)', () => {
+		const a = decodeRecord(new Decoder(encodeRecord(createRecord('k', 'v'))), 0n, 0n)
+		const b = decodeRecord(new Decoder(encodeRecord(createRecord('k', 'v'))), 0n, 0n)
+		expect(a.headers).toEqual([])
+		expect(b.headers).toEqual([])
+
+		// Mutating one header-less record's headers must not affect another.
+		a.headers.push({ key: 'x', value: null })
+		expect(a.headers).toHaveLength(1)
+		expect(b.headers).toEqual([])
+		expect(a.headers).not.toBe(b.headers)
+	})
+
+	it('decodeRecordInBatch (fast path) also gives each header-less record its own array', () => {
+		const a = decodeRecordInBatch(new Decoder(encodeRecord(createRecord('k', 'v'))), 0n, 0n)
+		const b = decodeRecordInBatch(new Decoder(encodeRecord(createRecord('k', 'v'))), 1n, 0n)
+		a.headers.push({ key: 'x', value: null })
+		expect(b.headers).toEqual([])
+		expect(a.headers).not.toBe(b.headers)
+	})
 })
