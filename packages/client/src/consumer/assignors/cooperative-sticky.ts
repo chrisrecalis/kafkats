@@ -221,55 +221,46 @@ export class CooperativeStickyAssignor implements PartitionAssignor {
 			}
 		}
 
-		// Phase 3: Rebalance - move partitions from overloaded to underloaded members
-		// This handles the case where A owns all partitions and B joins
-		// Without this, sticky phase keeps all with A and B gets nothing
-		const totalPartitions = allPartitions.length
-		const memberCount = members.length
-		const idealCount = Math.floor(totalPartitions / memberCount)
-		const extra = totalPartitions % memberCount // some members get idealCount + 1
-
-		// Keep rebalancing until balanced (max difference of 1 between any two members)
+		// Phase 3: Rebalance toward an even distribution. The sticky phase keeps every owned
+		// partition, so without this a member that owns all partitions would starve a
+		// newly-joined member.
+		//
+		// Repeatedly move one partition from the most-loaded member to a least-loaded member
+		// that is subscribed to the partition's topic, as long as their counts differ by >= 2.
+		// Each move strictly decreases the sum of squared counts, so the loop terminates, and it
+		// converges to max-min <= 1 when subscriptions are uniform. A fixed idealCount/extra cap
+		// (the previous approach) wrongly let every member rise to idealCount+1, leaving e.g.
+		// {2,2,0} for 4 partitions / 3 members — a stable point that starves the third member.
+		//
+		// This is a greedy, direct-move balancer: it does not perform relay/transitive moves
+		// across heterogeneous subscriptions, matching Kafka's relaxed sticky guarantee (KIP-54).
 		let rebalanced = true
 		while (rebalanced) {
 			rebalanced = false
 
-			// Sort members by count descending to find overloaded
-			const membersByCount = [...members].sort((a, b) => {
+			const byCount = [...members].sort((a, b) => {
 				const diff = assignments.get(b.memberId)!.size - assignments.get(a.memberId)!.size
 				if (diff !== 0) return diff
 				return a.memberId.localeCompare(b.memberId)
 			})
 
-			for (const overloaded of membersByCount) {
-				const overloadedAssignment = assignments.get(overloaded.memberId)!
-				// Max this member should have
-				const maxForMember = idealCount + (extra > 0 ? 1 : 0)
+			for (const donor of byCount) {
+				const donorAssignment = assignments.get(donor.memberId)!
 
-				if (overloadedAssignment.size <= maxForMember) {
-					continue // Not overloaded
-				}
+				// Recipients from least-loaded upward.
+				for (const recipient of [...byCount].reverse()) {
+					if (recipient.memberId === donor.memberId) continue
 
-				// Find an underloaded member to give a partition to
-				for (const underloaded of [...membersByCount].reverse()) {
-					if (underloaded.memberId === overloaded.memberId) continue
+					const recipientAssignment = assignments.get(recipient.memberId)!
+					// Only move when it improves balance (gap of >= 2).
+					if (donorAssignment.size - recipientAssignment.size < 2) continue
 
-					const underloadedAssignment = assignments.get(underloaded.memberId)!
-					const underloadedTopics = memberSubscriptions.get(underloaded.memberId)!
-
-					// Check if underloaded can accept more
-					if (underloadedAssignment.size >= idealCount) {
-						continue // Not underloaded enough
-					}
-
-					// Find a partition to move (prefer non-sticky ones, but any will do)
-					for (const key of overloadedAssignment) {
+					const recipientTopics = memberSubscriptions.get(recipient.memberId)!
+					for (const key of donorAssignment) {
 						const { topic } = parseKey(key)
-						if (!underloadedTopics.has(topic)) continue
-
-						// Move this partition
-						overloadedAssignment.delete(key)
-						underloadedAssignment.add(key)
+						if (!recipientTopics.has(topic)) continue
+						donorAssignment.delete(key)
+						recipientAssignment.add(key)
 						rebalanced = true
 						break
 					}
