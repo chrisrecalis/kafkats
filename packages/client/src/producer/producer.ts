@@ -1157,6 +1157,20 @@ export class Producer extends EventEmitter<ProducerEvents> {
 					],
 				})
 
+				// A top-level error (v4+) means the broker rejected the whole request; the
+				// per-partition results are empty/meaningless, so check it before they are.
+				if (response.errorCode !== ErrorCode.None) {
+					if (isCoordinatorErrorCode(response.errorCode)) {
+						this.cluster.invalidateCoordinator('TRANSACTION', this.config.transactionalId!)
+						coordinator = await this.cluster.getCoordinator('TRANSACTION', this.config.transactionalId!)
+					}
+
+					throw new KafkaProtocolError(
+						response.errorCode,
+						`AddPartitionsToTxn failed for transaction ${this.config.transactionalId}`
+					)
+				}
+
 				for (const topicResult of response.results) {
 					for (const partitionResult of topicResult.resultsByPartition) {
 						if (partitionResult.errorCode === ErrorCode.None) {
