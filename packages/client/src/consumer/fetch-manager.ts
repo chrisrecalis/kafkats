@@ -200,6 +200,37 @@ class FetchBuffer {
 		this.queue = filtered
 		this.bufferedBytes = newBytes
 	}
+
+	/**
+	 * Remove buffered data for specific partitions, returning the earliest buffered record offset
+	 * per partition that had buffered data. Used by pause(): the buffered records were never
+	 * delivered but the fetch offset already advanced past them, so the caller rewinds to the
+	 * earliest offset to re-fetch (and re-deliver) them on resume instead of dropping them.
+	 */
+	removePartitionsReturningEarliest(partitions: Array<{ topic: string; partition: number }>): Map<string, bigint> {
+		const earliest = new Map<string, bigint>()
+		if (partitions.length === 0) return earliest
+		const keysToRemove = new Set(partitions.map(p => tpKey(p.topic, p.partition)))
+		let newBytes = 0
+		const filtered: CompletedFetch[] = []
+		for (const f of this.queue) {
+			const key = tpKey(f.topic, f.partition)
+			if (!keysToRemove.has(key)) {
+				filtered.push(f)
+				newBytes += f.byteSize
+				continue
+			}
+			for (const record of f.records) {
+				const current = earliest.get(key)
+				if (current === undefined || record.offset < current) {
+					earliest.set(key, record.offset)
+				}
+			}
+		}
+		this.queue = filtered
+		this.bufferedBytes = newBytes
+		return earliest
+	}
 }
 
 /**
@@ -382,16 +413,27 @@ export class FetchManager {
 			partitions: formatPartitions(partitions),
 		})
 
+		// Clear buffered records for paused partitions so they are not delivered. They were never
+		// delivered but the fetch offset already advanced past them, so rewind to the earliest
+		// buffered offset â otherwise those records are lost (never delivered, never re-fetched).
+		const earliest = this.fetchBuffer?.removePartitionsReturningEarliest(partitions) ?? new Map<string, bigint>()
+
 		for (const tp of partitions) {
 			const key = tpKey(tp.topic, tp.partition)
 			const state = this.partitionStates.get(key)
 			if (state) {
 				state.paused = true
+				const earliestBuffered = earliest.get(key)
+				if (earliestBuffered !== undefined && earliestBuffered < state.offset) {
+					state.offset = earliestBuffered
+					// Fence any in-flight fetch issued at the old (higher) position. The pause flag
+					// alone is cleared on resume, so without bumping the epoch a stale fetch that
+					// resolves after resume would buffer at the old offset and advance past the
+					// rewound records, losing them. The very bug this rewind prevents.
+					state.fetchEpoch++
+				}
 			}
 		}
-
-		// Clear buffered records for paused partitions to ensure they are not delivered
-		this.fetchBuffer?.removePartitions(partitions)
 	}
 
 	/**
@@ -477,7 +519,7 @@ export class FetchManager {
 					}
 					// Records buffered from the now-invalid position precede (or are unrelated
 					// to) the reset offset; delivering them would violate the reset. Discard them
-					// BEFORE the listOffsets round-trip below — otherwise a concurrent poll() could
+					// BEFORE the listOffsets round-trip below â otherwise a concurrent poll() could
 					// drain the stale records while we await, or a transient lookup failure could
 					// skip the clear entirely.
 					this.fetchBuffer?.removePartitions([{ topic: state.topic, partition: state.partition }])
@@ -846,7 +888,7 @@ export class FetchManager {
 					break
 				}
 				// A decode failure AFTER at least one batch is the expected maxBytes-truncated
-				// trailing batch — stop and re-fetch it next round. A failure with NO batch
+				// trailing batch â stop and re-fetch it next round. A failure with NO batch
 				// decoded is genuine corruption (the broker always returns at least one
 				// complete batch), so surface it instead of silently dropping the partition's
 				// records.
@@ -892,7 +934,7 @@ export class FetchManager {
 				batches.push(batch)
 			} catch (e) {
 				// See decodeRecords: a failure with no batch decoded is genuine corruption,
-				// not a truncated trailing batch — surface it rather than dropping records.
+				// not a truncated trailing batch â surface it rather than dropping records.
 				if (batches.length === 0) {
 					throw new Error(`Failed to decode record batch (corrupt data): ${(e as Error).message}`)
 				}
