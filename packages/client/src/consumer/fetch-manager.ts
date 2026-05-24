@@ -470,25 +470,30 @@ export class FetchManager {
 		switch (errorCode) {
 			case ErrorCode.OffsetOutOfRange:
 				if (this.offsetManager && this.autoOffsetReset) {
-					// Capture the epoch across the (awaited) offset lookup: if a seek lands
-					// while we resolve the reset offset, the seek takes precedence and we must
-					// not overwrite its position with the reset.
-					const epochBeforeReset = state.fetchEpoch
-					let resetOffset: bigint | null = null
-					switch (this.autoOffsetReset) {
-						case 'earliest':
-							resetOffset = await this.offsetManager.getEarliestOffset(state.topic, state.partition)
-							break
-						case 'latest':
-							resetOffset = await this.offsetManager.getLatestOffset(state.topic, state.partition)
-							break
-						case 'none':
-							throw new Error(
-								`Offset out of range for ${state.topic}-${state.partition} at offset ${state.offset}`
-							)
+					if (this.autoOffsetReset === 'none') {
+						throw new Error(
+							`Offset out of range for ${state.topic}-${state.partition} at offset ${state.offset}`
+						)
 					}
-					if (resetOffset !== null && state.fetchEpoch === epochBeforeReset) {
-						state.offset = resetOffset
+					// Records buffered from the now-invalid position precede (or are unrelated
+					// to) the reset offset; delivering them would violate the reset. Discard them
+					// BEFORE the listOffsets round-trip below — otherwise a concurrent poll() could
+					// drain the stale records while we await, or a transient lookup failure could
+					// skip the clear entirely.
+					this.fetchBuffer?.removePartitions([{ topic: state.topic, partition: state.partition }])
+
+					// Capture the epoch across the (awaited) offset lookup: if a seek lands while we
+					// resolve the reset offset, the seek takes precedence and we must not overwrite
+					// its position with the reset.
+					{
+						const epochBeforeReset = state.fetchEpoch
+						const resetOffset =
+							this.autoOffsetReset === 'earliest'
+								? await this.offsetManager.getEarliestOffset(state.topic, state.partition)
+								: await this.offsetManager.getLatestOffset(state.topic, state.partition)
+						if (state.fetchEpoch === epochBeforeReset) {
+							state.offset = resetOffset
+						}
 					}
 				}
 				break
