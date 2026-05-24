@@ -10,6 +10,7 @@
 import type { Cluster } from '@/client/cluster.js'
 import type { Broker } from '@/client/broker.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
+import { KafkaProtocolError } from '@/client/errors.js'
 import {
 	decodeRecordBatchFrom,
 	decodeRecordBatchFromSync,
@@ -292,6 +293,10 @@ export class FetchManager {
 	// Buffered poll mode fields
 	private fetchBuffer: FetchBuffer | null = null
 	private brokerInFlight: Map<number, boolean> = new Map()
+	// A fatal, non-retriable fetch error (e.g. CORRUPT_MESSAGE) surfaced to the next poll().
+	// The background fetch loop swallows rejected fetches (logs only), so fatal per-partition
+	// errors are stashed here and re-thrown from poll() rather than silently dropping data.
+	private pendingError: Error | null = null
 
 	constructor(
 		cluster: Cluster,
@@ -544,6 +549,17 @@ export class FetchManager {
 			case ErrorCode.UnknownTopicOrPartition:
 				state.cachedLeader = null // Invalidate cached leader
 				await this.cluster.refreshMetadata([state.topic])
+				break
+
+			case ErrorCode.CorruptMessage:
+				// Re-fetching the same offset yields the same corrupt record, so this is not
+				// retriable. Surface it to the consumer (via the next poll()) instead of logging
+				// and dropping the partition's data; the position is left unchanged so the user can
+				// seek past the bad offset to recover.
+				this.pendingError = new KafkaProtocolError(
+					ErrorCode.CorruptMessage,
+					`${state.topic}-${state.partition} at offset ${state.offset}`
+				)
 				break
 
 			default:
@@ -820,6 +836,10 @@ export class FetchManager {
 	 * so subsequent polls return new records.
 	 */
 	async poll(): Promise<PartitionBatch[]> {
+		// Surface a fatal fetch error (e.g. CORRUPT_MESSAGE) recorded by the background loop.
+		// Cleared once thrown; if the condition persists the next fetch re-records it.
+		this.throwPendingError()
+
 		// Lazy initialization: start background fetch loop on first call
 		if (!this.fetchBuffer) {
 			const maxBufferedBytes = this.config.maxBufferedBytes ?? this.config.maxBytesPerPartition * 10
@@ -838,7 +858,19 @@ export class FetchManager {
 		// Wait for data to arrive (up to maxWaitMs)
 		const hasData = await this.fetchBuffer.waitForData(this.config.maxWaitMs, this.abortController?.signal)
 
+		// A fatal error may have been recorded by the background loop while we waited (it adds no
+		// data, so the waiter isn't signalled). Surface it now rather than returning an empty poll.
+		this.throwPendingError()
+
 		return hasData ? this.drainBuffer() : []
+	}
+
+	/** Throw and clear any fatal fetch error recorded by the background loop. No-op otherwise. */
+	private throwPendingError(): void {
+		if (!this.pendingError) return
+		const error = this.pendingError
+		this.pendingError = null
+		throw error
 	}
 
 	/**
