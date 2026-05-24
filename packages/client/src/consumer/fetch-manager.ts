@@ -212,6 +212,10 @@ interface PartitionState {
 	paused: boolean
 	abortController: AbortController // Per-partition abort signal for incremental control
 	cachedLeader: Broker | null // Cached leader broker - invalidated on NotLeaderOrFollower
+	// Bumped by seek(). A fetch captures the epoch at issue time; a response whose
+	// partition epoch changed is dropped, so a seek that lands mid-flight is not
+	// clobbered by the stale response advancing the offset.
+	fetchEpoch: number
 }
 
 /**
@@ -302,6 +306,7 @@ export class FetchManager {
 				paused: false,
 				abortController: new AbortController(),
 				cachedLeader: null,
+				fetchEpoch: 0,
 			}
 			this.partitionStates.set(key, state)
 		}
@@ -333,6 +338,7 @@ export class FetchManager {
 				paused: false,
 				abortController: new AbortController(),
 				cachedLeader: null,
+				fetchEpoch: 0,
 			}
 			this.partitionStates.set(key, state)
 		}
@@ -429,6 +435,10 @@ export class FetchManager {
 				newOffset: String(offset),
 			})
 			state.offset = offset
+			// Fence any in-flight fetch issued at the old position, and drop buffered
+			// records from before the seek, so neither clobbers the new position.
+			state.fetchEpoch++
+			this.fetchBuffer?.removePartitions([{ topic, partition }])
 		} else {
 			this.logger.warn('seek attempted on unassigned partition', { topic, partition })
 		}
@@ -460,17 +470,25 @@ export class FetchManager {
 		switch (errorCode) {
 			case ErrorCode.OffsetOutOfRange:
 				if (this.offsetManager && this.autoOffsetReset) {
+					// Capture the epoch across the (awaited) offset lookup: if a seek lands
+					// while we resolve the reset offset, the seek takes precedence and we must
+					// not overwrite its position with the reset.
+					const epochBeforeReset = state.fetchEpoch
+					let resetOffset: bigint | null = null
 					switch (this.autoOffsetReset) {
 						case 'earliest':
-							state.offset = await this.offsetManager.getEarliestOffset(state.topic, state.partition)
+							resetOffset = await this.offsetManager.getEarliestOffset(state.topic, state.partition)
 							break
 						case 'latest':
-							state.offset = await this.offsetManager.getLatestOffset(state.topic, state.partition)
+							resetOffset = await this.offsetManager.getLatestOffset(state.topic, state.partition)
 							break
 						case 'none':
 							throw new Error(
 								`Offset out of range for ${state.topic}-${state.partition} at offset ${state.offset}`
 							)
+					}
+					if (resetOffset !== null && state.fetchEpoch === epochBeforeReset) {
+						state.offset = resetOffset
 					}
 				}
 				break
@@ -644,15 +662,20 @@ export class FetchManager {
 		if (!this.fetchBuffer) return
 
 		// Map response entries back to the in-flight state we issued the fetch
-		// against. Used to fence stale responses via state.abortController.
+		// against. Used to fence stale responses via state.abortController and fetchEpoch.
 		const inflightStateByKey = new Map<string, PartitionState>()
+		// Epoch captured at issue time; a seek during the fetch bumps state.fetchEpoch,
+		// so the stale response is dropped instead of clobbering the new position.
+		const issuedEpochByKey = new Map<string, number>()
 		const topicsMap = new Map<string, Array<{ state: PartitionState }>>()
 		for (const state of partitions) {
 			if (!topicsMap.has(state.topic)) {
 				topicsMap.set(state.topic, [])
 			}
 			topicsMap.get(state.topic)!.push({ state })
-			inflightStateByKey.set(tpKey(state.topic, state.partition), state)
+			const key = tpKey(state.topic, state.partition)
+			inflightStateByKey.set(key, state)
+			issuedEpochByKey.set(key, state.fetchEpoch)
 		}
 
 		const topics = Array.from(topicsMap.entries()).map(([topic, parts]) => ({
@@ -681,10 +704,17 @@ export class FetchManager {
 			for (const partitionResponse of topicResponse.partitions) {
 				const key = tpKey(topicResponse.topic, partitionResponse.partitionIndex)
 				const state = inflightStateByKey.get(key)
-				// Fence: state was revoked, or the partition was paused, while the fetch was
-				// in flight. For pause we drop the records without advancing the offset so
-				// they are re-fetched on resume.
-				if (!state || state.abortController.signal.aborted || state.paused) continue
+				// Fence: state was revoked, the partition was paused, or a seek changed the fetch
+				// position while the fetch was in flight. Drop the records without advancing the
+				// offset so they are re-fetched (on resume / from the post-seek position) instead
+				// of being clobbered.
+				if (
+					!state ||
+					state.abortController.signal.aborted ||
+					state.paused ||
+					state.fetchEpoch !== issuedEpochByKey.get(key)
+				)
+					continue
 
 				if (partitionResponse.errorCode !== ErrorCode.None) {
 					await this.handleFetchError(state, partitionResponse.errorCode)
@@ -700,8 +730,13 @@ export class FetchManager {
 					)
 					let records = decodeResult instanceof Promise ? await decodeResult : decodeResult
 
-					// decodeRecords may have awaited; re-fence (revoked or paused mid-decode).
-					if (state.abortController.signal.aborted || state.paused) continue
+					// decodeRecords may have awaited; re-fence (revoked, paused, or seeked mid-decode).
+					if (
+						state.abortController.signal.aborted ||
+						state.paused ||
+						state.fetchEpoch !== issuedEpochByKey.get(key)
+					)
+						continue
 
 					records = filterRecordsFromOffset(records, fetchOffset)
 
