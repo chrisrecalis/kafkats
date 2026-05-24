@@ -286,5 +286,28 @@ describe('StickyAssignor', () => {
 			expect(aTotal).toBe(2)
 			expect(bTotal).toBe(2)
 		})
+
+		it('relays surplus through an intermediary when heterogeneous subscriptions block a direct move', () => {
+			// topics X=[0,1], Y=[0]. a owns both X (2); b owns Y (1); c idle (0).
+			// a cannot give to c (c is not subscribed to X) and a->b differs by only 1, so a
+			// purely direct balancer is stuck at {2,1,0}. Balancing must relay: a hands an X to
+			// b, b hands its Y to c, yielding {1,1,1}.
+			const members = [
+				member('a', ['X'], [{ topic: 'X', partitions: [0, 1] }]),
+				member('b', ['X', 'Y'], [{ topic: 'Y', partitions: [0] }]),
+				member('c', ['Y'], []),
+			]
+			const partitions = new Map([
+				['X', [0, 1]],
+				['Y', [0]],
+			])
+			const assignments = stickyAssignor.assign(members, partitions)
+
+			const sizes = ['a', 'b', 'c'].map(id => getAllPartitions(assignments, id).size)
+			expect(Math.max(...sizes) - Math.min(...sizes)).toBeLessThanOrEqual(1)
+			expect(getAllPartitions(assignments, 'c').size).toBe(1)
+			// c only ever holds a Y partition (its sole subscription).
+			expect(getPartitions(assignments, 'c', 'Y')).toEqual([0])
+		})
 	})
 })
