@@ -106,6 +106,9 @@ export class Decoder implements IDecoder {
 			byte = this.buffer[this.position++]!
 			value |= BigInt(byte & 0x7f) << shift
 			shift += 7n
+			if (shift > 63n && (byte & 0x80) !== 0) {
+				throw new Error('VARLONG is too long for 64-bit integer')
+			}
 		} while ((byte & 0x80) !== 0)
 
 		return zigZagDecode64(value)
@@ -128,7 +131,9 @@ export class Decoder implements IDecoder {
 			}
 		} while ((byte & 0x80) !== 0)
 
-		return value
+		// `value |= ... << shift` accumulates in a signed int32, so a UVARINT >= 2^31
+		// would otherwise read back negative. Coerce to unsigned.
+		return value >>> 0
 	}
 
 	readString(): string {

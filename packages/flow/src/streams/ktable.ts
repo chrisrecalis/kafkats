@@ -11,7 +11,13 @@ import {
 	type OutputProcessor,
 } from '@/processors/index.js'
 import { TableGroupByNode, type GroupedTableMapping, groupedTableMappingCodec } from '@/processors/table.js'
-import { TableTableJoinNode, TableTableLeftJoinNode, TableTableOuterJoinRightNode } from '@/processors/joins/index.js'
+import {
+	TableTableJoinNode,
+	TableTableLeftJoinNode,
+	TableTableLeftJoinOtherNode,
+	TableTableOuterJoinLeftNode,
+	TableTableOuterJoinRightNode,
+} from '@/processors/joins/index.js'
 import { KGroupedTableImpl } from '@/streams/grouped.js'
 // Note: Circular import with kstream.ts - ESM handles this at runtime
 import { KStreamImpl } from '@/streams/kstream.js'
@@ -188,11 +194,10 @@ export class KTableImpl<K, V> implements KTable<K, V> {
 		this.node.connect(leftJoinNode)
 		leftJoinNode.connect(mergeNode)
 
-		// When other (right) table updates, look up this (left) table - inner join behavior
-		// (only emit if left side exists)
-		const rightJoinNode = new TableTableJoinNode<K, V2, V, VR>(this.storeRef, (rightVal, leftVal) =>
-			joiner(leftVal, rightVal)
-		)
+		// When other (right) table updates, look up this (left) table. The result only exists
+		// while the left row exists; a right-side tombstone re-emits joiner(left, null) instead
+		// of deleting the still-valid left row.
+		const rightJoinNode = new TableTableLeftJoinOtherNode<K, V, V2, VR>(this.storeRef, joiner)
 		otherTable.node.connect(rightJoinNode)
 		rightJoinNode.connect(mergeNode)
 
@@ -218,10 +223,10 @@ export class KTableImpl<K, V> implements KTable<K, V> {
 		// Create a PassThrough node to merge results from both join paths
 		const mergeNode = new PassThroughNode<K, VR>()
 
-		// When this (left) table updates, look up other (right) table - left join
-		const leftJoinNode = new TableTableLeftJoinNode<K, V, V2, VR>(otherTable.storeRef, (leftVal, rightVal) =>
-			joiner(leftVal, rightVal)
-		)
+		// When this (left) table updates, look up other (right) table. A left-side tombstone
+		// only deletes the result when the right side is also absent; otherwise it re-emits
+		// joiner(null, right).
+		const leftJoinNode = new TableTableOuterJoinLeftNode<K, V, V2, VR>(otherTable.storeRef, joiner)
 		this.node.connect(leftJoinNode)
 		leftJoinNode.connect(mergeNode)
 

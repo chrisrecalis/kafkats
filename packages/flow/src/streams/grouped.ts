@@ -9,6 +9,7 @@ import {
 	WindowedReduceNode,
 	SessionAggregateNode,
 	SessionReduceNode,
+	WINDOW_STORE_RETENTION_MULTIPLIER,
 } from '@/processors/aggregation.js'
 import {
 	TableDeltaCountNode,
@@ -210,7 +211,7 @@ export class WindowedKGroupedStreamImpl<K, V> implements WindowedKGroupedStream<
 				storeName,
 				keyCodec,
 				valueCodec,
-				{ retentionMs: this.windowSizeMs * 24 },
+				{ retentionMs: this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER },
 				options?.changelog,
 				this.sourceTopics,
 				this.restrictRestorationToSourcePartitions
@@ -231,7 +232,7 @@ export class WindowedKGroupedStreamImpl<K, V> implements WindowedKGroupedStream<
 				storeName,
 				keyCodec,
 				valueCodec,
-				{ retentionMs: this.windowSizeMs * 24, windowSizeMs: this.windowSizeMs }, // Keep windows for 24x the window size
+				{ retentionMs: this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER, windowSizeMs: this.windowSizeMs }, // Keep windows for 24x the window size
 				options?.changelog,
 				this.sourceTopics,
 				this.restrictRestorationToSourcePartitions
@@ -296,7 +297,7 @@ export class WindowedKGroupedStreamImpl<K, V> implements WindowedKGroupedStream<
 				storeName,
 				keyCodec,
 				valueCodec,
-				{ retentionMs: this.windowSizeMs * 24 },
+				{ retentionMs: this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER },
 				options?.changelog,
 				this.sourceTopics,
 				this.restrictRestorationToSourcePartitions
@@ -310,7 +311,7 @@ export class WindowedKGroupedStreamImpl<K, V> implements WindowedKGroupedStream<
 				storeName,
 				keyCodec,
 				valueCodec,
-				{ retentionMs: this.windowSizeMs * 24, windowSizeMs: this.windowSizeMs },
+				{ retentionMs: this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER, windowSizeMs: this.windowSizeMs },
 				options?.changelog,
 				this.sourceTopics,
 				this.restrictRestorationToSourcePartitions
@@ -376,7 +377,7 @@ export class WindowedKGroupedStreamImpl<K, V> implements WindowedKGroupedStream<
 			storeName,
 			keyCodec,
 			valueCodec,
-			{ retentionMs: this.windowSizeMs * 24, windowSizeMs: this.windowSizeMs },
+			{ retentionMs: this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER, windowSizeMs: this.windowSizeMs },
 			options?.changelog,
 			this.sourceTopics,
 			this.restrictRestorationToSourcePartitions

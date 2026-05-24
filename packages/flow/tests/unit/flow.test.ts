@@ -727,6 +727,121 @@ describe('table-table joins', () => {
 
 		await app.close()
 	})
+
+	it('left join: deleting the right row re-emits joiner(left, null), not a tombstone', async () => {
+		const { app, consumers } = createTestApp()
+
+		type User = { name: string }
+		type Account = { balance: number }
+		type Result = { name: string; balance: number | null }
+
+		const results: Array<{ key: string | null; value: Result | null }> = []
+
+		const users = app.table('users', { key: codec.string(), value: codec.json<User>() })
+		const accounts = app.table('accounts', { key: codec.string(), value: codec.json<Account>() })
+
+		users
+			.leftJoin(accounts, (user, account) => ({
+				name: user.name,
+				balance: account?.balance ?? null,
+			}))
+			.toStream()
+			.peek((key, value) => results.push({ key, value }))
+
+		await app.start()
+		const consumer = consumers[0]!
+
+		await consumer.emitMessage('users', Buffer.from(JSON.stringify({ name: 'Alice' })), Buffer.from('user1'))
+		await consumer.emitMessage('accounts', Buffer.from(JSON.stringify({ balance: 100 })), Buffer.from('user1'))
+		// Delete the account (right tombstone). The left row still exists, so the join
+		// result must remain — re-emitted with a null balance, NOT deleted.
+		await consumer.emitMessage('accounts', null, Buffer.from('user1'))
+
+		expect(results).toHaveLength(3)
+		expect(results[0]).toEqual({ key: 'user1', value: { name: 'Alice', balance: null } })
+		expect(results[1]).toEqual({ key: 'user1', value: { name: 'Alice', balance: 100 } })
+		expect(results[2]).toEqual({ key: 'user1', value: { name: 'Alice', balance: null } })
+
+		await app.close()
+	})
+
+	it('outer join: deleting one side keeps the result from the other; deleting both tombstones', async () => {
+		const { app, consumers } = createTestApp()
+
+		type User = { name: string }
+		type Account = { balance: number }
+		type Result = { name: string | null; balance: number | null }
+
+		const results: Array<{ key: string | null; value: Result | null }> = []
+
+		const users = app.table('users', { key: codec.string(), value: codec.json<User>() })
+		const accounts = app.table('accounts', { key: codec.string(), value: codec.json<Account>() })
+
+		users
+			.outerJoin(accounts, (user, account) => ({
+				name: user?.name ?? null,
+				balance: account?.balance ?? null,
+			}))
+			.toStream()
+			.peek((key, value) => results.push({ key, value }))
+
+		await app.start()
+		const consumer = consumers[0]!
+
+		await consumer.emitMessage('users', Buffer.from(JSON.stringify({ name: 'Alice' })), Buffer.from('user1'))
+		await consumer.emitMessage('accounts', Buffer.from(JSON.stringify({ balance: 100 })), Buffer.from('user1'))
+
+		// Delete the LEFT row. The right row still exists, so the result must remain as
+		// joiner(null, account), NOT a tombstone.
+		await consumer.emitMessage('users', null, Buffer.from('user1'))
+		expect(results).toHaveLength(3)
+		expect(results[2]).toEqual({ key: 'user1', value: { name: null, balance: 100 } })
+
+		// Re-add the left, then delete the RIGHT row. The left still exists, so the result
+		// must remain as joiner(user, null), NOT a tombstone.
+		await consumer.emitMessage('users', Buffer.from(JSON.stringify({ name: 'Alice2' })), Buffer.from('user1'))
+		expect(results[3]).toEqual({ key: 'user1', value: { name: 'Alice2', balance: 100 } })
+		await consumer.emitMessage('accounts', null, Buffer.from('user1'))
+		expect(results[4]).toEqual({ key: 'user1', value: { name: 'Alice2', balance: null } })
+
+		// Now delete the left too: both sides gone -> result is a genuine tombstone.
+		await consumer.emitMessage('users', null, Buffer.from('user1'))
+		expect(results[5]).toEqual({ key: 'user1', value: null })
+
+		await app.close()
+	})
+
+	it('left join: right-side records/tombstones with no left row emit nothing', async () => {
+		const { app, consumers } = createTestApp()
+
+		type User = { name: string }
+		type Account = { balance: number }
+		type Result = { name: string; balance: number | null }
+
+		const results: Array<{ key: string | null; value: Result | null }> = []
+
+		const users = app.table('users', { key: codec.string(), value: codec.json<User>() })
+		const accounts = app.table('accounts', { key: codec.string(), value: codec.json<Account>() })
+
+		users
+			.leftJoin(accounts, (user, account) => ({
+				name: user.name,
+				balance: account?.balance ?? null,
+			}))
+			.toStream()
+			.peek((key, value) => results.push({ key, value }))
+
+		await app.start()
+		const consumer = consumers[0]!
+
+		// A right-side row (and its tombstone) for a key with no left row must produce no
+		// result at all — not even a tombstone (a left join only has rows where left exists).
+		await consumer.emitMessage('accounts', Buffer.from(JSON.stringify({ balance: 100 })), Buffer.from('user1'))
+		await consumer.emitMessage('accounts', null, Buffer.from('user1'))
+		expect(results).toHaveLength(0)
+
+		await app.close()
+	})
 })
 
 describe('table aggregations (KGroupedTable)', () => {
@@ -833,6 +948,43 @@ describe('table aggregations (KGroupedTable)', () => {
 		await app.close()
 	})
 
+	it('aggregate emits a tombstone (not the initializer) when the group becomes empty', async () => {
+		const { app, consumers } = createTestApp()
+
+		type Order = { region: string; amount: number }
+		type Stats = { total: number; count: number }
+
+		const results: Array<{ key: string | null; stats: Stats | null }> = []
+
+		app.table('orders', { key: codec.string(), value: codec.json<Order>() })
+			.groupBy((_key, value) => [value.region, value] as const, { key: codec.string() })
+			.aggregate<Stats>(
+				() => ({ total: 0, count: 0 }),
+				(_key, value, agg) => ({ total: agg.total + value.amount, count: agg.count + 1 }),
+				(_key, value, agg) => ({ total: agg.total - value.amount, count: agg.count - 1 }),
+				{ value: codec.json<Stats>() }
+			)
+			.toStream()
+			.peek((key, stats) => results.push({ key, stats }))
+
+		await app.start()
+		const consumer = consumers[0]!
+
+		await consumer.emitMessage(
+			'orders',
+			Buffer.from(JSON.stringify({ region: 'US', amount: 100 })),
+			Buffer.from('o1')
+		)
+		expect(results.at(-1)).toEqual({ key: 'US', stats: { total: 100, count: 1 } })
+
+		// Delete the only order in the group. The group is now empty, so the aggregate result
+		// must be a tombstone (consistent with count()/reduce()), NOT the initializer value.
+		await consumer.emitMessage('orders', null, Buffer.from('o1'))
+		expect(results.at(-1)).toEqual({ key: 'US', stats: null })
+
+		await app.close()
+	})
+
 	it('retracts counts when grouped key changes', async () => {
 		const { app, consumers } = createTestApp()
 
@@ -926,7 +1078,7 @@ describe('table aggregations (KGroupedTable)', () => {
 		type Order = { region: string; amount: number }
 		type Stats = { total: number; count: number }
 
-		const results: Array<{ key: string; stats: Stats }> = []
+		const results: Array<{ key: string; stats: Stats | null }> = []
 
 		app.table('orders', { key: codec.string(), value: codec.json<Order>() })
 			.groupBy((_key, value) => [value.region, value] as const, { key: codec.string() })
@@ -944,7 +1096,7 @@ describe('table aggregations (KGroupedTable)', () => {
 			)
 			.toStream()
 			.peek((key, stats) => {
-				if (key === null || stats === null) return
+				if (key === null) return
 				results.push({ key, stats })
 			})
 
@@ -960,17 +1112,18 @@ describe('table aggregations (KGroupedTable)', () => {
 		expect(results[results.length - 1]).toEqual({ key: 'US', stats: { total: 100, count: 1 } })
 
 		// Move order o1 from US to EU
-		// Should: subtract $100 from US, add $100 to EU
+		// Should: empty the US group (tombstone, since no members remain), add $100 to EU
 		await consumer.emitMessage(
 			'orders',
 			Buffer.from(JSON.stringify({ region: 'EU', amount: 100 })),
 			Buffer.from('o1')
 		)
 
-		const usRetraction = results.find(r => r.key === 'US' && r.stats.total === 0)
+		// US now has no members, so its aggregate is retracted with a tombstone.
+		const usRetraction = results.find(r => r.key === 'US' && r.stats === null)
 		expect(usRetraction).toBeDefined()
 
-		const euAdd = results.find(r => r.key === 'EU' && r.stats.total === 100)
+		const euAdd = results.find(r => r.key === 'EU' && r.stats?.total === 100)
 		expect(euAdd).toBeDefined()
 
 		await app.close()

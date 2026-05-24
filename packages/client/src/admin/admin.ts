@@ -289,10 +289,12 @@ export class Admin {
 	 *
 	 * Sends the request to the controller broker.
 	 *
+	 * Per-topic failures are reported in each result's `errorCode` (not thrown), consistent
+	 * with the other admin operations.
+	 *
 	 * @param topics - Topic names to delete
 	 * @param options - Optional timeout settings
-	 * @returns Results for each topic
-	 * @throws KafkaProtocolError if deletion fails
+	 * @returns Results for each topic, including a per-topic `errorCode`
 	 */
 	async deleteTopics(topics: string[], options?: { timeoutMs?: number }): Promise<DeleteTopicsResult[]> {
 		this.logger.debug('deleting topics', { topics })

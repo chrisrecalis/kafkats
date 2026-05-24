@@ -35,6 +35,27 @@ function makeSuccessResponse(topicId: string = TOPIC_ID, partitionIndex: number 
 	}
 }
 
+function makeResponse(partitions: Array<{ partitionIndex: number; errorCode: ErrorCode }>): ShareAcknowledgeResponse {
+	return {
+		throttleTimeMs: 0,
+		errorCode: ErrorCode.None,
+		errorMessage: null,
+		acquisitionLockTimeoutMs: 30000,
+		topics: [
+			{
+				topicId: TOPIC_ID,
+				partitions: partitions.map(p => ({
+					partitionIndex: p.partitionIndex,
+					errorCode: p.errorCode,
+					errorMessage: null,
+					currentLeader: { leaderId: 1, leaderEpoch: 0 },
+				})),
+			},
+		],
+		nodeEndpoints: [],
+	}
+}
+
 function makeAckManager(
 	sendAcknowledge: (broker: Broker, req: ShareAcknowledgeRequestWithoutEpoch) => Promise<ShareAcknowledgeResponse>
 ): AckManager {
@@ -170,5 +191,46 @@ describe('AckManager.flushAll - isRenewAck flag', () => {
 		expect(batches[0]?.firstOffset).toBe(10n)
 		expect(batches[0]?.lastOffset).toBe(12n)
 		expect(batches[0]?.acknowledgeTypes).toEqual([ACK_RENEW])
+	})
+})
+
+describe('AckManager.flushAll - cross-partition error isolation', () => {
+	it('retries a retriable partition even when another partition in the same request fails fatally', async () => {
+		let calls = 0
+		const sendAcknowledge = vi.fn(async (_broker: Broker, _req: ShareAcknowledgeRequestWithoutEpoch) => {
+			calls++
+			if (calls === 1) {
+				// One request, two partitions: P0 fails fatally (non-retriable), P1 hits a
+				// retriable leader error and should be queued for retry.
+				return makeResponse([
+					{ partitionIndex: 0, errorCode: ErrorCode.InvalidRecordState },
+					{ partitionIndex: 1, errorCode: ErrorCode.NotLeaderOrFollower },
+				])
+			}
+			// Retry attempt: the retriable partition now succeeds.
+			return makeResponse([{ partitionIndex: 1, errorCode: ErrorCode.None }])
+		})
+
+		const ackManager = makeAckManager(sendAcknowledge)
+		const p0 = ackManager.enqueue(TOPIC_NAME, TOPIC_ID, 0, 0n, ACK_ACCEPT)
+		const p1 = ackManager.enqueue(TOPIC_NAME, TOPIC_ID, 1, 0n, ACK_ACCEPT)
+		const p0Settled = p0.then(
+			() => 'resolved' as const,
+			() => 'rejected' as const
+		)
+		const p1Settled = p1.then(
+			() => 'resolved' as const,
+			() => 'rejected' as const
+		)
+
+		await ackManager.flushAll().catch(() => undefined)
+
+		// The retriable partition must NOT be rejected just because a different partition
+		// in the same request failed fatally — it must be retried and resolve.
+		expect(await p1Settled).toBe('resolved')
+		// The fatally-failed partition is rejected on its own promise.
+		expect(await p0Settled).toBe('rejected')
+		// The retriable partition was actually retried (a second ShareAcknowledge).
+		expect(sendAcknowledge).toHaveBeenCalledTimes(2)
 	})
 })

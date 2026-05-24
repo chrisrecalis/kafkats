@@ -127,9 +127,9 @@ describe('StickyAssignor', () => {
 			expect(getPartitions(assignments, 'b', 't1')).toEqual([0, 1])
 		})
 
-		it('handles new member joining with sticky assignments', () => {
-			// a owns all partitions, c joins
-			// Sticky assignor preserves a's ownership first, then assigns remaining to balance
+		it('rebalances to a joining member instead of starving it', () => {
+			// a owns all partitions, c joins owning none. The eager assignor revokes all
+			// partitions before reassignment, so it must rebalance — c must not be starved.
 			const members = [member('a', ['t'], [{ topic: 't', partitions: [0, 1, 2, 3] }]), member('c', ['t'], [])]
 			const partitions = new Map([['t', [0, 1, 2, 3]]])
 			const assignments = stickyAssignor.assign(members, partitions)
@@ -137,12 +137,12 @@ describe('StickyAssignor', () => {
 			const aPartitions = getPartitions(assignments, 'a', 't')
 			const cPartitions = getPartitions(assignments, 'c', 't')
 
-			// All partitions should be assigned
+			// All partitions assigned exactly once, balanced, and c is not starved.
 			expect(aPartitions.length + cPartitions.length).toBe(4)
-			// a keeps its sticky assignments, no new partitions to assign to c
-			// Sticky preserves ownership - a keeps all 4 since it already owns them
-			expect(aPartitions).toEqual([0, 1, 2, 3])
-			expect(cPartitions).toEqual([])
+			expect(cPartitions.length).toBeGreaterThan(0)
+			expect(Math.abs(aPartitions.length - cPartitions.length)).toBeLessThanOrEqual(1)
+			const overlap = aPartitions.filter(p => cPartitions.includes(p))
+			expect(overlap).toEqual([])
 		})
 
 		it('handles member leaving with sticky assignments', () => {
@@ -177,6 +177,38 @@ describe('StickyAssignor', () => {
 				getPartitions(assignments, 'b', 't').length +
 				getPartitions(assignments, 'c', 't').length
 			expect(total).toBe(2)
+		})
+
+		it('rebalances a fully-owned topic to max-min <= 1 across many members', () => {
+			// a owns all 6 partitions; b/c/d join. Must balance to 2/2/1/1 (max-min <= 1),
+			// not stop early at e.g. 3/1/1/1.
+			const members = [
+				member('a', ['t'], [{ topic: 't', partitions: [0, 1, 2, 3, 4, 5] }]),
+				member('b', ['t'], []),
+				member('c', ['t'], []),
+				member('d', ['t'], []),
+			]
+			const partitions = new Map([['t', [0, 1, 2, 3, 4, 5]]])
+			const assignments = stickyAssignor.assign(members, partitions)
+
+			const counts = ['a', 'b', 'c', 'd'].map(m => getAllPartitions(assignments, m).size)
+			expect(counts.reduce((s, n) => s + n, 0)).toBe(6)
+			expect(Math.max(...counts) - Math.min(...counts)).toBeLessThanOrEqual(1)
+		})
+
+		it('avoids avoidable starvation when members outnumber partitions and one owns all', () => {
+			// a owns both partitions; b/c join. Two members should get 1 and one gets 0
+			// (unavoidable), not a=2 / b=0 / c=0.
+			const members = [
+				member('a', ['t'], [{ topic: 't', partitions: [0, 1] }]),
+				member('b', ['t'], []),
+				member('c', ['t'], []),
+			]
+			const partitions = new Map([['t', [0, 1]]])
+			const assignments = stickyAssignor.assign(members, partitions)
+
+			const counts = ['a', 'b', 'c'].map(m => getAllPartitions(assignments, m).size).sort()
+			expect(counts).toEqual([0, 1, 1])
 		})
 	})
 

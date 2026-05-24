@@ -409,7 +409,6 @@ export class AckManager {
 						}
 					}
 
-					let fatalError: Error | null = null
 					for (const { partition } of items) {
 						const key = `${partition.topicId}:${partition.partitionIndex}`
 						const partitionResponse = responseByPartitionKey.get(key)
@@ -420,7 +419,6 @@ export class AckManager {
 							for (const e of partition.entries) {
 								e.reject(err)
 							}
-							fatalError ??= err
 							continue
 						}
 
@@ -453,11 +451,6 @@ export class AckManager {
 						for (const e of partition.entries) {
 							e.reject(err)
 						}
-						fatalError ??= err
-					}
-
-					if (fatalError) {
-						throw fatalError
 					}
 				} catch (error) {
 					const err = error instanceof Error ? error : new Error(String(error))
@@ -485,22 +478,18 @@ export class AckManager {
 			})
 		)
 
-		let topError: Error | null = null
+		// Each partition is settled individually by the per-partition loop above (resolve
+		// / reject inline / queue for retry). A broker task only throws on a request-level
+		// failure (network error or top-level error code), and the catch has already
+		// rejected that broker's partitions. A failure on one broker — or one partition —
+		// must NOT reject another partition's retriable acks, so we always return `retry`
+		// for the caller to retry rather than rejecting the whole map; we just log the
+		// broker-level failure here.
 		for (const r of results) {
 			if (r.status === 'rejected') {
 				const err = r.reason instanceof Error ? r.reason : new Error(String(r.reason))
-				topError ??= err
+				this.logger.error('share acknowledge failed for a broker', { error: err.message })
 			}
-		}
-
-		if (topError) {
-			for (const pending of retry.values()) {
-				for (const e of pending.entries) {
-					e.reject(topError)
-				}
-			}
-			this.logger.error('share acknowledge failed', { error: topError.message })
-			throw topError
 		}
 
 		return { retry, retryErrors }

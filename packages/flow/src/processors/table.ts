@@ -531,10 +531,11 @@ export class TableGroupedComputeAggregateNode<KSrc, K, V, A> extends Processor<K
 				}
 
 				if (!hasValues) {
-					// Keep aggregate semantics aligned with delta/subtractor behavior:
-					// no members means initializer value.
-					await store.put(key, aggregate)
-					await this.forward({ ...record, key, value: aggregate, headers: {} })
+					// No members remain in the group, so the result is retracted with a
+					// tombstone — consistent with the count and reduce recompute nodes. Emitting
+					// the initializer instead would leave a phantom entry for an empty group.
+					await store.delete(key)
+					await this.forward({ ...record, key, value: null as unknown as A, headers: {} })
 					return
 				}
 
