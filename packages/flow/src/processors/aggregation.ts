@@ -127,14 +127,19 @@ function resolveAdvanceMs(sizeMs: number, advanceMs: number): number {
 	return advance
 }
 
-type CleanupState = { lastCleanupStreamTimeMs: number; streamTimeMs: number }
+export type CleanupState = { lastCleanupStreamTimeMs: number; streamTimeMs: number }
 
 const CLEANUP_INTERVAL_MS = 60_000
 
 // Stream-time-driven retention: advance the high-water mark, fire expiry once per CLEANUP_INTERVAL_MS
 // of stream time. Caller passes the store's expire method (windows or sessions); without this, state-
-// store-backed processors leak.
-async function maybeExpire(state: CleanupState, timestamp: number, expire: (cutoff: number) => Promise<unknown>) {
+// store-backed processors leak. Shared by the windowed/session aggregation nodes and the
+// stream-stream join nodes.
+export async function maybeExpire(
+	state: CleanupState,
+	timestamp: number,
+	expire: (cutoff: number) => Promise<unknown>
+) {
 	state.streamTimeMs = Math.max(state.streamTimeMs, timestamp)
 	if (state.streamTimeMs - state.lastCleanupStreamTimeMs > CLEANUP_INTERVAL_MS) {
 		state.lastCleanupStreamTimeMs = state.streamTimeMs
