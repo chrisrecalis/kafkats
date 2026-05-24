@@ -16,6 +16,7 @@
 import type { PartitionAssignor, MemberSubscription, RebalanceProtocol } from './types.js'
 import type { MemberAssignment, TopicPartitionList } from './consumer-protocol.js'
 import { DEFAULT_PROTOCOL_VERSION } from './consumer-protocol.js'
+import { balanceByRelay } from './balance.js'
 import { tpKey, parseKey, type TopicPartition } from '@/utils/topic-partition.js'
 
 /**
@@ -221,65 +222,21 @@ export class CooperativeStickyAssignor implements PartitionAssignor {
 			}
 		}
 
-		// Phase 3: Rebalance - move partitions from overloaded to underloaded members
-		// This handles the case where A owns all partitions and B joins
-		// Without this, sticky phase keeps all with A and B gets nothing
-		const totalPartitions = allPartitions.length
-		const memberCount = members.length
-		const idealCount = Math.floor(totalPartitions / memberCount)
-		const extra = totalPartitions % memberCount // some members get idealCount + 1
-
-		// Keep rebalancing until balanced (max difference of 1 between any two members)
-		let rebalanced = true
-		while (rebalanced) {
-			rebalanced = false
-
-			// Sort members by count descending to find overloaded
-			const membersByCount = [...members].sort((a, b) => {
-				const diff = assignments.get(b.memberId)!.size - assignments.get(a.memberId)!.size
-				if (diff !== 0) return diff
-				return a.memberId.localeCompare(b.memberId)
-			})
-
-			for (const overloaded of membersByCount) {
-				const overloadedAssignment = assignments.get(overloaded.memberId)!
-				// Max this member should have
-				const maxForMember = idealCount + (extra > 0 ? 1 : 0)
-
-				if (overloadedAssignment.size <= maxForMember) {
-					continue // Not overloaded
-				}
-
-				// Find an underloaded member to give a partition to
-				for (const underloaded of [...membersByCount].reverse()) {
-					if (underloaded.memberId === overloaded.memberId) continue
-
-					const underloadedAssignment = assignments.get(underloaded.memberId)!
-					const underloadedTopics = memberSubscriptions.get(underloaded.memberId)!
-
-					// Check if underloaded can accept more
-					if (underloadedAssignment.size >= idealCount) {
-						continue // Not underloaded enough
-					}
-
-					// Find a partition to move (prefer non-sticky ones, but any will do)
-					for (const key of overloadedAssignment) {
-						const { topic } = parseKey(key)
-						if (!underloadedTopics.has(topic)) continue
-
-						// Move this partition
-						overloadedAssignment.delete(key)
-						underloadedAssignment.add(key)
-						rebalanced = true
-						break
-					}
-
-					if (rebalanced) break
-				}
-
-				if (rebalanced) break
-			}
-		}
+		// Phase 3: Rebalance toward an even distribution so a newly-joined member is not
+		// starved when an existing member owns everything. Runs on the target assignment;
+		// partitions whose target owner differs from the current owner are withheld
+		// (in-transit) by the caller and assigned once released, so the protocol settles
+		// over successive rebalances.
+		//
+		// Uses the shared relay balancer: it moves surplus toward under-loaded members,
+		// relaying through intermediaries when heterogeneous subscriptions block a direct
+		// move, and converges to max-min <= 1 within each connected group of compatible
+		// subscriptions (KIP-54).
+		balanceByRelay(
+			members.map(m => m.memberId),
+			assignments,
+			memberSubscriptions
+		)
 
 		return assignments
 	}
