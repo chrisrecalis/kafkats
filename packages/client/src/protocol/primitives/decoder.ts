@@ -128,7 +128,9 @@ export class Decoder implements IDecoder {
 			}
 		} while ((byte & 0x80) !== 0)
 
-		return value
+		// `value |= ... << shift` accumulates in a signed int32, so a UVARINT >= 2^31
+		// would otherwise read back negative. Coerce to unsigned.
+		return value >>> 0
 	}
 
 	readString(): string {
