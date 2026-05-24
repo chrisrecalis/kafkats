@@ -123,6 +123,27 @@ describe('InMemoryWindowStore', () => {
 
 		expect(results).toHaveLength(2)
 	})
+
+	it('range() preserves time order across the sign boundary (negative window starts)', async () => {
+		// Window times must be encoded order-preserving so range() (which selects by
+		// serialized-key byte comparison) is correct and consistent with the LMDB store.
+		// Signed big-endian would sort negative starts after positive ones, breaking a
+		// range that spans the sign boundary.
+		for (const windowStart of [200, -100, 0, -200, 100]) {
+			await store.put({ key: 'k', windowStart, windowEnd: windowStart + 10 }, windowStart)
+		}
+
+		const got: number[] = []
+		for await (const [, value] of store.range(
+			{ key: 'k', windowStart: -1000, windowEnd: -1000 },
+			{ key: 'k', windowStart: 1000, windowEnd: 1010 }
+		)) {
+			got.push(value)
+		}
+
+		// All five windows fall inside the range, returned in ascending windowStart order.
+		expect(got).toEqual([-200, -100, 0, 100, 200])
+	})
 })
 
 describe('InMemorySessionStore', () => {
