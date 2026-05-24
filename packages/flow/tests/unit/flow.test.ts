@@ -832,6 +832,43 @@ describe('table aggregations (KGroupedTable)', () => {
 		await app.close()
 	})
 
+	it('aggregate emits a tombstone (not the initializer) when the group becomes empty', async () => {
+		const { app, consumers } = createTestApp()
+
+		type Order = { region: string; amount: number }
+		type Stats = { total: number; count: number }
+
+		const results: Array<{ key: string | null; stats: Stats | null }> = []
+
+		app.table('orders', { key: codec.string(), value: codec.json<Order>() })
+			.groupBy((_key, value) => [value.region, value] as const, { key: codec.string() })
+			.aggregate<Stats>(
+				() => ({ total: 0, count: 0 }),
+				(_key, value, agg) => ({ total: agg.total + value.amount, count: agg.count + 1 }),
+				(_key, value, agg) => ({ total: agg.total - value.amount, count: agg.count - 1 }),
+				{ value: codec.json<Stats>() }
+			)
+			.toStream()
+			.peek((key, stats) => results.push({ key, stats }))
+
+		await app.start()
+		const consumer = consumers[0]!
+
+		await consumer.emitMessage(
+			'orders',
+			Buffer.from(JSON.stringify({ region: 'US', amount: 100 })),
+			Buffer.from('o1')
+		)
+		expect(results.at(-1)).toEqual({ key: 'US', stats: { total: 100, count: 1 } })
+
+		// Delete the only order in the group. The group is now empty, so the aggregate result
+		// must be a tombstone (consistent with count()/reduce()), NOT the initializer value.
+		await consumer.emitMessage('orders', null, Buffer.from('o1'))
+		expect(results.at(-1)).toEqual({ key: 'US', stats: null })
+
+		await app.close()
+	})
+
 	it('retracts counts when grouped key changes', async () => {
 		const { app, consumers } = createTestApp()
 
@@ -925,7 +962,7 @@ describe('table aggregations (KGroupedTable)', () => {
 		type Order = { region: string; amount: number }
 		type Stats = { total: number; count: number }
 
-		const results: Array<{ key: string; stats: Stats }> = []
+		const results: Array<{ key: string; stats: Stats | null }> = []
 
 		app.table('orders', { key: codec.string(), value: codec.json<Order>() })
 			.groupBy((_key, value) => [value.region, value] as const, { key: codec.string() })
@@ -943,7 +980,7 @@ describe('table aggregations (KGroupedTable)', () => {
 			)
 			.toStream()
 			.peek((key, stats) => {
-				if (key === null || stats === null) return
+				if (key === null) return
 				results.push({ key, stats })
 			})
 
@@ -959,17 +996,18 @@ describe('table aggregations (KGroupedTable)', () => {
 		expect(results[results.length - 1]).toEqual({ key: 'US', stats: { total: 100, count: 1 } })
 
 		// Move order o1 from US to EU
-		// Should: subtract $100 from US, add $100 to EU
+		// Should: empty the US group (tombstone, since no members remain), add $100 to EU
 		await consumer.emitMessage(
 			'orders',
 			Buffer.from(JSON.stringify({ region: 'EU', amount: 100 })),
 			Buffer.from('o1')
 		)
 
-		const usRetraction = results.find(r => r.key === 'US' && r.stats.total === 0)
+		// US now has no members, so its aggregate is retracted with a tombstone.
+		const usRetraction = results.find(r => r.key === 'US' && r.stats === null)
 		expect(usRetraction).toBeDefined()
 
-		const euAdd = results.find(r => r.key === 'EU' && r.stats.total === 100)
+		const euAdd = results.find(r => r.key === 'EU' && r.stats?.total === 100)
 		expect(euAdd).toBeDefined()
 
 		await app.close()
