@@ -437,8 +437,9 @@ export class Cluster extends EventEmitter<ClusterEvents> {
 			allowAutoTopicCreation: false,
 		})
 
-		// Update metadata
-		this.metadata = this.parseMetadataResponse(response)
+		// Update metadata. A topic-scoped response only carries the requested topics, so merge it
+		// into the existing snapshot rather than replacing (which would drop every other topic).
+		this.metadata = this.parseMetadataResponse(response, topics)
 		this.emit('metadataUpdate', this.metadata)
 
 		const durationMs = Date.now() - startTime
@@ -451,7 +452,21 @@ export class Cluster extends EventEmitter<ClusterEvents> {
 		return this.metadata
 	}
 
-	private parseMetadataResponse(response: MetadataResponse): ClusterMetadata {
+	/**
+	 * Build the new cluster metadata from a MetadataResponse.
+	 *
+	 * A MetadataResponse always carries the full broker/controller/cluster view, so those are
+	 * authoritative. The topic list, however, is scoped to the requested topics: when `scopedTopics`
+	 * is set we MERGE the response topics over the existing snapshot so topics that weren't requested
+	 * are preserved (a topic-scoped refresh must not wipe the rest of the cluster view). A full
+	 * refresh (`scopedTopics` undefined) rebuilds the topic set from the response.
+	 *
+	 * Per partition, a stale (lower leader-epoch) update is ignored: an out-of-order or older
+	 * metadata response must not regress a leader the client already learned about at a higher epoch.
+	 */
+	private parseMetadataResponse(response: MetadataResponse, scopedTopics?: string[]): ClusterMetadata {
+		const existing = this.metadata
+
 		const brokers = new Map<number, BrokerInfo>()
 		for (const broker of response.brokers) {
 			brokers.set(broker.nodeId, {
@@ -462,20 +477,55 @@ export class Cluster extends EventEmitter<ClusterEvents> {
 			})
 		}
 
+		// Carry over previously-known topics for a scoped refresh; rebuild from scratch for a full one.
 		const topics = new Map<string, TopicMetadata>()
+		if (scopedTopics && existing) {
+			for (const [name, topic] of existing.topics) {
+				topics.set(name, topic)
+			}
+		}
+
+		// All-zeros topic ID: brokers that don't support topic IDs (older Metadata versions).
+		const ZERO_TOPIC_ID = '00000000-0000-0000-0000-000000000000'
+
 		for (const topic of response.topics) {
 			if (topic.errorCode === ErrorCode.None && topic.name) {
+				const prior = existing?.topics.get(topic.name)
+				// A topic deleted and recreated under the same name gets a new topic ID and its
+				// leader epochs reset to 0. Don't carry over / epoch-gate against the old incarnation
+				// in that case — only treat `prior` as the same topic when the IDs match (or topic IDs
+				// aren't in play, both zero / unknown).
+				const existingTopic =
+					prior && (topic.topicId === ZERO_TOPIC_ID || prior.topicId === topic.topicId) ? prior : undefined
 				const partitions = new Map<number, PartitionMetadata>()
 				for (const partition of topic.partitions) {
 					if (partition.errorCode === ErrorCode.None) {
-						partitions.set(partition.partitionIndex, {
-							partitionIndex: partition.partitionIndex,
-							leaderId: partition.leaderId,
-							leaderEpoch: partition.leaderEpoch,
-							replicaNodes: partition.replicaNodes,
-							isrNodes: partition.isrNodes,
-							offlineReplicas: partition.offlineReplicas,
-						})
+						const previous = existingTopic?.partitions.get(partition.partitionIndex)
+						// Keep the previously-known leader if this response carries an older epoch.
+						// leaderEpoch < 0 means "unknown" (pre-KIP-320 broker); don't use it to gate.
+						if (
+							previous &&
+							previous.leaderEpoch >= 0 &&
+							partition.leaderEpoch >= 0 &&
+							partition.leaderEpoch < previous.leaderEpoch
+						) {
+							partitions.set(partition.partitionIndex, previous)
+						} else {
+							partitions.set(partition.partitionIndex, {
+								partitionIndex: partition.partitionIndex,
+								leaderId: partition.leaderId,
+								leaderEpoch: partition.leaderEpoch,
+								replicaNodes: partition.replicaNodes,
+								isrNodes: partition.isrNodes,
+								offlineReplicas: partition.offlineReplicas,
+							})
+						}
+					} else if (existingTopic) {
+						// Transient partition-level error: keep the partition we already knew about.
+						const previous = existingTopic.partitions.get(partition.partitionIndex)
+						if (previous) {
+							partitions.set(partition.partitionIndex, previous)
+						}
 					}
 				}
 
