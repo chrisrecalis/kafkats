@@ -177,6 +177,10 @@ export function createSnappyCodec(snappy: SnappyLib): CompressionCodec {
 	const isAsync = testResult instanceof Promise
 
 	if (isAsync) {
+		// The probe's result is discarded; swallow any rejection so it can't surface as an
+		// unhandled promise rejection (which crashes the process under the default handler).
+		testResult.catch(() => {})
+
 		// Native async library (snappy)
 		const asyncLib = snappy as SnappyNativeLib
 		return {
@@ -365,6 +369,10 @@ export function createZstdCodec(zstd: ZstdLib, options?: ZstdCodecOptions): Comp
 	const isAsync = testResult instanceof Promise
 
 	if (isAsync) {
+		// The probe's result is discarded; swallow any rejection so it can't surface as an
+		// unhandled promise rejection (which crashes the process under the default handler).
+		testResult.catch(() => {})
+
 		// Native async library (@mongodb-js/zstd, zstd-napi)
 		const asyncLib = zstd as ZstdNativeAsyncLib
 		return {

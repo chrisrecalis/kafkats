@@ -73,3 +73,39 @@ describe('compression registry', () => {
 		expect(compressionCodecs.get(CompressionType.Zstd)).toBeUndefined()
 	})
 })
+
+describe('async codec async-detection probe', () => {
+	async function expectNoUnhandledRejection(create: () => void): Promise<void> {
+		const rejections: unknown[] = []
+		const handler = (reason: unknown) => rejections.push(reason)
+		process.on('unhandledRejection', handler)
+		try {
+			create()
+			// Let the probe promise settle and Node's unhandled-rejection detection run.
+			await new Promise(resolve => setTimeout(resolve, 20))
+		} finally {
+			process.off('unhandledRejection', handler)
+		}
+		expect(rejections).toHaveLength(0)
+	}
+
+	it('does not leak an unhandled rejection when the async snappy probe rejects', async () => {
+		await expectNoUnhandledRejection(() => {
+			createSnappyCodec({
+				compress: () => Promise.reject(new Error('probe failed')),
+				uncompress: () => Promise.resolve(Buffer.alloc(0)),
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			} as any)
+		})
+	})
+
+	it('does not leak an unhandled rejection when the async zstd probe rejects', async () => {
+		await expectNoUnhandledRejection(() => {
+			createZstdCodec({
+				compress: () => Promise.reject(new Error('probe failed')),
+				decompress: () => Promise.resolve(Buffer.alloc(0)),
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			} as any)
+		})
+	})
+})
