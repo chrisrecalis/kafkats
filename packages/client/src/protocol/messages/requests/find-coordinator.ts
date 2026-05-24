@@ -52,11 +52,11 @@ export function encodeFindCoordinatorRequest(
 			encoder.writeInt8(request.keyType)
 
 			const keys = request.coordinatorKeys ?? [request.key]
-			// In flexible versions, coordinatorKeys is a compact array of structs.
-			// Each element includes the key and its own tagged-fields section.
+			// CoordinatorKeys is `[]string` in the schema: a compact array of primitive strings.
+			// Primitive array elements have NO per-element tagged-fields section (those exist only
+			// for arrays of sub-structs), so writing one corrupts the array on the broker.
 			encoder.writeCompactArray(keys, (k, enc) => {
 				enc.writeCompactString(k)
-				enc.writeEmptyTaggedFields()
 			})
 		} else {
 			// v3: single key field
