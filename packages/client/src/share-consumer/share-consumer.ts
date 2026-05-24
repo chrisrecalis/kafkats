@@ -71,6 +71,37 @@ import { pmap } from '@/utils/pmap.js'
 
 const EMPTY_BUFFER = Buffer.alloc(0)
 
+function isShareSessionError(code: ErrorCode): boolean {
+	return code === ErrorCode.ShareSessionNotFound || code === ErrorCode.InvalidShareSessionEpoch
+}
+
+/**
+ * Find a share-session-level error (ShareSessionNotFound / InvalidShareSessionEpoch) anywhere in a
+ * ShareFetch/ShareAcknowledge response — at the top level OR in any partition's `errorCode` or
+ * `acknowledgeErrorCode`. Such an error means the broker rejected the request without advancing its
+ * session epoch, so the client must reset rather than advance. A per-partition session error must be
+ * caught here (before advancing) because some callers (e.g. prefetch) discard the response entirely.
+ */
+function findShareSessionError(
+	topLevel: ErrorCode,
+	topics: Array<{ partitions: Array<{ errorCode: ErrorCode; acknowledgeErrorCode?: ErrorCode }> }>
+): ErrorCode | null {
+	if (isShareSessionError(topLevel)) {
+		return topLevel
+	}
+	for (const topic of topics) {
+		for (const partition of topic.partitions) {
+			if (isShareSessionError(partition.errorCode)) {
+				return partition.errorCode
+			}
+			if (partition.acknowledgeErrorCode !== undefined && isShareSessionError(partition.acknowledgeErrorCode)) {
+				return partition.acknowledgeErrorCode
+			}
+		}
+	}
+	return null
+}
+
 class ShareMessageAlreadyHandledError extends Error {
 	constructor(topic: string, partition: number, offset: bigint) {
 		super(`Share message ${topic}[${partition}]@${offset} already handled`)
@@ -315,12 +346,10 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 				throw e
 			}
 
-			if (
-				response.errorCode === ErrorCode.ShareSessionNotFound ||
-				response.errorCode === ErrorCode.InvalidShareSessionEpoch
-			) {
+			const sessionError = findShareSessionError(response.errorCode, response.topics)
+			if (sessionError !== null) {
 				this.resetShareSessionEpoch(broker.nodeId)
-				throw new KafkaProtocolError(response.errorCode, response.errorMessage ?? 'ShareFetch failed')
+				throw new KafkaProtocolError(sessionError, response.errorMessage ?? 'ShareFetch failed')
 			}
 
 			this.shareSessionEpochByBrokerId.set(broker.nodeId, nextShareSessionEpoch(epoch))
@@ -377,12 +406,10 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 				throw e
 			}
 
-			if (
-				response.errorCode === ErrorCode.ShareSessionNotFound ||
-				response.errorCode === ErrorCode.InvalidShareSessionEpoch
-			) {
+			const sessionError = findShareSessionError(response.errorCode, response.topics)
+			if (sessionError !== null) {
 				this.resetShareSessionEpoch(broker.nodeId)
-				throw new KafkaProtocolError(response.errorCode, response.errorMessage ?? 'ShareAcknowledge failed')
+				throw new KafkaProtocolError(sessionError, response.errorMessage ?? 'ShareAcknowledge failed')
 			}
 
 			this.shareSessionEpochByBrokerId.set(broker.nodeId, nextShareSessionEpoch(epoch))
