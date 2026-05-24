@@ -249,6 +249,7 @@ export class Broker {
 			connectionTimeoutMs: config.connectionTimeoutMs,
 			requestTimeoutMs: config.requestTimeoutMs,
 			maxInFlightRequests: config.maxInFlightRequests,
+			maxFrameSize: config.maxFrameSize,
 			tls: config.tls,
 			sasl: config.sasl,
 			logger: config.logger?.child({ connection: 'control' }) ?? config.logger,

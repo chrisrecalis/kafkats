@@ -228,6 +228,7 @@ export class ConnectionPool {
 			connectionTimeoutMs: this.config.connectionTimeoutMs,
 			requestTimeoutMs: this.config.requestTimeoutMs,
 			maxInFlightRequests: this.config.maxInFlightRequests,
+			maxFrameSize: this.config.maxFrameSize,
 			keepAlive: this.config.keepAlive,
 			keepAliveInitialDelayMs: this.config.keepAliveInitialDelayMs,
 			noDelay: this.config.noDelay,

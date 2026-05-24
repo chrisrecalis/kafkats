@@ -10,7 +10,7 @@ import { ApiKey } from '@/protocol/messages/api-keys.js'
 import { SocketFactory, type SocketFactoryOptions } from '@/network/socket-factory.js'
 import { RequestQueue, type RequestQueueOptions } from '@/network/request-queue.js'
 import { ConnectionClosedError, NetworkError } from '@/network/errors.js'
-import { KafkaFrameDecoder } from '@/network/kafka-frame-decoder.js'
+import { KafkaFrameDecoder, DEFAULT_MAX_FRAME_SIZE } from '@/network/kafka-frame-decoder.js'
 import { Decoder, Encoder } from '@/protocol/primitives/index.js'
 import { decodeResponseHeader, encodeRequestHeader } from '@/protocol/messages/headers.js'
 import { noopLogger, type Logger } from '@/logger.js'
@@ -56,7 +56,8 @@ export class Connection extends EventEmitter<ConnectionEvents> {
 	private readonly logger: Logger
 	private readonly saslConfig?: SaslConfig
 
-	private readonly frameDecoder = new KafkaFrameDecoder()
+	private readonly maxFrameSize: number
+	private readonly frameDecoder: KafkaFrameDecoder
 
 	private _state: ConnectionState = 'disconnected'
 	private connectPromise: Promise<void> | null = null
@@ -75,6 +76,8 @@ export class Connection extends EventEmitter<ConnectionEvents> {
 		this.port = options.port
 		this.clientId = options.clientId
 		this.saslConfig = options.sasl
+		this.maxFrameSize = options.maxFrameSize ?? DEFAULT_MAX_FRAME_SIZE
+		this.frameDecoder = new KafkaFrameDecoder(this.maxFrameSize)
 		this.logger =
 			options.logger?.child({ component: 'connection', host: options.host, port: options.port }) ?? noopLogger
 
@@ -360,6 +363,18 @@ export class Connection extends EventEmitter<ConnectionEvents> {
 
 				if (expectedLength === 0) {
 					expectedLength = responseBuffer.readInt32BE(0)
+					// Same bound as the main frame decoder: reject a corrupt/oversized length prefix
+					// during auth instead of growing responseBuffer toward an attacker-chosen size.
+					if (expectedLength < 0 || expectedLength > this.maxFrameSize) {
+						settle(() =>
+							reject(
+								new NetworkError(
+									`SASL response length ${expectedLength} exceeds maximum ${this.maxFrameSize} (corrupt stream?)`
+								)
+							)
+						)
+						return
+					}
 				}
 
 				const totalLength = 4 + expectedLength
@@ -502,7 +517,19 @@ export class Connection extends EventEmitter<ConnectionEvents> {
 	 * Data may arrive in chunks or multiple messages in one TCP segment.
 	 */
 	private handleData(data: Buffer): void {
-		for (const messageBuffer of this.frameDecoder.push(data)) {
+		let messages: Buffer[]
+		try {
+			messages = this.frameDecoder.push(data)
+		} catch (err) {
+			// A framing error (e.g. an oversized/corrupt length prefix) means the stream is
+			// desynced and unrecoverable. Tear down the socket first so close handling (reset +
+			// reject-in-flight + reconnect) is guaranteed to run, then surface the error — rather
+			// than letting the throw escape the 'data' handler.
+			this.socket?.destroy()
+			this.emit('error', err instanceof Error ? err : new NetworkError(String(err)))
+			return
+		}
+		for (const messageBuffer of messages) {
 			this.handleMessage(messageBuffer)
 		}
 	}

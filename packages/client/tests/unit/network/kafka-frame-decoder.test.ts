@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { KafkaFrameDecoder } from '@/network/kafka-frame-decoder.js'
+import { KafkaFrameDecoder, DEFAULT_MAX_FRAME_SIZE } from '@/network/kafka-frame-decoder.js'
 
 function frame(payload: Buffer): Buffer {
 	const buf = Buffer.allocUnsafe(4 + payload.length)
@@ -8,6 +8,33 @@ function frame(payload: Buffer): Buffer {
 	payload.copy(buf, 4)
 	return buf
 }
+
+function lengthPrefix(length: number): Buffer {
+	const buf = Buffer.allocUnsafe(4)
+	buf.writeInt32BE(length, 0)
+	return buf
+}
+
+describe('KafkaFrameDecoder max frame size', () => {
+	it('throws on a frame larger than the maximum instead of allocating it', () => {
+		const decoder = new KafkaFrameDecoder(1024)
+		// A corrupt length prefix of ~2 GiB would otherwise drive Buffer.allocUnsafe(2GiB).
+		expect(() => decoder.push(lengthPrefix(0x7fffffff))).toThrow(/exceeds maximum/)
+	})
+
+	it('uses a bounded default maximum', () => {
+		expect(DEFAULT_MAX_FRAME_SIZE).toBeLessThanOrEqual(0x7fffffff)
+		const decoder = new KafkaFrameDecoder()
+		expect(() => decoder.push(lengthPrefix(DEFAULT_MAX_FRAME_SIZE + 1))).toThrow(/exceeds maximum/)
+	})
+
+	it('accepts a frame exactly at the maximum', () => {
+		const decoder = new KafkaFrameDecoder(8)
+		const out = decoder.push(frame(Buffer.from('12345678')))
+		expect(out).toHaveLength(1)
+		expect(out[0]!.toString()).toBe('12345678')
+	})
+})
 
 describe('KafkaFrameDecoder', () => {
 	it('decodes a frame when length prefix spans chunks', () => {
