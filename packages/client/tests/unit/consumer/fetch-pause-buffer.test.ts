@@ -81,10 +81,13 @@ describe('FetchManager pause with already-buffered records', () => {
 		}
 
 		// Records buffered at offsets 10 and 11; the fetch offset advances to 12 when buffered.
-		fmAny.decodeRecords = vi.fn().mockReturnValue([
-			{ offset: 10n, key: null, value: Buffer.from('a'), headers: {}, timestamp: 0n },
-			{ offset: 11n, key: null, value: Buffer.from('b'), headers: {}, timestamp: 0n },
-		])
+		fmAny.decodeRecords = vi.fn().mockReturnValue({
+			records: [
+				{ offset: 10n, key: null, value: Buffer.from('a'), headers: {}, timestamp: 0n },
+				{ offset: 11n, key: null, value: Buffer.from('b'), headers: {}, timestamp: 0n },
+			],
+			nextOffset: 12n,
+		})
 
 		fm.addPartitions([{ topic: 't', partition: 0, offset: 10n }])
 		const state = fmAny.partitionStates.get('t:0')
@@ -141,10 +144,13 @@ describe('FetchManager pause with already-buffered records', () => {
 		}
 
 		// The in-flight fetch (issued at offset 12) would return offsets 12,13.
-		fmAny.decodeRecords = vi.fn().mockReturnValue([
-			{ offset: 12n, key: null, value: Buffer.from('a'), headers: {}, timestamp: 0n },
-			{ offset: 13n, key: null, value: Buffer.from('b'), headers: {}, timestamp: 0n },
-		])
+		fmAny.decodeRecords = vi.fn().mockReturnValue({
+			records: [
+				{ offset: 12n, key: null, value: Buffer.from('a'), headers: {}, timestamp: 0n },
+				{ offset: 13n, key: null, value: Buffer.from('b'), headers: {}, timestamp: 0n },
+			],
+			nextOffset: 14n,
+		})
 
 		fm.addPartitions([{ topic: 't', partition: 0, offset: 12n }])
 		const state = fmAny.partitionStates.get('t:0')

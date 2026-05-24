@@ -73,10 +73,13 @@ describe('FetchManager response fencing', () => {
 		}
 
 		// Stale records (offsets 12-13) that would clobber the fresh state's offset of 100n without the fence.
-		fmAny.decodeRecords = vi.fn().mockReturnValue([
-			{ offset: 12n, key: null, value: Buffer.from('a'), headers: {}, timestamp: 0n },
-			{ offset: 13n, key: null, value: Buffer.from('b'), headers: {}, timestamp: 0n },
-		])
+		fmAny.decodeRecords = vi.fn().mockReturnValue({
+			records: [
+				{ offset: 12n, key: null, value: Buffer.from('a'), headers: {}, timestamp: 0n },
+				{ offset: 13n, key: null, value: Buffer.from('b'), headers: {}, timestamp: 0n },
+			],
+			nextOffset: 14n,
+		})
 
 		fm.addPartitions([{ topic: 't', partition: 0, offset: 10n }])
 		const oldState = fmAny.partitionStates.get('t:0')
@@ -140,10 +143,13 @@ describe('FetchManager response fencing', () => {
 			isFull: () => false,
 		}
 
-		fmAny.decodeRecords = vi.fn().mockReturnValue([
-			{ offset: 10n, key: null, value: Buffer.from('a'), headers: {}, timestamp: 0n },
-			{ offset: 11n, key: null, value: Buffer.from('b'), headers: {}, timestamp: 0n },
-		])
+		fmAny.decodeRecords = vi.fn().mockReturnValue({
+			records: [
+				{ offset: 10n, key: null, value: Buffer.from('a'), headers: {}, timestamp: 0n },
+				{ offset: 11n, key: null, value: Buffer.from('b'), headers: {}, timestamp: 0n },
+			],
+			nextOffset: 12n,
+		})
 
 		fm.addPartitions([{ topic: 't', partition: 0, offset: 10n }])
 		const state = fmAny.partitionStates.get('t:0')
@@ -206,10 +212,13 @@ describe('FetchManager response fencing', () => {
 			isFull: () => false,
 		}
 
-		fmAny.decodeRecords = vi.fn().mockReturnValue([
-			{ offset: 10n, key: null, value: Buffer.from('a'), headers: {}, timestamp: 0n },
-			{ offset: 11n, key: null, value: Buffer.from('b'), headers: {}, timestamp: 0n },
-		])
+		fmAny.decodeRecords = vi.fn().mockReturnValue({
+			records: [
+				{ offset: 10n, key: null, value: Buffer.from('a'), headers: {}, timestamp: 0n },
+				{ offset: 11n, key: null, value: Buffer.from('b'), headers: {}, timestamp: 0n },
+			],
+			nextOffset: 12n,
+		})
 
 		fm.addPartitions([{ topic: 't', partition: 0, offset: 10n }])
 		const state = fmAny.partitionStates.get('t:0')
