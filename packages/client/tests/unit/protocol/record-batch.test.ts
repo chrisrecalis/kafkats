@@ -67,6 +67,58 @@ describe('record batch encoding', () => {
 		expect(isLogAppendTime(decoded.attributes)).toBe(true)
 	})
 
+	it('stamps every record with the batch append time under LogAppendTime', async () => {
+		// Distinct per-record timestamps so baseTimestamp + delta differs from maxTimestamp:
+		// baseTimestamp 1000, maxTimestamp 5000, deltas [0, 4000].
+		const batch = createRecordBatch(
+			[
+				{ key: 'k1', value: 'v1', timestamp: 1000 },
+				{ key: 'k2', value: 'v2', timestamp: 5000 },
+			],
+			0n,
+			1000n
+		)
+		expect(batch.maxTimestamp).toBe(5000n)
+
+		// Both decode paths (sync fast path + async) must report the append time for every record.
+		const sync = decodeRecordBatchFromSync(
+			new Decoder(encodeRecordBatchSync(batch, { timestampType: 'LogAppendTime' }))
+		)
+		expect(sync.records.map(r => r.timestamp)).toEqual([5000n, 5000n])
+
+		const asyncDecoded = await decodeRecordBatch(await encodeRecordBatch(batch, { timestampType: 'LogAppendTime' }))
+		expect(asyncDecoded.records.map(r => r.timestamp)).toEqual([5000n, 5000n])
+	})
+
+	it('stamps the append time under LogAppendTime on the sequential fast path too', () => {
+		const batch = createRecordBatch(
+			[
+				{ key: 'k1', value: 'v1', timestamp: 1000 },
+				{ key: 'k2', value: 'v2', timestamp: 5000 },
+			],
+			0n,
+			1000n
+		)
+		const decoded = decodeRecordBatchFromSync(
+			new Decoder(encodeRecordBatchSync(batch, { timestampType: 'LogAppendTime' })),
+			{ assumeSequentialOffsets: true }
+		)
+		expect(decoded.records.map(r => r.timestamp)).toEqual([5000n, 5000n])
+	})
+
+	it('keeps per-record timestamps under CreateTime (default)', async () => {
+		const batch = createRecordBatch(
+			[
+				{ key: 'k1', value: 'v1', timestamp: 1000 },
+				{ key: 'k2', value: 'v2', timestamp: 5000 },
+			],
+			0n,
+			1000n
+		)
+		const decoded = decodeRecordBatchFromSync(new Decoder(encodeRecordBatchSync(batch)))
+		expect(decoded.records.map(r => r.timestamp)).toEqual([1000n, 5000n])
+	})
+
 	it('computes compression type from attributes', async () => {
 		const batch = baseBatch()
 		const encoded = await encodeRecordBatch(batch, { compression: CompressionType.Gzip })
