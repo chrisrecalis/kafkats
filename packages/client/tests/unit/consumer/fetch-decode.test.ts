@@ -45,9 +45,11 @@ describe('FetchManager.decodeRecords corruption handling', () => {
 		// One complete batch followed by a truncated second batch (header underflows).
 		const buf = Buffer.concat([valid, valid.subarray(0, 6)])
 
-		const result = fm.decodeRecords(buf, [], 100n) as DecodedRecord[] | Promise<DecodedRecord[]>
+		const result = fm.decodeRecords(buf, [], 100n) as
+			| { records: DecodedRecord[]; nextOffset: bigint | null }
+			| Promise<{ records: DecodedRecord[]; nextOffset: bigint | null }>
 		expect(result).not.toBeInstanceOf(Promise)
-		const records = result as DecodedRecord[]
+		const { records } = result as { records: DecodedRecord[]; nextOffset: bigint | null }
 		expect(records.map(r => r.value?.toString('utf-8'))).toEqual(['hello'])
 	})
 })
