@@ -98,4 +98,19 @@ describe('varint helpers', () => {
 		expect(decodeUVarInt(twoPow31).value).toBe(2_147_483_648)
 		expect(new Decoder(twoPow31).readUVarInt()).toBe(2_147_483_648)
 	})
+
+	it('Decoder.readVarLong rejects a VARLONG that overflows 64 bits', () => {
+		// 10 continuation bytes never terminate within 64 bits. Without a shift guard the
+		// decoder over-reads past the value (failing later with a misleading underflow);
+		// it should reject it as too long instead.
+		const bytes = Buffer.from([0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80])
+		expect(() => new Decoder(bytes).readVarLong()).toThrow('VARLONG is too long for 64-bit integer')
+	})
+
+	it('Decoder.readVarLong still round-trips valid 64-bit values (guard does not over-reject)', () => {
+		const values = [0n, 1n, -1n, 2n ** 62n, -(2n ** 62n), 9223372036854775807n, -9223372036854775808n]
+		for (const v of values) {
+			expect(new Decoder(encodeVarLong(v)).readVarLong()).toBe(v)
+		}
+	})
 })
