@@ -68,6 +68,7 @@ describe('FetchManager response fencing', () => {
 				addedToBuffer.push({ topic: entry.topic, partition: entry.partition })
 			}),
 			removePartitions: vi.fn(),
+			removePartitionsReturningEarliest: vi.fn(() => new Map()),
 			isFull: () => false,
 		}
 
@@ -135,6 +136,7 @@ describe('FetchManager response fencing', () => {
 				addedToBuffer.push({ topic: entry.topic, partition: entry.partition })
 			}),
 			removePartitions: vi.fn(),
+			removePartitionsReturningEarliest: vi.fn(() => new Map()),
 			isFull: () => false,
 		}
 
