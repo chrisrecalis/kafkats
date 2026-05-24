@@ -460,18 +460,21 @@ export class FetchManager {
 		switch (errorCode) {
 			case ErrorCode.OffsetOutOfRange:
 				if (this.offsetManager && this.autoOffsetReset) {
-					switch (this.autoOffsetReset) {
-						case 'earliest':
-							state.offset = await this.offsetManager.getEarliestOffset(state.topic, state.partition)
-							break
-						case 'latest':
-							state.offset = await this.offsetManager.getLatestOffset(state.topic, state.partition)
-							break
-						case 'none':
-							throw new Error(
-								`Offset out of range for ${state.topic}-${state.partition} at offset ${state.offset}`
-							)
+					if (this.autoOffsetReset === 'none') {
+						throw new Error(
+							`Offset out of range for ${state.topic}-${state.partition} at offset ${state.offset}`
+						)
 					}
+					// Records buffered from the now-invalid position precede (or are unrelated
+					// to) the reset offset; delivering them would violate the reset. Discard them
+					// BEFORE the listOffsets round-trip below — otherwise a concurrent poll() could
+					// drain the stale records while we await, or a transient lookup failure could
+					// skip the clear entirely.
+					this.fetchBuffer?.removePartitions([{ topic: state.topic, partition: state.partition }])
+					state.offset =
+						this.autoOffsetReset === 'earliest'
+							? await this.offsetManager.getEarliestOffset(state.topic, state.partition)
+							: await this.offsetManager.getLatestOffset(state.topic, state.partition)
 				}
 				break
 
