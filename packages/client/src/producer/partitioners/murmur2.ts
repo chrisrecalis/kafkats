@@ -63,10 +63,15 @@ export function murmur2(data: Buffer): number {
 }
 
 /**
- * Convert a signed 32-bit integer to unsigned for positive modulo
+ * Make a signed 32-bit integer non-negative for partition modulo.
+ *
+ * Matches Kafka's org.apache.kafka.common.utils.Utils.toPositive, which clears
+ * only the sign bit (`number & 0x7fffffff`). Using `>>> 0` (full unsigned) would
+ * diverge for negative hashes and send ~half of all keys to a different
+ * partition than the Java client / librdkafka / kafkajs.
  */
 function toPositive(n: number): number {
-	return n >>> 0
+	return n & 0x7fffffff
 }
 
 /**
