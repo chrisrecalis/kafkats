@@ -77,6 +77,8 @@ export interface Joined<K, V1, V2> {
 	value?: Codec<V1>
 	otherValue?: Codec<V2>
 	within?: TimeWindows | SessionWindows | SlidingWindows
+	/** Changelog backing for the join window stores. Enabled by default. */
+	changelog?: boolean | ChangelogConfig
 }
 
 export interface Topic<K = Buffer, V = Buffer> {
