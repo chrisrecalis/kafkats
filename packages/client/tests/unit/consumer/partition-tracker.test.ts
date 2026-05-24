@@ -123,6 +123,34 @@ describe('PartitionTracker', () => {
 		})
 	})
 
+	describe('concurrent in-flight batches (ref-counting)', () => {
+		test('revoke waits for ALL concurrent batches on a partition, not just the first', async () => {
+			tracker.assign([{ topic: 'topic1', partition: 0 }])
+
+			// Two concurrent batches for the same partition (partitionConcurrency > 1).
+			expect(tracker.startProcessing('topic1', 0)).toBe(true)
+			expect(tracker.startProcessing('topic1', 0)).toBe(true)
+
+			let revokeCompleted = false
+			const revokePromise = tracker.revoke([{ topic: 'topic1', partition: 0 }]).then(() => {
+				revokeCompleted = true
+			})
+
+			await new Promise(resolve => setTimeout(resolve, 10))
+			expect(revokeCompleted).toBe(false)
+
+			// First batch finishes — revoke must STILL wait (second batch in flight).
+			tracker.endProcessing('topic1', 0)
+			await new Promise(resolve => setTimeout(resolve, 10))
+			expect(revokeCompleted).toBe(false)
+
+			// Second batch finishes — only now may revoke complete.
+			tracker.endProcessing('topic1', 0)
+			await revokePromise
+			expect(revokeCompleted).toBe(true)
+		})
+	})
+
 	describe('startProcessing', () => {
 		test('should return true for assigned partition', () => {
 			tracker.assign([{ topic: 'topic1', partition: 0 }])
