@@ -1425,6 +1425,33 @@ describe('windowed/session store changelog wiring', () => {
 		expect(changelogTopics.get('session-counts')).toBeDefined()
 	})
 
+	it('stream-stream join creates changelog-backed window stores for both sides with registered specs', () => {
+		const { app } = createTestApp()
+
+		const left = app.stream('left', { key: codec.string(), value: codec.json<{ id: string }>() })
+		const right = app.stream('right', { key: codec.string(), value: codec.json<{ id: string }>() })
+
+		left.join(right, (l, r) => ({ l, r }), { within: TimeWindows.of('10s') })
+
+		const { stateStores, changelogTopics } = internals(app)
+
+		const joinStoreNames = [...stateStores.keys()].filter(n => n.startsWith('stream-join-'))
+		expect(joinStoreNames).toHaveLength(2)
+
+		for (const name of joinStoreNames) {
+			// Both side stores must be changelog-backed so a restarted/rebalanced task rebuilds
+			// its in-flight join window instead of silently dropping matches.
+			expect(stateStores.get(name)).toBeInstanceOf(ChangelogBackedWindowStore)
+			const spec = changelogTopics.get(name)
+			expect(spec).toBeDefined()
+			// Changelog key round-trips a WindowedKey so restoration can decode it.
+			const encoded = spec.keyCodec.encode({ key: 'k', windowStart: 1000, windowEnd: 2000 })
+			expect(spec.keyCodec.decode(encoded)).toEqual({ key: 'k', windowStart: 1000, windowEnd: 2000 })
+			// Join windows are co-partitioned with their source, so restoration is restricted.
+			expect(spec.restrictRestorationToSourcePartitions).toBe(true)
+		}
+	})
+
 	it('threads restrictRestorationToSourcePartitions through windowedBy (re-keyed vs not)', () => {
 		const { app } = createTestApp()
 

@@ -1,5 +1,4 @@
 import type { KStream, KTable, KGroupedStream, Produced, Grouped, Materialized, Joined, KeyValue } from '@/types.js'
-import type { KeyValueStore } from '@/state.js'
 import {
 	type OutputProcessor,
 	PassThroughNode,
@@ -200,21 +199,29 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 		const leftStoreName = `stream-join-left-${this.app.nextStoreId()}`
 		const rightStoreName = `stream-join-right-${this.app.nextStoreId()}`
 
-		const leftStore = this.app.stateStoreProvider.createWindowStore<K, V>(leftStoreName, {
+		// Back both side stores with a changelog so a restarted/rebalanced task rebuilds its
+		// in-flight join window instead of silently dropping matches. A stream-stream join
+		// requires its inputs to be co-partitioned (same key, same partition count) — the caller's
+		// responsibility, as in Kafka Streams, since this library does not auto-insert a
+		// repartition topic. Given that, each side's store is co-partitioned with its own stream's
+		// source topics, so restoration is restricted to the assigned source partitions.
+		const windowOptions = { retentionMs: joinWindowMs * 2, windowSizeMs: joinWindowMs }
+		const leftStore = this.app.getOrCreateWindowStore<K, V>(
+			leftStoreName,
 			keyCodec,
 			valueCodec,
-			retentionMs: joinWindowMs * 2,
-			windowSizeMs: joinWindowMs,
-		})
-		const rightStore = this.app.stateStoreProvider.createWindowStore<K, V2>(rightStoreName, {
+			windowOptions,
+			options?.changelog,
+			this.sourceTopics
+		)
+		const rightStore = this.app.getOrCreateWindowStore<K, V2>(
+			rightStoreName,
 			keyCodec,
-			valueCodec: otherValueCodec,
-			retentionMs: joinWindowMs * 2,
-			windowSizeMs: joinWindowMs,
-		})
-
-		this.app.stateStores.set(leftStoreName, leftStore as KeyValueStore<unknown, unknown>)
-		this.app.stateStores.set(rightStoreName, rightStore as KeyValueStore<unknown, unknown>)
+			otherValueCodec,
+			windowOptions,
+			options?.changelog,
+			otherStream.sourceTopics
+		)
 
 		const leftStoreRef = { store: leftStore }
 		const rightStoreRef = { store: rightStore }
@@ -288,21 +295,29 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 		const leftStoreName = `stream-left-join-left-${this.app.nextStoreId()}`
 		const rightStoreName = `stream-left-join-right-${this.app.nextStoreId()}`
 
-		const leftStore = this.app.stateStoreProvider.createWindowStore<K, V>(leftStoreName, {
+		// Back both side stores with a changelog so a restarted/rebalanced task rebuilds its
+		// in-flight join window instead of silently dropping matches. A stream-stream join
+		// requires its inputs to be co-partitioned (same key, same partition count) — the caller's
+		// responsibility, as in Kafka Streams, since this library does not auto-insert a
+		// repartition topic. Given that, each side's store is co-partitioned with its own stream's
+		// source topics, so restoration is restricted to the assigned source partitions.
+		const windowOptions = { retentionMs: joinWindowMs * 2, windowSizeMs: joinWindowMs }
+		const leftStore = this.app.getOrCreateWindowStore<K, V>(
+			leftStoreName,
 			keyCodec,
 			valueCodec,
-			retentionMs: joinWindowMs * 2,
-			windowSizeMs: joinWindowMs,
-		})
-		const rightStore = this.app.stateStoreProvider.createWindowStore<K, V2>(rightStoreName, {
+			windowOptions,
+			options?.changelog,
+			this.sourceTopics
+		)
+		const rightStore = this.app.getOrCreateWindowStore<K, V2>(
+			rightStoreName,
 			keyCodec,
-			valueCodec: otherValueCodec,
-			retentionMs: joinWindowMs * 2,
-			windowSizeMs: joinWindowMs,
-		})
-
-		this.app.stateStores.set(leftStoreName, leftStore as KeyValueStore<unknown, unknown>)
-		this.app.stateStores.set(rightStoreName, rightStore as KeyValueStore<unknown, unknown>)
+			otherValueCodec,
+			windowOptions,
+			options?.changelog,
+			otherStream.sourceTopics
+		)
 
 		const leftStoreRef = { store: leftStore }
 		const rightStoreRef = { store: rightStore }
@@ -363,21 +378,29 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 		const leftStoreName = `stream-outer-join-left-${this.app.nextStoreId()}`
 		const rightStoreName = `stream-outer-join-right-${this.app.nextStoreId()}`
 
-		const leftStore = this.app.stateStoreProvider.createWindowStore<K, V>(leftStoreName, {
+		// Back both side stores with a changelog so a restarted/rebalanced task rebuilds its
+		// in-flight join window instead of silently dropping matches. A stream-stream join
+		// requires its inputs to be co-partitioned (same key, same partition count) — the caller's
+		// responsibility, as in Kafka Streams, since this library does not auto-insert a
+		// repartition topic. Given that, each side's store is co-partitioned with its own stream's
+		// source topics, so restoration is restricted to the assigned source partitions.
+		const windowOptions = { retentionMs: joinWindowMs * 2, windowSizeMs: joinWindowMs }
+		const leftStore = this.app.getOrCreateWindowStore<K, V>(
+			leftStoreName,
 			keyCodec,
 			valueCodec,
-			retentionMs: joinWindowMs * 2,
-			windowSizeMs: joinWindowMs,
-		})
-		const rightStore = this.app.stateStoreProvider.createWindowStore<K, V2>(rightStoreName, {
+			windowOptions,
+			options?.changelog,
+			this.sourceTopics
+		)
+		const rightStore = this.app.getOrCreateWindowStore<K, V2>(
+			rightStoreName,
 			keyCodec,
-			valueCodec: otherValueCodec,
-			retentionMs: joinWindowMs * 2,
-			windowSizeMs: joinWindowMs,
-		})
-
-		this.app.stateStores.set(leftStoreName, leftStore as KeyValueStore<unknown, unknown>)
-		this.app.stateStores.set(rightStoreName, rightStore as KeyValueStore<unknown, unknown>)
+			otherValueCodec,
+			windowOptions,
+			options?.changelog,
+			otherStream.sourceTopics
+		)
 
 		const leftStoreRef = { store: leftStore }
 		const rightStoreRef = { store: rightStore }
