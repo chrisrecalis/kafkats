@@ -681,8 +681,10 @@ export class FetchManager {
 			for (const partitionResponse of topicResponse.partitions) {
 				const key = tpKey(topicResponse.topic, partitionResponse.partitionIndex)
 				const state = inflightStateByKey.get(key)
-				// Fence: state was revoked while the fetch was in flight.
-				if (!state || state.abortController.signal.aborted) continue
+				// Fence: state was revoked, or the partition was paused, while the fetch was
+				// in flight. For pause we drop the records without advancing the offset so
+				// they are re-fetched on resume.
+				if (!state || state.abortController.signal.aborted || state.paused) continue
 
 				if (partitionResponse.errorCode !== ErrorCode.None) {
 					await this.handleFetchError(state, partitionResponse.errorCode)
@@ -698,8 +700,8 @@ export class FetchManager {
 					)
 					let records = decodeResult instanceof Promise ? await decodeResult : decodeResult
 
-					// decodeRecords may have awaited; re-fence.
-					if (state.abortController.signal.aborted) continue
+					// decodeRecords may have awaited; re-fence (revoked or paused mid-decode).
+					if (state.abortController.signal.aborted || state.paused) continue
 
 					records = filterRecordsFromOffset(records, fetchOffset)
 
