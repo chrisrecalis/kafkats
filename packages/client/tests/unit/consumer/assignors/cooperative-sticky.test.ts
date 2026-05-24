@@ -349,6 +349,78 @@ describe('CooperativeStickyAssignor', () => {
 		})
 	})
 
+	describe('phase 3 balance (max-min <= 1)', () => {
+		// Drive the cooperative protocol to a fixed point: each round feeds the previous
+		// output back as ownedPartitions (withheld partitions become unowned), until the
+		// assignment stops changing. Returns the converged per-member partition counts.
+		function runToConvergence(
+			initialMembers: MemberSubscription[],
+			partitions: Map<string, number[]>
+		): Map<string, number> {
+			let owned = new Map<string, TopicPartitionList[]>()
+			for (const m of initialMembers) owned.set(m.memberId, m.metadata.ownedPartitions ?? [])
+
+			for (let round = 0; round < 20; round++) {
+				const roundMembers = initialMembers.map(m =>
+					member(m.memberId, m.metadata.topics, owned.get(m.memberId) ?? [])
+				)
+				const result = cooperativeStickyAssignor.assign(roundMembers, partitions)
+
+				const next = new Map<string, TopicPartitionList[]>()
+				let changed = false
+				for (const m of initialMembers) {
+					const partsList = result.get(m.memberId)?.partitions ?? []
+					next.set(m.memberId, partsList)
+					const prev = owned.get(m.memberId) ?? []
+					if (JSON.stringify(prev) !== JSON.stringify(partsList)) changed = true
+				}
+				owned = next
+				if (!changed) break
+			}
+
+			const counts = new Map<string, number>()
+			for (const m of initialMembers) {
+				let total = 0
+				for (const tp of owned.get(m.memberId) ?? []) total += tp.partitions.length
+				counts.set(m.memberId, total)
+			}
+			return counts
+		}
+
+		it('does not strand a newly-joined member when partitions are not evenly divisible', () => {
+			// a owns [0,1], b owns [2,3], c joins owning nothing. total=4, members=3.
+			// The ideal is max-min <= 1 (2,1,1). The buggy phase 3 caps every member at
+			// idealCount+1 (=2), so 2,2,0 looks "balanced" and c is starved forever.
+			const members = [
+				member('a', ['t'], [{ topic: 't', partitions: [0, 1] }]),
+				member('b', ['t'], [{ topic: 't', partitions: [2, 3] }]),
+				member('c', ['t'], []),
+			]
+			const partitions = new Map([['t', [0, 1, 2, 3]]])
+
+			const counts = runToConvergence(members, partitions)
+			const values = [...counts.values()]
+			expect(values.reduce((s, v) => s + v, 0)).toBe(4) // all partitions assigned
+			expect(Math.max(...values) - Math.min(...values)).toBeLessThanOrEqual(1)
+			expect(counts.get('c')!).toBeGreaterThanOrEqual(1) // c is not starved
+		})
+
+		it('converges to max-min <= 1 with six partitions and an idle joiner', () => {
+			// a owns 4, b owns 2, c joins. total=6, members=3 -> ideal 2,2,2.
+			const members = [
+				member('a', ['t'], [{ topic: 't', partitions: [0, 1, 2, 3] }]),
+				member('b', ['t'], [{ topic: 't', partitions: [4, 5] }]),
+				member('c', ['t'], []),
+			]
+			const partitions = new Map([['t', [0, 1, 2, 3, 4, 5]]])
+
+			const counts = runToConvergence(members, partitions)
+			const values = [...counts.values()]
+			expect(values.reduce((s, v) => s + v, 0)).toBe(6)
+			expect(Math.max(...values) - Math.min(...values)).toBeLessThanOrEqual(1)
+		})
+	})
+
 	describe('incremental rebalance simulation', () => {
 		it('simulates a complete two-phase cooperative rebalance', () => {
 			// Phase 1: a owns everything, b joins
