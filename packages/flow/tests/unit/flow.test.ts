@@ -641,6 +641,247 @@ describe('table-table joins', () => {
 		await app.close()
 	})
 
+	it('does not emit a tombstone when deleting a key the other table never matched', async () => {
+		const { app, consumers } = createTestApp()
+
+		type User = { name: string }
+		type Account = { balance: number }
+		type Result = { name: string; balance: number }
+
+		const emitted: Array<{ key: string | null; value: Result | null }> = []
+
+		const users = app.table('users', { key: codec.string(), value: codec.json<User>() })
+		const accounts = app.table('accounts', { key: codec.string(), value: codec.json<Account>() })
+
+		users
+			.join(accounts, (user, account) => ({ name: user.name, balance: account.balance }))
+			.toStream()
+			.peek((key, value) => {
+				emitted.push({ key, value })
+			})
+
+		await app.start()
+		const consumer = consumers[0]!
+
+		// Establish a real join result for user1 (both sides present).
+		await consumer.emitMessage('users', Buffer.from(JSON.stringify({ name: 'Alice' })), Buffer.from('user1'))
+		await consumer.emitMessage('accounts', Buffer.from(JSON.stringify({ balance: 100 })), Buffer.from('user1'))
+		expect(emitted).toEqual([{ key: 'user1', value: { name: 'Alice', balance: 100 } }])
+
+		// Deleting a user the accounts table never matched: an inner join never produced a result for
+		// it, so there is nothing to retract — no output should be forwarded.
+		emitted.length = 0
+		await consumer.emitMessage('users', null, Buffer.from('ghost'))
+		expect(emitted).toHaveLength(0)
+
+		// Deleting user1, whose account row exists, DOES retract the prior join result.
+		await consumer.emitMessage('users', null, Buffer.from('user1'))
+		expect(emitted).toEqual([{ key: 'user1', value: null }])
+
+		await app.close()
+	})
+
+	it('inner join: no spurious tombstone without a prior join result', async () => {
+		const { app, consumers } = createTestApp()
+
+		type User = { name: string }
+		type Account = { balance: number }
+		type Result = { name: string; balance: number }
+
+		const emitted: Array<{ key: string | null; value: Result | null }> = []
+
+		const users = app.table('users', { key: codec.string(), value: codec.json<User>() })
+		const accounts = app.table('accounts', { key: codec.string(), value: codec.json<Account>() })
+
+		users
+			.join(accounts, (user, account) => ({ name: user.name, balance: account.balance }))
+			.toStream()
+			.peek((key, value) => {
+				emitted.push({ key, value })
+			})
+
+		await app.start()
+		const consumer = consumers[0]!
+
+		// Accounts has 'k' but users never did. A users tombstone for 'k' must not retract — no inner
+		// result ever existed, even though the other side is present.
+		await consumer.emitMessage('accounts', Buffer.from(JSON.stringify({ balance: 50 })), Buffer.from('k'))
+		await consumer.emitMessage('users', null, Buffer.from('k'))
+		expect(emitted).toHaveLength(0)
+
+		// A real result, then a duplicate delete: only the first delete retracts; the second (the key
+		// is already gone on this side) must not emit a second tombstone.
+		await consumer.emitMessage('users', Buffer.from(JSON.stringify({ name: 'Ann' })), Buffer.from('u'))
+		await consumer.emitMessage('accounts', Buffer.from(JSON.stringify({ balance: 10 })), Buffer.from('u'))
+		expect(emitted).toEqual([{ key: 'u', value: { name: 'Ann', balance: 10 } }])
+
+		emitted.length = 0
+		await consumer.emitMessage('users', null, Buffer.from('u'))
+		await consumer.emitMessage('users', null, Buffer.from('u'))
+		expect(emitted).toEqual([{ key: 'u', value: null }])
+
+		await app.close()
+	})
+
+	it('left join: no tombstone when the left row never existed', async () => {
+		const { app, consumers } = createTestApp()
+
+		type User = { name: string }
+		type Account = { balance: number }
+		type Result = { name: string; balance: number | null }
+
+		const emitted: Array<{ key: string | null; value: Result | null }> = []
+
+		const users = app.table('users', { key: codec.string(), value: codec.json<User>() })
+		const accounts = app.table('accounts', { key: codec.string(), value: codec.json<Account>() })
+
+		users
+			.leftJoin(accounts, (user, account) => ({ name: user.name, balance: account?.balance ?? null }))
+			.toStream()
+			.peek((key, value) => {
+				emitted.push({ key, value })
+			})
+
+		await app.start()
+		const consumer = consumers[0]!
+
+		// Tombstone for a left key that never existed: a left join only ever emitted for an existing
+		// left row, so there is nothing to retract.
+		await consumer.emitMessage('users', null, Buffer.from('ghost'))
+		expect(emitted).toHaveLength(0)
+
+		// A real left row emits (left, null); deleting it retracts.
+		await consumer.emitMessage('users', Buffer.from(JSON.stringify({ name: 'Bob' })), Buffer.from('b'))
+		expect(emitted).toEqual([{ key: 'b', value: { name: 'Bob', balance: null } }])
+
+		emitted.length = 0
+		await consumer.emitMessage('users', null, Buffer.from('b'))
+		expect(emitted).toEqual([{ key: 'b', value: null }])
+
+		await app.close()
+	})
+
+	it('outer join: no tombstone when neither side ever existed', async () => {
+		const { app, consumers } = createTestApp()
+
+		type User = { name: string }
+		type Account = { balance: number }
+		type Result = { name: string | null; balance: number | null }
+
+		const emitted: Array<{ key: string | null; value: Result | null }> = []
+
+		const users = app.table('users', { key: codec.string(), value: codec.json<User>() })
+		const accounts = app.table('accounts', { key: codec.string(), value: codec.json<Account>() })
+
+		users
+			.outerJoin(accounts, (user, account) => ({
+				name: user?.name ?? null,
+				balance: account?.balance ?? null,
+			}))
+			.toStream()
+			.peek((key, value) => {
+				emitted.push({ key, value })
+			})
+
+		await app.start()
+		const consumer = consumers[0]!
+
+		// Tombstone for a key neither side ever held: no outer result existed, so nothing to retract.
+		await consumer.emitMessage('users', null, Buffer.from('ghost'))
+		expect(emitted).toHaveLength(0)
+
+		// A real left-only result emits; deleting the only side retracts.
+		await consumer.emitMessage('users', Buffer.from(JSON.stringify({ name: 'Cara' })), Buffer.from('c'))
+		expect(emitted).toEqual([{ key: 'c', value: { name: 'Cara', balance: null } }])
+
+		emitted.length = 0
+		await consumer.emitMessage('users', null, Buffer.from('c'))
+		expect(emitted).toEqual([{ key: 'c', value: null }])
+
+		await app.close()
+	})
+
+	it('inner join: right-side deletes retract precisely', async () => {
+		const { app, consumers } = createTestApp()
+
+		type User = { name: string }
+		type Account = { balance: number }
+		type Result = { name: string; balance: number }
+
+		const emitted: Array<{ key: string | null; value: Result | null }> = []
+
+		const users = app.table('users', { key: codec.string(), value: codec.json<User>() })
+		const accounts = app.table('accounts', { key: codec.string(), value: codec.json<Account>() })
+
+		users
+			.join(accounts, (user, account) => ({ name: user.name, balance: account.balance }))
+			.toStream()
+			.peek((key, value) => {
+				emitted.push({ key, value })
+			})
+
+		await app.start()
+		const consumer = consumers[0]!
+
+		// Right-driven: a users row exists but accounts never did; an accounts tombstone for it must not
+		// retract a result that never existed.
+		await consumer.emitMessage('users', Buffer.from(JSON.stringify({ name: 'Ghost' })), Buffer.from('ghost'))
+		await consumer.emitMessage('accounts', null, Buffer.from('ghost'))
+		expect(emitted).toHaveLength(0)
+
+		// Real result, then a right-side delete retracts; a duplicate right delete must not re-emit.
+		await consumer.emitMessage('users', Buffer.from(JSON.stringify({ name: 'Ann' })), Buffer.from('u'))
+		await consumer.emitMessage('accounts', Buffer.from(JSON.stringify({ balance: 10 })), Buffer.from('u'))
+		expect(emitted).toEqual([{ key: 'u', value: { name: 'Ann', balance: 10 } }])
+
+		emitted.length = 0
+		await consumer.emitMessage('accounts', null, Buffer.from('u'))
+		await consumer.emitMessage('accounts', null, Buffer.from('u'))
+		expect(emitted).toEqual([{ key: 'u', value: null }])
+
+		await app.close()
+	})
+
+	it('outer join: right-side deletes retract precisely', async () => {
+		const { app, consumers } = createTestApp()
+
+		type User = { name: string }
+		type Account = { balance: number }
+		type Result = { name: string | null; balance: number | null }
+
+		const emitted: Array<{ key: string | null; value: Result | null }> = []
+
+		const users = app.table('users', { key: codec.string(), value: codec.json<User>() })
+		const accounts = app.table('accounts', { key: codec.string(), value: codec.json<Account>() })
+
+		users
+			.outerJoin(accounts, (user, account) => ({
+				name: user?.name ?? null,
+				balance: account?.balance ?? null,
+			}))
+			.toStream()
+			.peek((key, value) => {
+				emitted.push({ key, value })
+			})
+
+		await app.start()
+		const consumer = consumers[0]!
+
+		// Right-driven outer: a tombstone for a key neither side ever held must not retract.
+		await consumer.emitMessage('accounts', null, Buffer.from('ghost'))
+		expect(emitted).toHaveLength(0)
+
+		// A right-only result emits; deleting the only (right) side retracts.
+		await consumer.emitMessage('accounts', Buffer.from(JSON.stringify({ balance: 5 })), Buffer.from('a'))
+		expect(emitted).toEqual([{ key: 'a', value: { name: null, balance: 5 } }])
+
+		emitted.length = 0
+		await consumer.emitMessage('accounts', null, Buffer.from('a'))
+		expect(emitted).toEqual([{ key: 'a', value: null }])
+
+		await app.close()
+	})
+
 	it('left joins tables - left side always emits', async () => {
 		const { app, consumers } = createTestApp()
 

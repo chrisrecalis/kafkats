@@ -74,7 +74,11 @@ export class TableStateNode<K, V> extends Processor<K, V> {
 		}
 
 		const key = record.key
+		// Capture the prior value before mutating so downstream join nodes can tell whether a join
+		// result previously existed (and thus whether a tombstone is a real retraction, not a no-op).
+		let oldValue: V | null = null
 		if (key !== null) {
+			oldValue = (await store.get(key)) ?? null
 			if (record.value === null) {
 				await store.delete(key)
 			} else {
@@ -82,7 +86,7 @@ export class TableStateNode<K, V> extends Processor<K, V> {
 			}
 		}
 
-		await this.forward(record)
+		await this.forward({ ...record, oldValue })
 	}
 }
 

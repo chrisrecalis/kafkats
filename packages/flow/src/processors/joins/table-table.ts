@@ -28,24 +28,27 @@ export class TableTableJoinNode<K, V1, V2, VR> extends Processor<K, V1, K, VR> {
 		if (key === null) {
 			return
 		}
-		if (record.value === null) {
-			const next: StreamRecord<K, VR> = { ...record, value: null }
-			await this.forward(next)
-			return
-		}
 
+		// The other side doesn't change on this side's update, so the same lookup decides both the new
+		// and prior results. An inner-join result exists only when both sides are present.
 		const otherValue = await store.get(key)
-		if (otherValue === undefined) {
-			// Inner join: skip if no matching record in other table
+		const newResult =
+			record.value !== null && otherValue !== undefined ? this.joiner(record.value, otherValue) : null
+
+		if (newResult !== null) {
+			await this.forward({ ...record, value: newResult, oldValue: undefined })
 			return
 		}
 
-		const joinedValue = this.joiner(record.value, otherValue)
-		const next: StreamRecord<K, VR> = {
-			...record,
-			value: joinedValue,
+		// No current result. Forward a tombstone only if one previously existed — this side had a value
+		// AND the other side is present. oldValue is undefined for records not produced by a table state
+		// node (e.g. a derived table); fall back to retracting whenever the other side is present.
+		const oldValue = record.oldValue as V1 | null | undefined
+		const hadResult =
+			oldValue === undefined ? otherValue !== undefined : oldValue !== null && otherValue !== undefined
+		if (hadResult) {
+			await this.forward({ ...record, value: null, oldValue: undefined })
 		}
-		await this.forward(next)
 	}
 }
 
@@ -75,19 +78,22 @@ export class TableTableLeftJoinNode<K, V1, V2, VR> extends Processor<K, V1, K, V
 		if (key === null) {
 			return
 		}
-		if (record.value === null) {
-			const next: StreamRecord<K, VR> = { ...record, value: null }
-			await this.forward(next)
+
+		// A left join emits a result for any existing left row, regardless of the other side.
+		const otherValue = await store.get(key)
+		const newResult = record.value !== null ? this.joiner(record.value, otherValue ?? null) : null
+
+		if (newResult !== null) {
+			await this.forward({ ...record, value: newResult, oldValue: undefined })
 			return
 		}
 
-		const otherValue = await store.get(key)
-		const joinedValue = this.joiner(record.value, otherValue ?? null)
-		const next: StreamRecord<K, VR> = {
-			...record,
-			value: joinedValue,
+		// Left tombstone: retract only if the left row previously existed. oldValue is undefined for
+		// records not produced by a table state node; fall back to the legacy always-retract behavior.
+		const oldValue = record.oldValue as V1 | null | undefined
+		if (oldValue === undefined || oldValue !== null) {
+			await this.forward({ ...record, value: null, oldValue: undefined })
 		}
-		await this.forward(next)
 	}
 }
 
@@ -130,8 +136,9 @@ export class TableTableLeftJoinOtherNode<K, V1, V2, VR> extends Processor<K, V2,
 
 		// Left row exists: emit joiner(left, right). record.value may be null (right tombstone),
 		// in which case the result is joiner(left, null) — the left row is retained, not deleted.
+		// Clear oldValue so the right input's prior value can't masquerade as the result's prior value.
 		const joinedValue = this.joiner(leftValue, record.value)
-		await this.forward({ ...record, value: joinedValue })
+		await this.forward({ ...record, value: joinedValue, oldValue: undefined })
 	}
 }
 
@@ -166,15 +173,21 @@ export class TableTableOuterJoinLeftNode<K, V1, V2, VR> extends Processor<K, V1,
 			return
 		}
 
+		// Right doesn't change on this side's update, so the same lookup decides new and prior results.
 		const rightValue = await store.get(key)
-		if (record.value === null && rightValue === undefined) {
-			// Both sides absent: the result no longer exists.
-			await this.forward({ ...record, value: null })
+		if (record.value !== null || rightValue !== undefined) {
+			// At least one side present → the outer result exists; emit (left, right|null).
+			await this.forward({ ...record, value: this.joiner(record.value, rightValue ?? null), oldValue: undefined })
 			return
 		}
 
-		const joinedValue = this.joiner(record.value, rightValue ?? null)
-		await this.forward({ ...record, value: joinedValue })
+		// Both sides absent now. Retract only if a result previously existed: the right side is absent
+		// (unchanged), so that requires the left side to have had a value. oldValue is undefined for
+		// records not produced by a table state node; fall back to always retracting.
+		const oldValue = record.oldValue as V1 | null | undefined
+		if (oldValue === undefined || oldValue !== null) {
+			await this.forward({ ...record, value: null, oldValue: undefined })
+		}
 	}
 }
 
@@ -209,14 +222,20 @@ export class TableTableOuterJoinRightNode<K, V1, V2, VR> extends Processor<K, V2
 			return
 		}
 
+		// Left doesn't change on this side's update, so the same lookup decides new and prior results.
 		const leftValue = await store.get(key)
-		if (record.value === null && leftValue === undefined) {
-			// Both sides absent: the result no longer exists.
-			await this.forward({ ...record, value: null })
+		if (record.value !== null || leftValue !== undefined) {
+			// At least one side present → the outer result exists; emit (left|null, right).
+			await this.forward({ ...record, value: this.joiner(leftValue ?? null, record.value), oldValue: undefined })
 			return
 		}
 
-		const joinedValue = this.joiner(leftValue ?? null, record.value)
-		await this.forward({ ...record, value: joinedValue })
+		// Both sides absent now. Retract only if a result previously existed: the left side is absent
+		// (unchanged), so that requires the right side to have had a value. oldValue is undefined for
+		// records not produced by a table state node; fall back to always retracting.
+		const oldValue = record.oldValue as V2 | null | undefined
+		if (oldValue === undefined || oldValue !== null) {
+			await this.forward({ ...record, value: null, oldValue: undefined })
+		}
 	}
 }

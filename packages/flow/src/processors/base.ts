@@ -6,6 +6,14 @@ import type { Codec } from '@/codec.js'
 export type StreamRecord<K, V> = {
 	key: K | null
 	value: V | null
+	/**
+	 * The key's prior value, set by a table state node (null if the key was absent before this
+	 * update); undefined for records not produced by a table state node. Table-table join nodes read
+	 * it to retract a result only when one previously existed. Typed `unknown` so it rides through
+	 * value-retyping spreads (`{ ...record, value }`) without a type error; the table nodes that read
+	 * it know its concrete type.
+	 */
+	oldValue?: unknown
 	topic: string
 	partition: number
 	offset: bigint
