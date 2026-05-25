@@ -939,7 +939,6 @@ export class FetchManager {
 				// - Assume sequential offsets to avoid per-record BigInt conversions
 				const batch = decodeRecordBatchFromSync(decoder, {
 					assumeSequentialOffsets: true,
-					// Skip the per-batch CRC32C pass when the consumer opts out (checkCrcs: false).
 					verifyCrc: this.config.checkCrcs !== false,
 				})
 				batches.push(batch)
@@ -993,7 +992,6 @@ export class FetchManager {
 				// - Assume sequential offsets to avoid per-record BigInt conversions
 				const batch = await decodeRecordBatchFrom(decoder, {
 					assumeSequentialOffsets: true,
-					// Skip the per-batch CRC32C pass when the consumer opts out (checkCrcs: false).
 					verifyCrc: this.config.checkCrcs !== false,
 				})
 				batches.push(batch)
