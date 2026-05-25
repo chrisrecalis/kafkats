@@ -252,6 +252,8 @@ async function benchmarkKafkaJsConsumer(
 	const diagnostics = options.diagnostics ? startDiagnostics() : null
 
 	await consumer.run({
+		partitionsConsumedConcurrently: 3,
+		autoCommit: true,
 		eachMessage: (): Promise<void> => {
 			// Start timing from first message (after group join)
 			if (startTime === 0) {
@@ -331,7 +333,7 @@ async function benchmarkPlatformaticConsumer(
 		minBytes: ALIGNED_CONSUMER_CONFIG.minBytes,
 		maxBytes: ALIGNED_CONSUMER_CONFIG.maxBytesPerPartition,
 		maxWaitTime: ALIGNED_CONSUMER_CONFIG.maxWaitMs,
-		autocommit: false,
+		autocommit: true,
 		isolationLevel: 'READ_COMMITTED',
 	})
 
