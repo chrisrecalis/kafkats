@@ -91,6 +91,7 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 			maxWaitMs: config.maxWaitMs ?? DEFAULT_CONSUMER_CONFIG.maxWaitMs,
 			autoOffsetReset: config.autoOffsetReset ?? DEFAULT_CONSUMER_CONFIG.autoOffsetReset,
 			isolationLevel: config.isolationLevel ?? DEFAULT_CONSUMER_CONFIG.isolationLevel,
+			checkCrcs: config.checkCrcs ?? DEFAULT_CONSUMER_CONFIG.checkCrcs,
 			partitionAssignmentStrategy:
 				config.partitionAssignmentStrategy ?? DEFAULT_CONSUMER_CONFIG.partitionAssignmentStrategy,
 		}

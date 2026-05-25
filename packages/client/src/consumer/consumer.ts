@@ -92,6 +92,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			maxWaitMs: config.maxWaitMs ?? DEFAULT_CONSUMER_CONFIG.maxWaitMs,
 			autoOffsetReset: config.autoOffsetReset ?? DEFAULT_CONSUMER_CONFIG.autoOffsetReset,
 			isolationLevel: config.isolationLevel ?? DEFAULT_CONSUMER_CONFIG.isolationLevel,
+			checkCrcs: config.checkCrcs ?? DEFAULT_CONSUMER_CONFIG.checkCrcs,
 			partitionAssignmentStrategy:
 				config.partitionAssignmentStrategy ?? DEFAULT_CONSUMER_CONFIG.partitionAssignmentStrategy,
 			onBeforeRebalance: config.onBeforeRebalance,
@@ -181,6 +182,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 				maxWaitMs: this.config.maxWaitMs,
 				partitionConcurrency,
 				isolationLevel: this.config.isolationLevel,
+				checkCrcs: this.config.checkCrcs,
 			},
 			logger
 		)
