@@ -246,6 +246,12 @@ export interface ConsumerConfig {
 	 */
 	isolationLevel?: IsolationLevel
 	/**
+	 * Automatically check the CRC32C of consumed record batches. Guards against on-the-wire or
+	 * on-disk corruption; the check adds a per-batch pass over the payload, so it may be disabled
+	 * when seeking extreme performance. Matches the Java consumer's `check.crcs` (default true).
+	 */
+	checkCrcs?: boolean
+	/**
 	 * Partition assignment strategy preference.
 	 * - 'cooperative-sticky': Incremental rebalance (Kafka 2.4+, default)
 	 * - 'sticky': Minimize movement, eager rebalance
@@ -287,6 +293,7 @@ export interface ResolvedConsumerConfig {
 	maxWaitMs: number
 	autoOffsetReset: AutoOffsetReset
 	isolationLevel: IsolationLevel
+	checkCrcs: boolean
 	partitionAssignmentStrategy: PartitionAssignmentStrategy
 	onBeforeRebalance?: () => Promise<void>
 }
@@ -317,6 +324,7 @@ export const DEFAULT_CONSUMER_CONFIG = {
 	maxWaitMs: 5000,
 	autoOffsetReset: 'latest' as AutoOffsetReset,
 	isolationLevel: 'read_committed' as IsolationLevel,
+	checkCrcs: true,
 	partitionAssignmentStrategy: 'cooperative-sticky' as PartitionAssignmentStrategy,
 } as const
 

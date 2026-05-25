@@ -259,6 +259,8 @@ export interface FetchManagerConfig {
 	maxWaitMs: number
 	partitionConcurrency: number
 	isolationLevel: IsolationLevel
+	/** Verify the CRC32C of each fetched batch (default true). See ConsumerConfig.checkCrcs. */
+	checkCrcs?: boolean
 	/** Maximum bytes to buffer for poll() mode. Default: maxBytesPerPartition * 10 */
 	maxBufferedBytes?: number
 }
@@ -272,6 +274,7 @@ export const DEFAULT_FETCH_CONFIG: FetchManagerConfig = {
 	maxWaitMs: 5000,
 	partitionConcurrency: 1,
 	isolationLevel: 'read_committed',
+	checkCrcs: true,
 }
 
 /**
@@ -936,6 +939,7 @@ export class FetchManager {
 				// - Assume sequential offsets to avoid per-record BigInt conversions
 				const batch = decodeRecordBatchFromSync(decoder, {
 					assumeSequentialOffsets: true,
+					verifyCrc: this.config.checkCrcs !== false,
 				})
 				batches.push(batch)
 			} catch (e) {
@@ -988,6 +992,7 @@ export class FetchManager {
 				// - Assume sequential offsets to avoid per-record BigInt conversions
 				const batch = await decodeRecordBatchFrom(decoder, {
 					assumeSequentialOffsets: true,
+					verifyCrc: this.config.checkCrcs !== false,
 				})
 				batches.push(batch)
 			} catch (e) {
