@@ -300,6 +300,14 @@ export class SessionReduceNode<K, V> extends Processor<K, V, Windowed<K>, V> {
 		const newSessionKey: WindowedKey<K> = { key, windowStart: mergedStart, windowEnd: mergedEnd }
 		await store.put(newSessionKey, mergedValue)
 
+		// Retract each merged-away session whose window differs from the new merged window, so a
+		// downstream table/consumer keyed on the windowed key doesn't retain the absorbed sessions.
+		for (const { windowedKey } of overlappingSessions) {
+			if (windowedKey.windowStart === mergedStart && windowedKey.windowEnd === mergedEnd) continue
+			const removed: Windowed<K> = { key, window: { start: windowedKey.windowStart, end: windowedKey.windowEnd } }
+			await this.forward({ ...record, key: removed, value: null })
+		}
+
 		const windowedResult: Windowed<K> = { key, window: { start: mergedStart, end: mergedEnd } }
 		const next: StreamRecord<Windowed<K>, V> = { ...record, key: windowedResult, value: mergedValue }
 		await this.forward(next)
@@ -477,6 +485,14 @@ export class SessionAggregateNode<K, V, A> extends Processor<K, V, Windowed<K>, 
 			windowEnd: mergedEnd,
 		}
 		await store.put(newSessionKey, mergedValue)
+
+		// Retract each merged-away session whose window differs from the new merged window, so a
+		// downstream table/consumer keyed on the windowed key doesn't retain the absorbed sessions.
+		for (const { windowedKey } of overlappingSessions) {
+			if (windowedKey.windowStart === mergedStart && windowedKey.windowEnd === mergedEnd) continue
+			const removed: Windowed<K> = { key, window: { start: windowedKey.windowStart, end: windowedKey.windowEnd } }
+			await this.forward({ ...record, key: removed, value: null })
+		}
 
 		// Forward the session result
 		const windowedResult: Windowed<K> = {
