@@ -74,21 +74,22 @@ const producer = client.producer({
 
 ### Options Reference
 
-| Option                 | Type                                              | Default     | Description                |
-| ---------------------- | ------------------------------------------------- | ----------- | -------------------------- |
-| `acks`                 | `'all' \| 'leader' \| 'none'`                     | `'all'`     | Acknowledgment mode        |
-| `compression`          | `'none' \| 'gzip' \| 'snappy' \| 'lz4' \| 'zstd'` | `'none'`    | Compression type           |
-| `lingerMs`             | `number`                                          | `5`         | Batch wait time (ms)       |
-| `maxBatchBytes`        | `number`                                          | `16384`     | Max batch size (bytes)     |
-| `retries`              | `number`                                          | `3`         | Retry attempts             |
-| `retryBackoffMs`       | `number`                                          | `100`       | Initial retry backoff (ms) |
-| `maxRetryBackoffMs`    | `number`                                          | `1000`      | Max retry backoff (ms)     |
-| `partitioner`          | `'murmur2' \| 'round-robin' \| Function`          | `'murmur2'` | Partitioning strategy      |
-| `requestTimeoutMs`     | `number`                                          | `30000`     | Request timeout (ms)       |
-| `idempotent`           | `boolean`                                         | `false`     | Enable idempotent producer |
-| `maxInFlight`          | `number`                                          | `5`         | Max in-flight requests     |
-| `transactionalId`      | `string`                                          | -           | Enable transactions        |
-| `transactionTimeoutMs` | `number`                                          | `60000`     | Transaction timeout (ms)   |
+| Option                 | Type                                              | Default     | Description                                                                                            |
+| ---------------------- | ------------------------------------------------- | ----------- | ------------------------------------------------------------------------------------------------------ |
+| `acks`                 | `'all' \| 'leader' \| 'none'`                     | `'all'`     | Acknowledgment mode                                                                                    |
+| `compression`          | `'none' \| 'gzip' \| 'snappy' \| 'lz4' \| 'zstd'` | `'none'`    | Compression type                                                                                       |
+| `lingerMs`             | `number`                                          | `5`         | Batch wait time (ms)                                                                                   |
+| `maxBatchBytes`        | `number`                                          | `16384`     | Max batch size (bytes)                                                                                 |
+| `retries`              | `number`                                          | `3`         | Retry attempts                                                                                         |
+| `retryBackoffMs`       | `number`                                          | `100`       | Initial retry backoff (ms)                                                                             |
+| `maxRetryBackoffMs`    | `number`                                          | `1000`      | Max retry backoff (ms)                                                                                 |
+| `partitioner`          | `'murmur2' \| 'round-robin' \| Function`          | `'murmur2'` | Partitioning strategy                                                                                  |
+| `requestTimeoutMs`     | `number`                                          | `30000`     | Request timeout (ms)                                                                                   |
+| `idempotent`           | `boolean`                                         | `false`     | Enable idempotent producer                                                                             |
+| `maxInFlight`          | `number`                                          | `5`         | Max in-flight requests                                                                                 |
+| `transactionalId`      | `string`                                          | -           | Enable transactions                                                                                    |
+| `transactionTimeoutMs` | `number`                                          | `60000`     | Transaction timeout (ms)                                                                               |
+| `maxBlockMs`           | `number`                                          | `60000`     | Max time to block acquiring a producer id during transactional/idempotent producer initialization (ms) |
 
 ### Acknowledgment Modes
 
@@ -124,19 +125,20 @@ const consumer = client.consumer({
 
 ### Options Reference
 
-| Option                        | Type                                          | Default                | Description                   |
-| ----------------------------- | --------------------------------------------- | ---------------------- | ----------------------------- |
-| `groupId`                     | `string`                                      | -                      | Required. Consumer group ID   |
-| `groupInstanceId`             | `string`                                      | -                      | Static membership ID          |
-| `sessionTimeoutMs`            | `number`                                      | `30000`                | Session timeout (ms)          |
-| `rebalanceTimeoutMs`          | `number`                                      | `60000`                | Rebalance timeout (ms)        |
-| `heartbeatIntervalMs`         | `number`                                      | `3000`                 | Heartbeat interval (ms)       |
-| `maxBytesPerPartition`        | `number`                                      | `1048576`              | Max fetch bytes per partition |
-| `minBytes`                    | `number`                                      | `1`                    | Min bytes to fetch            |
-| `maxWaitMs`                   | `number`                                      | `5000`                 | Max fetch wait time (ms)      |
-| `autoOffsetReset`             | `'earliest' \| 'latest' \| 'none'`            | `'latest'`             | Offset reset strategy         |
-| `isolationLevel`              | `'read_committed' \| 'read_uncommitted'`      | `'read_committed'`     | Transaction isolation         |
-| `partitionAssignmentStrategy` | `'cooperative-sticky' \| 'sticky' \| 'range'` | `'cooperative-sticky'` | Assignment strategy           |
+| Option                        | Type                                          | Default                | Description                                           |
+| ----------------------------- | --------------------------------------------- | ---------------------- | ----------------------------------------------------- |
+| `groupId`                     | `string`                                      | -                      | Required. Consumer group ID                           |
+| `groupInstanceId`             | `string`                                      | -                      | Static membership ID                                  |
+| `sessionTimeoutMs`            | `number`                                      | `30000`                | Session timeout (ms)                                  |
+| `rebalanceTimeoutMs`          | `number`                                      | `60000`                | Rebalance timeout (ms)                                |
+| `heartbeatIntervalMs`         | `number`                                      | `3000`                 | Heartbeat interval (ms)                               |
+| `maxBytesPerPartition`        | `number`                                      | `1048576`              | Max fetch bytes per partition                         |
+| `minBytes`                    | `number`                                      | `1`                    | Min bytes to fetch                                    |
+| `maxWaitMs`                   | `number`                                      | `5000`                 | Max fetch wait time (ms)                              |
+| `autoOffsetReset`             | `'earliest' \| 'latest' \| 'none'`            | `'latest'`             | Offset reset strategy                                 |
+| `isolationLevel`              | `'read_committed' \| 'read_uncommitted'`      | `'read_committed'`     | Transaction isolation                                 |
+| `partitionAssignmentStrategy` | `'cooperative-sticky' \| 'sticky' \| 'range'` | `'cooperative-sticky'` | Assignment strategy                                   |
+| `defaultApiTimeoutMs`         | `number`                                      | `60000`                | Max time to retry offset fetch/commit operations (ms) |
 
 ### Offset Reset Strategies
 

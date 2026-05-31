@@ -12,6 +12,11 @@ export type RetryOptions = ReconnectionStrategyOptions & {
 	resolveOnAbort?: boolean
 	shouldRetry?: (error: unknown) => boolean
 	onRetry?: (params: { attempt: number; delayMs: number; error: unknown }) => void | Promise<void>
+	/**
+	 * Wall-clock deadline (ms) for the whole retry loop. Once exceeded, retries stop and the last
+	 * error is rethrown even if attempts remain. Leave undefined for purely attempt-bounded retries.
+	 */
+	maxElapsedMs?: number
 }
 
 export function createRetryStrategyOptions(config: RetryBackoffConfig): ReconnectionStrategyOptions {
@@ -23,8 +28,9 @@ export function createRetryStrategyOptions(config: RetryBackoffConfig): Reconnec
 }
 
 export async function retry<T>(fn: (attempt: number) => Promise<T>, options: RetryOptions = {}): Promise<T> {
-	const { signal, resolveOnAbort, shouldRetry, onRetry, ...strategyOptions } = options
+	const { signal, resolveOnAbort, shouldRetry, onRetry, maxElapsedMs, ...strategyOptions } = options
 	const strategy = new ReconnectionStrategy(strategyOptions)
+	const startedAt = Date.now()
 
 	while (strategy.shouldReconnect()) {
 		const attempt = strategy.currentAttempts + 1
@@ -37,7 +43,9 @@ export async function retry<T>(fn: (attempt: number) => Promise<T>, options: Ret
 
 			const delayMs = strategy.nextDelay()
 			strategy.recordFailure()
-			if (!strategy.shouldReconnect()) {
+			// Stop on attempt budget OR on the wall-clock deadline (would elapse past it after sleeping).
+			const deadlineExceeded = maxElapsedMs !== undefined && Date.now() - startedAt + delayMs >= maxElapsedMs
+			if (!strategy.shouldReconnect() || deadlineExceeded) {
 				throw error
 			}
 

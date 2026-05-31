@@ -148,6 +148,9 @@ export class Connection extends EventEmitter<ConnectionEvents> {
 		try {
 			this.socket = await this.socketFactory.connect(this.host, this.port)
 
+			// Attach the error handler before SASL so a socket error during auth isn't left unhandled.
+			this.socket.on('error', this.handleError.bind(this))
+
 			// Perform SASL authentication if configured
 			// This must happen before setting up the normal request queue
 			if (this.saslConfig) {
@@ -161,7 +164,6 @@ export class Connection extends EventEmitter<ConnectionEvents> {
 			})
 
 			this.socket.on('data', this.handleData.bind(this))
-			this.socket.on('error', this.handleError.bind(this))
 			this.socket.on('close', this.handleClose.bind(this))
 
 			this.scheduleSaslReauthentication(this.saslSessionLifetimeMs)
@@ -236,7 +238,7 @@ export class Connection extends EventEmitter<ConnectionEvents> {
 			}
 			this.startSaslReauthentication().catch(error => {
 				const err = error instanceof Error ? error : new Error(String(error))
-				this.emit('error', err)
+				this.emitError(err)
 				this.socket?.destroy()
 			})
 		}, delayMs)
@@ -526,7 +528,7 @@ export class Connection extends EventEmitter<ConnectionEvents> {
 			// reject-in-flight + reconnect) is guaranteed to run, then surface the error — rather
 			// than letting the throw escape the 'data' handler.
 			this.socket?.destroy()
-			this.emit('error', err instanceof Error ? err : new NetworkError(String(err)))
+			this.emitError(err instanceof Error ? err : new NetworkError(String(err)))
 			return
 		}
 		for (const messageBuffer of messages) {
@@ -540,7 +542,7 @@ export class Connection extends EventEmitter<ConnectionEvents> {
 	private handleMessage(data: Buffer): void {
 		// First 4 bytes are always the correlation ID
 		if (data.length < 4) {
-			this.emit('error', new NetworkError('Response too short to contain correlation ID'))
+			this.emitError(new NetworkError('Response too short to contain correlation ID'))
 			return
 		}
 
@@ -556,9 +558,18 @@ export class Connection extends EventEmitter<ConnectionEvents> {
 		}
 	}
 
+	private emitError(error: Error): void {
+		if (this.listenerCount('error') > 0) {
+			this.emit('error', error)
+			return
+		}
+		this.logger.error('connection error', { error: error.message })
+	}
+
 	private handleError(error: Error): void {
+		// Log the socket error; emitError surfaces it to any listener (or logs again if none).
 		this.logger.error('socket error', { error: error.message })
-		this.emit('error', error)
+		this.emitError(error)
 	}
 
 	private handleClose(hadError: boolean): void {

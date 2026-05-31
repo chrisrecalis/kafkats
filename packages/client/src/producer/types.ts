@@ -101,6 +101,11 @@ export interface ProducerConfig {
 	 * Keep these in sync to avoid surprises. Only used when transactionalId is set.
 	 */
 	transactionTimeoutMs?: number
+	/**
+	 * Maximum time in ms to block while initializing a transactional or idempotent producer,
+	 * retrying coordinator discovery and InitProducerId before failing (default: 60000).
+	 */
+	maxBlockMs?: number
 }
 
 /**
@@ -120,6 +125,7 @@ export interface ResolvedProducerConfig {
 	idempotent: boolean
 	maxInFlight: number
 	transactionTimeoutMs: number
+	maxBlockMs: number
 }
 
 export type ProducerTraceStage = 'encode_batch' | 'produce_request'

@@ -276,6 +276,11 @@ export interface ConsumerConfig {
 	 * protocol blocks on this promise; throwing rejects the rebalance.
 	 */
 	onBeforeRebalance?: () => Promise<void>
+	/**
+	 * Maximum time in ms to retry coordinator-related offset fetch and commit operations before
+	 * failing (default: 60000).
+	 */
+	defaultApiTimeoutMs?: number
 }
 
 /**
@@ -295,6 +300,7 @@ export interface ResolvedConsumerConfig {
 	isolationLevel: IsolationLevel
 	checkCrcs: boolean
 	partitionAssignmentStrategy: PartitionAssignmentStrategy
+	defaultApiTimeoutMs: number
 	onBeforeRebalance?: () => Promise<void>
 }
 
@@ -326,6 +332,7 @@ export const DEFAULT_CONSUMER_CONFIG = {
 	isolationLevel: 'read_committed' as IsolationLevel,
 	checkCrcs: true,
 	partitionAssignmentStrategy: 'cooperative-sticky' as PartitionAssignmentStrategy,
+	defaultApiTimeoutMs: 60000,
 } as const
 
 /**

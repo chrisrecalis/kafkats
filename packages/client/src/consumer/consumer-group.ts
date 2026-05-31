@@ -94,6 +94,7 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 			checkCrcs: config.checkCrcs ?? DEFAULT_CONSUMER_CONFIG.checkCrcs,
 			partitionAssignmentStrategy:
 				config.partitionAssignmentStrategy ?? DEFAULT_CONSUMER_CONFIG.partitionAssignmentStrategy,
+			defaultApiTimeoutMs: config.defaultApiTimeoutMs ?? DEFAULT_CONSUMER_CONFIG.defaultApiTimeoutMs,
 		}
 		// If a custom assignor is provided, use it; otherwise derive from strategy
 		this.assignor = assignor ?? this.getAssignorForStrategy(this.config.partitionAssignmentStrategy)
@@ -346,7 +347,7 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 		} catch (error) {
 			// Ignore errors during leave - we're leaving anyway
 			this.logger.error('leave group error', { error: (error as Error).message })
-			this.emit('error', error as Error)
+			this.emitError(error as Error)
 		} finally {
 			this.state = ConsumerGroupState.UNJOINED
 			this.memberId = ''
@@ -727,6 +728,14 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 				await this.syncGroup(topics)
 				break
 
+			case ErrorCode.CoordinatorLoadInProgress:
+				// Coordinator still loading - retriable; backoff and rejoin from scratch.
+				await sleep(500, { signal: this.abortController?.signal })
+				this.state = ConsumerGroupState.UNJOINED
+				await this.joinGroup(topics)
+				await this.syncGroup(topics)
+				break
+
 			case ErrorCode.FencedInstanceId:
 				throw new KafkaProtocolError(
 					errorCode,
@@ -777,7 +786,7 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 				})
 				.catch(error => {
 					this.logger.error('heartbeat failed', { error: (error as Error).message })
-					this.emit('error', error as Error)
+					this.emitError(error as Error)
 				})
 				.finally(() => {
 					if (this.state === ConsumerGroupState.STABLE && !this.abortController?.signal.aborted) {
@@ -828,8 +837,7 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 				// For static members, UNKNOWN_MEMBER_ID after being replaced is a fencing scenario.
 				// Surface this as FENCED_INSTANCE_ID and stop instead of trying to transparently rejoin.
 				if (this.config.groupInstanceId) {
-					this.emit(
-						'error',
+					this.emitError(
 						new KafkaProtocolError(ErrorCode.FencedInstanceId, 'Static member instance is fenced')
 					)
 					break
@@ -862,13 +870,21 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 				if (fencedPartitions.length > 0) {
 					this.emit('sessionLost', fencedPartitions)
 				}
-				this.emit('error', new KafkaProtocolError(errorCode, 'Static member instance is fenced'))
+				this.emitError(new KafkaProtocolError(errorCode, 'Static member instance is fenced'))
 				break
 			}
 
 			default:
-				this.emit('error', new KafkaProtocolError(errorCode, 'Heartbeat failed'))
+				this.emitError(new KafkaProtocolError(errorCode, 'Heartbeat failed'))
 		}
+	}
+
+	private emitError(error: Error): void {
+		if (this.listenerCount('error') > 0) {
+			this.emit('error', error)
+			return
+		}
+		this.logger.error('consumer group error', { error: error.message })
 	}
 
 	/**

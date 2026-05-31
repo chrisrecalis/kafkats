@@ -70,6 +70,7 @@ const DEFAULT_CONFIG: Required<Omit<ProducerConfig, 'transactionalId' | 'trace'>
 	idempotent: false,
 	maxInFlight: 5,
 	transactionTimeoutMs: 60000,
+	maxBlockMs: 60000,
 }
 
 /**
@@ -1591,9 +1592,18 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	 * Actual initialization logic - separated for proper promise handling
 	 */
 	private async doInitializeIdempotentProducer(): Promise<void> {
-		const strategy = new ReconnectionStrategy(createRetryStrategyOptions(this.config))
+		// Retry coordinator discovery + InitProducerId until maxBlockMs, riding through a loading or
+		// briefly-unreachable coordinator. Non-retriable protocol errors fail fast.
+		const deadlineAt = Date.now() + this.config.maxBlockMs
+		const backoff = new ReconnectionStrategy({
+			initialDelayMs: this.config.retryBackoffMs,
+			maxDelayMs: this.config.maxRetryBackoffMs,
+			maxAttempts: Number.MAX_SAFE_INTEGER,
+		})
+		let lastError: Error = new Error('InitProducerId timed out before the coordinator was ready')
 
-		while (strategy.shouldReconnect()) {
+		while (Date.now() < deadlineAt) {
+			let response: Awaited<ReturnType<Broker['initProducerId']>>
 			try {
 				let broker: Broker
 
@@ -1605,75 +1615,75 @@ export class Producer extends EventEmitter<ProducerEvents> {
 					broker = await (this.cluster as unknown as { getAnyBroker: () => Promise<Broker> }).getAnyBroker()
 				}
 
-				const response = await broker.initProducerId({
+				response = await broker.initProducerId({
 					transactionalId: this.config.transactionalId,
 					transactionTimeoutMs: this.config.transactionalId ? this.config.transactionTimeoutMs : 0,
 					producerId: this.producerId !== -1n ? this.producerId : undefined,
 					producerEpoch: this.producerEpoch !== -1 ? this.producerEpoch : undefined,
 				})
-
-				// Check for errors
-				if (response.errorCode !== ErrorCode.None) {
-					const errorCode = response.errorCode
-
-					// Retriable errors (including coordinator movement) should backoff and retry.
-					if (isRetriableError(errorCode)) {
-						// If our transaction coordinator moved, invalidate cache so the next attempt re-discovers it.
-						if (
-							this.config.transactionalId &&
-							(errorCode === ErrorCode.NotCoordinator || errorCode === ErrorCode.CoordinatorNotAvailable)
-						) {
-							this.cluster.invalidateCoordinator('TRANSACTION', this.config.transactionalId)
-						}
-
-						strategy.recordFailure()
-						if (strategy.shouldReconnect()) {
-							await this.sleep(strategy.nextDelay())
-							continue
-						}
-					}
-
-					// CLUSTER_AUTHORIZATION_FAILED or other non-retriable errors
-					this.idempotentState = 'error'
-					throw new Error(`InitProducerId failed: ${ErrorCode[errorCode] ?? errorCode}`)
-				}
-
-				// Success - store producer identity
-				this.producerId = response.producerId
-				this.producerEpoch = response.producerEpoch
-
-				// Reset sequences on (re)initialization
-				this.sequences.clear()
-				this.reservedSequences.clear()
-
-				// Reset transaction state on (re)initialization
-				this.transactionState = 'idle'
-				this.partitionsInTransaction.clear()
-				this.offsetsToCommit.clear()
-
-				this.accumulator.setFenced(false)
-
-				this.idempotentState = 'running'
-				this.logger.info('idempotent producer initialized', {
-					producerId: this.producerId.toString(),
-					producerEpoch: this.producerEpoch,
-					transactionalId: this.config.transactionalId,
-				})
-				return
 			} catch (error) {
-				strategy.recordFailure()
+				// Transport failure: re-discover the coordinator and retry until the deadline.
+				if (this.config.transactionalId) {
+					this.cluster.invalidateCoordinator('TRANSACTION', this.config.transactionalId)
+				}
+				lastError = error instanceof Error ? error : new Error(String(error))
+				const delay = backoff.nextDelay()
+				backoff.recordFailure()
+				await this.sleep(delay)
+				continue
+			}
 
-				if (!strategy.shouldReconnect()) {
-					this.idempotentState = 'error'
-					throw error
+			// Protocol-level error handling — outside the try so a non-retriable code escapes the
+			// loop instead of being re-caught and treated as a transport failure.
+			if (response.errorCode !== ErrorCode.None) {
+				const errorCode = response.errorCode
+
+				if (isRetriableError(errorCode)) {
+					// If our transaction coordinator moved, invalidate so the next attempt re-discovers it.
+					if (
+						this.config.transactionalId &&
+						(errorCode === ErrorCode.NotCoordinator || errorCode === ErrorCode.CoordinatorNotAvailable)
+					) {
+						this.cluster.invalidateCoordinator('TRANSACTION', this.config.transactionalId)
+					}
+					lastError = new Error(`InitProducerId failed: ${ErrorCode[errorCode] ?? errorCode}`)
+					const delay = backoff.nextDelay()
+					backoff.recordFailure()
+					await this.sleep(delay)
+					continue
 				}
 
-				await this.sleep(strategy.nextDelay())
+				// CLUSTER_AUTHORIZATION_FAILED or other non-retriable errors — fail fast.
+				this.idempotentState = 'error'
+				throw new Error(`InitProducerId failed: ${ErrorCode[errorCode] ?? errorCode}`)
 			}
+
+			// Success - store producer identity
+			this.producerId = response.producerId
+			this.producerEpoch = response.producerEpoch
+
+			// Reset sequences on (re)initialization
+			this.sequences.clear()
+			this.reservedSequences.clear()
+
+			// Reset transaction state on (re)initialization
+			this.transactionState = 'idle'
+			this.partitionsInTransaction.clear()
+			this.offsetsToCommit.clear()
+
+			this.accumulator.setFenced(false)
+
+			this.idempotentState = 'running'
+			this.logger.info('idempotent producer initialized', {
+				producerId: this.producerId.toString(),
+				producerEpoch: this.producerEpoch,
+				transactionalId: this.config.transactionalId,
+			})
+			return
 		}
 
 		this.idempotentState = 'error'
-		throw new Error('Failed to initialize idempotent producer: max retries exceeded')
+		throw lastError
 	}
 
 	/**
@@ -1846,6 +1856,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 			idempotent,
 			maxInFlight: idempotent ? Math.min(maxInFlight, 5) : maxInFlight,
 			transactionTimeoutMs: config.transactionTimeoutMs ?? 60000,
+			maxBlockMs: config.maxBlockMs ?? DEFAULT_CONFIG.maxBlockMs,
 		}
 	}
 
