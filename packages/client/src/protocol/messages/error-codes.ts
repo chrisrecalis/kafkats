@@ -119,6 +119,7 @@ export enum ErrorCode {
 	FetchSessionTopicIdError = 106,
 	IneligibleReplica = 107,
 	NewLeaderElected = 108,
+	FencedMemberEpoch = 110,
 	InvalidRecordState = 121,
 	ShareSessionNotFound = 122,
 	InvalidShareSessionEpoch = 123,
@@ -148,6 +149,7 @@ const RETRIABLE_ERRORS = new Set<ErrorCode>([
 	ErrorCode.InvalidFetchSessionEpoch,
 	ErrorCode.ShareSessionNotFound,
 	ErrorCode.InvalidShareSessionEpoch,
+	ErrorCode.ShareSessionLimitReached,
 	ErrorCode.ListenerNotFound,
 	ErrorCode.FencedLeaderEpoch,
 	ErrorCode.UnknownLeaderEpoch,
@@ -244,6 +246,8 @@ export function getErrorMessage(code: ErrorCode): string {
 		[ErrorCode.InvalidProducerEpoch]:
 			'The producer attempted an operation with an old epoch; a newer producer with the same transactionalId has fenced it',
 		[ErrorCode.ProducerFenced]: 'The producer has been fenced by a newer instance with the same transactionalId',
+		[ErrorCode.FencedMemberEpoch]:
+			'The member epoch is fenced by the group coordinator; the member must abandon its partitions and rejoin',
 	}
 
 	return messages[code] ?? `Unknown error code: ${code}`

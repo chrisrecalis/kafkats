@@ -200,11 +200,11 @@ describe('AckManager.flushAll - cross-partition error isolation', () => {
 		const sendAcknowledge = vi.fn(async (_broker: Broker, _req: ShareAcknowledgeRequestWithoutEpoch) => {
 			calls++
 			if (calls === 1) {
-				// One request, two partitions: P0 fails fatally (non-retriable), P1 hits a
-				// retriable leader error and should be queued for retry.
+				// One request, two partitions: P0 fails fatally (non-retriable), P1 hits a retriable
+				// share-session error and should be queued for retry with a fresh session.
 				return makeResponse([
 					{ partitionIndex: 0, errorCode: ErrorCode.InvalidRecordState },
-					{ partitionIndex: 1, errorCode: ErrorCode.NotLeaderOrFollower },
+					{ partitionIndex: 1, errorCode: ErrorCode.InvalidShareSessionEpoch },
 				])
 			}
 			// Retry attempt: the retriable partition now succeeds.
@@ -232,5 +232,37 @@ describe('AckManager.flushAll - cross-partition error isolation', () => {
 		expect(await p0Settled).toBe('rejected')
 		// The retriable partition was actually retried (a second ShareAcknowledge).
 		expect(sendAcknowledge).toHaveBeenCalledTimes(2)
+	})
+
+	it('fails (does not retry) an acknowledgement on a leader-change error and refreshes metadata', async () => {
+		const sendAcknowledge = vi.fn(async () =>
+			makeResponse([{ partitionIndex: 0, errorCode: ErrorCode.NotLeaderOrFollower }])
+		)
+		const refreshMetadata = vi.fn(async () => undefined)
+		const fakeBroker = { nodeId: 1 } as unknown as Broker
+		const ackManager = new AckManager(
+			'test-group',
+			() => 'member-1',
+			sendAcknowledge,
+			async () => fakeBroker,
+			refreshMetadata,
+			() => undefined,
+			noopLogger,
+			1000
+		)
+
+		const p = ackManager.enqueue(TOPIC_NAME, TOPIC_ID, 0, 0n, ACK_ACCEPT)
+		const settled = p.then(
+			() => 'resolved' as const,
+			() => 'rejected' as const
+		)
+		await ackManager.flushAll().catch(() => undefined)
+
+		// Re-sending the ack to a re-resolved leader could ack a record we no longer hold: it must be
+		// failed (the record redelivers), NOT retried.
+		expect(await settled).toBe('rejected')
+		expect(sendAcknowledge).toHaveBeenCalledTimes(1)
+		// Leadership is refreshed so the next fetch re-resolves the leader.
+		expect(refreshMetadata).toHaveBeenCalledWith([TOPIC_NAME])
 	})
 })
