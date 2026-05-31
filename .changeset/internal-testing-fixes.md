@@ -1,8 +1,8 @@
 ---
-'@kafkats/client': patch
-'@kafkats/flow': patch
-'@kafkats/codec-zod': patch
-'@kafkats/flow-state-lmdb': patch
+'@kafkats/client': minor
+'@kafkats/flow': minor
+'@kafkats/codec-zod': minor
+'@kafkats/flow-state-lmdb': minor
 ---
 
 Various fixes from internal testing:
