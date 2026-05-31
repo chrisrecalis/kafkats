@@ -118,6 +118,25 @@ describe('ShareConsumer ShareSessionLimitReached (133)', () => {
 		// 133 is a share-session error: epoch reset to the initial value, not advanced to 6.
 		expect(c.shareSessionEpochByBrokerId.get(1)).toBe(0)
 	})
+
+	it('does NOT treat 133 as a session error on the ShareAcknowledge path (epoch advances)', async () => {
+		const c = makeConsumer()
+		const broker = {
+			nodeId: 1,
+			shareAcknowledge: vi.fn().mockResolvedValue({
+				throttleTimeMs: 0,
+				errorCode: ErrorCode.ShareSessionLimitReached,
+				errorMessage: null,
+				acquisitionLockTimeoutMs: 0,
+				topics: [],
+				nodeEndpoints: [],
+			}),
+		}
+		c.shareSessionEpochByBrokerId.set(1, 5)
+		// An acknowledge never opens a session, so 133 is not a session reset here: the epoch advances.
+		await c.shareAcknowledge(broker, { groupId: 'g1', memberId: 'm1', topics: [] })
+		expect(c.shareSessionEpochByBrokerId.get(1)).toBe(6)
+	})
 })
 
 describe('ShareConsumer member fencing', () => {
@@ -146,7 +165,9 @@ describe('ShareConsumer member fencing', () => {
 			expect(c.memberEpoch).toBe(0) // reset to the rejoin epoch
 			expect(c.memberId).toBe(originalMemberId) // memberId is kept across a fence
 			expect(c.assignment).toEqual([]) // assignment abandoned
-			expect(c.shareSessionEpochByBrokerId.size).toBe(0) // per-broker sessions wiped
+			// Per-broker share sessions are left intact (as in Java); they reset via a session error if
+			// the broker invalidated them, rather than being cleared mid-run (which would race in-flight ops).
+			expect(c.shareSessionEpochByBrokerId.get(1)).toBe(5)
 			expect(revoked).toHaveBeenCalledWith([{ topic: 't', partition: 0 }])
 		})
 	}

@@ -80,11 +80,14 @@ const EMPTY_BUFFER = Buffer.alloc(0)
 // async-iterator consumer. 1 most faithfully matches the pull model.
 const STREAM_QUEUE_HIGH_WATER_MARK = 1
 
-function isShareSessionError(code: ErrorCode): boolean {
+// ShareSessionLimitReached (133) is a session error on the ShareFetch path (open a new session) but
+// NOT on the ShareAcknowledge path (an acknowledge never opens a session) -- callers pass
+// includeLimitReached=false for acknowledge, matching the Java ShareSessionHandler.
+function isShareSessionError(code: ErrorCode, includeLimitReached = true): boolean {
 	return (
 		code === ErrorCode.ShareSessionNotFound ||
 		code === ErrorCode.InvalidShareSessionEpoch ||
-		code === ErrorCode.ShareSessionLimitReached
+		(includeLimitReached && code === ErrorCode.ShareSessionLimitReached)
 	)
 }
 
@@ -133,17 +136,21 @@ function classifyFetchPartitionError(code: ErrorCode): 'refresh' | 'skip' | 'fat
  */
 function findShareSessionError(
 	topLevel: ErrorCode,
-	topics: Array<{ partitions: Array<{ errorCode: ErrorCode; acknowledgeErrorCode?: ErrorCode }> }>
+	topics: Array<{ partitions: Array<{ errorCode: ErrorCode; acknowledgeErrorCode?: ErrorCode }> }>,
+	includeLimitReached = true
 ): ErrorCode | null {
-	if (isShareSessionError(topLevel)) {
+	if (isShareSessionError(topLevel, includeLimitReached)) {
 		return topLevel
 	}
 	for (const topic of topics) {
 		for (const partition of topic.partitions) {
-			if (isShareSessionError(partition.errorCode)) {
+			if (isShareSessionError(partition.errorCode, includeLimitReached)) {
 				return partition.errorCode
 			}
-			if (partition.acknowledgeErrorCode !== undefined && isShareSessionError(partition.acknowledgeErrorCode)) {
+			if (
+				partition.acknowledgeErrorCode !== undefined &&
+				isShareSessionError(partition.acknowledgeErrorCode, includeLimitReached)
+			) {
 				return partition.acknowledgeErrorCode
 			}
 		}
@@ -303,6 +310,7 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 		this.heartbeatIntervalMs = 1000
 		this.assignment = []
 		this.didInitialPrefetch = false
+		this.lastAcquisitionLockTimeoutMs = 0
 		this.topicIdByName.clear()
 		this.topicNameById.clear()
 		this.subscribedTopics = []
@@ -582,7 +590,9 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 				throw e
 			}
 
-			const sessionError = findShareSessionError(response.errorCode, response.topics)
+			// A ShareAcknowledge never opens a session, so ShareSessionLimitReached (133) is not a
+			// session error here (matches Java); only ShareSessionNotFound / InvalidShareSessionEpoch reset.
+			const sessionError = findShareSessionError(response.errorCode, response.topics, false)
 			if (sessionError !== null) {
 				this.resetShareSessionEpoch(broker.nodeId)
 				throw new KafkaProtocolError(sessionError, response.errorMessage ?? 'ShareAcknowledge failed')
@@ -777,19 +787,16 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 		// No further action needed here.
 	}
 
-	// Reset to a freshly-joining member after a fence (FencedMemberEpoch / UnknownMemberId): rejoin
-	// epoch is 0, the memberId is kept (it is this member's lifetime id), and the per-broker share
-	// sessions are wiped so the next ShareFetch starts fresh full sessions. The broker already
-	// dropped this member's acquisition locks, so its in-flight records redeliver to the group after
-	// the lock timeout — we do not ack/release them here (those acks would fail anyway).
+	// Reset to a freshly-joining member after a fence (FencedMemberEpoch / UnknownMemberId): the rejoin
+	// epoch is 0 and the memberId is kept (it is this member's lifetime id). The assignment is dropped;
+	// the broker already released this member's acquisition locks, so its records redeliver to the
+	// group. Per-broker share sessions are left intact (as in the Java client): clearing them mid-run
+	// would race in-flight ShareFetch/ShareAcknowledge completions on the per-broker op queue, and if
+	// the broker did invalidate a session the next ShareFetch gets a session error and resets naturally.
 	private transitionToFenced(): void {
 		this.memberEpoch = 0
-		this.shareSessionEpochByBrokerId.clear()
-		this.shareSessionPartitionsByBrokerId.clear()
-		this.shareSessionQueueByBrokerId.clear()
 		const revoked = this.assignment
 		this.assignment = []
-		this.didInitialPrefetch = false
 		if (revoked.length > 0) {
 			this.emit('partitionsRevoked', revoked)
 		}
@@ -911,7 +918,18 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 	): Promise<ShareFetchWorkItem[]> {
 		const signal = this.abortController!.signal
 
+		// A top-level (response-level) ShareFetch error: ride through recoverable ones (refresh metadata
+		// or skip this round) rather than throwing fatally, as the Java client does. Share-session errors
+		// were already handled in shareFetch() before this. Only a genuinely fatal code stops the consumer.
 		if (response.errorCode !== ErrorCode.None) {
+			const cls = classifyFetchPartitionError(response.errorCode)
+			if (cls === 'refresh') {
+				this.fetchMetadataStale = true
+				return []
+			}
+			if (cls === 'skip') {
+				return []
+			}
 			throw new KafkaProtocolError(response.errorCode, response.errorMessage ?? 'ShareFetch failed')
 		}
 
