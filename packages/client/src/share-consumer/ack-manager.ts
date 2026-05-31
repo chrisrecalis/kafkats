@@ -9,13 +9,24 @@ import type { ShareAcknowledgeResponse } from '@/protocol/messages/responses/sha
 
 import type { Logger } from '@/logger.js'
 
+/**
+ * GAP (wire type 0): not a user action. Emitted internally for an acquired offset that has no
+ * delivered record (a compaction hole or a control-batch offset) so the broker can advance the
+ * share-partition start offset past it instead of redelivering it forever.
+ */
+export const ACK_GAP = 0
 export const ACK_ACCEPT = 1
 export const ACK_RELEASE = 2
 export const ACK_REJECT = 3
 /** RENEW (KIP-1222, ShareAcknowledge/ShareFetch v2+) extends the acquisition lock without finalizing delivery. */
 export const ACK_RENEW = 4
 
-export type AcknowledgeType = typeof ACK_ACCEPT | typeof ACK_RELEASE | typeof ACK_REJECT | typeof ACK_RENEW
+export type AcknowledgeType =
+	| typeof ACK_GAP
+	| typeof ACK_ACCEPT
+	| typeof ACK_RELEASE
+	| typeof ACK_REJECT
+	| typeof ACK_RENEW
 
 type PendingAckEntry = {
 	offset: bigint
@@ -321,8 +332,12 @@ export class AckManager {
 		retry: Map<string, PendingPartitionAcks>
 		retryErrors: Map<string, Error>
 	}> {
-		const isLeaderError = (errorCode: ErrorCode): boolean =>
+		// A leader change does NOT mean "retry the ack": re-sending an acknowledgement to a freshly
+		// resolved leader could ack a record this member no longer holds (the broker released it). Fail
+		// the ack (the record redelivers after the lock timeout) and refresh leadership for next time.
+		const isLeaderChangeError = (errorCode: ErrorCode): boolean =>
 			errorCode === ErrorCode.NotLeaderOrFollower ||
+			errorCode === ErrorCode.FencedLeaderEpoch ||
 			errorCode === ErrorCode.UnknownTopicOrPartition ||
 			errorCode === ErrorCode.UnknownTopicId
 
@@ -331,6 +346,7 @@ export class AckManager {
 
 		const retry = new Map<string, PendingPartitionAcks>()
 		const retryErrors = new Map<string, Error>()
+		const leaderChangeTopics = new Set<string>()
 
 		const partitions = [...pendingByKey.values()]
 		const resolved = await Promise.allSettled(
@@ -435,9 +451,12 @@ export class AckManager {
 								`ShareAcknowledge failed for ${partition.topicName}-${partition.partitionIndex}`
 						)
 
-						if (isLeaderError(partitionResponse.errorCode)) {
-							retry.set(key, partition)
-							retryErrors.set(key, err)
+						if (isLeaderChangeError(partitionResponse.errorCode)) {
+							// Fail the ack; refresh leadership for the next fetch. The record redelivers.
+							for (const e of partition.entries) {
+								e.reject(err)
+							}
+							leaderChangeTopics.add(partition.topicName)
 							continue
 						}
 
@@ -454,17 +473,22 @@ export class AckManager {
 					}
 				} catch (error) {
 					const err = error instanceof Error ? error : new Error(String(error))
-					if (
-						err instanceof KafkaProtocolError &&
-						(isLeaderError(err.errorCode) || isShareSessionError(err.errorCode))
-					) {
-						if (isShareSessionError(err.errorCode)) {
-							this.resetShareSessionEpoch(brokerId)
-						}
+					if (err instanceof KafkaProtocolError && isShareSessionError(err.errorCode)) {
+						this.resetShareSessionEpoch(brokerId)
 						for (const { partition } of items) {
 							const key = `${partition.topicId}:${partition.partitionIndex}`
 							retry.set(key, partition)
 							retryErrors.set(key, err)
+						}
+						return
+					}
+					if (err instanceof KafkaProtocolError && isLeaderChangeError(err.errorCode)) {
+						// Top-level leader-change: fail this broker's acks, refresh leadership, do not retry.
+						for (const { partition } of items) {
+							for (const e of partition.entries) {
+								e.reject(err)
+							}
+							leaderChangeTopics.add(partition.topicName)
 						}
 						return
 					}
@@ -490,6 +514,12 @@ export class AckManager {
 				const err = r.reason instanceof Error ? r.reason : new Error(String(r.reason))
 				this.logger.error('share acknowledge failed for a broker', { error: err.message })
 			}
+		}
+
+		// Refresh leadership for partitions whose acks failed on a leader change, so the next fetch
+		// re-resolves the leader. The acks themselves were already failed (not queued for retry).
+		if (leaderChangeTopics.size > 0) {
+			await this.refreshMetadata([...leaderChangeTopics]).catch(() => {})
 		}
 
 		return { retry, retryErrors }

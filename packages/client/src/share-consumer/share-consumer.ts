@@ -11,14 +11,18 @@ import { EventEmitter } from 'node:events'
 import type { Broker } from '@/client/broker.js'
 import type { Cluster } from '@/client/cluster.js'
 import {
+	BrokerNotAvailableError,
 	CoordinatorNotAvailableError,
+	KafkaError,
 	KafkaFeatureDisabledError,
 	KafkaFeatureUnsupportedError,
 	KafkaProtocolError,
+	LeaderNotAvailableError,
 	NotCoordinatorError,
 	UnsupportedVersionError,
 } from '@/client/errors.js'
-import { ErrorCode } from '@/protocol/messages/error-codes.js'
+import { NetworkError } from '@/network/errors.js'
+import { ErrorCode, getErrorName } from '@/protocol/messages/error-codes.js'
 import type { DecodedRecord } from '@/protocol/records/index.js'
 import { decodeRecordBatchFrom, decodeRecordBatchFromSync } from '@/protocol/records/index.js'
 
@@ -52,7 +56,7 @@ import { sleep } from '@/utils/sleep.js'
 import { Decoder } from '@/protocol/primitives/decoder.js'
 
 import type { ShareAcknowledgeRequestWithoutEpoch } from './ack-manager.js'
-import { AckManager, ACK_ACCEPT, ACK_RELEASE, ACK_REJECT, ACK_RENEW } from './ack-manager.js'
+import { AckManager, ACK_GAP, ACK_ACCEPT, ACK_RELEASE, ACK_REJECT, ACK_RENEW } from './ack-manager.js'
 import {
 	SHARE_ACQUIRE_MODE_BATCH_OPTIMIZED,
 	SHARE_ACQUIRE_MODE_RECORD_LIMIT,
@@ -71,8 +75,56 @@ import { pmap } from '@/utils/pmap.js'
 
 const EMPTY_BUFFER = Buffer.alloc(0)
 
-function isShareSessionError(code: ErrorCode): boolean {
-	return code === ErrorCode.ShareSessionNotFound || code === ErrorCode.InvalidShareSessionEpoch
+// stream() back-pressure: with the fetch loop at concurrency 1, parking the handler once this many
+// records are buffered keeps the loop from fetching (and broker-locking) unboundedly ahead of a slow
+// async-iterator consumer. 1 most faithfully matches the pull model.
+const STREAM_QUEUE_HIGH_WATER_MARK = 1
+
+// ShareSessionLimitReached (133) is a session error on the ShareFetch path (open a new session) but
+// NOT on the ShareAcknowledge path (an acknowledge never opens a session) -- callers pass
+// includeLimitReached=false for acknowledge, matching the Java ShareSessionHandler.
+function isShareSessionError(code: ErrorCode, includeLimitReached = true): boolean {
+	return (
+		code === ErrorCode.ShareSessionNotFound ||
+		code === ErrorCode.InvalidShareSessionEpoch ||
+		(includeLimitReached && code === ErrorCode.ShareSessionLimitReached)
+	)
+}
+
+// Transient infrastructure errors the fetch/heartbeat loops ride through (refresh metadata or
+// re-resolve the coordinator and retry) instead of treating as fatal: a broker dying mid-request
+// (socket closed / connect failed / request timeout), an unavailable broker or leader, a moved
+// coordinator, or any retriable protocol error. Non-retriable errors (auth, feature disabled) fall
+// through to fatal and stop the consumer.
+function isTransientShareError(error: unknown): boolean {
+	if (error instanceof NetworkError) return true
+	if (error instanceof BrokerNotAvailableError || error instanceof LeaderNotAvailableError) return true
+	if (error instanceof KafkaError) return error.retriable
+	return false
+}
+
+// Per-partition ShareFetch errorCode classification. Most fetch errors are recoverable: skip the
+// partition this round (its acquired records redeliver after the lock timeout) and, for the
+// metadata-class errors, refresh metadata so the next round re-resolves the leader. Only a small set
+// is fatal. Mirrors the Java ShareFetchCollector.handleInitializeErrors behaviour.
+const FETCH_PARTITION_REFRESH_ERRORS = new Set<ErrorCode>([
+	ErrorCode.NotLeaderOrFollower,
+	ErrorCode.ReplicaNotAvailable,
+	ErrorCode.KafkaStorageError,
+	ErrorCode.FencedLeaderEpoch,
+	ErrorCode.OffsetNotAvailable,
+	ErrorCode.UnknownTopicOrPartition,
+	ErrorCode.UnknownTopicId,
+	ErrorCode.InconsistentTopicId,
+])
+const FETCH_PARTITION_SKIP_ONLY_ERRORS = new Set<ErrorCode>([
+	ErrorCode.UnknownLeaderEpoch,
+	ErrorCode.UnknownServerError,
+])
+function classifyFetchPartitionError(code: ErrorCode): 'refresh' | 'skip' | 'fatal' {
+	if (FETCH_PARTITION_REFRESH_ERRORS.has(code)) return 'refresh'
+	if (FETCH_PARTITION_SKIP_ONLY_ERRORS.has(code)) return 'skip'
+	return 'fatal'
 }
 
 /**
@@ -84,17 +136,21 @@ function isShareSessionError(code: ErrorCode): boolean {
  */
 function findShareSessionError(
 	topLevel: ErrorCode,
-	topics: Array<{ partitions: Array<{ errorCode: ErrorCode; acknowledgeErrorCode?: ErrorCode }> }>
+	topics: Array<{ partitions: Array<{ errorCode: ErrorCode; acknowledgeErrorCode?: ErrorCode }> }>,
+	includeLimitReached = true
 ): ErrorCode | null {
-	if (isShareSessionError(topLevel)) {
+	if (isShareSessionError(topLevel, includeLimitReached)) {
 		return topLevel
 	}
 	for (const topic of topics) {
 		for (const partition of topic.partitions) {
-			if (isShareSessionError(partition.errorCode)) {
+			if (isShareSessionError(partition.errorCode, includeLimitReached)) {
 				return partition.errorCode
 			}
-			if (partition.acknowledgeErrorCode !== undefined && isShareSessionError(partition.acknowledgeErrorCode)) {
+			if (
+				partition.acknowledgeErrorCode !== undefined &&
+				isShareSessionError(partition.acknowledgeErrorCode, includeLimitReached)
+			) {
 				return partition.acknowledgeErrorCode
 			}
 		}
@@ -147,7 +203,15 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 	private shareSessionQueueByBrokerId: Map<number, Promise<void>> = new Map()
 	private heartbeatIntervalMs: number = 1000
 	private assignment: TopicPartition[] = []
+	// Warm-up prefetch is done once per run (on the first assignment). prefetchAssignedPartitions
+	// discards the records it acquires, so re-running it on every rebalance would needlessly redeliver.
 	private didInitialPrefetch = false
+	// Latest broker-reported acquisition-lock timeout (ms); how long the app has to process/renew a
+	// record before its lock expires and it is redelivered. Surfaced via acquisitionLockTimeoutMs.
+	private lastAcquisitionLockTimeoutMs = 0
+	// Set when a ShareFetch task hit a transient error (dead broker / stale leader) so the fetch
+	// loop refreshes metadata and re-resolves leaders before the next round.
+	private fetchMetadataStale = false
 	private topicIdByName: Map<string, string> = new Map()
 	private topicNameById: Map<string, string> = new Map()
 	private subscribedTopics: string[] = []
@@ -168,10 +232,39 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 		const acquireMode = config.acquireMode ?? DEFAULT_SHARE_CONSUMER_CONFIG.acquireMode
 		this.acquireModeWire =
 			acquireMode === 'record_limit' ? SHARE_ACQUIRE_MODE_RECORD_LIMIT : SHARE_ACQUIRE_MODE_BATCH_OPTIMIZED
+		this.validateConfig()
+	}
+
+	private validateConfig(): void {
+		const c = this.config
+		if (!c.groupId) {
+			throw new Error('ShareConsumer requires a non-empty groupId')
+		}
+		if (!Number.isInteger(c.maxRecords) || c.maxRecords <= 0) {
+			throw new Error(`ShareConsumer maxRecords must be a positive integer (got ${c.maxRecords})`)
+		}
+		if (!Number.isInteger(c.batchSize) || c.batchSize <= 0) {
+			throw new Error(`ShareConsumer batchSize must be a positive integer (got ${c.batchSize})`)
+		}
+		if (c.minBytes < 0) {
+			throw new Error(`ShareConsumer minBytes must be >= 0 (got ${c.minBytes})`)
+		}
+		if (c.maxBytes < c.minBytes) {
+			throw new Error(`ShareConsumer maxBytes (${c.maxBytes}) must be >= minBytes (${c.minBytes})`)
+		}
+		if (c.maxWaitMs < 0) {
+			throw new Error(`ShareConsumer maxWaitMs must be >= 0 (got ${c.maxWaitMs})`)
+		}
 	}
 
 	get isRunning(): boolean {
 		return this.state === 'running'
+	}
+
+	/** Latest broker-reported acquisition-lock timeout in ms (how long before an unacked record is
+	 * redelivered), or 0 before the first fetch. Use it to decide when to call message.renew(). */
+	get acquisitionLockTimeoutMs(): number {
+		return this.lastAcquisitionLockTimeoutMs
 	}
 
 	/**
@@ -217,6 +310,7 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 		this.heartbeatIntervalMs = 1000
 		this.assignment = []
 		this.didInitialPrefetch = false
+		this.lastAcquisitionLockTimeoutMs = 0
 		this.topicIdByName.clear()
 		this.topicNameById.clear()
 		this.subscribedTopics = []
@@ -373,6 +467,9 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 			}
 
 			this.shareSessionEpochByBrokerId.set(broker.nodeId, nextShareSessionEpoch(epoch))
+			if (response.acquisitionLockTimeoutMs > 0) {
+				this.lastAcquisitionLockTimeoutMs = response.acquisitionLockTimeoutMs
+			}
 			// Record the partition set the broker's session now holds, so the next fetch can
 			// forget any partitions that drop out of the assignment.
 			this.shareSessionPartitionsByBrokerId.set(broker.nodeId, currentByTopic)
@@ -420,15 +517,22 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 				const response = await this.shareFetch(broker, topicPartitions, overrides)
 				return { broker, response }
 			} catch (error) {
-				if (
-					error instanceof KafkaProtocolError &&
-					(error.errorCode === ErrorCode.ShareSessionNotFound ||
-						error.errorCode === ErrorCode.InvalidShareSessionEpoch)
-				) {
+				if (error instanceof KafkaProtocolError && isShareSessionError(error.errorCode)) {
 					this.logger.debug('share session error, retrying with a new session', {
 						leaderId,
 						errorCode: error.errorCode,
 						error: error.message,
+					})
+					return null
+				}
+				// A broker dying mid-fetch (or a stale leader) must not sink the whole round's
+				// Promise.all and kill the consumer. Drop this leader for now, flag metadata stale so
+				// the loop re-resolves leaders, and let the records be re-fetched next round.
+				if (isTransientShareError(error)) {
+					this.fetchMetadataStale = true
+					this.logger.debug('share fetch to leader failed, retrying next round', {
+						leaderId,
+						error: (error as Error).message,
 					})
 					return null
 				}
@@ -486,7 +590,9 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 				throw e
 			}
 
-			const sessionError = findShareSessionError(response.errorCode, response.topics)
+			// A ShareAcknowledge never opens a session, so ShareSessionLimitReached (133) is not a
+			// session error here (matches Java); only ShareSessionNotFound / InvalidShareSessionEpoch reset.
+			const sessionError = findShareSessionError(response.errorCode, response.topics, false)
 			if (sessionError !== null) {
 				this.resetShareSessionEpoch(broker.nodeId)
 				throw new KafkaProtocolError(sessionError, response.errorMessage ?? 'ShareAcknowledge failed')
@@ -585,6 +691,14 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 					await sleep(250, { signal, resolveOnAbort: true })
 					continue
 				}
+				// Re-resolve the coordinator and retry on a transient failure (e.g. the coordinator
+				// broker died) instead of failing the join.
+				if (isTransientShareError(error)) {
+					this.cluster.invalidateCoordinator('GROUP', this.config.groupId)
+					this.coordinator = null
+					await sleep(250, { signal, resolveOnAbort: true })
+					continue
+				}
 				throw error
 			}
 
@@ -628,6 +742,20 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 				throw new NotCoordinatorError('GROUP', this.config.groupId)
 			}
 
+			// Fencing is recoverable, not fatal: the coordinator advanced past this member's epoch (or
+			// forgot it). Abandon the assignment and rejoin with epoch 0 on the next heartbeat.
+			if (
+				response.errorCode === ErrorCode.FencedMemberEpoch ||
+				response.errorCode === ErrorCode.UnknownMemberId
+			) {
+				this.logger.info('share group member fenced; abandoning assignment and rejoining', {
+					errorCode: response.errorCode,
+					memberId: this.memberId,
+				})
+				this.transitionToFenced()
+				return
+			}
+
 			const message = response.errorMessage ?? `ShareGroupHeartbeat failed for ${this.config.groupId}`
 			// Share Groups are feature-flagged. When the broker supports the Share APIs but the
 			// share.version feature is not enabled, ShareGroupHeartbeat returns InvalidRequest.
@@ -659,6 +787,21 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 		// No further action needed here.
 	}
 
+	// Reset to a freshly-joining member after a fence (FencedMemberEpoch / UnknownMemberId): the rejoin
+	// epoch is 0 and the memberId is kept (it is this member's lifetime id). The assignment is dropped;
+	// the broker already released this member's acquisition locks, so its records redeliver to the
+	// group. Per-broker share sessions are left intact (as in the Java client): clearing them mid-run
+	// would race in-flight ShareFetch/ShareAcknowledge completions on the per-broker op queue, and if
+	// the broker did invalidate a session the next ShareFetch gets a session error and resets naturally.
+	private transitionToFenced(): void {
+		this.memberEpoch = 0
+		const revoked = this.assignment
+		this.assignment = []
+		if (revoked.length > 0) {
+			this.emit('partitionsRevoked', revoked)
+		}
+	}
+
 	private async applyAssignment(raw: Array<{ topicId: string; partitions: number[] }>): Promise<void> {
 		if (this.topicNameById.size === 0) {
 			await this.refreshTopicIdMaps([])
@@ -688,9 +831,11 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 
 		this.assignment = next
 
-		// Share groups effectively start from "now" when a member first begins fetching. On initial
-		// assignment, proactively issue a non-blocking ShareFetch to establish the starting point
-		// before emitting partitionsAssigned (so callers can safely produce after this event).
+		// Share groups effectively start from "now" when a member first begins fetching. On the first
+		// assignment, proactively issue a non-blocking ShareFetch to establish the starting point before
+		// emitting partitionsAssigned (so callers can safely produce after this event). Only once per
+		// run: prefetchAssignedPartitions discards what it acquires, so repeating it per-rebalance would
+		// needlessly redeliver records.
 		if (!this.didInitialPrefetch && next.length > 0) {
 			await this.prefetchAssignedPartitions(next)
 			this.didInitialPrefetch = true
@@ -768,11 +913,23 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 	private async collectShareFetchWorkItems(
 		broker: Broker,
 		response: ShareFetchResponse,
-		subscriptionByTopic: Map<string, TopicSubscription<unknown, unknown>>
+		subscriptionByTopic: Map<string, TopicSubscription<unknown, unknown>>,
+		ackManager: AckManager
 	): Promise<ShareFetchWorkItem[]> {
 		const signal = this.abortController!.signal
 
+		// A top-level (response-level) ShareFetch error: ride through recoverable ones (refresh metadata
+		// or skip this round) rather than throwing fatally, as the Java client does. Share-session errors
+		// were already handled in shareFetch() before this. Only a genuinely fatal code stops the consumer.
 		if (response.errorCode !== ErrorCode.None) {
+			const cls = classifyFetchPartitionError(response.errorCode)
+			if (cls === 'refresh') {
+				this.fetchMetadataStale = true
+				return []
+			}
+			if (cls === 'skip') {
+				return []
+			}
 			throw new KafkaProtocolError(response.errorCode, response.errorMessage ?? 'ShareFetch failed')
 		}
 
@@ -793,17 +950,24 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 				if (signal.aborted || this.state !== 'running') break
 
 				if (partitionResponse.errorCode !== ErrorCode.None) {
-					// Best-effort metadata refresh on leadership/unknown topic errors
-					if (
-						partitionResponse.errorCode === ErrorCode.NotLeaderOrFollower ||
-						partitionResponse.errorCode === ErrorCode.UnknownTopicOrPartition ||
-						partitionResponse.errorCode === ErrorCode.UnknownTopicId
-					) {
-						await this.cluster.refreshMetadata([topicName])
-						await this.refreshTopicIdMaps([])
+					const cls = classifyFetchPartitionError(partitionResponse.errorCode)
+					if (cls === 'refresh') {
+						this.logger.debug('share fetch partition error, refreshing metadata and skipping', {
+							topic: topicName,
+							partition: partitionResponse.partitionIndex,
+							errorCode: getErrorName(partitionResponse.errorCode),
+						})
+						this.fetchMetadataStale = true
 						continue
 					}
-
+					if (cls === 'skip') {
+						this.logger.warn('share fetch partition error, skipping this round', {
+							topic: topicName,
+							partition: partitionResponse.partitionIndex,
+							errorCode: getErrorName(partitionResponse.errorCode),
+						})
+						continue
+					}
 					throw new KafkaProtocolError(
 						partitionResponse.errorCode,
 						partitionResponse.errorMessage ??
@@ -823,10 +987,7 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 						continue
 					}
 
-					if (
-						partitionResponse.acknowledgeErrorCode === ErrorCode.ShareSessionNotFound ||
-						partitionResponse.acknowledgeErrorCode === ErrorCode.InvalidShareSessionEpoch
-					) {
+					if (isShareSessionError(partitionResponse.acknowledgeErrorCode)) {
 						this.resetShareSessionEpoch(broker.nodeId)
 					}
 
@@ -837,17 +998,39 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 					)
 				}
 
-				const recordsData = partitionResponse.recordsData
-				if (!recordsData || recordsData.length === 0) {
-					continue
-				}
-
-				const records = await this.decodeRecords(recordsData)
-				if (records.length === 0) {
-					continue
-				}
-
 				const acquiredRecords = partitionResponse.acquiredRecords
+				const recordsData = partitionResponse.recordsData
+
+				// Nothing acquired and no data: nothing to deliver or gap-ack.
+				if (acquiredRecords.length === 0 && (!recordsData || recordsData.length === 0)) {
+					continue
+				}
+
+				const records = recordsData && recordsData.length > 0 ? await this.decodeRecords(recordsData) : []
+				const recordOffsets = new Set<bigint>()
+				for (const r of records) recordOffsets.add(r.offset)
+
+				// Gap-ack every acquired offset that has no delivered record (a compaction hole or a
+				// control-batch offset, which decodeRecords drops). Without this the share-partition
+				// start offset stalls and those offsets redeliver forever. Fire-and-forget: the fetch
+				// round's flushAll sends them. Runs even when records is empty (control-only response).
+				// A gap-ack can legitimately fail (lock expired, leader moved); the offset just
+				// redelivers, so swallow the rejection rather than letting it escape as unhandled.
+				for (const range of acquiredRecords) {
+					for (let off = range.firstOffset; off <= range.lastOffset; off++) {
+						if (!recordOffsets.has(off)) {
+							void ackManager
+								.enqueue(
+									topicName,
+									topicResponse.topicId,
+									partitionResponse.partitionIndex,
+									off,
+									ACK_GAP
+								)
+								.catch(() => {})
+						}
+					}
+				}
 
 				for (const record of records) {
 					if (signal.aborted || this.state !== 'running') break
@@ -855,13 +1038,18 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 					const range = acquiredRecords.find(
 						r => record.offset >= r.firstOffset && record.offset <= r.lastOffset
 					)
+					// Deliver only records the broker actually acquired (locked) for this member. A
+					// ShareFetch can return batch data spanning already-acked records (e.g. when the
+					// share-partition start offset is held back by a gap); records outside every acquired
+					// range are not held by this member and must be skipped, not reprocessed.
+					if (!range) continue
 
 					items.push({
 						topicName,
 						topicId: topicResponse.topicId,
 						partitionIndex: partitionResponse.partitionIndex,
 						record,
-						deliveryCount: range?.deliveryCount,
+						deliveryCount: range.deliveryCount,
 						decoder,
 						keyDecoder,
 					})
@@ -936,10 +1124,19 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 
 		if (handled === 0 && autoAckOnSuccess) {
 			handled = 1
-			// Await (like the explicit ack()) so a failed auto-ack surfaces instead of being
-			// silently swallowed — otherwise the record is redelivered after its acquisition
-			// lock expires with no signal to the application.
-			await ackManager.enqueue(topicName, topicId, partitionIndex, record.offset, ACK_ACCEPT)
+			try {
+				await ackManager.enqueue(topicName, topicId, partitionIndex, record.offset, ACK_ACCEPT)
+			} catch (error) {
+				// A failed auto-ack (e.g. the acquisition lock expired) must not kill the consumer: the
+				// record is left to redeliver after the lock times out. Surface it in the log rather than
+				// throwing, which would tear down the fetch loop.
+				this.logger.warn('auto-acknowledge failed; record will be redelivered', {
+					topic: topicName,
+					partition: partitionIndex,
+					offset: record.offset.toString(),
+					error: (error as Error).message,
+				})
+			}
 		}
 
 		return 1
@@ -959,6 +1156,14 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 					continue
 				}
 				if (error instanceof KafkaProtocolError && error.errorCode === ErrorCode.CoordinatorLoadInProgress) {
+					await sleep(250, { signal, resolveOnAbort: true })
+					continue
+				}
+				// The coordinator broker may have died mid-heartbeat: drop it so the next iteration
+				// re-resolves a live coordinator, rather than tearing down the consumer.
+				if (isTransientShareError(error)) {
+					this.cluster.invalidateCoordinator('GROUP', this.config.groupId)
+					this.coordinator = null
 					await sleep(250, { signal, resolveOnAbort: true })
 					continue
 				}
@@ -999,74 +1204,111 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 
 		try {
 			while (!signal.aborted && this.state === 'running') {
-				const partitionsByLeader = new Map<number, Map<string, number[]>>()
+				try {
+					const partitionsByLeader = new Map<number, Map<string, number[]>>()
 
-				for (const tp of this.assignment) {
-					const topicId = this.topicIdByName.get(tp.topic)
-					if (!topicId) continue
+					for (const tp of this.assignment) {
+						const topicId = this.topicIdByName.get(tp.topic)
+						if (!topicId) continue
 
-					const leader = await this.cluster.getLeaderForPartition(tp.topic, tp.partition)
-					const byTopic = partitionsByLeader.get(leader.nodeId) ?? new Map<string, number[]>()
-					const partitions = byTopic.get(topicId) ?? []
-					partitions.push(tp.partition)
-					byTopic.set(topicId, partitions)
-					partitionsByLeader.set(leader.nodeId, byTopic)
-				}
-
-				// Brokers whose share session still holds partitions that are no longer assigned to
-				// them (e.g. the last assigned partition on a broker was revoked or moved away). They
-				// are absent from partitionsByLeader, so without an explicit forget-only ShareFetch the
-				// broker would retain the stale partitions (and their acquisition locks) until the
-				// session times out. Send an empty fetch so forgottenTopicsData drops them now.
-				const forgetOnlyBrokerIds: number[] = []
-				for (const [brokerId, byTopic] of this.shareSessionPartitionsByBrokerId) {
-					if (!partitionsByLeader.has(brokerId) && byTopic.size > 0) {
-						forgetOnlyBrokerIds.push(brokerId)
+						const leader = await this.cluster.getLeaderForPartition(tp.topic, tp.partition)
+						const byTopic = partitionsByLeader.get(leader.nodeId) ?? new Map<string, number[]>()
+						const partitions = byTopic.get(topicId) ?? []
+						partitions.push(tp.partition)
+						byTopic.set(topicId, partitions)
+						partitionsByLeader.set(leader.nodeId, byTopic)
 					}
-				}
 
-				if (partitionsByLeader.size === 0 && forgetOnlyBrokerIds.length === 0) {
-					await sleep(opts.idleBackoffMs, { signal, resolveOnAbort: true })
-					continue
-				}
+					// Brokers whose share session still holds partitions that are no longer assigned to
+					// them (e.g. the last assigned partition on a broker was revoked or moved away). They
+					// are absent from partitionsByLeader, so without an explicit forget-only ShareFetch the
+					// broker would retain the stale partitions (and their acquisition locks) until the
+					// session times out. Send an empty fetch so forgottenTopicsData drops them now.
+					const forgetOnlyBrokerIds: number[] = []
+					for (const [brokerId, byTopic] of this.shareSessionPartitionsByBrokerId) {
+						if (!partitionsByLeader.has(brokerId) && byTopic.size > 0) {
+							forgetOnlyBrokerIds.push(brokerId)
+						}
+					}
 
-				const fetchTasks: Array<Promise<{ broker: Broker; response: ShareFetchResponse } | null>> = []
-
-				for (const [leaderId, byTopicId] of partitionsByLeader) {
-					const topicPartitions = [...byTopicId.entries()].map(([topicId, partitions]) => ({
-						topicId,
-						partitions,
-					}))
-					fetchTasks.push(this.buildShareFetchTask(leaderId, topicPartitions))
-				}
-
-				// Empty topicPartitions => topics:[] with forgottenTopicsData listing the stale set.
-				for (const brokerId of forgetOnlyBrokerIds) {
-					fetchTasks.push(this.buildShareFetchTask(brokerId, []))
-				}
-
-				const fetchResults = await Promise.all(fetchTasks)
-				const workItems: ShareFetchWorkItem[] = []
-				for (const result of fetchResults) {
-					if (!result || signal.aborted || this.state !== 'running') {
+					if (partitionsByLeader.size === 0 && forgetOnlyBrokerIds.length === 0) {
+						await sleep(opts.idleBackoffMs, { signal, resolveOnAbort: true })
 						continue
 					}
-					workItems.push(
-						...(await this.collectShareFetchWorkItems(result.broker, result.response, subscriptionByTopic))
+
+					const fetchTasks: Array<Promise<{ broker: Broker; response: ShareFetchResponse } | null>> = []
+
+					for (const [leaderId, byTopicId] of partitionsByLeader) {
+						const topicPartitions = [...byTopicId.entries()].map(([topicId, partitions]) => ({
+							topicId,
+							partitions,
+						}))
+						fetchTasks.push(this.buildShareFetchTask(leaderId, topicPartitions))
+					}
+
+					// Empty topicPartitions => topics:[] with forgottenTopicsData listing the stale set.
+					for (const brokerId of forgetOnlyBrokerIds) {
+						fetchTasks.push(this.buildShareFetchTask(brokerId, []))
+					}
+
+					const fetchResults = await Promise.all(fetchTasks)
+
+					// A leader died/moved or a topic id changed this round: refresh metadata AND the topic-id
+					// maps so the next round re-resolves leaders and topic ids instead of retrying stale ones.
+					if (this.fetchMetadataStale) {
+						this.fetchMetadataStale = false
+						await this.refreshTopicIdMaps(this.subscribedTopics).catch(() => {})
+					}
+
+					const workItems: ShareFetchWorkItem[] = []
+					for (const result of fetchResults) {
+						if (!result || signal.aborted || this.state !== 'running') {
+							continue
+						}
+						workItems.push(
+							...(await this.collectShareFetchWorkItems(
+								result.broker,
+								result.response,
+								subscriptionByTopic,
+								ackManager
+							))
+						)
+					}
+
+					const delivered = await pmap(
+						workItems,
+						item => this.processShareFetchWorkItem(item, handler, ackManager, autoAckOnSuccess),
+						opts.concurrency,
+						signal
 					)
-				}
+					const totalDelivered = delivered.reduce((a, b) => a + b, 0)
 
-				const delivered = await pmap(
-					workItems,
-					item => this.processShareFetchWorkItem(item, handler, ackManager, autoAckOnSuccess),
-					opts.concurrency,
-					signal
-				)
-				const totalDelivered = delivered.reduce((a, b) => a + b, 0)
+					await ackManager.flushAll()
 
-				await ackManager.flushAll()
-
-				if (totalDelivered === 0) {
+					if (totalDelivered === 0) {
+						await sleep(opts.idleBackoffMs, { signal, resolveOnAbort: true })
+					}
+				} catch (error) {
+					if (signal.aborted || this.state !== 'running') break
+					// A per-partition error the classifier deemed fatal (e.g. CorruptMessage, auth) is
+					// authoritative even if its code is globally "retriable" — surface it rather than
+					// retrying the same partition forever. Share-session errors are excluded: they are
+					// genuinely retried with a fresh session.
+					if (
+						error instanceof KafkaProtocolError &&
+						!isShareSessionError(error.errorCode) &&
+						classifyFetchPartitionError(error.errorCode) === 'fatal'
+					) {
+						throw error
+					}
+					// Transient infrastructure failures (dead broker, stale leader, moved coordinator)
+					// must not kill the consumer: refresh metadata, back off, and retry. Acquired-but-
+					// unprocessed records are redelivered after their acquisition lock expires.
+					if (!isTransientShareError(error)) throw error
+					this.logger.debug('share fetch loop transient error, refreshing metadata and retrying', {
+						error: (error as Error).message,
+					})
+					await this.cluster.refreshMetadata(this.subscribedTopics).catch(() => {})
 					await sleep(opts.idleBackoffMs, { signal, resolveOnAbort: true })
 				}
 			}
@@ -1145,19 +1387,22 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 		let fetchPromise: Promise<void> | null = null
 		let loopError: Error | null = null
 		let previousMessage: ShareMessage<unknown, unknown> | null = null
+		// Resolves the back-pressure gate when the iterator drains; declared out here so the finally can
+		// release a fetch loop parked on a full queue (otherwise shutdown would deadlock). A holder object
+		// keeps the closure-assigned resolver visible to control-flow analysis at the call sites.
+		const gate: { resume: (() => void) | null } = { resume: null }
 
 		const implicitFinalize = (
 			message: ShareMessage<unknown, unknown>,
 			op: 'ack' | 'release',
 			stopOnError: boolean
-		) => {
-			void message[op]().catch(error => {
+		): Promise<void> =>
+			message[op]().catch(error => {
 				if (error instanceof ShareMessageAlreadyHandledError) return
 				const err = error instanceof Error ? error : new Error(String(error))
 				this.emitError(err)
 				if (stopOnError) this.stop()
 			})
-		}
 
 		try {
 			const { subscriptions, topics: rawTopics } = this.getSubscriptionsAndTopics(subscription)
@@ -1178,6 +1423,13 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 				if (resolveNext) {
 					resolveNext()
 					resolveNext = null
+				}
+				// Back-pressure: park the fetch loop (concurrency 1) until the iterator drains below the
+				// high-water mark, so we don't fetch/lock records unboundedly ahead of a slow consumer.
+				if (messageQueue.length >= STREAM_QUEUE_HIGH_WATER_MARK) {
+					return new Promise<void>(resolve => {
+						gate.resume = () => resolve()
+					})
 				}
 				return Promise.resolve()
 			}
@@ -1205,6 +1457,11 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 
 				while (messageQueue.length > 0) {
 					const item = messageQueue.shift()!
+					// Drained below the gate: unblock the fetch loop.
+					if (gate.resume && messageQueue.length < STREAM_QUEUE_HIGH_WATER_MARK) {
+						gate.resume()
+						gate.resume = null
+					}
 					if (previousMessage) {
 						implicitFinalize(previousMessage, 'ack', true)
 					}
@@ -1213,17 +1470,30 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 				}
 			}
 		} finally {
-			// Iterator exit is ambiguous (clean break vs user throw); release rather than ack
-			// so the message returns to the share group for redelivery instead of being silently consumed.
-			if (previousMessage) {
-				implicitFinalize(previousMessage, 'release', false)
-				previousMessage = null
+			// Iterator exit is ambiguous (clean break vs user throw); release rather than ack so the
+			// message returns to the share group for redelivery instead of being silently consumed. The
+			// release is enqueued (synchronously into the ack manager) before shutdown closes it.
+			const releasePromise = previousMessage ? implicitFinalize(previousMessage, 'release', false) : null
+			previousMessage = null
+
+			// Unblock a fetch loop parked on the back-pressure gate so it can reach its finally and flush.
+			if (gate.resume) {
+				gate.resume()
+				gate.resume = null
 			}
 
 			this.stop()
 			const promises = [heartbeatPromise, fetchPromise].filter((p): p is Promise<void> => p !== null)
 			await Promise.allSettled(promises)
 			await this.finalizeRun()
+			if (releasePromise) await releasePromise
+		}
+
+		// Surface a fatal background loop error to the iterator consumer (matching runEach) instead of
+		// ending the stream cleanly as if it had drained normally.
+		if (loopError) {
+			const err: Error = loopError ?? new Error('ShareConsumer stream loop failed')
+			throw err
 		}
 	}
 }
