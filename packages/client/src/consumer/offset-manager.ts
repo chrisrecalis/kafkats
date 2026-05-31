@@ -26,6 +26,7 @@ export class OffsetManager {
 	private readonly groupId: string
 	private readonly groupInstanceId?: string
 	private readonly logger: Logger
+	private readonly apiTimeoutMs: number
 
 	// Current state (set by consumer group on join/rejoin)
 	private memberId: string = ''
@@ -47,10 +48,11 @@ export class OffsetManager {
 	// (e.g. trigger rejoin on IllegalGeneration).
 	private onCommitError: ((error: Error) => void) | null = null
 
-	constructor(cluster: Cluster, groupId: string, groupInstanceId?: string, logger?: Logger) {
+	constructor(cluster: Cluster, groupId: string, groupInstanceId?: string, logger?: Logger, apiTimeoutMs = 60000) {
 		this.cluster = cluster
 		this.groupId = groupId
 		this.groupInstanceId = groupInstanceId
+		this.apiTimeoutMs = apiTimeoutMs
 		this.logger = logger?.child({ component: 'offset-manager', groupId }) ?? noopLogger
 	}
 
@@ -288,7 +290,20 @@ export class OffsetManager {
 			}
 		}
 
-		if (firstError) throw firstError
+		if (firstError) {
+			// Re-discover the coordinator before the next attempt, else commits retry forever against
+			// the stale one. The caller (auto-commit loop / revoke-time commit) drives re-attempts.
+			if (
+				firstError.errorCode === ErrorCode.NotCoordinator ||
+				firstError.errorCode === ErrorCode.CoordinatorNotAvailable
+			) {
+				this.cluster.invalidateCoordinator('GROUP', this.groupId)
+				this.coordinator = await this.cluster
+					.getCoordinator('GROUP', this.groupId)
+					.catch(() => this.coordinator)
+			}
+			throw firstError
+		}
 
 		this.logger.debug('offsets committed successfully')
 	}
@@ -317,16 +332,38 @@ export class OffsetManager {
 			partitions: partitions.map(partitionIndex => ({ partitionIndex })),
 		}))
 
-		const response = await this.coordinator.offsetFetch({
-			groupId: this.groupId,
-			topics,
-		})
-
-		// Check for top-level error
-		if (response.errorCode !== ErrorCode.None) {
-			this.logger.error('offset fetch failed', { errorCode: response.errorCode })
-			throw new KafkaProtocolError(response.errorCode, 'OffsetFetch failed')
-		}
+		// Retriable top-level codes (coordinator loading/moved) must not fatally fail consumer
+		// start/rebalance — retry with backoff and re-discover the coordinator.
+		const response = await retry(
+			async () => {
+				if (!this.coordinator) {
+					throw new KafkaProtocolError(ErrorCode.CoordinatorNotAvailable, 'OffsetFetch: no coordinator')
+				}
+				const res = await this.coordinator.offsetFetch({ groupId: this.groupId, topics })
+				if (res.errorCode !== ErrorCode.None) {
+					throw new KafkaProtocolError(res.errorCode, 'OffsetFetch failed')
+				}
+				return res
+			},
+			{
+				// Time-bounded by defaultApiTimeoutMs; maxAttempts is only a non-firing safety net.
+				maxAttempts: 1_000,
+				maxElapsedMs: this.apiTimeoutMs,
+				initialDelayMs: 100,
+				maxDelayMs: 1_000,
+				multiplier: 2,
+				jitter: 0,
+				shouldRetry: error => isKafkaError(error) && error.retriable,
+				onRetry: async ({ error }) => {
+					const errorCode = isKafkaError(error) ? error.errorCode : undefined
+					if (errorCode === ErrorCode.NotCoordinator || errorCode === ErrorCode.CoordinatorNotAvailable) {
+						this.cluster.invalidateCoordinator('GROUP', this.groupId)
+						const refreshed = await this.cluster.getCoordinator('GROUP', this.groupId).catch(() => null)
+						if (refreshed) this.coordinator = refreshed
+					}
+				},
+			}
+		)
 
 		// Build result map
 		const result = new Map<string, bigint>()

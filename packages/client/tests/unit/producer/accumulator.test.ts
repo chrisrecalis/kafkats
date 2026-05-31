@@ -19,6 +19,7 @@ function createConfig(overrides: Partial<ResolvedProducerConfig> = {}): Resolved
 		idempotent: false,
 		maxInFlight: 5,
 		transactionTimeoutMs: 60000,
+		maxBlockMs: 60000,
 		...overrides,
 	}
 }

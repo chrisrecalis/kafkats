@@ -95,6 +95,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			checkCrcs: config.checkCrcs ?? DEFAULT_CONSUMER_CONFIG.checkCrcs,
 			partitionAssignmentStrategy:
 				config.partitionAssignmentStrategy ?? DEFAULT_CONSUMER_CONFIG.partitionAssignmentStrategy,
+			defaultApiTimeoutMs: config.defaultApiTimeoutMs ?? DEFAULT_CONSUMER_CONFIG.defaultApiTimeoutMs,
 			onBeforeRebalance: config.onBeforeRebalance,
 		}
 	}
@@ -166,7 +167,8 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			this.cluster,
 			this.config.groupId,
 			useConsumerGroup ? this.config.groupInstanceId : undefined,
-			logger
+			logger,
+			this.config.defaultApiTimeoutMs
 		)
 		// Wire auto-commit failures back to the consumer so generation/coordinator
 		// errors are surfaced as 'error' events and trigger a rejoin instead of

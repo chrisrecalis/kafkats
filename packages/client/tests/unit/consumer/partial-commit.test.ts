@@ -20,7 +20,8 @@ describe('OffsetManager.commitPendingOffsets partial-failure handling', () => {
 		})
 
 		const cluster = {
-			getCoordinator: vi.fn(),
+			getCoordinator: vi.fn().mockResolvedValue({ offsetCommit }),
+			invalidateCoordinator: vi.fn(),
 			getLogger: () => null,
 		}
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any

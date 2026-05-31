@@ -241,6 +241,9 @@ export function getErrorMessage(code: ErrorCode): string {
 		[ErrorCode.ShareSessionNotFound]: 'The share session was not found',
 		[ErrorCode.InvalidShareSessionEpoch]: 'The share session epoch is invalid',
 		[ErrorCode.ShareSessionLimitReached]: 'The limit of share sessions has been reached',
+		[ErrorCode.InvalidProducerEpoch]:
+			'The producer attempted an operation with an old epoch; a newer producer with the same transactionalId has fenced it',
+		[ErrorCode.ProducerFenced]: 'The producer has been fenced by a newer instance with the same transactionalId',
 	}
 
 	return messages[code] ?? `Unknown error code: ${code}`

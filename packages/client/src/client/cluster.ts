@@ -153,7 +153,7 @@ export class Cluster extends EventEmitter<ClusterEvents> {
 		for (const broker of this.brokers.values()) {
 			disconnectPromises.push(
 				broker.disconnect().catch((error: Error) => {
-					this.emit('error', error)
+					this.emitError(error)
 				})
 			)
 		}
@@ -161,7 +161,7 @@ export class Cluster extends EventEmitter<ClusterEvents> {
 		for (const broker of this.bootstrapBrokers) {
 			disconnectPromises.push(
 				broker.disconnect().catch((error: Error) => {
-					this.emit('error', error)
+					this.emitError(error)
 				})
 			)
 		}
@@ -362,6 +362,14 @@ export class Cluster extends EventEmitter<ClusterEvents> {
 		}
 
 		return this.getBroker(this.metadata.controllerId)
+	}
+
+	private emitError(error: Error): void {
+		if (this.listenerCount('error') > 0) {
+			this.emit('error', error)
+			return
+		}
+		this.logger.error('cluster error', { error: error.message })
 	}
 
 	async getAnyBroker(): Promise<Broker> {
@@ -570,7 +578,7 @@ export class Cluster extends EventEmitter<ClusterEvents> {
 		const intervalMs = this.config.metadataRefreshIntervalMs ?? DEFAULT_METADATA_REFRESH_INTERVAL_MS
 		this.metadataRefreshInterval = setInterval(() => {
 			this.refreshMetadata().catch((error: Error) => {
-				this.emit('error', error)
+				this.emitError(error)
 			})
 		}, intervalMs)
 
