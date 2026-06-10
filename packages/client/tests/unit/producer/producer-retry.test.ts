@@ -54,6 +54,44 @@ describe('Producer retry behavior', () => {
 			expect(mockCluster.refreshMetadata).toHaveBeenCalled()
 		})
 
+		it('re-routes NOT_LEADER_OR_FOLLOWER retries to the refreshed partition leader', async () => {
+			const oldLeader = createMockBroker(1)
+			const newLeader = createMockBroker(2)
+			mockCluster.getLeaderForPartition
+				.mockImplementationOnce(async () => oldLeader)
+				.mockImplementationOnce(async () => newLeader)
+
+			oldLeader.produce.mockImplementation(async () =>
+				buildProduceResponse([
+					{
+						name: 'test-topic',
+						partitions: [{ partitionIndex: 0, errorCode: ErrorCode.NotLeaderOrFollower }],
+					},
+				])
+			)
+			newLeader.produce.mockImplementation(async () =>
+				buildProduceResponse([
+					{
+						name: 'test-topic',
+						partitions: [{ partitionIndex: 0, errorCode: ErrorCode.None, baseOffset: 101n }],
+					},
+				])
+			)
+
+			const producer = new Producer(mockCluster, {
+				lingerMs: 0,
+				retries: 3,
+				retryBackoffMs: 1,
+			})
+
+			const result = await producer.send('test-topic', { value: Buffer.from('test') })
+
+			expect(result.offset).toBe(101n)
+			expect(oldLeader.produce).toHaveBeenCalledTimes(1)
+			expect(newLeader.produce).toHaveBeenCalledTimes(1)
+			expect(mockCluster.refreshMetadata).toHaveBeenCalledWith(['test-topic'])
+		})
+
 		it('retries on REQUEST_TIMED_OUT', async () => {
 			const producer = new Producer(mockCluster, {
 				lingerMs: 0,
