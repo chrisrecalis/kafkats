@@ -374,26 +374,43 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 				continue
 			}
 
+			const batchesByPartition = new Map<string, typeof batches>()
+			for (const batch of batches) {
+				const key = `${batch.topic}:${batch.partition}`
+				const partitionBatches = batchesByPartition.get(key)
+				if (partitionBatches) {
+					partitionBatches.push(batch)
+				} else {
+					batchesByPartition.set(key, [batch])
+				}
+			}
+
 			try {
 				await pmapVoid(
-					batches,
-					async batch => {
-						// Skip batches from partitions that were revoked during rebalance
-						// Check both FetchManager (has partition state) and PartitionTracker (assigned + not revoking)
-						if (!fetchManager.isPartitionAssigned(batch.topic, batch.partition)) {
-							return
-						}
+					Array.from(batchesByPartition.values()),
+					async partitionBatches => {
+						for (const batch of partitionBatches) {
+							if (signal.aborted) {
+								return
+							}
 
-						// Mark partition as processing - returns false if partition is not assigned or being revoked
-						if (!partitionTracker.startProcessing(batch.topic, batch.partition)) {
-							return
-						}
+							// Skip batches from partitions that were revoked during rebalance
+							// Check both FetchManager (has partition state) and PartitionTracker (assigned + not revoking)
+							if (!fetchManager.isPartitionAssigned(batch.topic, batch.partition)) {
+								continue
+							}
 
-						try {
-							await batchHandler(batch.topic, batch.partition, batch.records, decoders, handlerCtx)
-						} finally {
-							// Mark processing complete - this unblocks any pending revoke() wait
-							partitionTracker.endProcessing(batch.topic, batch.partition)
+							// Mark partition as processing - returns false if partition is not assigned or being revoked
+							if (!partitionTracker.startProcessing(batch.topic, batch.partition)) {
+								continue
+							}
+
+							try {
+								await batchHandler(batch.topic, batch.partition, batch.records, decoders, handlerCtx)
+							} finally {
+								// Mark processing complete - this unblocks any pending revoke() wait
+								partitionTracker.endProcessing(batch.topic, batch.partition)
+							}
 						}
 					},
 					concurrency,
