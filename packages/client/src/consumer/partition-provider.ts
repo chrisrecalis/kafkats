@@ -8,7 +8,7 @@
 import type { Broker } from '@/client/broker.js'
 import type { Cluster } from '@/client/cluster.js'
 import type { Logger } from '@/logger.js'
-import type { ConsumerGroup } from './consumer-group.js'
+import type { ConsumerGroup, JoinResult } from './consumer-group.js'
 import type { OffsetManager } from './offset-manager.js'
 import type { TopicPartition, ManualAssignment, AutoOffsetReset } from './types.js'
 import { retry } from '@/utils/retry.js'
@@ -209,10 +209,15 @@ export class GroupPartitionProvider implements PartitionProvider {
 			await this.callbacks.onRebalance()
 
 			const previousAssignment = this.consumerGroup.currentAssignment
-			if (this.consumerGroup.currentRebalanceProtocol === 'eager') {
-				await this.handleEagerRebalance(previousAssignment)
+			const rejoinResult = await this.consumerGroup.rejoin(this.topics)
+			if (!this.isRunning()) return
+
+			await this.updateGroupState()
+
+			if (rejoinResult.protocol === 'eager') {
+				await this.handleEagerRebalance(previousAssignment, rejoinResult.assignment)
 			} else {
-				await this.handleCooperativeRebalance()
+				await this.handleCooperativeRebalance(rejoinResult)
 			}
 		} catch (error) {
 			const err = error instanceof Error ? error : new Error(String(error))
@@ -225,27 +230,21 @@ export class GroupPartitionProvider implements PartitionProvider {
 		}
 	}
 
-	private async handleEagerRebalance(previousAssignment: TopicPartition[]): Promise<void> {
+	private async handleEagerRebalance(
+		previousAssignment: TopicPartition[],
+		assignment: TopicPartition[]
+	): Promise<void> {
 		this.logger.debug('eager rebalance: revoking all partitions')
 
 		if (previousAssignment.length > 0) {
 			await this.callbacks!.onPartitionsRevoked(previousAssignment)
 		}
 
-		const rejoinResult = await this.consumerGroup.rejoin(this.topics)
-		if (!this.isRunning()) return
-
-		await this.updateGroupState()
-		const partitionsWithOffsets = await this.resolveOffsets(rejoinResult.assignment)
+		const partitionsWithOffsets = await this.resolveOffsets(assignment)
 		await this.callbacks!.onPartitionsAssigned(partitionsWithOffsets)
 	}
 
-	private async handleCooperativeRebalance(): Promise<void> {
-		let rejoinResult = await this.consumerGroup.rejoin(this.topics)
-		if (!this.isRunning()) return
-
-		await this.updateGroupState()
-
+	private async handleCooperativeRebalance(rejoinResult: JoinResult): Promise<void> {
 		if (rejoinResult.protocol === 'cooperative') {
 			this.logger.debug('cooperative rebalance: phase 1', {
 				revokedCount: rejoinResult.revoked.length,
