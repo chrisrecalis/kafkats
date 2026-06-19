@@ -151,6 +151,10 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	// Broker-level batching: collect ready batches and group by broker
 	private pendingBatches: PartitionBatch[] = []
 	private drainScheduled = false
+	// Every outstanding send() promise. A send's promise settles only once all its
+	// messages are acked (including retries), so flush() can wait for in-progress sends
+	// by awaiting these directly — no need to inspect internal batch/drain state.
+	private activeSends = new Set<Promise<unknown>>()
 	// Partitions with an in-flight send. A partition stays muted until its send
 	// settles, so at most one batch per partition is ever in flight (preserves
 	// per-partition ordering for the idempotent producer).
@@ -766,7 +770,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 					} satisfies TopicDefinition<Buffer, Buffer>)
 				: topic
 
-		return this.internalSend(topicDef, messages)
+		return this.trackSend(this.internalSend(topicDef, messages))
 	}
 
 	/**
@@ -818,81 +822,109 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	}
 
 	/**
+	 * Register a send's promise so flush() can wait for it, removing it once settled.
+	 * Returns the same promise so callers can `return this.trackSend(...)`. The internal
+	 * tracking chain swallows rejections — the caller still holds the promise and observes
+	 * any failure itself.
+	 */
+	private trackSend<T>(promise: Promise<T>): Promise<T> {
+		this.activeSends.add(promise)
+		const remove = (): void => void this.activeSends.delete(promise)
+		void promise.then(remove, remove)
+		return promise
+	}
+
+	/**
+	 * Resolve the target partition for a message, applying the partitioner and sticky
+	 * fallback for keyless messages. Throws if the resolved partition is out of range.
+	 */
+	private resolvePartition<V, K>(
+		topic: string,
+		msg: ProducerMessage<V, K>,
+		keyBuffer: Buffer | null,
+		valueBuffer: Buffer | null,
+		partitionCount: number
+	): number {
+		let partition = msg.partition
+		if (partition === undefined) {
+			partition = this.config.partitioner(topic, keyBuffer, valueBuffer ?? EMPTY_BUFFER, partitionCount)
+			if (partition === -1) {
+				partition = this.getStickyPartition(topic, partitionCount)
+			}
+		}
+		if (partition < 0 || partition >= partitionCount) {
+			throw new Error(`Invalid partition ${partition} for topic ${topic} (has ${partitionCount})`)
+		}
+		return partition
+	}
+
+	/**
+	 * Encode and append every message of one send as a single accumulator transaction
+	 * (so a multi-message send stays in one batch), returning a per-message promise that
+	 * settles when the broker acks or the send fails.
+	 */
+	private enqueueMessages<V, K>(
+		topicDef: TopicDefinition<V, K>,
+		msgArray: ProducerMessage<V, K>[],
+		partitionCount: number
+	): Promise<SendResult>[] {
+		const { encodeKey, encodeValue } = this.resolveEncoders(topicDef)
+
+		this.accumulator.beginAppendTransaction()
+		const promises = msgArray.map(
+			msg =>
+				new Promise<SendResult>((resolve, reject) => {
+					try {
+						const valueBuffer = msg.value === null ? null : encodeValue(msg.value)
+						const keyBuffer = encodeKey(msg.key)
+						const partition = this.resolvePartition(
+							topicDef.topic,
+							msg,
+							keyBuffer,
+							valueBuffer,
+							partitionCount
+						)
+
+						const headers: Record<string, Buffer> = {}
+						if (msg.headers) {
+							for (const [k, v] of Object.entries(msg.headers)) {
+								headers[k] = Buffer.isBuffer(v) ? v : Buffer.from(v, 'utf-8')
+							}
+						}
+
+						this.accumulator.append({
+							topic: topicDef.topic,
+							partition,
+							key: keyBuffer,
+							value: valueBuffer,
+							headers,
+							timestamp: BigInt(msg.timestamp?.getTime() ?? Date.now()),
+							resolve,
+							reject,
+						})
+					} catch (error) {
+						reject(error instanceof Error ? error : new Error(String(error)))
+					}
+				})
+		)
+		this.accumulator.endAppendTransaction()
+		return promises
+	}
+
+	/**
 	 * Internal send implementation (bypasses transactional check)
 	 */
 	private async internalSend<V, K>(
 		topicDef: TopicDefinition<V, K>,
 		messages: ProducerMessage<V, K> | ProducerMessage<V, K>[]
 	): Promise<SendResult | SendResult[]> {
-		// Lazy initialization for idempotent producer
 		await this.ensureInitialized()
 
 		const msgArray = Array.isArray(messages) ? messages : [messages]
 		const isSingle = !Array.isArray(messages)
-
-		const { encodeKey, encodeValue } = this.resolveEncoders(topicDef)
-
-		// Get partition count for topic
 		const partitionCount = await this.getPartitionCount(topicDef.topic)
 
-		// Begin transaction to collect all messages before flushing
-		// This prevents fragmentation when sending large arrays
-		this.accumulator.beginAppendTransaction()
-
-		const promises = msgArray.map(msg => {
-			return new Promise<SendResult>((resolve, reject) => {
-				try {
-					const valueBuffer = msg.value === null ? null : encodeValue(msg.value)
-					const partitionValue = valueBuffer ?? EMPTY_BUFFER
-					const keyBuffer = encodeKey(msg.key)
-
-					const headers: Record<string, Buffer> = {}
-					if (msg.headers) {
-						for (const [k, v] of Object.entries(msg.headers)) {
-							headers[k] = Buffer.isBuffer(v) ? v : Buffer.from(v, 'utf-8')
-						}
-					}
-
-					let partition = msg.partition
-					if (partition === undefined) {
-						partition = this.config.partitioner(topicDef.topic, keyBuffer, partitionValue, partitionCount)
-
-						// Handle sticky partitioner for keyless messages
-						if (partition === -1) {
-							partition = this.getStickyPartition(topicDef.topic, partitionCount)
-						}
-					}
-
-					// Validate partition
-					if (partition < 0 || partition >= partitionCount) {
-						reject(
-							new Error(
-								`Invalid partition ${partition} for topic ${topicDef.topic} (has ${partitionCount})`
-							)
-						)
-						return
-					}
-
-					const queuedMessage: QueuedMessage = {
-						topic: topicDef.topic,
-						partition,
-						key: keyBuffer,
-						value: valueBuffer,
-						headers,
-						timestamp: BigInt(msg.timestamp?.getTime() ?? Date.now()),
-						resolve,
-						reject,
-					}
-
-					this.accumulator.append(queuedMessage)
-				} catch (error) {
-					reject(error instanceof Error ? error : new Error(String(error)))
-				}
-			})
-		})
-
-		// End transaction - flush all accumulated batches at once
-		this.accumulator.endAppendTransaction()
+		const promises = this.enqueueMessages(topicDef, msgArray, partitionCount)
 
 		const results = await Promise.all(promises)
 		return isSingle ? results[0]! : results
@@ -905,19 +937,11 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	 * for acknowledgment from the broker.
 	 */
 	async flush(): Promise<void> {
+		// Force lingering batches out now instead of waiting for lingerMs, then wait for
+		// every outstanding send to settle. allSettled so one failed send doesn't reject
+		// flush(); failures surface on the individual send() promises.
 		this.accumulator.flush()
-
-		// Loop until pendingBatches and inflight are both empty. Wait via setImmediate
-		// (a macrotask), NOT queueMicrotask: a partition's deferred batches stay in
-		// pendingBatches until its in-flight send settles (see drainPendingBatches), and
-		// that settlement is an I/O event. An unbounded microtask spin would starve the
-		// event loop's poll phase so the send never completes and flush() would hang.
-		while (this.pendingBatches.length > 0 || this.drainScheduled || this.inflight.size > 0) {
-			while (this.pendingBatches.length > 0 || this.drainScheduled) {
-				await new Promise<void>(resolve => setImmediate(resolve))
-			}
-			await Promise.all(this.inflight)
-		}
+		await Promise.allSettled(this.activeSends)
 	}
 
 	/**
@@ -1030,7 +1054,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 							} satisfies TopicDefinition<Buffer, Buffer>)
 						: topic
 
-				return this.transactionalSend(topicDef, messages)
+				return this.trackSend(this.transactionalSend(topicDef, messages))
 			},
 
 			sendOffsets: async (params: SendOffsetsParams): Promise<void> => {

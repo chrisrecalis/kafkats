@@ -18,9 +18,9 @@ describe('Producer.flush()', () => {
 		vi.restoreAllMocks()
 	})
 
-	it('waits for deferred batches in pendingBatches to actually be sent', async () => {
-		// Regression: flush() must await drains scheduled in queueMicrotask
-		// (and any partition-level re-queue chains) before resolving.
+	it('waits for an in-flight fire-and-forget send to actually be sent', async () => {
+		// Regression: flush() must wait for sends that have not been awaited — including
+		// across the async hops and drain microtasks before the batch reaches the broker.
 		const producer = new Producer(mockCluster, {
 			lingerMs: 0,
 			retries: 0,
@@ -38,28 +38,15 @@ describe('Producer.flush()', () => {
 			])
 		})
 
-		const queuedMessage = {
-			topic: 'test-topic',
-			partition: 0,
-			key: null,
-			value: Buffer.from('hello'),
-			headers: {},
-			timestamp: BigInt(Date.now()),
-			resolve: vi.fn(),
-			reject: vi.fn(),
-		}
-		;(producer as unknown as { pendingBatches: unknown[] }).pendingBatches.push({
-			topic: 'test-topic',
-			partition: 0,
-			messages: [queuedMessage],
-			sizeBytes: 5,
-			createdAt: Date.now(),
-		})
-		;(producer as unknown as { scheduleDrain: () => void }).scheduleDrain()
+		// Fire-and-forget: do not await the send. flush() must still wait for it.
+		const sent = producer.send('test-topic', { value: Buffer.from('hello') })
+		void sent.catch(() => {})
 
 		await producer.flush()
 
 		expect(producePromiseResolved).toBe(true)
 		expect(mockBroker.produce).toHaveBeenCalledTimes(1)
+
+		await sent
 	})
 })
