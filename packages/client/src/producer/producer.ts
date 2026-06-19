@@ -393,8 +393,12 @@ export class Producer extends EventEmitter<ProducerEvents> {
 				if (outcome.retryError) {
 					this.failPreparedBatches(outcome.retryBatches, () => outcome.retryError!)
 				} else {
-					this.failPreparedBatches(outcome.retryBatches, prepared =>
-						new Error(`Produce failed for ${prepared.batch.topic}-${prepared.batch.partition}: max retries exceeded`)
+					this.failPreparedBatches(
+						outcome.retryBatches,
+						prepared =>
+							new Error(
+								`Produce failed for ${prepared.batch.topic}-${prepared.batch.partition}: max retries exceeded`
+							)
 					)
 				}
 				return
@@ -477,7 +481,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 
 			const retryBatches: PreparedProduceBatch[] = []
 			for (const prepared of preparedBatches) {
-				const { batch, recordCount, batchId, messagesToSend } = prepared
+				const { batch } = prepared
 				const topicResponse = response.topics.find(t => t.name === batch.topic)
 				const partitionResponse = topicResponse?.partitions.find(p => p.partitionIndex === batch.partition)
 
@@ -518,7 +522,9 @@ export class Producer extends EventEmitter<ProducerEvents> {
 
 					this.failPreparedBatch(
 						prepared,
-						new Error(`Produce failed for ${batch.topic}-${batch.partition}: ${ErrorCode[errorCode] ?? errorCode}`)
+						new Error(
+							`Produce failed for ${batch.topic}-${batch.partition}: ${ErrorCode[errorCode] ?? errorCode}`
+						)
 					)
 					continue
 				}
