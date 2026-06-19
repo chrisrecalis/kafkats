@@ -9,7 +9,6 @@ import type { ProduceRequest } from '@/protocol/messages/requests/produce.js'
 import { ErrorCode, isRetriableError } from '@/protocol/messages/error-codes.js'
 import {
 	shouldRefreshMetadata,
-	KafkaError,
 	ProducerFencedError,
 	InvalidTxnStateError,
 	TransactionAbortedError,
@@ -49,6 +48,21 @@ import type {
 } from './types.js'
 
 const EMPTY_BUFFER = Buffer.alloc(0)
+
+type PreparedProduceBatch = {
+	batch: PartitionBatch
+	encodedBatch: Buffer
+	baseSequence: number
+	recordCount: number
+	batchId: symbol
+	messagesToSend: QueuedMessage[]
+}
+
+type ProduceAttemptOutcome = {
+	retryBatches: PreparedProduceBatch[]
+	stop: boolean
+	retryError?: Error
+}
 
 function isCoordinatorErrorCode(errorCode: ErrorCode): boolean {
 	return errorCode === ErrorCode.NotCoordinator || errorCode === ErrorCode.CoordinatorNotAvailable
@@ -220,7 +234,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 			this.mutedPartitions.add(key)
 		}
 
-		const promise = this.sendBatchesGroupedByBroker(toSend)
+		const promise = this.sendBatchesWithRetries(toSend)
 		this.inflight.add(promise)
 		promise.finally(() => {
 			this.inflight.delete(promise)
@@ -234,103 +248,21 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		})
 	}
 
-	/**
-	 * Send batches grouped by broker
-	 *
-	 * Groups the given batches by their leader broker and sends
-	 * one ProduceRequest per broker containing all partitions.
-	 */
-	private async sendBatchesGroupedByBroker(batches: PartitionBatch[]): Promise<void> {
-		const topics = Array.from(new Set(batches.map(b => b.topic)))
-
-		const strategy = new ReconnectionStrategy(createRetryStrategyOptions(this.config))
-
-		let lastError: unknown
-
-		while (strategy.shouldReconnect()) {
-			try {
-				// Look up leader for each batch and group by broker
-				const batchesByBroker = new Map<Broker, PartitionBatch[]>()
-
-				for (const batch of batches) {
-					const leader = await this.cluster.getLeaderForPartition(batch.topic, batch.partition)
-					const existing = batchesByBroker.get(leader) ?? []
-					existing.push(batch)
-					batchesByBroker.set(leader, existing)
-				}
-
-				// Send one request per broker in parallel.
-				// We use allSettled to ensure we don't emit unhandled rejections here; individual messages will be
-				// resolved/rejected by sendBrokerBatches().
-				const sendPromises: Promise<void>[] = []
-				for (const [broker, brokerBatches] of batchesByBroker) {
-					sendPromises.push(this.sendBrokerBatches(broker, brokerBatches))
-				}
-
-				await Promise.allSettled(sendPromises)
-				return
-			} catch (error) {
-				lastError = error
-				strategy.recordFailure()
-
-				if (error instanceof KafkaError && shouldRefreshMetadata(error.errorCode)) {
-					await this.cluster.refreshMetadata(topics)
-					for (const topic of topics) {
-						this.partitionCache.delete(topic)
-					}
-				}
-
-				if (!strategy.shouldReconnect()) {
-					break
-				}
-
-				await this.sleep(strategy.nextDelay())
-			}
-		}
-
-		const finalError =
-			lastError instanceof Error ? lastError : new Error(`Failed to send batches: ${String(lastError)}`)
-
-		// We failed before we could hand the batches to sendBrokerBatches(), so reject all message promises and
-		// mark the batches as completed to unblock flush/drain.
-		for (const batch of batches) {
-			for (const msg of batch.messages) {
-				msg.reject(finalError)
-			}
-			this.accumulator.batchCompleted()
-		}
-	}
-
-	/**
-	 * Send multiple partition batches to a single broker in one ProduceRequest
-	 */
-	private async sendBrokerBatches(broker: Broker, batches: PartitionBatch[]): Promise<void> {
-		await this.acquireInflightSlot()
-
+	private async sendBatchesWithRetries(batches: PartitionBatch[]): Promise<void> {
 		try {
-			await this.doSendBrokerBatches(broker, batches)
+			const preparedBatches = await this.prepareProduceBatches(batches)
+			if (preparedBatches.length > 0) {
+				await this.sendPreparedBatches(preparedBatches)
+			}
 		} finally {
-			this.releaseInflightSlot()
 			for (let i = 0; i < batches.length; i++) {
 				this.accumulator.batchCompleted()
 			}
 		}
 	}
 
-	/**
-	 * Internal implementation of broker batch send
-	 */
-	private async doSendBrokerBatches(broker: Broker, batches: PartitionBatch[]): Promise<void> {
-		// Prepare all batches: reserve sequences, encode record batches
-		const preparedBatches: Array<{
-			batch: PartitionBatch
-			encodedBatch: Buffer
-			baseSequence: number
-			recordCount: number
-			batchId: symbol
-			messagesToSend: QueuedMessage[]
-		}> = []
-
+	private async prepareProduceBatches(batches: PartitionBatch[]): Promise<PreparedProduceBatch[]> {
+		const preparedBatches: PreparedProduceBatch[] = []
 		for (const batch of batches) {
 			const { topic, partition, messages } = batch
 			let recordCount = messages.length
@@ -433,9 +365,180 @@ export class Producer extends EventEmitter<ProducerEvents> {
 				}
 			}
 		}
+		return preparedBatches
+	}
 
-		if (preparedBatches.length === 0) return
+	private async sendPreparedBatches(preparedBatches: PreparedProduceBatch[]): Promise<void> {
+		const strategy = new ReconnectionStrategy(createRetryStrategyOptions(this.config))
+		let pendingBatches = preparedBatches
 
+		while (strategy.shouldReconnect()) {
+			try {
+				const outcome = await this.sendPreparedBatchesOnce(pendingBatches)
+				if (outcome.stop) {
+					return
+				}
+
+				if (outcome.retryBatches.length === 0) {
+					return
+				}
+
+				strategy.recordFailure()
+				if (strategy.shouldReconnect()) {
+					await this.sleep(strategy.nextDelay())
+					pendingBatches = outcome.retryBatches
+					continue
+				}
+
+				if (outcome.retryError) {
+					this.failPreparedBatches(outcome.retryBatches, () => outcome.retryError!)
+				} else {
+					this.failPreparedBatches(
+						outcome.retryBatches,
+						prepared =>
+							new Error(
+								`Produce failed for ${prepared.batch.topic}-${prepared.batch.partition}: max retries exceeded`
+							)
+					)
+				}
+				return
+			} catch (error) {
+				strategy.recordFailure()
+
+				if (!strategy.shouldReconnect()) {
+					const failure = error instanceof Error ? error : new Error(String(error))
+					this.failPreparedBatches(pendingBatches, () => failure)
+					return
+				}
+
+				await this.sleep(strategy.nextDelay())
+			}
+		}
+	}
+
+	private async sendPreparedBatchesOnce(preparedBatches: PreparedProduceBatch[]): Promise<ProduceAttemptOutcome> {
+		const batchesByBroker = await this.groupPreparedBatchesByLeader(preparedBatches)
+		const outcomes = await Promise.all(
+			Array.from(batchesByBroker.entries()).map(async ([, { broker, batches }]) => {
+				try {
+					return await this.sendPreparedBatchesToBroker(broker, batches, preparedBatches)
+				} catch (error) {
+					return {
+						retryBatches: batches,
+						stop: false,
+						retryError: error instanceof Error ? error : new Error(String(error)),
+					}
+				}
+			})
+		)
+
+		if (outcomes.some(outcome => outcome.stop)) {
+			return { retryBatches: [], stop: true }
+		}
+
+		return {
+			retryBatches: outcomes.flatMap(outcome => outcome.retryBatches),
+			stop: false,
+			retryError: outcomes.find(outcome => outcome.retryError)?.retryError,
+		}
+	}
+
+	private async groupPreparedBatchesByLeader(
+		preparedBatches: PreparedProduceBatch[]
+	): Promise<Map<number, { broker: Broker; batches: PreparedProduceBatch[] }>> {
+		const batchesByBroker = new Map<number, { broker: Broker; batches: PreparedProduceBatch[] }>()
+		for (const prepared of preparedBatches) {
+			const { batch } = prepared
+			const broker = await this.cluster.getLeaderForPartition(batch.topic, batch.partition)
+			const existing = batchesByBroker.get(broker.nodeId) ?? { broker, batches: [] }
+			existing.batches.push(prepared)
+			batchesByBroker.set(broker.nodeId, existing)
+		}
+		return batchesByBroker
+	}
+
+	private async sendPreparedBatchesToBroker(
+		broker: Broker,
+		preparedBatches: PreparedProduceBatch[],
+		allPendingBatches: PreparedProduceBatch[]
+	): Promise<ProduceAttemptOutcome> {
+		const request = this.buildProduceRequest(preparedBatches)
+
+		await this.acquireInflightSlot()
+		try {
+			const requestStart = performance.now()
+			const response = await broker.produce(request)
+			const requestEnd = performance.now()
+			if (this.trace) {
+				this.trace({
+					stage: 'produce_request',
+					durationMs: requestEnd - requestStart,
+					recordCount: preparedBatches.reduce((sum, p) => sum + p.recordCount, 0),
+					bytes: preparedBatches.reduce((sum, p) => sum + p.encodedBatch.length, 0),
+					brokerId: broker.nodeId,
+				})
+			}
+
+			const retryBatches: PreparedProduceBatch[] = []
+			for (const prepared of preparedBatches) {
+				const { batch } = prepared
+				const topicResponse = response.topics.find(t => t.name === batch.topic)
+				const partitionResponse = topicResponse?.partitions.find(p => p.partitionIndex === batch.partition)
+
+				if (!partitionResponse) {
+					this.failPreparedBatch(prepared, new Error(`No response for ${batch.topic}-${batch.partition}`))
+					continue
+				}
+
+				if (partitionResponse.errorCode !== ErrorCode.None) {
+					const errorCode = partitionResponse.errorCode
+
+					if (
+						this.config.idempotent &&
+						(errorCode === ErrorCode.ProducerFenced || errorCode === ErrorCode.InvalidProducerEpoch)
+					) {
+						this.handleFencingError(prepared, allPendingBatches)
+						return { retryBatches: [], stop: true }
+					}
+
+					if (this.config.idempotent && errorCode === ErrorCode.DuplicateSequenceNumber) {
+						this.handleDuplicateSequence(prepared, partitionResponse)
+						continue
+					}
+
+					if (this.config.idempotent && errorCode === ErrorCode.OutOfOrderSequenceNumber) {
+						this.handleOutOfOrderSequence(prepared, allPendingBatches)
+						return { retryBatches: [], stop: true }
+					}
+
+					if (isRetriableError(errorCode)) {
+						retryBatches.push(prepared)
+						if (shouldRefreshMetadata(errorCode)) {
+							await this.cluster.refreshMetadata([batch.topic])
+							this.partitionCache.delete(batch.topic)
+						}
+						continue
+					}
+
+					this.failPreparedBatch(
+						prepared,
+						new Error(
+							`Produce failed for ${batch.topic}-${batch.partition}: ${ErrorCode[errorCode] ?? errorCode}`
+						)
+					)
+					continue
+				}
+
+				this.handleBatchSuccess(prepared, partitionResponse)
+			}
+
+			return { retryBatches, stop: false }
+		} finally {
+			this.releaseInflightSlot()
+		}
+	}
+
+	private buildProduceRequest(preparedBatches: PreparedProduceBatch[]): ProduceRequest {
 		const topicMap = new Map<string, Array<{ partitionIndex: number; records: Buffer }>>()
 		for (const { batch, encodedBatch } of preparedBatches) {
 			const partitions = topicMap.get(batch.topic) ?? []
@@ -443,7 +546,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 			topicMap.set(batch.topic, partitions)
 		}
 
-		const request: ProduceRequest = {
+		return {
 			transactionalId: this.config.transactionalId,
 			acks: this.config.acks,
 			timeoutMs: this.config.requestTimeoutMs,
@@ -452,163 +555,25 @@ export class Producer extends EventEmitter<ProducerEvents> {
 				partitions,
 			})),
 		}
+	}
 
-		const strategy = new ReconnectionStrategy(createRetryStrategyOptions(this.config))
+	private failPreparedBatches(
+		preparedBatches: PreparedProduceBatch[],
+		errorFor: (prepared: PreparedProduceBatch) => Error
+	): void {
+		for (const prepared of preparedBatches) {
+			this.failPreparedBatch(prepared, errorFor(prepared))
+		}
+	}
 
-		while (strategy.shouldReconnect()) {
-			try {
-				const requestStart = performance.now()
-				const response = await broker.produce(request)
-				const requestEnd = performance.now()
-				if (this.trace) {
-					const totalRecords = preparedBatches.reduce((sum, p) => sum + p.recordCount, 0)
-					const totalBytes = preparedBatches.reduce((sum, p) => sum + p.encodedBatch.length, 0)
-					this.trace({
-						stage: 'produce_request',
-						durationMs: requestEnd - requestStart,
-						recordCount: totalRecords,
-						bytes: totalBytes,
-						brokerId: broker.nodeId,
-					})
-				}
-
-				let hasRetriableError = false
-				const batchesToRetry: typeof preparedBatches = []
-
-				for (const prepared of preparedBatches) {
-					const { batch, recordCount, batchId, messagesToSend } = prepared
-					const topicResponse = response.topics.find(t => t.name === batch.topic)
-					const partitionResponse = topicResponse?.partitions.find(p => p.partitionIndex === batch.partition)
-
-					if (!partitionResponse) {
-						const error = new Error(`No response for ${batch.topic}-${batch.partition}`)
-						for (const msg of messagesToSend) {
-							msg.reject(error)
-						}
-						if (this.config.idempotent) {
-							this.rollbackSequence(batch.topic, batch.partition, recordCount)
-							this.inflightBatches.delete(batchId)
-						}
-						continue
-					}
-
-					if (partitionResponse.errorCode !== ErrorCode.None) {
-						const errorCode = partitionResponse.errorCode
-
-						// Handle fencing errors
-						if (
-							this.config.idempotent &&
-							(errorCode === ErrorCode.ProducerFenced || errorCode === ErrorCode.InvalidProducerEpoch)
-						) {
-							this.handleFencingError(prepared, preparedBatches)
-							return
-						}
-
-						// Handle duplicate sequence (treat as success)
-						if (this.config.idempotent && errorCode === ErrorCode.DuplicateSequenceNumber) {
-							this.handleDuplicateSequence(prepared, partitionResponse)
-							continue
-						}
-
-						// Handle out-of-order sequence
-						if (this.config.idempotent && errorCode === ErrorCode.OutOfOrderSequenceNumber) {
-							this.handleOutOfOrderSequence(prepared, preparedBatches)
-							return
-						}
-
-						// Handle retriable errors
-						if (isRetriableError(errorCode)) {
-							hasRetriableError = true
-							batchesToRetry.push(prepared)
-							if (shouldRefreshMetadata(errorCode)) {
-								await this.cluster.refreshMetadata([batch.topic])
-								this.partitionCache.delete(batch.topic)
-							}
-							continue
-						}
-
-						// Non-retriable error
-						if (this.config.idempotent) {
-							this.rollbackSequence(batch.topic, batch.partition, recordCount)
-							this.inflightBatches.delete(batchId)
-						}
-						const error = new Error(
-							`Produce failed for ${batch.topic}-${batch.partition}: ${ErrorCode[errorCode] ?? errorCode}`
-						)
-						for (const msg of messagesToSend) {
-							msg.reject(error)
-						}
-						continue
-					}
-
-					// Success
-					this.handleBatchSuccess(prepared, partitionResponse)
-				}
-
-				// If no retriable errors, we're done
-				if (!hasRetriableError || batchesToRetry.length === 0) {
-					return
-				}
-
-				// Retry only the failed batches
-				strategy.recordFailure()
-				if (strategy.shouldReconnect()) {
-					await this.sleep(strategy.nextDelay())
-
-					// Rebuild request with only failed batches
-					const retryTopicMap = new Map<string, Array<{ partitionIndex: number; records: Buffer }>>()
-					for (const { batch, encodedBatch } of batchesToRetry) {
-						const partitions = retryTopicMap.get(batch.topic) ?? []
-						partitions.push({ partitionIndex: batch.partition, records: encodedBatch })
-						retryTopicMap.set(batch.topic, partitions)
-					}
-
-					request.topics = Array.from(retryTopicMap.entries()).map(([name, partitions]) => ({
-						name,
-						partitions,
-					}))
-
-					// Update preparedBatches to only contain retries for next iteration
-					preparedBatches.length = 0
-					preparedBatches.push(...batchesToRetry)
-					continue
-				}
-
-				// Max retries exceeded for remaining batches
-				for (const prepared of batchesToRetry) {
-					const { batch, recordCount, batchId, messagesToSend } = prepared
-					if (this.config.idempotent) {
-						this.rollbackSequence(batch.topic, batch.partition, recordCount)
-						this.inflightBatches.delete(batchId)
-					}
-					const error = new Error(
-						`Produce failed for ${batch.topic}-${batch.partition}: max retries exceeded`
-					)
-					for (const msg of messagesToSend) {
-						msg.reject(error)
-					}
-				}
-				return
-			} catch (error) {
-				strategy.recordFailure()
-
-				if (!strategy.shouldReconnect()) {
-					// Max retries exceeded
-					for (const prepared of preparedBatches) {
-						const { batch, recordCount, batchId, messagesToSend } = prepared
-						if (this.config.idempotent) {
-							this.rollbackSequence(batch.topic, batch.partition, recordCount)
-							this.inflightBatches.delete(batchId)
-						}
-						for (const msg of messagesToSend) {
-							msg.reject(error instanceof Error ? error : new Error(String(error)))
-						}
-					}
-					return
-				}
-
-				await this.sleep(strategy.nextDelay())
-			}
+	private failPreparedBatch(prepared: PreparedProduceBatch, error: Error): void {
+		const { batch, recordCount, batchId, messagesToSend } = prepared
+		if (this.config.idempotent) {
+			this.rollbackSequence(batch.topic, batch.partition, recordCount)
+			this.inflightBatches.delete(batchId)
+		}
+		for (const msg of messagesToSend) {
+			msg.reject(error)
 		}
 	}
 
@@ -1330,10 +1295,12 @@ export class Producer extends EventEmitter<ProducerEvents> {
 				partitionCount: this.partitionsInTransaction.size,
 				groupCount: this.offsetsToCommit.size,
 			})
-		} finally {
 			this.transactionState = 'idle'
 			this.partitionsInTransaction.clear()
 			this.offsetsToCommit.clear()
+		} catch (error) {
+			this.transactionState = 'committing'
+			throw error
 		}
 	}
 

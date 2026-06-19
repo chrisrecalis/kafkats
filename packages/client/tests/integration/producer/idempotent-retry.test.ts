@@ -118,25 +118,27 @@ describe.concurrent('Producer (integration) - idempotency', () => {
 		// same partition during an in-flight send is observed.
 		const producerAny = producer as unknown as Record<string, unknown>
 		const originalSend = (
-			producerAny['doSendBrokerBatches'] as (
+			producerAny['sendPreparedBatchesToBroker'] as (
 				broker: unknown,
-				batches: Array<{ topic: string; partition: number }>
-			) => Promise<void>
+				batches: Array<{ batch: { topic: string; partition: number } }>,
+				allPending: unknown
+			) => Promise<unknown>
 		).bind(producer)
 		const active = new Set<string>()
 		const overlaps: string[] = []
-		producerAny['doSendBrokerBatches'] = async (
+		producerAny['sendPreparedBatchesToBroker'] = async (
 			broker: unknown,
-			batches: Array<{ topic: string; partition: number }>
-		): Promise<void> => {
-			const keys = batches.map(b => `${b.topic}:${b.partition}`)
+			batches: Array<{ batch: { topic: string; partition: number } }>,
+			allPending: unknown
+		): Promise<unknown> => {
+			const keys = batches.map(b => `${b.batch.topic}:${b.batch.partition}`)
 			for (const key of keys) {
 				if (active.has(key)) overlaps.push(key)
 				active.add(key)
 			}
 			try {
 				await new Promise(resolve => setTimeout(resolve, 50))
-				return await originalSend(broker, batches)
+				return await originalSend(broker, batches, allPending)
 			} finally {
 				for (const key of keys) active.delete(key)
 			}
@@ -188,11 +190,19 @@ describe.concurrent('Producer (integration) - idempotency', () => {
 		// Slow the network send so later batches pile up behind the first (muted) one.
 		const producerAny = producer as unknown as Record<string, unknown>
 		const originalSend = (
-			producerAny['doSendBrokerBatches'] as (broker: unknown, batches: unknown) => Promise<void>
+			producerAny['sendPreparedBatchesToBroker'] as (
+				broker: unknown,
+				batches: unknown,
+				allPending: unknown
+			) => Promise<unknown>
 		).bind(producer)
-		producerAny['doSendBrokerBatches'] = async (broker: unknown, batches: unknown): Promise<void> => {
+		producerAny['sendPreparedBatchesToBroker'] = async (
+			broker: unknown,
+			batches: unknown,
+			allPending: unknown
+		): Promise<unknown> => {
 			await new Promise(resolve => setTimeout(resolve, 200))
-			return originalSend(broker, batches)
+			return originalSend(broker, batches, allPending)
 		}
 
 		// Fire several same-partition sends without awaiting: the first goes in flight and
