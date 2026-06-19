@@ -5,6 +5,51 @@ import { OffsetManager } from '@/consumer/offset-manager.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
 
 describe('FetchManager OffsetOutOfRange handling', () => {
+	it("surfaces OffsetOutOfRange from poll() when autoOffsetReset='none'", async () => {
+		const broker = {
+			nodeId: 1,
+			fetch: vi.fn().mockResolvedValue({
+				topics: [
+					{
+						topic: 't',
+						partitions: [
+							{
+								partitionIndex: 0,
+								errorCode: ErrorCode.OffsetOutOfRange,
+								recordsData: null,
+							},
+						],
+					},
+				],
+			}),
+		}
+
+		const cluster = {
+			getLeaderForPartition: vi.fn().mockResolvedValue(broker),
+			getLogger: () => null,
+		}
+
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const offsetManager = new OffsetManager(cluster as any, 'g1')
+		const fm = new FetchManager(
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			cluster as any,
+			offsetManager,
+			'none',
+			{
+				maxBytesPerPartition: 1024,
+				minBytes: 1,
+				maxWaitMs: 20,
+				partitionConcurrency: 1,
+				isolationLevel: 'read_uncommitted',
+			}
+		)
+
+		fm.addPartitions([{ topic: 't', partition: 0, offset: 100n }])
+
+		await expect(fm.poll()).rejects.toThrow(/Offset out of range/)
+	})
+
 	it('discards buffered records for a partition when its fetch offset is reset out of range', async () => {
 		// A fetch for t:0 comes back OffsetOutOfRange (e.g. retention deleted the segment
 		// the consumer was positioned at). The partition still has records buffered from an

@@ -536,9 +536,10 @@ export class FetchManager {
 			case ErrorCode.OffsetOutOfRange:
 				if (this.offsetManager && this.autoOffsetReset) {
 					if (this.autoOffsetReset === 'none') {
-						throw new Error(
+						this.pendingError = new Error(
 							`Offset out of range for ${state.topic}-${state.partition} at offset ${state.offset}`
 						)
+						break
 					}
 					// Records buffered from the now-invalid position precede (or are unrelated
 					// to) the reset offset; delivering them would violate the reset. Discard them
