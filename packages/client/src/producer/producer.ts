@@ -822,39 +822,76 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	}
 
 	/**
-	 * Internal send implementation (bypasses transactional check)
+	 * Mark a send as in progress before its batch reaches pendingBatches.
+	 *
+	 * A send suspends on async hops (ensureInitialized, getPartitionCount,
+	 * addPartitionsToTransaction) before endAppendTransaction registers its batch. During
+	 * that window none of flush()'s usual signals (pendingBatches, drainScheduled, inflight)
+	 * are set, so without this counter flush() would see an idle producer and return early.
+	 *
+	 * Returns a release callback to call once the batch is registered (or the send fails).
+	 * It is idempotent, so callers can release on the success path and again from a finally.
 	 */
-	private async internalSend<V, K>(
-		topicDef: TopicDefinition<V, K>,
-		messages: ProducerMessage<V, K> | ProducerMessage<V, K>[]
-	): Promise<SendResult | SendResult[]> {
-		// Track this send before any async hop so flush() can see it while we're still
-		// suspended on ensureInitialized() / getPartitionCount() — before the batch reaches
-		// pendingBatches. Decremented as soon as endAppendTransaction() registers the batch.
+	private trackPendingSend(): () => void {
 		this.pendingSendRegistrations++
-		let batchRegistered = false
-		try {
-			// Lazy initialization for idempotent producer
-			await this.ensureInitialized()
+		let released = false
+		return () => {
+			if (released) return
+			released = true
+			this.pendingSendRegistrations--
+		}
+	}
 
-			const msgArray = Array.isArray(messages) ? messages : [messages]
-			const isSingle = !Array.isArray(messages)
+	/**
+	 * Resolve the target partition for a message, applying the partitioner and sticky
+	 * fallback for keyless messages. Throws if the resolved partition is out of range.
+	 */
+	private resolvePartition<V, K>(
+		topic: string,
+		msg: ProducerMessage<V, K>,
+		keyBuffer: Buffer | null,
+		valueBuffer: Buffer | null,
+		partitionCount: number
+	): number {
+		let partition = msg.partition
+		if (partition === undefined) {
+			partition = this.config.partitioner(topic, keyBuffer, valueBuffer ?? EMPTY_BUFFER, partitionCount)
+			if (partition === -1) {
+				partition = this.getStickyPartition(topic, partitionCount)
+			}
+		}
+		if (partition < 0 || partition >= partitionCount) {
+			throw new Error(`Invalid partition ${partition} for topic ${topic} (has ${partitionCount})`)
+		}
+		return partition
+	}
 
-			const { encodeKey, encodeValue } = this.resolveEncoders(topicDef)
+	/**
+	 * Encode and append every message of one send as a single accumulator transaction
+	 * (so a multi-message send stays in one batch), returning a per-message promise that
+	 * settles when the broker acks or the send fails.
+	 */
+	private enqueueMessages<V, K>(
+		topicDef: TopicDefinition<V, K>,
+		msgArray: ProducerMessage<V, K>[],
+		partitionCount: number
+	): Promise<SendResult>[] {
+		const { encodeKey, encodeValue } = this.resolveEncoders(topicDef)
 
-			// Get partition count for topic
-			const partitionCount = await this.getPartitionCount(topicDef.topic)
-
-			// Begin transaction to collect all messages before flushing
-			// This prevents fragmentation when sending large arrays
-			this.accumulator.beginAppendTransaction()
-
-			const promises = msgArray.map(msg => {
-				return new Promise<SendResult>((resolve, reject) => {
+		this.accumulator.beginAppendTransaction()
+		const promises = msgArray.map(
+			msg =>
+				new Promise<SendResult>((resolve, reject) => {
 					try {
 						const valueBuffer = msg.value === null ? null : encodeValue(msg.value)
-						const partitionValue = valueBuffer ?? EMPTY_BUFFER
 						const keyBuffer = encodeKey(msg.key)
+						const partition = this.resolvePartition(
+							topicDef.topic,
+							msg,
+							keyBuffer,
+							valueBuffer,
+							partitionCount
+						)
 
 						const headers: Record<string, Buffer> = {}
 						if (msg.headers) {
@@ -863,32 +900,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 							}
 						}
 
-						let partition = msg.partition
-						if (partition === undefined) {
-							partition = this.config.partitioner(
-								topicDef.topic,
-								keyBuffer,
-								partitionValue,
-								partitionCount
-							)
-
-							// Handle sticky partitioner for keyless messages
-							if (partition === -1) {
-								partition = this.getStickyPartition(topicDef.topic, partitionCount)
-							}
-						}
-
-						// Validate partition
-						if (partition < 0 || partition >= partitionCount) {
-							reject(
-								new Error(
-									`Invalid partition ${partition} for topic ${topicDef.topic} (has ${partitionCount})`
-								)
-							)
-							return
-						}
-
-						const queuedMessage: QueuedMessage = {
+						this.accumulator.append({
 							topic: topicDef.topic,
 							partition,
 							key: keyBuffer,
@@ -897,26 +909,38 @@ export class Producer extends EventEmitter<ProducerEvents> {
 							timestamp: BigInt(msg.timestamp?.getTime() ?? Date.now()),
 							resolve,
 							reject,
-						}
-
-						this.accumulator.append(queuedMessage)
+						})
 					} catch (error) {
 						reject(error instanceof Error ? error : new Error(String(error)))
 					}
 				})
-			})
+		)
+		this.accumulator.endAppendTransaction()
+		return promises
+	}
 
-			// End transaction - flush all accumulated batches at once
-			this.accumulator.endAppendTransaction()
-			batchRegistered = true
-			this.pendingSendRegistrations--
+	/**
+	 * Internal send implementation (bypasses transactional check)
+	 */
+	private async internalSend<V, K>(
+		topicDef: TopicDefinition<V, K>,
+		messages: ProducerMessage<V, K> | ProducerMessage<V, K>[]
+	): Promise<SendResult | SendResult[]> {
+		const markRegistered = this.trackPendingSend()
+		try {
+			await this.ensureInitialized()
+
+			const msgArray = Array.isArray(messages) ? messages : [messages]
+			const isSingle = !Array.isArray(messages)
+			const partitionCount = await this.getPartitionCount(topicDef.topic)
+
+			const promises = this.enqueueMessages(topicDef, msgArray, partitionCount)
+			markRegistered()
 
 			const results = await Promise.all(promises)
 			return isSingle ? results[0]! : results
 		} finally {
-			if (!batchRegistered) {
-				this.pendingSendRegistrations--
-			}
+			markRegistered()
 		}
 	}
 
@@ -1116,11 +1140,11 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		topicDef: TopicDefinition<V, K>,
 		messages: ProducerMessage<V, K> | ProducerMessage<V, K>[]
 	): Promise<SendResult | SendResult[]> {
-		// Cover the async pre-work (getPartitionCount, addPartitionsToTransaction) that
-		// happens before internalSend() — same blind-window fix as internalSend().
-		// internalSend() will add its own increment; decrement here hands off to it.
-		this.pendingSendRegistrations++
-		let handedOff = false
+		// Keep flush() waiting across the transactional pre-work (getPartitionCount,
+		// addPartitionsToTransaction) that runs before internalSend() registers the batch.
+		// internalSend() opens its own registration before this one is released, so there
+		// is no gap where flush() could observe an idle producer.
+		const markRegistered = this.trackPendingSend()
 		try {
 			const isSingle = !Array.isArray(messages)
 			const msgArray = Array.isArray(messages) ? messages : [messages]
@@ -1154,15 +1178,9 @@ export class Producer extends EventEmitter<ProducerEvents> {
 				await this.addPartitionsToTransaction(topicDef.topic, Array.from(partitionsToAdd))
 			}
 
-			// Hand off to internalSend, which will add its own pendingSendRegistrations++.
-			// Decrement ours here so the count stays accurate.
-			handedOff = true
-			this.pendingSendRegistrations--
 			return this.internalSend(topicDef, isSingle ? resolvedMessages[0]! : resolvedMessages)
 		} finally {
-			if (!handedOff) {
-				this.pendingSendRegistrations--
-			}
+			markRegistered()
 		}
 	}
 
