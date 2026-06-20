@@ -221,10 +221,19 @@ export interface Lz4JsLib {
 
 /**
  * LZ4 library interface for lz4-napi (native async, compress/uncompress API)
+ *
+ * Note: lz4-napi exposes both raw-block (compress/uncompress) and framed
+ * (compressFrame/decompressFrame) APIs.  Kafka's RecordBatch v2 requires the
+ * LZ4 *framing* format (magic bytes 0x184D2204), so createLz4Codec detects
+ * the presence of compressFrame and prefers the framed API when available.
  */
 export interface Lz4NapiLib {
 	compress: (data: Buffer | Uint8Array | string) => Promise<Buffer>
 	uncompress: (data: Buffer | Uint8Array | string) => Promise<Buffer>
+	/** Present in lz4-napi ≥ 2.x — produces the LZ4 frame format required by Kafka */
+	compressFrame?: (data: Buffer | Uint8Array | string) => Promise<Buffer>
+	/** Present in lz4-napi ≥ 2.x — decompresses LZ4 frame format */
+	decompressFrame?: (data: Buffer | Uint8Array | string) => Promise<Buffer>
 }
 
 /**
@@ -276,11 +285,26 @@ export function createLz4Codec(lz4: Lz4Lib): CompressionCodec {
 	}
 
 	if ('uncompress' in lz4) {
-		// lz4-napi with async compress/uncompress API
-		return {
-			compress: lz4.compress,
-			decompress: lz4.uncompress,
+		const napiLib = lz4 as Lz4NapiLib
+		// lz4-napi exposes both raw-block (compress/uncompress) and framed
+		// (compressFrame/decompressFrame) APIs.  Kafka RecordBatch v2 requires the
+		// LZ4 *framing* format (magic bytes 0x184D2204), so prefer the framed API.
+		if (napiLib.compressFrame && napiLib.decompressFrame) {
+			return {
+				compress: (data: Buffer) => napiLib.compressFrame!(data),
+				decompress: (data: Buffer) => napiLib.decompressFrame!(data),
+			}
 		}
+		// Raw-block lz4-napi (< 2.x): compressFrame/decompressFrame are absent.
+		// Raw-block LZ4 lacks the magic-bytes framing (0x184D2204) that Kafka's
+		// RecordBatch v2 requires — every produce will be rejected by the broker
+		// with UnknownServerError.  Silently falling back would turn a dependency
+		// mismatch into completely opaque broker failures, so we fail fast here.
+		throw new Error(
+			'lz4-napi >= 2.x exposing compressFrame/decompressFrame is required for Kafka LZ4 ' +
+				'(raw-block LZ4 is rejected by the broker). ' +
+				'Install lz4-napi@2.x or later.',
+		)
 	}
 
 	// lz4js with sync compress/decompress API

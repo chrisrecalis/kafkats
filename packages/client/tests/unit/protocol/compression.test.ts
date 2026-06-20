@@ -58,6 +58,38 @@ describe('compression registry', () => {
 		expect(decompressed).toEqual(payload)
 	})
 
+	it('prefers the framed lz4-napi API (compressFrame/decompressFrame) over raw block', async () => {
+		let framedCompress = 0
+		let framedDecompress = 0
+		const codec = createLz4Codec({
+			compress: async () => Buffer.from('raw-block-must-not-be-used'),
+			uncompress: async () => Buffer.from('raw-block-must-not-be-used'),
+			compressFrame: async (data: Buffer) => {
+				framedCompress++
+				return Buffer.from(data)
+			},
+			decompressFrame: async (data: Buffer) => {
+				framedDecompress++
+				return Buffer.from(data)
+			},
+		})
+		const payload = Buffer.from('lz4-frame')
+		const compressed = await codec.compress(payload)
+		const decompressed = await codec.decompress(compressed)
+		expect(framedCompress).toBe(1)
+		expect(framedDecompress).toBe(1)
+		expect(decompressed).toEqual(payload)
+	})
+
+	it('throws for raw-block lz4-napi (< 2.x) lacking compressFrame — Kafka RecordBatch v2 requires LZ4 framing', () => {
+		expect(() =>
+			createLz4Codec({
+				compress: async (data: Buffer) => data,
+				uncompress: async (data: Buffer) => data,
+			}),
+		).toThrow(/lz4-napi >= 2\.x/)
+	})
+
 	it('creates a Zstd codec from async functions', async () => {
 		const codec = createZstdCodec({
 			compress: async (data: Buffer) => data,
