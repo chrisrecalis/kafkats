@@ -427,10 +427,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 					// The batches were transmitted (everSent=true) but the outcome is
 					// ambiguous — fence + reinit for idempotent producers.
 					this.failPreparedBatches(outcome.retryBatches, () => outcome.retryError!, true)
-				} else if (
-					this.config.idempotent &&
-					outcome.retryBatches.some(p => p.everSent)
-				) {
+				} else if (this.config.idempotent && outcome.retryBatches.some(p => p.everSent)) {
 					// Retry exhaustion for an idempotent batch that was already transmitted at
 					// least once (everSent=true).  The triggering code (e.g.
 					// NotEnoughReplicasAfterAppend, RequestTimedOut) may mean the append

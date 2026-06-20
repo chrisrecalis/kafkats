@@ -529,7 +529,10 @@ describe('Producer retry behavior', () => {
 			// Initialize by sending one successful message
 			mockBroker.produce.mockResolvedValueOnce(
 				buildProduceResponse([
-					{ name: 'test-topic', partitions: [{ partitionIndex: 0, errorCode: ErrorCode.None, baseOffset: 0n }] },
+					{
+						name: 'test-topic',
+						partitions: [{ partitionIndex: 0, errorCode: ErrorCode.None, baseOffset: 0n }],
+					},
 				])
 			)
 			await producer.send('test-topic', { value: Buffer.from('init') })
@@ -561,7 +564,10 @@ describe('Producer retry behavior', () => {
 			// confirming fence+reinit was triggered, not just a sequence rollback.
 			mockBroker.produce.mockResolvedValueOnce(
 				buildProduceResponse([
-					{ name: 'test-topic', partitions: [{ partitionIndex: 0, errorCode: ErrorCode.None, baseOffset: 99n }] },
+					{
+						name: 'test-topic',
+						partitions: [{ partitionIndex: 0, errorCode: ErrorCode.None, baseOffset: 99n }],
+					},
 				])
 			)
 			const result = await producer.send('test-topic', { value: Buffer.from('after') })
@@ -587,7 +593,10 @@ describe('Producer retry behavior', () => {
 
 			mockBroker.produce.mockResolvedValueOnce(
 				buildProduceResponse([
-					{ name: 'test-topic', partitions: [{ partitionIndex: 0, errorCode: ErrorCode.None, baseOffset: 77n }] },
+					{
+						name: 'test-topic',
+						partitions: [{ partitionIndex: 0, errorCode: ErrorCode.None, baseOffset: 77n }],
+					},
 				])
 			)
 			const result = await producer.send('test-topic', { value: Buffer.from('after') })
@@ -640,7 +649,10 @@ describe('Producer retry behavior', () => {
 			// Initialize
 			mockBroker.produce.mockResolvedValueOnce(
 				buildProduceResponse([
-					{ name: 'test-topic', partitions: [{ partitionIndex: 0, errorCode: ErrorCode.None, baseOffset: 0n }] },
+					{
+						name: 'test-topic',
+						partitions: [{ partitionIndex: 0, errorCode: ErrorCode.None, baseOffset: 0n }],
+					},
 				])
 			)
 			await producer.send('test-topic', { value: Buffer.from('init') })
