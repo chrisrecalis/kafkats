@@ -324,25 +324,38 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 
 	/**
 	 * Leave the consumer group
+	 *
+	 * Static members (groupInstanceId set) do NOT send LeaveGroup on graceful shutdown.
+	 * Per KIP-345, sending LeaveGroup as a static member triggers an immediate rebalance,
+	 * defeating the purpose of static membership (cheap rolling restarts). Static members
+	 * should simply stop heartbeating and let the broker wait for them to rejoin within
+	 * sessionTimeoutMs before triggering a rebalance.
+	 *
+	 * Dynamic members (no groupInstanceId) send LeaveGroup so the broker can immediately
+	 * rebalance rather than waiting for the session timeout.
 	 */
 	async leave(): Promise<void> {
-		this.logger.info('leaving group', { memberId: this.memberId })
+		this.logger.info('leaving group', { memberId: this.memberId, static: !!this.config.groupInstanceId })
 		this.stopHeartbeat()
 		this.state = ConsumerGroupState.LEAVING
 
 		try {
-			if (this.coordinator && this.memberId) {
+			// Static members must NOT send LeaveGroup — doing so triggers an immediate rebalance
+			// and defeats the purpose of static membership (KIP-345).
+			if (this.coordinator && this.memberId && !this.config.groupInstanceId) {
 				await this.coordinator.leaveGroup({
 					groupId: this.config.groupId,
 					members: [
 						{
 							memberId: this.memberId,
-							groupInstanceId: this.config.groupInstanceId ?? null,
+							groupInstanceId: null,
 							reason: 'Consumer leaving group',
 						},
 					],
 				})
 				this.logger.debug('leave group response received')
+			} else if (this.config.groupInstanceId) {
+				this.logger.debug('static member: skipping LeaveGroup to avoid triggering rebalance (KIP-345)')
 			}
 		} catch (error) {
 			// Ignore errors during leave - we're leaving anyway
