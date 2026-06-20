@@ -1,5 +1,55 @@
 # @kafkats/codec-zod
 
+## 0.9.1
+
+### Patch Changes
+
+- f278cd7: fix(producer): prevent idempotent producer false-ack under leader failover
+
+    Under `acks=all` with an idempotent producer, a batch that was sent and committed by
+    the broker but whose response was lost (e.g. the partition leader is killed mid-flight)
+    could exhaust its retries and then have its sequence rolled back. A subsequent batch
+    reused the same base sequence, the broker answered `DUPLICATE_SEQUENCE_NUMBER` pointing
+    at the prior batch's offsets, and the client resolved the _new_ batch's records with
+    those offsets — acknowledging records that were never written to the log.
+
+    On retry-exhaustion of an idempotent batch that was already put on the wire, the producer
+    now reinitializes the producer id/epoch (rather than reusing the sequence) and rejects the
+    affected sends, matching the Java client's handling of append-ambiguous outcomes. A
+    stale-epoch guard additionally prevents a response from a previous producer epoch from
+    mutating the new epoch's sequence state.
+
+- a7f3952: fix(compression): emit LZ4 frame format for lz4-napi (Kafka rejected raw-block LZ4)
+
+    `createLz4Codec` used `lz4-napi`'s `compress`/`uncompress`, which produce the raw LZ4
+    _block_ format. Kafka's RecordBatch v2 requires the LZ4 _frame_ format (magic bytes
+    `0x184D2204`), so every `lz4-napi`-compressed produce was rejected by the broker with
+    `UnknownServerError` ("invalid magic bytes").
+
+    When the `lz4-napi` instance exposes the framed API (`compressFrame`/`decompressFrame`,
+    available in lz4-napi >= 2.x), the codec now uses it. Older `lz4-napi` builds that only
+    expose the raw-block API now throw a clear error at codec-creation time instead of
+    silently producing data the broker rejects. The `lz4` (node-lz4) and `lz4js` paths
+    already use framed APIs and are unaffected.
+
+- 9125b65: fix(consumer): static members must not send LeaveGroup on shutdown (KIP-345)
+
+    A consumer configured with `groupInstanceId` (static membership) was sending a
+    `LeaveGroup` request on graceful shutdown. Per KIP-345 a static member must not do
+    this — sending `LeaveGroup` triggers an immediate group rebalance, defeating the
+    purpose of static membership (cheap rolling restarts, where the member is expected
+    to rejoin within `sessionTimeoutMs` with its existing partition assignment).
+
+    `ConsumerGroup.leave()` now skips the `LeaveGroup` request when `groupInstanceId` is
+    set and simply stops heartbeating, letting the broker hold the member's partitions
+    until it rejoins or the session times out. Dynamic members (no `groupInstanceId`)
+    continue to send `LeaveGroup` for an immediate rebalance.
+
+- Updated dependencies [f278cd7]
+- Updated dependencies [a7f3952]
+- Updated dependencies [9125b65]
+    - @kafkats/client@0.9.1
+
 ## 0.9.0
 
 ### Minor Changes
