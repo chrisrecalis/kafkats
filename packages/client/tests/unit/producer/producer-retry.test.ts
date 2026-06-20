@@ -499,6 +499,164 @@ describe('Producer retry behavior', () => {
 		})
 	})
 
+	describe('idempotent producer - retry exhaustion fences on append-ambiguous codes', () => {
+		// BLOCKER 1: when an idempotent batch has been transmitted (everSent=true) and
+		// retries are exhausted, we must fence+reinit regardless of which retriable code
+		// was returned, because codes like NotEnoughReplicasAfterAppend and RequestTimedOut
+		// mean the append MAY have happened.  Rolling back the sequence and reusing it
+		// would enable a future DuplicateSequenceNumber to false-ack a different batch.
+
+		async function setupIdempotentProducer(producerId: bigint, epochAfterInit: number) {
+			let initCount = 0
+			mockBroker.initProducerId.mockImplementation(async () => {
+				initCount++
+				return {
+					throttleTimeMs: 0,
+					errorCode: ErrorCode.None,
+					producerId,
+					producerEpoch: epochAfterInit + initCount - 1,
+				}
+			})
+			mockCluster.getAnyBroker.mockResolvedValue(mockBroker)
+
+			const producer = new Producer(mockCluster, {
+				lingerMs: 0,
+				retries: 2,
+				retryBackoffMs: 1,
+				idempotent: true,
+			})
+
+			// Initialize by sending one successful message
+			mockBroker.produce.mockResolvedValueOnce(
+				buildProduceResponse([
+					{ name: 'test-topic', partitions: [{ partitionIndex: 0, errorCode: ErrorCode.None, baseOffset: 0n }] },
+				])
+			)
+			await producer.send('test-topic', { value: Buffer.from('init') })
+			mockBroker.produce.mockReset()
+
+			return { producer, getInitCount: () => initCount }
+		}
+
+		it('fences+reinits on retry exhaustion with NOT_ENOUGH_REPLICAS_AFTER_APPEND (everSent=true)', async () => {
+			const { producer, getInitCount } = await setupIdempotentProducer(5000n, 1)
+
+			// Every produce attempt returns NotEnoughReplicasAfterAppend (append happened,
+			// acks didn't complete).  After retries=2, exhaustion triggers fence+reinit.
+			mockBroker.produce.mockResolvedValue(
+				buildProduceResponse([
+					{
+						name: 'test-topic',
+						partitions: [{ partitionIndex: 0, errorCode: ErrorCode.NotEnoughReplicasAfterAppend }],
+					},
+				])
+			)
+
+			// Send must reject with "max retries exceeded" (not hang, not silent drop)
+			await expect(producer.send('test-topic', { value: Buffer.from('msg') })).rejects.toThrow(
+				'max retries exceeded'
+			)
+
+			// After rejection, producer must have re-initialized (new epoch) —
+			// confirming fence+reinit was triggered, not just a sequence rollback.
+			mockBroker.produce.mockResolvedValueOnce(
+				buildProduceResponse([
+					{ name: 'test-topic', partitions: [{ partitionIndex: 0, errorCode: ErrorCode.None, baseOffset: 99n }] },
+				])
+			)
+			const result = await producer.send('test-topic', { value: Buffer.from('after') })
+			expect(result.offset).toBe(99n)
+			expect(getInitCount()).toBe(2) // reinit happened
+		})
+
+		it('fences+reinits on retry exhaustion with REQUEST_TIMED_OUT (acks=all, append-ambiguous)', async () => {
+			const { producer, getInitCount } = await setupIdempotentProducer(5001n, 1)
+
+			mockBroker.produce.mockResolvedValue(
+				buildProduceResponse([
+					{
+						name: 'test-topic',
+						partitions: [{ partitionIndex: 0, errorCode: ErrorCode.RequestTimedOut }],
+					},
+				])
+			)
+
+			await expect(producer.send('test-topic', { value: Buffer.from('msg') })).rejects.toThrow(
+				'max retries exceeded'
+			)
+
+			mockBroker.produce.mockResolvedValueOnce(
+				buildProduceResponse([
+					{ name: 'test-topic', partitions: [{ partitionIndex: 0, errorCode: ErrorCode.None, baseOffset: 77n }] },
+				])
+			)
+			const result = await producer.send('test-topic', { value: Buffer.from('after') })
+			expect(result.offset).toBe(77n)
+			expect(getInitCount()).toBe(2) // reinit happened
+		})
+
+		it('does NOT fence on retry exhaustion with NOT_LEADER_OR_FOLLOWER for non-idempotent producer (everSent, non-idempotent)', async () => {
+			// Non-idempotent producer: exhaustion is always a definitive rollback,
+			// not a fence+reinit.  The existing behavior must be unchanged.
+			const producer = new Producer(mockCluster, {
+				lingerMs: 0,
+				retries: 1,
+				retryBackoffMs: 1,
+			})
+
+			mockBroker.produce.mockResolvedValue(
+				buildProduceResponse([
+					{
+						name: 'test-topic',
+						partitions: [{ partitionIndex: 0, errorCode: ErrorCode.NotLeaderOrFollower }],
+					},
+				])
+			)
+
+			await expect(producer.send('test-topic', { value: Buffer.from('msg') })).rejects.toThrow(
+				'max retries exceeded'
+			)
+			// No initProducerId calls expected (non-idempotent producer never initializes)
+			expect(mockBroker.initProducerId).not.toHaveBeenCalled()
+		})
+
+		it('does NOT fence on retry exhaustion for idempotent batch that was never transmitted (everSent=false)', async () => {
+			// If the batch could not be sent at all (e.g. leader lookup fails before
+			// broker.produce() is called), everSent is false and rollback is safe.
+			let initCount = 0
+			mockBroker.initProducerId.mockImplementation(async () => {
+				initCount++
+				return { throttleTimeMs: 0, errorCode: ErrorCode.None, producerId: 5002n, producerEpoch: initCount }
+			})
+			mockCluster.getAnyBroker.mockResolvedValue(mockBroker)
+
+			const producer = new Producer(mockCluster, {
+				lingerMs: 0,
+				retries: 1,
+				retryBackoffMs: 1,
+				idempotent: true,
+			})
+
+			// Initialize
+			mockBroker.produce.mockResolvedValueOnce(
+				buildProduceResponse([
+					{ name: 'test-topic', partitions: [{ partitionIndex: 0, errorCode: ErrorCode.None, baseOffset: 0n }] },
+				])
+			)
+			await producer.send('test-topic', { value: Buffer.from('init') })
+			mockBroker.produce.mockReset()
+			const initCountAfterInit = initCount
+
+			// getLeaderForPartition always fails — broker.produce() never called, everSent stays false
+			mockCluster.getLeaderForPartition.mockRejectedValue(new Error('no leader'))
+
+			await expect(producer.send('test-topic', { value: Buffer.from('msg') })).rejects.toThrow()
+
+			// No extra reinit should have happened (batch was never sent)
+			expect(initCount).toBe(initCountAfterInit)
+		})
+	})
+
 	describe('metadata refresh on errors', () => {
 		it('refreshes metadata on NOT_LEADER_OR_FOLLOWER', async () => {
 			const producer = new Producer(mockCluster, {
