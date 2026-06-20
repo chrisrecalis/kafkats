@@ -104,7 +104,7 @@ describe('ConsumerGroup.leave() — KIP-345 static membership', () => {
 						groupInstanceId: null,
 					}),
 				]),
-			}),
+			})
 		)
 	})
 
