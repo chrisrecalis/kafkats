@@ -77,7 +77,9 @@ type PreparedProduceBatch = {
 	 */
 	encodedProducerId: bigint
 	/**
-	 * The producerEpoch encoded into this batch's RecordBatch header.
+	 * The producerEpoch encoded into this batch's RecordBatch header. Compared against
+	 * the current epoch when the response arrives to detect a reinit that happened
+	 * in-flight (see isStaleEpoch).
 	 */
 	encodedProducerEpoch: number
 }
@@ -422,31 +424,9 @@ export class Producer extends EventEmitter<ProducerEvents> {
 				}
 
 				if (outcome.retryError) {
-					// retryError is set when sendPreparedBatchesToBroker threw a network
-					// exception (broker.produce() rejected before a response was received).
-					// The batches were transmitted (everSent=true) but the outcome is
-					// ambiguous — fence + reinit for idempotent producers.
-					this.failPreparedBatches(outcome.retryBatches, () => outcome.retryError!, true)
-				} else if (this.config.idempotent && outcome.retryBatches.some(p => p.everSent)) {
-					// Retry exhaustion for an idempotent batch that was already transmitted at
-					// least once (everSent=true).  The triggering code (e.g.
-					// NotEnoughReplicasAfterAppend, RequestTimedOut) may mean the append
-					// DID happen — the broker's response is not a definitive rejection of the
-					// write.  We cannot safely roll back the sequence and reuse it under the
-					// current epoch.  Treat the outcome as ambiguous: fence + reinit so the
-					// next epoch starts at sequence 0.  The app still gets a clear rejection.
-					this.failPreparedBatches(
-						outcome.retryBatches,
-						prepared =>
-							new Error(
-								`Produce failed for ${prepared.batch.topic}-${prepared.batch.partition}: max retries exceeded`
-							),
-						true // ambiguous — fence + reinit
-					)
+					// broker.produce() rejected before any response arrived.
+					this.failPreparedBatches(outcome.retryBatches, () => outcome.retryError!)
 				} else {
-					// Retry exhaustion for a batch that was never transmitted (everSent=false),
-					// or a non-idempotent producer.  Each attempt received an explicit broker
-					// response — the outcome is definitive (broker rejected, not appended).
 					this.failPreparedBatches(
 						outcome.retryBatches,
 						prepared =>
@@ -461,9 +441,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 
 				if (!strategy.shouldReconnect()) {
 					const failure = error instanceof Error ? error : new Error(String(error))
-					// Network exception with no broker response — outcome is ambiguous for
-					// any batch that was already transmitted (everSent=true).
-					this.failPreparedBatches(pendingBatches, () => failure, true)
+					this.failPreparedBatches(pendingBatches, () => failure)
 					return
 				}
 
@@ -522,11 +500,8 @@ export class Producer extends EventEmitter<ProducerEvents> {
 
 		await this.acquireInflightSlot()
 		try {
-			// Mark every batch as transmitted BEFORE we await the network send.
-			// Once broker.produce() is called the broker may have appended the batch —
-			// even a connection-drop or timeout after this point means the outcome is
-			// ambiguous.  failPreparedBatch uses everSent to decide whether it is safe
-			// to roll back the reserved sequence or whether it must fence + reinit.
+			// Mark as transmitted before awaiting: once broker.produce() is called the broker
+			// may have appended the batch, so any failure after this point is ambiguous.
 			for (const prepared of preparedBatches) {
 				prepared.everSent = true
 			}
@@ -547,16 +522,10 @@ export class Producer extends EventEmitter<ProducerEvents> {
 			for (const prepared of preparedBatches) {
 				const { batch } = prepared
 
-				// Stale-epoch guard: if a fenceAndReinit occurred while this request was
-				// in flight, this response belongs to the old epoch.  fenceAndReinit already
-				// rejected the messages — skip without touching any sequence/commit state.
-				// This protects handleBatchSuccess (commitSequence), handleDuplicateSequence,
-				// and all error paths uniformly.
-				if (
-					this.config.idempotent &&
-					(prepared.encodedProducerId !== this.producerId ||
-						prepared.encodedProducerEpoch !== this.producerEpoch)
-				) {
+				// A fenceAndReinit while this request was in flight makes the response belong
+				// to the old epoch; fenceAndReinit already rejected its messages, so skip it
+				// without touching any sequence/commit state.
+				if (this.isStaleEpoch(prepared)) {
 					this.logger.debug('skipping stale-epoch response', {
 						topic: batch.topic,
 						partition: batch.partition,
@@ -570,9 +539,8 @@ export class Producer extends EventEmitter<ProducerEvents> {
 				const partitionResponse = topicResponse?.partitions.find(p => p.partitionIndex === batch.partition)
 
 				if (!partitionResponse) {
-					// The broker responded to the ProduceRequest but did not include this
-					// partition.  Since the request was transmitted (everSent=true) the outcome
-					// is ambiguous — treat the same as a connection failure: fence + reinit.
+					// Broker responded but omitted this partition: the outcome is ambiguous
+					// (the request was transmitted), so fence + reinit like a connection failure.
 					const ambiguousError = new Error(
 						`Ambiguous produce outcome (no broker response for ${batch.topic}-${batch.partition}) — fencing producer`
 					)
@@ -651,34 +619,54 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	}
 
 	/**
-	 * Fail a collection of prepared batches, choosing between a definitive rollback
-	 * (outcome certain — broker explicitly rejected or batch was never transmitted)
-	 * and a fence+reinit (outcome ambiguous — connection failure after transmission).
+	 * True when a prepared batch was encoded under a producer identity that no longer
+	 * matches the current one — i.e. a fenceAndReinit bumped the epoch between when the
+	 * batch was prepared and when its response arrived. Only meaningful for idempotent
+	 * producers (non-idempotent batches encode -1/-1 and are never compared).
+	 */
+	private isStaleEpoch(prepared: PreparedProduceBatch): boolean {
+		return (
+			this.config.idempotent &&
+			(prepared.encodedProducerId !== this.producerId || prepared.encodedProducerEpoch !== this.producerEpoch)
+		)
+	}
+
+	/** Reject every message still queued in pendingBatches (split remainders) and clear the queue. */
+	private rejectAndClearPendingBatches(error: Error): void {
+		for (const batch of this.pendingBatches) {
+			for (const msg of batch.messages) {
+				msg.reject(error)
+			}
+		}
+		this.pendingBatches = []
+	}
+
+	/**
+	 * Fail a collection of prepared batches.
 	 *
-	 * @param ambiguous - true when the failure is a network exception that occurred
-	 *   AFTER the ProduceRequest was transmitted (everSent=true batches may have been
-	 *   appended by the broker).  false when the broker's own response is the final
-	 *   authority (retriable error exhaustion, explicit non-retriable error code).
+	 * For an idempotent producer, if any batch was already transmitted (everSent) its
+	 * append outcome is unknown — reusing its sequence could later let a
+	 * DuplicateSequenceNumber response resolve a different batch's messages with the wrong
+	 * offsets (a false ack). So we fence + reinit, restarting the next epoch at sequence 0.
+	 * Otherwise (nothing transmitted, or a non-idempotent producer) we roll back each
+	 * batch's reserved sequence and reject its messages.
+	 *
+	 * Definitive single-batch rejections (an explicit broker error code) call
+	 * failPreparedBatch directly instead.
 	 */
 	private failPreparedBatches(
 		preparedBatches: PreparedProduceBatch[],
-		errorFor: (prepared: PreparedProduceBatch) => Error,
-		ambiguous = false
+		errorFor: (prepared: PreparedProduceBatch) => Error
 	): void {
-		// An idempotent producer that already transmitted a batch (everSent=true) and
-		// lost the connection before any broker response cannot know whether the broker
-		// appended the records.  Reusing the same sequence number under the same epoch
-		// would let a future DuplicateSequenceNumber response resolve a DIFFERENT batch's
-		// messages with the wrong offsets (Defect B / false-ack scenario).
-		// Fence + reinit so the next epoch starts at sequence 0.
-		if (ambiguous && this.config.idempotent && preparedBatches.some(p => p.everSent)) {
-			const firstSent = preparedBatches.find(p => p.everSent)!
-			const error = errorFor(firstSent)
-			const ambiguousError = new Error(
-				`Ambiguous produce outcome after send — fencing producer for safety: ${error.message}`
-			)
-			this.fenceAndReinit(ambiguousError, preparedBatches)
-			return
+		if (this.config.idempotent) {
+			const firstSent = preparedBatches.find(p => p.everSent)
+			if (firstSent) {
+				const ambiguousError = new Error(
+					`Ambiguous produce outcome after send — fencing producer for safety: ${errorFor(firstSent).message}`
+				)
+				this.fenceAndReinit(ambiguousError, preparedBatches)
+				return
+			}
 		}
 
 		for (const prepared of preparedBatches) {
@@ -689,11 +677,8 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	private failPreparedBatch(prepared: PreparedProduceBatch, error: Error): void {
 		const { batch, recordCount, batchId, messagesToSend } = prepared
 		if (this.config.idempotent) {
-			// Roll back the reserved sequence regardless of everSent when the outcome is
-			// DEFINITIVE (broker explicitly rejected the batch via an error code, or this
-			// is a pre-send encoding failure).  The caller is responsible for ensuring
-			// this method is only called for definitive failures — ambiguous outcomes
-			// (connection failures, no broker response) go through fenceAndReinit instead.
+			// Safe to roll back: this path is only for definitive failures (explicit broker
+			// error code, or a pre-send encoding failure) where the sequence was not consumed.
 			this.rollbackSequence(batch.topic, batch.partition, recordCount)
 			this.inflightBatches.delete(batchId)
 		}
@@ -753,11 +738,9 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	): void {
 		const { batch, baseSequence, encodedProducerId, encodedProducerEpoch } = prepared
 
-		// Guard: producer identity must match what was encoded.
-		// If the epoch changed (reinit happened between prepare and this response),
-		// this response belongs to a different producer era and is not a legitimate
-		// dedup for this batch's messages.
-		if (encodedProducerId !== this.producerId || encodedProducerEpoch !== this.producerEpoch) {
+		// Defense-in-depth: if the epoch changed (reinit between prepare and this response),
+		// the dedup does not apply to this batch's messages.
+		if (this.isStaleEpoch(prepared)) {
 			this.logger.error('duplicate sequence number with stale producer identity — fencing producer', {
 				topic: batch.topic,
 				partition: batch.partition,
@@ -891,15 +874,8 @@ export class Producer extends EventEmitter<ProducerEvents> {
 			this.inflightBatches.delete(p.batchId)
 		}
 
-		// Reject and clear any split-remainder batches queued in pendingBatches.
-		// These are PartitionBatch objects with raw QueuedMessage arrays — reject
-		// their messages so they do not dangle after the epoch changes.
-		for (const pendingBatch of this.pendingBatches) {
-			for (const msg of pendingBatch.messages) {
-				msg.reject(error)
-			}
-		}
-		this.pendingBatches = []
+		// Split-remainder batches would otherwise dangle once the epoch changes.
+		this.rejectAndClearPendingBatches(error)
 
 		this.failAllInflightBatches(error)
 		this.accumulator.clearWithRejection(error)
@@ -1155,12 +1131,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		// If flush() threw, batches may still be in pendingBatches / inflightBatches /
 		// the accumulator. Reject everything so caller promises don't hang.
 		const disconnectError = new Error('Producer disconnected')
-		for (const batch of this.pendingBatches) {
-			for (const msg of batch.messages) {
-				msg.reject(disconnectError)
-			}
-		}
-		this.pendingBatches.length = 0
+		this.rejectAndClearPendingBatches(disconnectError)
 		this.failAllInflightBatches(disconnectError)
 		this.accumulator.clearWithRejection(disconnectError)
 
