@@ -101,6 +101,68 @@ describe.concurrent('EOS (integration) - transactions', () => {
 		await client.disconnect()
 	})
 
+	it('aborts instead of committing when a transactional send fails definitively', async () => {
+		const client = createClient('it-tx-failed-send')
+		await client.connect()
+
+		const topicName = uniqueName('it-tx-failed-send')
+		const testTopic = topic<string>(topicName, { value: codec.string() })
+
+		await client.createTopics([{ name: topicName, numPartitions: 1, replicationFactor: 1 }])
+
+		const producer = client.producer({
+			transactionalId: uniqueName('tx'),
+			retries: 10,
+			retryBackoffMs: 250,
+			maxRetryBackoffMs: 1000,
+		})
+
+		// Larger than the broker default message.max.bytes (~1MiB) — the broker rejects
+		// the batch with MessageTooLarge, a definitive non-retriable error.
+		const oversized = 'x'.repeat(2 * 1024 * 1024)
+
+		await expect(
+			producer.transaction(async tx => {
+				await tx.send(testTopic, { value: 'normal' })
+				// Fire-and-forget: the failure must still poison the transaction so
+				// commit refuses to expose the partial transaction.
+				void tx.send(testTopic, { value: oversized }).catch(() => {})
+			})
+		).rejects.toThrow(/Transaction aborted/i)
+
+		// read_committed must see NO records from the aborted transaction.
+		const rc = client.consumer({
+			groupId: uniqueName('it-group'),
+			autoOffsetReset: 'earliest',
+			isolationLevel: 'read_committed',
+		})
+
+		const rcReceived: string[] = []
+		const abortController = new AbortController()
+		const rcRun = rc.runEach(
+			testTopic,
+			async message => {
+				rcReceived.push(message.value)
+				rc.stop()
+			},
+			{ autoCommit: false, signal: abortController.signal }
+		)
+
+		await new Promise<void>((resolve, reject) => {
+			rc.once('running', () => resolve())
+			rc.once('error', err => reject(err))
+		})
+
+		await sleep(1000)
+		abortController.abort()
+		await rcRun
+
+		expect(rcReceived).toEqual([])
+
+		await producer.disconnect()
+		await client.disconnect()
+	})
+
 	it('aborted transactions are hidden from read_committed consumers', async () => {
 		const client = createClient('it-tx-abort')
 		await client.connect()
