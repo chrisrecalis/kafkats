@@ -50,6 +50,10 @@ interface CompletedFetch {
 	partition: number
 	records: DecodedRecord[]
 	byteSize: number
+	// Assignment epoch of the partition when the fetch was buffered (see
+	// FetchManager.assignmentEpochs). Stale batches are fenced by comparing this
+	// against the current epoch at delivery time.
+	assignmentEpoch: number
 }
 
 /**
@@ -302,6 +306,10 @@ export class FetchManager {
 	private readonly cluster: Cluster
 	private readonly config: FetchManagerConfig
 	private readonly partitionStates: Map<string, PartitionState> = new Map()
+	// Per-partition assignment epoch, bumped whenever a partition is removed. Survives
+	// remove/re-add cycles (eager rebalance), so a batch drained before the rebalance can
+	// be told apart from one fetched under the new assignment of the same partition.
+	private readonly assignmentEpochs: Map<string, number> = new Map()
 	private readonly logger: Logger
 	private readonly autoOffsetReset?: AutoOffsetReset
 	private readonly offsetManager?: OffsetManager
@@ -340,8 +348,9 @@ export class FetchManager {
 			partitions: formatPartitions(partitions),
 		})
 		// Abort all existing partition loops
-		for (const state of this.partitionStates.values()) {
+		for (const [key, state] of this.partitionStates) {
 			state.abortController.abort()
+			this.bumpAssignmentEpoch(key)
 		}
 		this.partitionStates.clear()
 
@@ -417,6 +426,10 @@ export class FetchManager {
 				// Abort the partition's fetch loop
 				state.abortController.abort()
 				this.partitionStates.delete(key)
+				// Fence batches already drained by poll(): if the partition is re-added
+				// (eager rebalance keeps some partitions), those stale batches must not be
+				// delivered — their records are re-fetched from the committed offset.
+				this.bumpAssignmentEpoch(key)
 			}
 		}
 
@@ -526,6 +539,34 @@ export class FetchManager {
 	 */
 	isPartitionAssigned(topic: string, partition: number): boolean {
 		return this.partitionStates.has(tpKey(topic, partition))
+	}
+
+	private bumpAssignmentEpoch(key: string): void {
+		this.assignmentEpochs.set(key, (this.assignmentEpochs.get(key) ?? 0) + 1)
+	}
+
+	/**
+	 * Current assignment epoch for a partition (0 if it was never removed)
+	 */
+	getAssignmentEpoch(topic: string, partition: number): number {
+		return this.assignmentEpochs.get(tpKey(topic, partition)) ?? 0
+	}
+
+	/**
+	 * Check whether a drained batch is still deliverable: its partition must be assigned
+	 * AND its assignment epoch must match the current one. A mismatch means the partition
+	 * was removed (and possibly re-added by an eager rebalance) after the batch was
+	 * buffered — delivering it would duplicate records re-fetched from the committed
+	 * offset under the new assignment.
+	 */
+	isBatchAssigned(batch: PartitionBatch): boolean {
+		if (!this.partitionStates.has(tpKey(batch.topic, batch.partition))) {
+			return false
+		}
+		return (
+			batch.assignmentEpoch === undefined ||
+			batch.assignmentEpoch === this.getAssignmentEpoch(batch.topic, batch.partition)
+		)
 	}
 
 	/**
@@ -836,6 +877,7 @@ export class FetchManager {
 							partition: state.partition,
 							records,
 							byteSize,
+							assignmentEpoch: this.getAssignmentEpoch(state.topic, state.partition),
 						})
 					}
 

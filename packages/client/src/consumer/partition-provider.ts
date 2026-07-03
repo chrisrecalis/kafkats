@@ -209,24 +209,39 @@ export class GroupPartitionProvider implements PartitionProvider {
 			await this.callbacks.onRebalance()
 
 			const previousAssignment = this.consumerGroup.currentAssignment
+			const wasEager = this.consumerGroup.currentRebalanceProtocol === 'eager'
+
+			// Eager protocol: revoke ALL partitions (which commits their final offsets)
+			// BEFORE rejoining. The commit runs under the OLD generation, which the broker
+			// accepts until the member rejoins — committing after JoinGroup would let the
+			// new owner fetch a stale committed offset and reprocess records.
+			if (wasEager && previousAssignment.length > 0) {
+				await this.callbacks.onPartitionsRevoked(previousAssignment)
+			}
+
 			const rejoinResult = await this.consumerGroup.rejoin(this.topics)
 			if (!this.isRunning()) return
 
 			await this.updateGroupState()
 
 			if (rejoinResult.protocol === 'eager') {
-				await this.handleEagerRebalance(previousAssignment, rejoinResult.assignment)
+				// If the previous generation was eager everything was already revoked
+				// pre-join; only a cooperative→eager protocol switch still needs the revoke.
+				await this.handleEagerRebalance(wasEager ? [] : previousAssignment, rejoinResult.assignment)
 			} else {
-				await this.handleCooperativeRebalance(rejoinResult)
+				// If the previous generation was eager, all partitions were revoked pre-join,
+				// so the full final assignment (not just the added delta) must be assigned.
+				await this.handleCooperativeRebalance(rejoinResult, wasEager)
 			}
 		} catch (error) {
 			const err = error instanceof Error ? error : new Error(String(error))
 			this.logger.error('rebalance handler failed', { error: err.message })
-			// Stop the group too: if onRebalance (e.g. EOS commit) failed, continuing the
-			// fetch loop on the stale assignment would be unsafe. The error is surfaced via
-			// onError; the run loop sees the stop and exits cleanly.
+			// Stop the group: if the rebalance failed (e.g. EOS commit in onRebalance),
+			// continuing the fetch loop on the stale assignment would be unsafe. Rethrow so
+			// the poll loop that drives checkAndHandleRebalance exits instead of fetching
+			// partitions this consumer no longer owns after leaving the group.
 			void this.consumerGroup.stop().catch(() => {})
-			this.callbacks.onError(err)
+			throw err
 		}
 	}
 
@@ -234,8 +249,12 @@ export class GroupPartitionProvider implements PartitionProvider {
 		previousAssignment: TopicPartition[],
 		assignment: TopicPartition[]
 	): Promise<void> {
-		this.logger.debug('eager rebalance: revoking all partitions')
+		this.logger.debug('eager rebalance: assigning new generation', {
+			pendingRevokeCount: previousAssignment.length,
+		})
 
+		// Normally empty: the eager protocol revokes before the rejoin. Non-empty only
+		// on a cooperative→eager protocol switch, where the revoke could not happen early.
 		if (previousAssignment.length > 0) {
 			await this.callbacks!.onPartitionsRevoked(previousAssignment)
 		}
@@ -244,7 +263,12 @@ export class GroupPartitionProvider implements PartitionProvider {
 		await this.callbacks!.onPartitionsAssigned(partitionsWithOffsets)
 	}
 
-	private async handleCooperativeRebalance(rejoinResult: JoinResult): Promise<void> {
+	/**
+	 * @param assignFullAssignment - assign the full final assignment instead of only the
+	 * added delta. Used when the previous generation ran the eager protocol (all
+	 * partitions were revoked before the rejoin), so kept partitions must be re-added.
+	 */
+	private async handleCooperativeRebalance(rejoinResult: JoinResult, assignFullAssignment = false): Promise<void> {
 		if (rejoinResult.protocol === 'cooperative') {
 			this.logger.debug('cooperative rebalance: phase 1', {
 				revokedCount: rejoinResult.revoked.length,
@@ -283,9 +307,10 @@ export class GroupPartitionProvider implements PartitionProvider {
 				addedCount: rejoinResult.added.length,
 			})
 
-			if (rejoinResult.added.length > 0) {
-				const addedWithOffsets = await this.resolveOffsets(rejoinResult.added)
-				await this.callbacks!.onPartitionsAssigned(addedWithOffsets)
+			const toAssign = assignFullAssignment ? rejoinResult.assignment : rejoinResult.added
+			if (toAssign.length > 0) {
+				const assignedWithOffsets = await this.resolveOffsets(toAssign)
+				await this.callbacks!.onPartitionsAssigned(assignedWithOffsets)
 			}
 		}
 	}
