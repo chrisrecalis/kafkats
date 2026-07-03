@@ -274,7 +274,16 @@ export class Broker {
 
 		this.logger.debug('connecting', { host: this.host, port: this.port })
 		await Promise.all([this.connection.connect(), this.fetchConnection.connect()])
-		await this.negotiateApiVersions()
+		try {
+			await this.negotiateApiVersions()
+		} catch (error) {
+			// A broker with failed negotiation must not stay cached as connected:
+			// its apiVersions map is empty, so every subsequent request would throw
+			// a non-retriable UnsupportedVersionError. Close the connections so the
+			// next connect() retries cleanly.
+			await Promise.allSettled([this.connection.close(false), this.fetchConnection.close(false)])
+			throw error
+		}
 		this.logger.debug('connected', { host: this.host, port: this.port })
 	}
 

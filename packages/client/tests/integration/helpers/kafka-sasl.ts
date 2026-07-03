@@ -20,6 +20,11 @@ export interface WithKafkaSaslOptions {
 	mechanism: SaslMechanism
 	username?: string
 	password?: string
+	/**
+	 * Extra broker environment variables (e.g. KAFKA_CONNECTIONS_MAX_REAUTH_MS).
+	 * Forces a dedicated container instead of the pre-warmed one.
+	 */
+	brokerEnv?: Record<string, string>
 }
 
 type SharedSaslContext = {
@@ -55,7 +60,7 @@ export async function withKafkaSasl<T>(
 ): Promise<T> {
 	const username = options.username ?? 'testuser'
 	const password = options.password ?? 'testpass'
-	const key = `${options.mechanism}:${username}:${password}`
+	const key = `${options.mechanism}:${username}:${password}:${JSON.stringify(options.brokerEnv ?? {})}`
 
 	if (!sharedSaslContexts.has(key)) {
 		sharedSaslContexts.set(key, initSaslContext(options, username, password))
@@ -100,9 +105,9 @@ async function initSaslContext(
 ): Promise<SharedSaslContext> {
 	const logLevel = (process.env.KAFKA_TS_LOG_LEVEL as LogLevel) ?? 'silent'
 
-	// Check for pre-warmed container from global setup
+	// Check for pre-warmed container from global setup (custom broker env needs its own container)
 	const prewarmedBroker = getPrewarmedBrokerAddress(options.mechanism)
-	if (prewarmedBroker && username === 'testuser' && password === 'testpass') {
+	if (prewarmedBroker && username === 'testuser' && password === 'testpass' && !options.brokerEnv) {
 		// Use pre-warmed container
 		const saslConfig: SaslConfig = {
 			mechanism: options.mechanism,
@@ -175,6 +180,7 @@ async function startKafkaSasl(
 					// Inter-broker uses PLAINTEXT for simplicity
 					KAFKA_INTER_BROKER_LISTENER_NAME: 'BROKER',
 					...envConfig,
+					...options.brokerEnv,
 				})
 				.withWaitStrategy(waitStrategy)
 				.start()
@@ -190,6 +196,7 @@ async function startKafkaSasl(
 						// Inter-broker uses PLAINTEXT for simplicity
 						KAFKA_INTER_BROKER_LISTENER_NAME: 'BROKER',
 						...envConfig,
+						...options.brokerEnv,
 					})
 					.withWaitStrategy(waitStrategy)
 					.start()

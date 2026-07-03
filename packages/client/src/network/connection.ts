@@ -20,6 +20,8 @@ import type { SaslMechanism } from '@/auth/sasl-mechanism.js'
 import { sleep } from '@/utils/sleep.js'
 import { encodeSaslAuthenticateRequest } from '@/protocol/messages/requests/sasl-authenticate.js'
 import { decodeSaslAuthenticateResponse } from '@/protocol/messages/responses/sasl-authenticate.js'
+import { encodeSaslHandshakeRequest } from '@/protocol/messages/requests/sasl-handshake.js'
+import { decodeSaslHandshakeResponse } from '@/protocol/messages/responses/sasl-handshake.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import {
 	IllegalSaslStateError,
@@ -126,6 +128,11 @@ export class Connection extends EventEmitter<ConnectionEvents> {
 			return
 		}
 
+		// A close is in progress — refuse to race it with a new connect.
+		if (this._state === 'closing') {
+			throw new ConnectionClosedError('Cannot connect while connection is closing')
+		}
+
 		// Connection in progress - wait for it
 		if (this._state === 'connecting' && this.connectPromise) {
 			return this.connectPromise
@@ -146,7 +153,16 @@ export class Connection extends EventEmitter<ConnectionEvents> {
 
 	private async doConnect(startTime: number): Promise<void> {
 		try {
-			this.socket = await this.socketFactory.connect(this.host, this.port)
+			const socket = await this.socketFactory.connect(this.host, this.port)
+
+			// close() may have run while the socket factory was dialing. Adopting the
+			// fresh socket now would resurrect a closed connection and leak the socket.
+			if (this._state !== 'connecting') {
+				socket.destroy()
+				throw new ConnectionClosedError('Connection closed during connect')
+			}
+
+			this.socket = socket
 
 			// Attach the error handler before SASL so a socket error during auth isn't left unhandled.
 			this.socket.on('error', this.handleError.bind(this))
@@ -155,6 +171,11 @@ export class Connection extends EventEmitter<ConnectionEvents> {
 			// This must happen before setting up the normal request queue
 			if (this.saslConfig) {
 				await this.performSaslAuthentication()
+
+				// Re-check: close() may have landed while authentication was in flight.
+				if ((this._state as ConnectionState) !== 'connecting') {
+					throw new ConnectionClosedError('Connection closed during connect')
+				}
 			}
 
 			this._state = 'connected'
@@ -172,7 +193,10 @@ export class Connection extends EventEmitter<ConnectionEvents> {
 			this.logger.debug('connected', { durationMs })
 			this.emit('connect')
 		} catch (error) {
-			this._state = 'disconnected'
+			// Don't clobber a concurrent close(): only 'connecting' falls back to 'disconnected'.
+			if (this._state === 'connecting') {
+				this._state = 'disconnected'
+			}
 			if (this.socket) {
 				this.socket.destroy()
 				this.socket = null
@@ -268,6 +292,44 @@ export class Connection extends EventEmitter<ConnectionEvents> {
 			port: this.port,
 			clientId: this.clientId,
 		})
+
+		// Requests that were already queued before reauthentication started would
+		// otherwise be dispatched between the reauth exchanges (send()/sendNoResponse()
+		// only gate NEW sends). Once the broker enters re-authentication mode it only
+		// accepts SaslAuthenticate, so drain the queue before starting.
+		while (this.isConnected && this.requestQueue.queuedCount > 0) {
+			await sleep(10)
+		}
+
+		// KIP-368: the broker only enters re-authentication mode after receiving a
+		// SaslHandshake request on the already-authenticated channel. Sending
+		// SaslAuthenticate directly is answered with ILLEGAL_SASL_STATE.
+		const handshakeVersion = 1
+		const handshakeBuffer = await this.send(
+			ApiKey.SaslHandshake,
+			handshakeVersion,
+			encoder => encodeSaslHandshakeRequest(encoder, handshakeVersion, { mechanism: mechanism.name }),
+			Connection.AUTH_TIMEOUT_MS
+		)
+
+		const handshakeDecoder = new Decoder(handshakeBuffer)
+		decodeResponseHeader(handshakeDecoder, ApiKey.SaslHandshake, handshakeVersion)
+		const handshakeResponse = decodeSaslHandshakeResponse(handshakeDecoder, handshakeVersion)
+
+		if (handshakeResponse.errorCode === ErrorCode.UnsupportedSaslMechanism) {
+			throw new UnsupportedSaslMechanismError(mechanism.name, handshakeResponse.enabledMechanisms)
+		}
+
+		if (handshakeResponse.errorCode === ErrorCode.IllegalSaslState) {
+			throw new IllegalSaslStateError(`SASL handshake failed: illegal SASL state (mechanism: ${mechanism.name})`)
+		}
+
+		if (handshakeResponse.errorCode !== ErrorCode.None) {
+			throw new KafkaProtocolError(
+				handshakeResponse.errorCode,
+				`SASL handshake failed (mechanism: ${mechanism.name})`
+			)
+		}
 
 		const version = 1
 		const authGenerator = mechanism.authenticate()
@@ -434,8 +496,8 @@ export class Connection extends EventEmitter<ConnectionEvents> {
 		}
 
 		// Block normal requests while reauthentication is in progress.
-		// Allow the SaslAuthenticate exchange itself to proceed.
-		if (this.saslReauthPromise && apiKey !== ApiKey.SaslAuthenticate) {
+		// Allow the SaslHandshake/SaslAuthenticate exchange itself to proceed.
+		if (this.saslReauthPromise && apiKey !== ApiKey.SaslAuthenticate && apiKey !== ApiKey.SaslHandshake) {
 			await this.saslReauthPromise
 		}
 
@@ -484,7 +546,7 @@ export class Connection extends EventEmitter<ConnectionEvents> {
 		}
 
 		// Block normal requests while reauthentication is in progress.
-		if (this.saslReauthPromise && apiKey !== ApiKey.SaslAuthenticate) {
+		if (this.saslReauthPromise && apiKey !== ApiKey.SaslAuthenticate && apiKey !== ApiKey.SaslHandshake) {
 			await this.saslReauthPromise
 		}
 
