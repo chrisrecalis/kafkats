@@ -202,6 +202,51 @@ describe('Broker', () => {
 			expect(() => broker.getApiVersion(ApiKey.Metadata)).toThrow(UnsupportedVersionError)
 		})
 
+		it('does not stay cached as connected when ApiVersions negotiation fails', async () => {
+			const controlConnection = createMockConnection()
+			const fetchConnection = createMockConnection()
+
+			const broker = new Broker({
+				host: 'localhost',
+				port: 9092,
+				nodeId: 1,
+				clientId: 'test-client',
+			})
+
+			;(broker as unknown as { connection: typeof controlConnection }).connection = controlConnection
+			;(broker as unknown as { fetchConnection: typeof fetchConnection }).fetchConnection = fetchConnection
+
+			// First ApiVersions request fails (e.g. transient network error), later ones succeed.
+			let failNegotiation = true
+			controlConnection.setSendHandler(async apiKey => {
+				if (apiKey === ApiKey.ApiVersions) {
+					if (failNegotiation) {
+						failNegotiation = false
+						throw new NetworkError('ECONNRESET during ApiVersions')
+					}
+					return buildApiVersionsResponse([
+						{ apiKey: ApiKey.ApiVersions, minVersion: 0, maxVersion: 3 },
+						{ apiKey: ApiKey.Metadata, minVersion: 0, maxVersion: 12 },
+					])
+				}
+				throw new Error(`Unexpected API key: ${apiKey}`)
+			})
+
+			await expect(broker.connect()).rejects.toThrow(NetworkError)
+
+			// A broker with failed negotiation must not present itself as connected —
+			// its apiVersions map is empty and every request would throw a
+			// non-retriable UnsupportedVersionError.
+			expect(broker.isConnected).toBe(false)
+			expect(controlConnection.close).toHaveBeenCalled()
+			expect(fetchConnection.close).toHaveBeenCalled()
+
+			// A subsequent connect() must retry negotiation cleanly and succeed.
+			await broker.connect()
+			expect(broker.isConnected).toBe(true)
+			expect(broker.getApiVersion(ApiKey.Metadata)).toBeGreaterThanOrEqual(0)
+		})
+
 		it('throws KafkaProtocolError when ApiVersions returns error', async () => {
 			const controlConnection = createMockConnection()
 			const fetchConnection = createMockConnection()

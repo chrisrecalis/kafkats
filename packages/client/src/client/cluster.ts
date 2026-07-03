@@ -58,6 +58,7 @@ export class Cluster extends EventEmitter<ClusterEvents> {
 	private readonly bootstrapBrokers: Broker[] = []
 	private metadata: ClusterMetadata | null = null
 	private readonly coordinatorCache: Map<string, CoordinatorEntry> = new Map()
+	private readonly brokerConnectPromises: Map<number, Promise<Broker>> = new Map()
 	private metadataRefreshPromise: Promise<ClusterMetadata> | null = null
 	private metadataRefreshInterval: ReturnType<typeof setInterval> | null = null
 	private isConnected = false
@@ -177,14 +178,30 @@ export class Cluster extends EventEmitter<ClusterEvents> {
 
 	async getBroker(nodeId: number): Promise<Broker> {
 		// Check if we already have a connection
-		let broker = this.brokers.get(nodeId)
-		if (broker?.isConnected) {
+		const cached = this.brokers.get(nodeId)
+		if (cached?.isConnected) {
 			this.logger.debug('broker cache hit', { nodeId })
-			return broker
+			return cached
 		}
 
 		this.logger.debug('broker cache miss', { nodeId })
 
+		// Deduplicate concurrent connect attempts for the same node: without this,
+		// two callers racing past the cache check would each create and connect a
+		// Broker, and the one overwritten in the map would leak its connections.
+		const inFlight = this.brokerConnectPromises.get(nodeId)
+		if (inFlight) {
+			return inFlight
+		}
+
+		const promise = this.doGetBroker(nodeId).finally(() => {
+			this.brokerConnectPromises.delete(nodeId)
+		})
+		this.brokerConnectPromises.set(nodeId, promise)
+		return promise
+	}
+
+	private async doGetBroker(nodeId: number): Promise<Broker> {
 		// Find broker info in metadata
 		if (!this.metadata) {
 			await this.refreshMetadata()
@@ -194,6 +211,27 @@ export class Cluster extends EventEmitter<ClusterEvents> {
 		if (!brokerInfo) {
 			this.logger.error('broker not found in metadata', { nodeId })
 			throw new BrokerNotAvailableError(nodeId)
+		}
+
+		let broker = this.brokers.get(nodeId)
+
+		// The node may have moved since this Broker was created. Its host/port are
+		// immutable, so reconnecting the cached instance would dial the OLD address
+		// forever — recreate it against the fresh metadata address instead.
+		if (broker && !broker.isConnected && (broker.host !== brokerInfo.host || broker.port !== brokerInfo.port)) {
+			this.logger.debug('broker address changed, recreating', {
+				nodeId,
+				oldHost: broker.host,
+				oldPort: broker.port,
+				host: brokerInfo.host,
+				port: brokerInfo.port,
+			})
+			const stale = broker
+			this.brokers.delete(nodeId)
+			broker = undefined
+			stale.disconnect().catch((error: Error) => {
+				this.emitError(error)
+			})
 		}
 
 		// Create new broker connection if needed
@@ -499,6 +537,18 @@ export class Cluster extends EventEmitter<ClusterEvents> {
 		const ZERO_TOPIC_ID = '00000000-0000-0000-0000-000000000000'
 
 		for (const topic of response.topics) {
+			// A topic that comes back with a fatal topic-level error no longer exists —
+			// drop any carried-over entry so stale leaders aren't served from the cache
+			// after the topic was deleted.
+			if (
+				topic.name &&
+				(topic.errorCode === ErrorCode.UnknownTopicOrPartition ||
+					topic.errorCode === ErrorCode.InvalidTopicException)
+			) {
+				topics.delete(topic.name)
+				continue
+			}
+
 			if (topic.errorCode === ErrorCode.None && topic.name) {
 				const prior = existing?.topics.get(topic.name)
 				// A topic deleted and recreated under the same name gets a new topic ID and its
