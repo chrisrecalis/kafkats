@@ -265,13 +265,21 @@ export async function decodePartitionRecordBatches(partition: FetchPartitionResp
 			break // Not enough data for baseOffset + batchLength
 		}
 
-		try {
-			const batch = await decodeRecordBatchFrom(decoder)
-			batches.push(batch)
-		} catch {
-			// If we fail to decode, we've probably hit the end of complete batches
-			break
+		// Peek batchLength to distinguish a legitimately truncated trailing batch (the broker may
+		// cut the last batch off at maxBytes) from a corrupt one. Only truncation may be swallowed;
+		// decode errors on a complete batch (e.g. a CRC32C mismatch) must propagate — treating them
+		// as end-of-data would silently drop records and leave the partition stuck.
+		const batchStart = decoder.offset()
+		decoder.seek(batchStart + 8) // skip baseOffset(int64)
+		const batchLength = decoder.readInt32()
+		decoder.seek(batchStart)
+
+		if (decoder.remaining() < 12 + batchLength) {
+			break // Partial trailing batch — legal truncation
 		}
+
+		const batch = await decodeRecordBatchFrom(decoder)
+		batches.push(batch)
 	}
 
 	return batches

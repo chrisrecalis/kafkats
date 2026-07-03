@@ -6,6 +6,7 @@
  * Version 12+ uses flexible encoding (compact types + tagged fields).
  */
 
+import { Encoder } from '@/protocol/primitives/index.js'
 import type { IEncoder } from '@/protocol/primitives/index.js'
 import { ApiKey, isFlexibleVersion } from '@/protocol/messages/api-keys.js'
 
@@ -202,15 +203,11 @@ function encodeFetchRequestNonFlexible(encoder: IEncoder, version: number, reque
 
 /**
  * Encode a Fetch request using flexible encoding (v12+)
+ *
+ * Exported for testing; production code goes through {@link encodeFetchRequest}.
  */
-function encodeFetchRequestFlexible(encoder: IEncoder, version: number, request: FetchRequest): void {
-	// Cluster ID (v12+, tagged field in some versions)
-	if (version >= 12 && version < 15) {
-		// Pre-v15: clusterId is in request body
-		encoder.writeCompactNullableString(request.clusterId ?? null)
-	}
-
-	// Replica ID
+export function encodeFetchRequestFlexible(encoder: IEncoder, version: number, request: FetchRequest): void {
+	// Replica ID (moved into the tagged ReplicaState field in v15+; inline through v14)
 	encoder.writeInt32(request.replicaId ?? -1)
 
 	// Max wait time
@@ -269,8 +266,15 @@ function encodeFetchRequestFlexible(encoder: IEncoder, version: number, request:
 	// Rack ID (v11+)
 	encoder.writeCompactString(request.rackId ?? '')
 
-	// Tagged fields
-	encoder.writeEmptyTaggedFields()
+	// Tagged fields: ClusterId is TAGGED field 0 in v12+ (never an inline body field).
+	// It defaults to null and is only sent when set.
+	if (request.clusterId != null) {
+		const clusterIdData = new Encoder(request.clusterId.length + 5)
+		clusterIdData.writeCompactString(request.clusterId)
+		encoder.writeTaggedFields([{ tag: 0, data: clusterIdData.toBuffer() }])
+	} else {
+		encoder.writeEmptyTaggedFields()
+	}
 }
 
 /**

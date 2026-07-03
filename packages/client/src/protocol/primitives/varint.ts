@@ -16,7 +16,9 @@
  * ZigZag encode a 32-bit signed integer to unsigned
  */
 export function zigZagEncode32(value: number): number {
-	return (value << 1) ^ (value >> 31)
+	// `<<`/`^` operate on signed int32, so the raw result goes negative for values in
+	// [2^30, 2^31) and [-2^31, -2^30). Coerce to unsigned — zigzag output is a uint32.
+	return ((value << 1) ^ (value >> 31)) >>> 0
 }
 
 /**
