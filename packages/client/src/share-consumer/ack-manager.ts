@@ -310,7 +310,15 @@ export class AckManager {
 			if (attempt === 0) {
 				const topicsToRefresh = [...new Set([...retry.values()].map(p => p.topicName))]
 				if (topicsToRefresh.length > 0) {
-					await this.refreshMetadata(topicsToRefresh)
+					// A refresh failure must not escape here: the retry entries were already removed
+					// from pendingByPartitionKey, so flushAllLoop's catch could never settle them and
+					// their ack promises would leak (deadlocking callers and stop()). Swallow it and
+					// let the second attempt settle them against possibly-stale metadata.
+					await this.refreshMetadata(topicsToRefresh).catch(err => {
+						this.logger.debug('metadata refresh before share acknowledge retry failed', {
+							error: (err as Error).message,
+						})
+					})
 				}
 			}
 
@@ -461,9 +469,15 @@ export class AckManager {
 						}
 
 						if (isShareSessionError(partitionResponse.errorCode)) {
+							// A ShareAcknowledge can never open a share session (KIP-932): after a session
+							// error a retry would re-send with shareSessionEpoch=0, which the broker always
+							// rejects with InvalidShareSessionEpoch. Fail the acks (the records redeliver
+							// after the lock timeout, by design) and reset the epoch so the next ShareFetch
+							// re-establishes the session.
 							this.resetShareSessionEpoch(brokerId)
-							retry.set(key, partition)
-							retryErrors.set(key, err)
+							for (const e of partition.entries) {
+								e.reject(err)
+							}
 							continue
 						}
 
@@ -474,11 +488,14 @@ export class AckManager {
 				} catch (error) {
 					const err = error instanceof Error ? error : new Error(String(error))
 					if (err instanceof KafkaProtocolError && isShareSessionError(err.errorCode)) {
+						// See the per-partition session-error handling above: retrying is futile (an
+						// acknowledge cannot open a session), so fail this broker's acks and reset the
+						// epoch for the next ShareFetch.
 						this.resetShareSessionEpoch(brokerId)
 						for (const { partition } of items) {
-							const key = `${partition.topicId}:${partition.partitionIndex}`
-							retry.set(key, partition)
-							retryErrors.set(key, err)
+							for (const e of partition.entries) {
+								e.reject(err)
+							}
 						}
 						return
 					}

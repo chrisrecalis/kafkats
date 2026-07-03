@@ -134,7 +134,10 @@ export interface ShareMessage<V = Buffer, K = Buffer> {
 	offset: bigint
 	timestamp: bigint
 	key: K | null
-	value: V
+	/**
+	 * Decoded record value, or null for a tombstone record (a record produced with a null value).
+	 */
+	value: V | null
 	headers: Record<string, Buffer>
 	/**
 	 * Delivery attempt count when available (protocol-dependent).
