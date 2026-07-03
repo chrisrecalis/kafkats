@@ -158,6 +158,32 @@ function findShareSessionError(
 	return null
 }
 
+type ShareDecodedRecords = {
+	records: DecodedRecord[]
+	/** Highest offset covered by a fully decoded batch (baseOffset + lastOffsetDelta), or null if none. */
+	maxDecodedOffset: bigint | null
+	/** True when the buffer ended with a partial (maxBytes-truncated) trailing batch. */
+	truncated: boolean
+}
+
+/** RecordBatch preamble outside batchLength's coverage: baseOffset (int64) + batchLength (int32). */
+const RECORD_BATCH_PREAMBLE_BYTES = 12
+
+/**
+ * True when the bytes remaining in `decoder` cannot hold the next batch's declared length — the
+ * broker hit maxBytes and truncated the trailing batch. This is the ONLY decode failure that may be
+ * treated as truncation; a fully-present batch that fails to decode is corruption.
+ */
+function isTruncatedTrailingBatch(data: Buffer, decoder: Decoder): boolean {
+	if (decoder.remaining() < RECORD_BATCH_PREAMBLE_BYTES) {
+		return true
+	}
+	const peek = new Decoder(data, decoder.offset())
+	peek.readInt64() // baseOffset
+	const batchLength = peek.readInt32()
+	return decoder.remaining() < RECORD_BATCH_PREAMBLE_BYTES + batchLength
+}
+
 class ShareMessageAlreadyHandledError extends Error {
 	constructor(topic: string, partition: number, offset: bigint) {
 		super(`Share message ${topic}[${partition}]@${offset} already handled`)
@@ -204,7 +230,8 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 	private heartbeatIntervalMs: number = 1000
 	private assignment: TopicPartition[] = []
 	// Warm-up prefetch is done once per run (on the first assignment). prefetchAssignedPartitions
-	// discards the records it acquires, so re-running it on every rebalance would needlessly redeliver.
+	// releases (never delivers) the records it acquires, so re-running it on every rebalance would
+	// needlessly acquire-and-release records.
 	private didInitialPrefetch = false
 	// Latest broker-reported acquisition-lock timeout (ms); how long the app has to process/renew a
 	// record before its lock expires and it is redelivered. Surfaced via acquisitionLockTimeoutMs.
@@ -565,9 +592,53 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 			[...partitionsByLeader.entries()].map(async ([leaderId, byTopicId]) => {
 				const broker = await this.cluster.getBroker(leaderId)
 				const topicPartitions = [...byTopicId.entries()].map(([topicId, ids]) => ({ topicId, partitions: ids }))
-				await this.shareFetch(broker, topicPartitions, { maxWaitMs: 0, minBytes: 0 })
+				const response = await this.shareFetch(broker, topicPartitions, { maxWaitMs: 0, minBytes: 0 })
+				await this.releasePrefetchedRecords(broker, response)
 			})
 		)
+	}
+
+	/**
+	 * The warm-up prefetch only exists to establish the share session / start offset; any records the
+	 * broker acquired for it are never delivered. Hand them straight back with RELEASE — abandoning
+	 * them would delay their first real delivery by the acquisition-lock timeout and burn one of
+	 * their delivery attempts. Best-effort: on failure the records redeliver after the lock timeout.
+	 */
+	private async releasePrefetchedRecords(broker: Broker, response: ShareFetchResponse): Promise<void> {
+		const topics: ShareAcknowledgeRequest['topics'] = []
+		for (const topic of response.topics) {
+			const partitions: ShareAcknowledgeRequest['topics'][number]['partitions'] = []
+			for (const partition of topic.partitions) {
+				if (partition.errorCode !== ErrorCode.None || partition.acquiredRecords.length === 0) continue
+				partitions.push({
+					partitionIndex: partition.partitionIndex,
+					acknowledgementBatches: partition.acquiredRecords.map(range => ({
+						firstOffset: range.firstOffset,
+						lastOffset: range.lastOffset,
+						acknowledgeTypes: [ACK_RELEASE],
+					})),
+				})
+			}
+			if (partitions.length > 0) {
+				topics.push({ topicId: topic.topicId, partitions })
+			}
+		}
+		if (topics.length === 0) {
+			return
+		}
+
+		try {
+			await this.shareAcknowledge(broker, {
+				groupId: this.config.groupId,
+				memberId: this.memberId,
+				isRenewAck: false,
+				topics,
+			})
+		} catch (error) {
+			this.logger.debug('failed to release prefetched records; they redeliver after the lock timeout', {
+				error: (error as Error).message,
+			})
+		}
 	}
 
 	private async shareAcknowledge(
@@ -834,8 +905,8 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 		// Share groups effectively start from "now" when a member first begins fetching. On the first
 		// assignment, proactively issue a non-blocking ShareFetch to establish the starting point before
 		// emitting partitionsAssigned (so callers can safely produce after this event). Only once per
-		// run: prefetchAssignedPartitions discards what it acquires, so repeating it per-rebalance would
-		// needlessly redeliver records.
+		// run: prefetchAssignedPartitions releases what it acquires, so repeating it per-rebalance would
+		// needlessly acquire-and-release records.
 		if (!this.didInitialPrefetch && next.length > 0) {
 			await this.prefetchAssignedPartitions(next)
 			this.didInitialPrefetch = true
@@ -849,30 +920,39 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 		}
 	}
 
-	private async decodeRecords(data: Buffer): Promise<DecodedRecord[]> {
+	private async decodeRecords(data: Buffer): Promise<ShareDecodedRecords> {
 		const decoder = new Decoder(data)
 
-		type Batch = { attributes: number; records: DecodedRecord[] }
+		type Batch = { attributes: number; baseOffset: bigint; lastOffsetDelta: number; records: DecodedRecord[] }
 		const batches: Batch[] = []
+		let truncated = false
 
 		let needsAsync = false
 		while (decoder.remaining() > 0) {
+			// A partial trailing batch (fewer bytes than its declared batchLength) is the expected
+			// maxBytes truncation: stop and leave its records to a later fetch. Only this structural
+			// check may classify a failure as truncation — a batch whose bytes are all present but
+			// fail to decode is genuine corruption and must surface, because gap-acking the acquired
+			// offsets it failed to deliver would tell the broker they don't exist and permanently
+			// advance the share-partition start offset past real records.
+			if (isTruncatedTrailingBatch(data, decoder)) {
+				truncated = true
+				break
+			}
 			try {
 				const batch = decodeRecordBatchFromSync(decoder, { assumeSequentialOffsets: true })
-				batches.push({ attributes: batch.attributes, records: batch.records })
+				batches.push({
+					attributes: batch.attributes,
+					baseOffset: batch.baseOffset,
+					lastOffsetDelta: batch.lastOffsetDelta,
+					records: batch.records,
+				})
 			} catch (e) {
 				if ((e as Error).message.includes('cannot decode compressed')) {
 					needsAsync = true
 					break
 				}
-				// A failure with no batch decoded is genuine corruption (the broker returns
-				// at least one complete batch); surface it instead of silently abandoning
-				// acquired records (which would otherwise stay locked until the lock expires).
-				// A failure after >=1 batch is the expected maxBytes-truncated trailing batch.
-				if (batches.length === 0) {
-					throw new Error(`Failed to decode share-fetch record batch (corrupt data): ${(e as Error).message}`)
-				}
-				break
+				throw new Error(`Failed to decode share-fetch record batch (corrupt data): ${(e as Error).message}`)
 			}
 		}
 
@@ -881,33 +961,43 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 		}
 
 		const out: DecodedRecord[] = []
+		let maxDecodedOffset: bigint | null = null
 		for (const b of batches) {
+			const batchEnd = b.baseOffset + BigInt(b.lastOffsetDelta)
+			if (maxDecodedOffset === null || batchEnd > maxDecodedOffset) {
+				maxDecodedOffset = batchEnd
+			}
 			if (isControlBatch(b.attributes)) continue
 			out.push(...b.records)
 		}
-		return out
+		return { records: out, maxDecodedOffset, truncated }
 	}
 
-	private async decodeRecordsAsync(data: Buffer): Promise<DecodedRecord[]> {
+	private async decodeRecordsAsync(data: Buffer): Promise<ShareDecodedRecords> {
 		const decoder = new Decoder(data)
 		const out: DecodedRecord[] = []
-		let decoded = 0
+		let maxDecodedOffset: bigint | null = null
+		let truncated = false
 		while (decoder.remaining() > 0) {
+			// See decodeRecords: only a structurally partial trailing batch is truncation; any other
+			// decode failure is corruption and must surface rather than gap-ack real records away.
+			if (isTruncatedTrailingBatch(data, decoder)) {
+				truncated = true
+				break
+			}
 			try {
 				const batch = await decodeRecordBatchFrom(decoder, { assumeSequentialOffsets: true })
-				decoded++
+				const batchEnd = batch.baseOffset + BigInt(batch.lastOffsetDelta)
+				if (maxDecodedOffset === null || batchEnd > maxDecodedOffset) {
+					maxDecodedOffset = batchEnd
+				}
 				if (isControlBatch(batch.attributes)) continue
 				out.push(...batch.records)
 			} catch (e) {
-				// See decodeRecords: surface genuine corruption (no batch decoded) instead of
-				// silently abandoning acquired records; a later failure is the truncated tail.
-				if (decoded === 0) {
-					throw new Error(`Failed to decode share-fetch record batch (corrupt data): ${(e as Error).message}`)
-				}
-				break
+				throw new Error(`Failed to decode share-fetch record batch (corrupt data): ${(e as Error).message}`)
 			}
 		}
-		return out
+		return { records: out, maxDecodedOffset, truncated }
 	}
 
 	private async collectShareFetchWorkItems(
@@ -1006,7 +1096,10 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 					continue
 				}
 
-				const records = recordsData && recordsData.length > 0 ? await this.decodeRecords(recordsData) : []
+				const { records, maxDecodedOffset, truncated } =
+					recordsData && recordsData.length > 0
+						? await this.decodeRecords(recordsData)
+						: { records: [] as DecodedRecord[], maxDecodedOffset: null, truncated: false }
 				const recordOffsets = new Set<bigint>()
 				for (const r of records) recordOffsets.add(r.offset)
 
@@ -1018,17 +1111,14 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 				// redelivers, so swallow the rejection rather than letting it escape as unhandled.
 				for (const range of acquiredRecords) {
 					for (let off = range.firstOffset; off <= range.lastOffset; off++) {
-						if (!recordOffsets.has(off)) {
-							void ackManager
-								.enqueue(
-									topicName,
-									topicResponse.topicId,
-									partitionResponse.partitionIndex,
-									off,
-									ACK_GAP
-								)
-								.catch(() => {})
-						}
+						if (recordOffsets.has(off)) continue
+						// When the trailing batch was maxBytes-truncated, acquired offsets beyond the
+						// decoded data are real records that simply weren't delivered — they must
+						// redeliver (lock timeout), never be gap-acked as nonexistent.
+						if (truncated && (maxDecodedOffset === null || off > maxDecodedOffset)) continue
+						void ackManager
+							.enqueue(topicName, topicResponse.topicId, partitionResponse.partitionIndex, off, ACK_GAP)
+							.catch(() => {})
 					}
 				}
 
@@ -1361,8 +1451,14 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 				this.runPromiseResolve = resolve
 			})
 
-			await Promise.race([loops, stopPromise])
-			await Promise.allSettled([heartbeatPromise, fetchPromise])
+			try {
+				await Promise.race([loops, stopPromise])
+			} finally {
+				// The race rejects when a loop fails fatally; both loops must still settle before
+				// finalizeRun/leaveGroup run and 'stopped' is emitted (mirrors stream()). Skipping
+				// this would report quiescence while the surviving loop is still active.
+				await Promise.allSettled([heartbeatPromise, fetchPromise])
+			}
 
 			this.runPromiseResolve = null
 

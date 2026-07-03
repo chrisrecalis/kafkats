@@ -195,43 +195,49 @@ describe('AckManager.flushAll - isRenewAck flag', () => {
 })
 
 describe('AckManager.flushAll - cross-partition error isolation', () => {
-	it('retries a retriable partition even when another partition in the same request fails fatally', async () => {
-		let calls = 0
-		const sendAcknowledge = vi.fn(async (_broker: Broker, _req: ShareAcknowledgeRequestWithoutEpoch) => {
-			calls++
-			if (calls === 1) {
-				// One request, two partitions: P0 fails fatally (non-retriable), P1 hits a retriable
-				// share-session error and should be queued for retry with a fresh session.
-				return makeResponse([
-					{ partitionIndex: 0, errorCode: ErrorCode.InvalidRecordState },
-					{ partitionIndex: 1, errorCode: ErrorCode.InvalidShareSessionEpoch },
-				])
-			}
-			// Retry attempt: the retriable partition now succeeds.
-			return makeResponse([{ partitionIndex: 1, errorCode: ErrorCode.None }])
-		})
+	it('settles every partition in the request independently, including a session-error partition', async () => {
+		const sendAcknowledge = vi.fn(async (_broker: Broker, _req: ShareAcknowledgeRequestWithoutEpoch) =>
+			// One request, three partitions: P0 fails fatally, P1 hits a share-session error (which
+			// fails fast — an acknowledge can never open a session, so a retry with a fresh session
+			// would carry epoch 0 and always be rejected), and P2 succeeds.
+			makeResponse([
+				{ partitionIndex: 0, errorCode: ErrorCode.InvalidRecordState },
+				{ partitionIndex: 1, errorCode: ErrorCode.InvalidShareSessionEpoch },
+				{ partitionIndex: 2, errorCode: ErrorCode.None },
+			])
+		)
 
-		const ackManager = makeAckManager(sendAcknowledge)
-		const p0 = ackManager.enqueue(TOPIC_NAME, TOPIC_ID, 0, 0n, ACK_ACCEPT)
-		const p1 = ackManager.enqueue(TOPIC_NAME, TOPIC_ID, 1, 0n, ACK_ACCEPT)
-		const p0Settled = p0.then(
-			() => 'resolved' as const,
-			() => 'rejected' as const
+		const resetShareSessionEpoch = vi.fn()
+		const fakeBroker = { nodeId: 1 } as unknown as Broker
+		const ackManager = new AckManager(
+			'test-group',
+			() => 'member-1',
+			sendAcknowledge,
+			async () => fakeBroker,
+			async () => undefined,
+			resetShareSessionEpoch,
+			noopLogger,
+			1000
 		)
-		const p1Settled = p1.then(
-			() => 'resolved' as const,
-			() => 'rejected' as const
-		)
+		const settle = (p: Promise<void>) =>
+			p.then(
+				() => 'resolved' as const,
+				() => 'rejected' as const
+			)
+		const p0Settled = settle(ackManager.enqueue(TOPIC_NAME, TOPIC_ID, 0, 0n, ACK_ACCEPT))
+		const p1Settled = settle(ackManager.enqueue(TOPIC_NAME, TOPIC_ID, 1, 0n, ACK_ACCEPT))
+		const p2Settled = settle(ackManager.enqueue(TOPIC_NAME, TOPIC_ID, 2, 0n, ACK_ACCEPT))
 
 		await ackManager.flushAll().catch(() => undefined)
 
-		// The retriable partition must NOT be rejected just because a different partition
-		// in the same request failed fatally — it must be retried and resolve.
-		expect(await p1Settled).toBe('resolved')
-		// The fatally-failed partition is rejected on its own promise.
+		// Each partition settles on its own outcome; failures in one never leak into another.
 		expect(await p0Settled).toBe('rejected')
-		// The retriable partition was actually retried (a second ShareAcknowledge).
-		expect(sendAcknowledge).toHaveBeenCalledTimes(2)
+		expect(await p1Settled).toBe('rejected')
+		expect(await p2Settled).toBe('resolved')
+		// The session error fails fast: no futile retry with shareSessionEpoch=0, but the epoch is
+		// reset so the next ShareFetch re-establishes the session.
+		expect(sendAcknowledge).toHaveBeenCalledTimes(1)
+		expect(resetShareSessionEpoch).toHaveBeenCalledWith(1)
 	})
 
 	it('fails (does not retry) an acknowledgement on a leader-change error and refreshes metadata', async () => {
