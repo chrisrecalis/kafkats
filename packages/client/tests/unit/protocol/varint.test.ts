@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { Decoder } from '@/protocol/primitives/decoder.js'
+import { Encoder } from '@/protocol/primitives/encoder.js'
 import {
 	decodeUVarInt,
 	decodeVarInt,
@@ -112,5 +113,48 @@ describe('varint helpers', () => {
 		for (const v of values) {
 			expect(new Decoder(encodeVarLong(v)).readVarLong()).toBe(v)
 		}
+	})
+})
+
+describe('32-bit zigzag boundary values (must stay unsigned, not overflow int32)', () => {
+	it('zigZagEncode32 matches the protobuf/Kafka zigzag spec for large magnitudes', () => {
+		// zigzag(n) = 2n for n >= 0, zigzag(n) = -2n - 1 for n < 0 — always in [0, 2^32).
+		expect(zigZagEncode32(2 ** 30)).toBe(2 ** 31)
+		expect(zigZagEncode32(2 ** 31 - 1)).toBe(2 ** 32 - 2)
+		expect(zigZagEncode32(-(2 ** 30))).toBe(2 ** 31 - 1)
+		expect(zigZagEncode32(-(2 ** 31))).toBe(2 ** 32 - 1)
+	})
+
+	it('round-trips VARINT boundary values through encode/decode and sizes', () => {
+		const values = [0, -1, 2 ** 30, 2 ** 31 - 1, -(2 ** 30), -(2 ** 31)]
+		for (const value of values) {
+			const encoded = encodeVarInt(value)
+			expect(decodeVarInt(encoded).value).toBe(value)
+			expect(encoded.length).toBe(varIntSize(value))
+			expect(zigZagDecode32(zigZagEncode32(value))).toBe(value)
+		}
+	})
+
+	it('emits the spec 5-byte uvarint encodings at the boundaries', () => {
+		// zigzag(2^30) === 2^31 → uvarint 80 80 80 80 08
+		expect([...encodeVarInt(2 ** 30)]).toEqual([0x80, 0x80, 0x80, 0x80, 0x08])
+		// zigzag(-2^31) === 2^32 - 1 → uvarint ff ff ff ff 0f
+		expect([...encodeVarInt(-(2 ** 31))]).toEqual([0xff, 0xff, 0xff, 0xff, 0x0f])
+	})
+
+	it('Encoder.writeVarInt / Decoder.readVarInt round-trip boundary values', () => {
+		const values = [2 ** 30, 2 ** 31 - 1, -(2 ** 30), -(2 ** 31)]
+		for (const value of values) {
+			const enc = new Encoder()
+			enc.writeVarInt(value)
+			expect(new Decoder(enc.toBuffer()).readVarInt()).toBe(value)
+		}
+	})
+
+	it('encodeUVarInt and uvarIntSize accept the full uint32 range', () => {
+		expect([...encodeUVarInt(2 ** 32 - 1)]).toEqual([0xff, 0xff, 0xff, 0xff, 0x0f])
+		expect(uvarIntSize(2 ** 32 - 1)).toBe(5)
+		expect(uvarIntSize(2 ** 31)).toBe(5)
+		expect(decodeUVarInt(encodeUVarInt(2 ** 31)).value).toBe(2 ** 31)
 	})
 })

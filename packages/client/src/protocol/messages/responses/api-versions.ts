@@ -4,6 +4,7 @@
  * Returns the list of API versions supported by the broker.
  */
 
+import { Decoder } from '@/protocol/primitives/index.js'
 import type { IDecoder } from '@/protocol/primitives/index.js'
 import { ApiKey, isFlexibleVersion, type ApiVersionRange } from '@/protocol/messages/api-keys.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
@@ -81,37 +82,49 @@ export function decodeApiVersionsResponse(decoder: IDecoder, version: number): A
 		throttleTimeMs = decoder.readInt32()
 	}
 
-	// v3+ features
+	// v3+ features (KIP-584): SupportedFeatures (tag 0), FinalizedFeaturesEpoch (tag 1),
+	// FinalizedFeatures (tag 2) and ZkMigrationReady (tag 3) are TAGGED fields in the
+	// response-level tagged section — they are never inline body fields.
 	let supportedFeatures: SupportedFeature[] | undefined
 	let finalizedFeaturesEpoch: bigint | undefined
 	let finalizedFeatures: FinalizedFeature[] | undefined
 	let zkMigrationReady: boolean | undefined
 
-	if (version >= 3 && flexible) {
-		// Supported features
-		supportedFeatures = decoder.readCompactArray(d => {
-			const name = d.readCompactString()
-			const minVersion = d.readInt16()
-			const maxVersion = d.readInt16()
-			d.skipTaggedFields()
-			return { name, minVersion, maxVersion }
-		})
+	if (flexible) {
+		const taggedFields = decoder.readTaggedFields()
 
-		// Finalized features epoch
-		finalizedFeaturesEpoch = decoder.readInt64()
-
-		// Finalized features
-		finalizedFeatures = decoder.readCompactArray(d => {
-			const name = d.readCompactString()
-			const maxVersionLevel = d.readInt16()
-			const minVersionLevel = d.readInt16()
-			d.skipTaggedFields()
-			return { name, maxVersionLevel, minVersionLevel }
-		})
-
-		// ZK migration ready (added in later versions, may be in tagged fields)
-		// Skip top-level tagged fields which may contain zkMigrationReady
-		decoder.skipTaggedFields()
+		for (const field of taggedFields) {
+			const d = new Decoder(field.data)
+			switch (field.tag) {
+				case 0:
+					supportedFeatures = d.readCompactArray(fd => {
+						const name = fd.readCompactString()
+						const minVersion = fd.readInt16()
+						const maxVersion = fd.readInt16()
+						fd.skipTaggedFields()
+						return { name, minVersion, maxVersion }
+					})
+					break
+				case 1:
+					finalizedFeaturesEpoch = d.readInt64()
+					break
+				case 2:
+					finalizedFeatures = d.readCompactArray(fd => {
+						const name = fd.readCompactString()
+						const maxVersionLevel = fd.readInt16()
+						const minVersionLevel = fd.readInt16()
+						fd.skipTaggedFields()
+						return { name, maxVersionLevel, minVersionLevel }
+					})
+					break
+				case 3:
+					zkMigrationReady = d.readBoolean()
+					break
+				default:
+					// Unknown tagged field — ignore
+					break
+			}
+		}
 	}
 
 	return {
