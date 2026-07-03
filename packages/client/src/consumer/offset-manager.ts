@@ -343,6 +343,20 @@ export class OffsetManager {
 				if (res.errorCode !== ErrorCode.None) {
 					throw new KafkaProtocolError(res.errorCode, 'OffsetFetch failed')
 				}
+				// Partition-level errors must never be treated as "no committed offset" —
+				// falling through to autoOffsetReset would silently lose the consumer's
+				// position. Retriable codes are retried by the surrounding retry();
+				// non-retriable ones propagate to the caller.
+				for (const topic of res.topics) {
+					for (const partition of topic.partitions) {
+						if (partition.errorCode !== ErrorCode.None) {
+							throw new KafkaProtocolError(
+								partition.errorCode,
+								`OffsetFetch failed for ${topic.name}-${partition.partitionIndex}`
+							)
+						}
+					}
+				}
 				return res
 			},
 			{
@@ -365,13 +379,10 @@ export class OffsetManager {
 			}
 		)
 
-		// Build result map
+		// Build result map (partition-level errors were rejected above)
 		const result = new Map<string, bigint>()
 		for (const topic of response.topics) {
 			for (const partition of topic.partitions) {
-				if (partition.errorCode !== ErrorCode.None) {
-					continue
-				}
 				// -1 means no committed offset
 				if (partition.committedOffset >= 0n) {
 					const key = tpKey(topic.name, partition.partitionIndex)

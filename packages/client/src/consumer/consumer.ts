@@ -220,7 +220,24 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 				// offsets of the partitions being revoked and make the next owner
 				// reprocess them.
 				if (this.commitOffsets && !this.sessionLost) {
-					await this.offsetManager!.commitPendingOffsets()
+					try {
+						await this.offsetManager!.commitPendingOffsets()
+					} catch (error) {
+						// The broker may already be past the commit window (RebalanceInProgress
+						// once the group left PreparingRebalance) or the generation may be gone.
+						// Tolerate those: the revoke must still proceed so this consumer stops
+						// fetching partitions it no longer owns; the offsets stay uncommitted and
+						// the next owner may reprocess (at-least-once). Other errors are fatal.
+						const code = error instanceof KafkaProtocolError ? error.errorCode : null
+						const tolerable =
+							code === ErrorCode.RebalanceInProgress || (code !== null && isGenerationLostErrorCode(code))
+						if (!tolerable) {
+							throw error
+						}
+						this.logger.warn('offset commit during revoke failed; continuing rebalance', {
+							error: (error as Error).message,
+						})
+					}
 				}
 				this.offsetManager!.removeAssignedPartitions(partitions)
 				this.fetchManager!.removePartitions(partitions)
@@ -394,9 +411,12 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 								return
 							}
 
-							// Skip batches from partitions that were revoked during rebalance
-							// Check both FetchManager (has partition state) and PartitionTracker (assigned + not revoking)
-							if (!fetchManager.isPartitionAssigned(batch.topic, batch.partition)) {
+							// Skip batches from partitions that were revoked during rebalance.
+							// The assignment-epoch check also drops batches drained before an
+							// eager rebalance removed and re-added a retained partition — those
+							// records are re-fetched from the committed offset and would
+							// otherwise be delivered twice.
+							if (!fetchManager.isBatchAssigned(batch)) {
 								continue
 							}
 
@@ -692,9 +712,12 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 					continue
 				}
 
-				for (const { topic, partition, records } of batches) {
-					// Skip batches from partitions that were revoked during rebalance
-					if (!fetchManager.isPartitionAssigned(topic, partition)) {
+				for (const batch of batches) {
+					const { topic, partition, records } = batch
+					// Skip batches from partitions that were revoked during rebalance. The
+					// assignment-epoch check also drops batches drained before an eager
+					// rebalance removed and re-added a retained partition (see runPollLoop).
+					if (!fetchManager.isBatchAssigned(batch)) {
 						continue
 					}
 
@@ -826,10 +849,10 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	private handleAutoCommitError(error: Error): void {
 		const code = error instanceof KafkaProtocolError ? error.errorCode : null
 
-		// RebalanceInProgress is expected during a cooperative rebalance — the
-		// next generation will retry. Trigger the rejoin path silently.
+		// RebalanceInProgress is expected during a rebalance — the consumed offsets are
+		// retained so the revoke-time commit during the rejoin can retry them. Wiping
+		// them here would make the next owner resume from a stale committed offset.
 		if (code === ErrorCode.RebalanceInProgress) {
-			this.offsetManager?.clearConsumedOffsets()
 			this.consumerGroup?.emit('rebalance')
 			return
 		}

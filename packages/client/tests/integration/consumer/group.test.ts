@@ -518,6 +518,147 @@ describe.concurrent('Consumer (integration) - groups', () => {
 		await Promise.all([client1.disconnect(), client2.disconnect()])
 	})
 
+	it('eager rebalance commits processed offsets before rejoining (no reprocessing by the new owner)', async () => {
+		// Protocol contract under the eager protocol: when a rebalance is needed, the
+		// consumer must revoke its partitions and commit their final offsets BEFORE
+		// sending JoinGroup (the commit runs under the old generation). The JoinGroup
+		// barrier then guarantees the other members' post-sync OffsetFetch sees those
+		// commits. If the commit instead happens after rejoining, the new owner races
+		// the commit, fetches a stale committed offset, and reprocesses records.
+		//
+		// Consumer A relies on the revoke-time commit only: its auto-commit interval is
+		// far longer than the test, so any offset visible to B must have been committed
+		// by the rebalance itself. (A commit failure during the revoke is tolerated by
+		// the client — the group falls back to at-least-once — but with a healthy broker,
+		// as here, the pre-join commit must succeed and no duplicates may appear.)
+		const client1 = createClient('it-eager-commit-before-rejoin-1')
+		const client2 = createClient('it-eager-commit-before-rejoin-2')
+		await Promise.all([client1.connect(), client2.connect()])
+
+		const topicName = uniqueName('it-eager-commit-before-rejoin')
+		const testTopic = topic<string>(topicName, {
+			value: string(),
+		})
+
+		await client1.createTopics([{ name: topicName, numPartitions: 2, replicationFactor: 1 }])
+		const producer = client1.producer({ lingerMs: 0 })
+
+		const groupId = uniqueName('it-group')
+		const consumerConfig = {
+			groupId,
+			autoOffsetReset: 'earliest' as const,
+			partitionAssignmentStrategy: 'range' as const, // eager protocol
+			sessionTimeoutMs: 10_000,
+			rebalanceTimeoutMs: 20_000,
+			heartbeatIntervalMs: 1000,
+		}
+
+		const consumer1 = client1.consumer(consumerConfig)
+		const consumer2 = client2.consumer(consumerConfig)
+
+		// Every delivery across the whole group, keyed by partition:offset.
+		const deliveries = new Map<string, string[]>()
+		const recordDelivery =
+			(consumerId: string) => async (message: { value: string; partition: number; offset: bigint }) => {
+				const key = `${message.partition}:${message.offset}`
+				const seenBy = deliveries.get(key) ?? []
+				seenBy.push(consumerId)
+				deliveries.set(key, seenBy)
+			}
+
+		const assigned1 = new Set<number>()
+		const assigned2 = new Set<number>()
+		consumer1.on('partitionsAssigned', parts => {
+			for (const p of parts) assigned1.add(p.partition)
+		})
+		consumer1.on('partitionsRevoked', parts => {
+			for (const p of parts) assigned1.delete(p.partition)
+		})
+		consumer2.on('partitionsAssigned', parts => {
+			for (const p of parts) assigned2.add(p.partition)
+		})
+		consumer2.on('partitionsRevoked', parts => {
+			for (const p of parts) assigned2.delete(p.partition)
+		})
+
+		// Auto-commit interval far beyond the test duration: only the revoke-time commit
+		// can persist consumer A's progress.
+		const run1 = consumer1.runEach(testTopic, recordDelivery('consumer1'), {
+			autoCommit: true,
+			autoCommitIntervalMs: 300_000,
+		})
+		await waitUntilRunning(consumer1, run1)
+		await vi.waitFor(
+			() => {
+				expect(assigned1.size).toBe(2)
+			},
+			{ timeout: 20_000 }
+		)
+
+		// A processes 4 records (2 per partition) before the rebalance.
+		await producer.send(testTopic, [
+			{ value: 'before-p0-a', partition: 0 },
+			{ value: 'before-p0-b', partition: 0 },
+			{ value: 'before-p1-a', partition: 1 },
+			{ value: 'before-p1-b', partition: 1 },
+		])
+		await producer.flush()
+		await vi.waitFor(
+			() => {
+				expect(deliveries.size).toBe(4)
+			},
+			{ timeout: 10_000 }
+		)
+
+		// B joins: eager rebalance. A must commit its 4 processed offsets before rejoining,
+		// so whichever partition B takes over resumes AFTER the 'before' records.
+		const run2 = consumer2.runEach(testTopic, recordDelivery('consumer2'), {
+			autoCommit: true,
+			autoCommitIntervalMs: 300_000,
+		})
+		await waitUntilRunning(consumer2, run2)
+
+		await vi.waitFor(
+			() => {
+				const union = new Set<number>([...assigned1, ...assigned2])
+				const overlap = [...assigned1].filter(p => assigned2.has(p))
+				expect(union.size).toBe(2)
+				expect(overlap).toHaveLength(0)
+				expect(assigned1.size).toBe(1)
+				expect(assigned2.size).toBe(1)
+			},
+			{ timeout: 20_000 }
+		)
+
+		// Post-rebalance records prove both consumers are live and mark test completion.
+		await producer.send(testTopic, [
+			{ value: 'after-p0', partition: 0 },
+			{ value: 'after-p1', partition: 1 },
+		])
+		await producer.flush()
+
+		await vi.waitFor(
+			() => {
+				// 4 'before' + 2 'after' offsets, each delivered at least once
+				expect(deliveries.size).toBe(6)
+			},
+			{ timeout: 20_000 }
+		)
+
+		consumer1.stop()
+		consumer2.stop()
+		await Promise.all([run1, run2])
+
+		// No offset may be delivered more than once across the group: consumer B must not
+		// reprocess records consumer A already handled before the rebalance.
+		for (const [key, seenBy] of deliveries) {
+			expect(seenBy, `offset ${key} delivered to ${seenBy.join(', ')}`).toHaveLength(1)
+		}
+
+		await producer.disconnect()
+		await Promise.all([client1.disconnect(), client2.disconnect()])
+	})
+
 	it('poll/stream returns records only from owned partitions during cooperative rebalance', async () => {
 		const client1 = createClient('it-coop-poll-rebalance-1')
 		const client2 = createClient('it-coop-poll-rebalance-2')
