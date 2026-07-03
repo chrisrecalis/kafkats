@@ -168,6 +168,15 @@ export class RecordAccumulator extends EventEmitter<AccumulatorEvents> {
 	}
 
 	/**
+	 * Account for a batch that enters the send pipeline without passing through
+	 * flushBatch() (e.g. the remainder of a sequence-wrap split). Keeps
+	 * pendingBatches balanced with the batchCompleted() call its send will make.
+	 */
+	batchEnqueued(): void {
+		this.pendingBatches++
+	}
+
+	/**
 	 * Signal that a batch has been processed
 	 *
 	 * Call this after sending a batch (success or failure).

@@ -56,6 +56,30 @@ describe.concurrent('Producer (integration) - timestamps', () => {
 		await client.disconnect()
 	})
 
+	it('returns a SendResult timestamp near send time for CreateTime topics', async () => {
+		const client = createClient('it-timestamp-send-result')
+		await client.connect()
+
+		const topicName = uniqueName('it-timestamp-send-result')
+		const testTopic = topic<string>(topicName, { value: codec.string() })
+
+		await client.createTopics([{ name: topicName, numPartitions: 1, replicationFactor: 1 }])
+
+		const producer = client.producer({ lingerMs: 0 })
+
+		// CreateTime topics return logAppendTimeMs = -1 in the produce response; the
+		// SendResult must fall back to the record's own timestamp, not new Date(-1).
+		const beforeSend = Date.now()
+		const result = await producer.send(testTopic, { value: 'send-result-timestamp' })
+		const afterSend = Date.now()
+
+		expect(result.timestamp.getTime()).toBeGreaterThanOrEqual(beforeSend - 1000)
+		expect(result.timestamp.getTime()).toBeLessThanOrEqual(afterSend + 1000)
+
+		await producer.disconnect()
+		await client.disconnect()
+	})
+
 	it('preserves custom timestamps when provided', async () => {
 		const client = createClient('it-timestamp-custom')
 		await client.connect()

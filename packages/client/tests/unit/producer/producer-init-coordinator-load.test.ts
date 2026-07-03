@@ -21,6 +21,11 @@ describe('Producer InitProducerId retries CoordinatorLoadInProgress', () => {
 		mockCluster.getCoordinator.mockResolvedValue(txnCoordinator)
 		mockCluster.getAnyBroker.mockResolvedValue(txnCoordinator)
 		txnCoordinator.endTxn.mockResolvedValue({ throttleTimeMs: 0, errorCode: ErrorCode.None })
+		txnCoordinator.addOffsetsToTxn.mockResolvedValue({ throttleTimeMs: 0, errorCode: ErrorCode.None })
+		txnCoordinator.txnOffsetCommit.mockResolvedValue({
+			throttleTimeMs: 0,
+			topics: [{ name: 'test-topic', partitions: [{ partitionIndex: 0, errorCode: ErrorCode.None }] }],
+		})
 	})
 
 	afterEach(() => {
@@ -54,7 +59,15 @@ describe('Producer InitProducerId retries CoordinatorLoadInProgress', () => {
 			transactionalId: 'tx-1',
 		})
 
-		await expect(producer.transaction(async () => {})).resolves.toBeUndefined()
+		// Non-empty transaction (offsets prepared) so EndTxn is actually sent.
+		await expect(
+			producer.transaction(async tx => {
+				await tx.sendOffsets({
+					groupId: 'g1',
+					offsets: [{ topic: 'test-topic', partition: 0, offset: 1n }],
+				})
+			})
+		).resolves.toBeUndefined()
 		// 6 CoordinatorLoadInProgress + 1 success = 7 calls — proves init retried well past the
 		// old produce budget (retries + 1 = 4) before succeeding.
 		expect(txnCoordinator.initProducerId).toHaveBeenCalledTimes(7)

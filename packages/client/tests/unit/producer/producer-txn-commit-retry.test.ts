@@ -79,10 +79,6 @@ describe('Producer.commitTransactionOffsets retry', () => {
 		})
 	}
 
-	async function runEmptyTransaction(producer: Producer) {
-		await producer.transaction(async () => {})
-	}
-
 	it('retries TxnOffsetCommit on RebalanceInProgress', async () => {
 		groupCoordinator.txnOffsetCommit
 			.mockResolvedValueOnce(commitOffsetsResponse(ErrorCode.RebalanceInProgress))
@@ -111,11 +107,13 @@ describe('Producer.commitTransactionOffsets retry', () => {
 	})
 
 	it('aborts the transaction when EndTxn(commit) fails', async () => {
+		// Non-empty transaction (offsets prepared) so EndTxn is actually sent.
+		groupCoordinator.txnOffsetCommit.mockResolvedValue(commitOffsetsResponse(ErrorCode.None))
 		txnCoordinator.endTxn
 			.mockImplementationOnce(async () => endTxnResponse(ErrorCode.InvalidTxnState))
 			.mockImplementationOnce(async () => endTxnResponse(ErrorCode.None))
 
-		await expect(runEmptyTransaction(makeProducer())).rejects.toThrow(/Transaction aborted/)
+		await expect(runTransaction(makeProducer())).rejects.toThrow(/Transaction aborted/)
 
 		expect(txnCoordinator.endTxn).toHaveBeenCalledTimes(2)
 		expect(txnCoordinator.endTxn).toHaveBeenNthCalledWith(
