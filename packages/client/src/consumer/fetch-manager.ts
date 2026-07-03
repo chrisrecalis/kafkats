@@ -25,6 +25,23 @@ import { noopLogger, type Logger } from '@/logger.js'
 import { tpKey, formatPartitions } from '@/utils/topic-partition.js'
 import { sleep } from '@/utils/sleep.js'
 
+/**
+ * True when the bytes at the decoder's position cannot hold the batch they declare: either the
+ * 12-byte preamble (baseOffset + batchLength) is cut off, or fewer than `12 + batchLength` bytes
+ * remain. The broker may legally cut the trailing batch at maxBytes; only that case may be
+ * skipped - decode failures on a fully-present batch are corruption.
+ */
+function isTruncatedTrailingBatch(decoder: Decoder): boolean {
+	if (decoder.remaining() < 12) {
+		return true
+	}
+	const batchStart = decoder.offset()
+	decoder.seek(batchStart + 8) // skip baseOffset(int64)
+	const batchLength = decoder.readInt32()
+	decoder.seek(batchStart)
+	return decoder.remaining() < 12 + batchLength
+}
+
 function filterRecordsFromOffset(records: DecodedRecord[], minOffset: bigint): DecodedRecord[] {
 	if (records.length === 0) {
 		return records
@@ -977,6 +994,14 @@ export class FetchManager {
 		// Try synchronous decoding first (faster, no promise overhead)
 		let needsAsync = false
 		while (decoder.remaining() > 0) {
+			// A maxBytes-truncated trailing batch is legal and detected structurally (framing
+			// underflow). The broker always returns the FIRST batch complete, so underflow with
+			// nothing decoded is corruption; and any decode failure on a fully-present batch
+			// (e.g. CRC mismatch) is corruption too - treating either as truncation would
+			// silently drop records and leave the partition re-fetching the same data forever.
+			if (batches.length > 0 && isTruncatedTrailingBatch(decoder)) {
+				break
+			}
 			try {
 				// Hot-path decode options:
 				// - Assume sequential offsets to avoid per-record BigInt conversions
@@ -991,15 +1016,7 @@ export class FetchManager {
 					needsAsync = true
 					break
 				}
-				// A decode failure AFTER at least one batch is the expected maxBytes-truncated
-				// trailing batch â stop and re-fetch it next round. A failure with NO batch
-				// decoded is genuine corruption (the broker always returns at least one
-				// complete batch), so surface it instead of silently dropping the partition's
-				// records.
-				if (batches.length === 0) {
-					throw new Error(`Failed to decode record batch (corrupt data): ${(e as Error).message}`)
-				}
-				break
+				throw new Error(`Failed to decode record batch (corrupt data): ${(e as Error).message}`)
 			}
 		}
 
@@ -1030,6 +1047,14 @@ export class FetchManager {
 		}> = []
 
 		while (decoder.remaining() > 0) {
+			// A maxBytes-truncated trailing batch is legal and detected structurally (framing
+			// underflow). The broker always returns the FIRST batch complete, so underflow with
+			// nothing decoded is corruption; and any decode failure on a fully-present batch
+			// (e.g. CRC mismatch) is corruption too - treating either as truncation would
+			// silently drop records and leave the partition re-fetching the same data forever.
+			if (batches.length > 0 && isTruncatedTrailingBatch(decoder)) {
+				break
+			}
 			try {
 				// Hot-path decode options:
 				// - Assume sequential offsets to avoid per-record BigInt conversions
@@ -1039,12 +1064,7 @@ export class FetchManager {
 				})
 				batches.push(batch)
 			} catch (e) {
-				// See decodeRecords: a failure with no batch decoded is genuine corruption,
-				// not a truncated trailing batch â surface it rather than dropping records.
-				if (batches.length === 0) {
-					throw new Error(`Failed to decode record batch (corrupt data): ${(e as Error).message}`)
-				}
-				break
+				throw new Error(`Failed to decode record batch (corrupt data): ${(e as Error).message}`)
 			}
 		}
 
