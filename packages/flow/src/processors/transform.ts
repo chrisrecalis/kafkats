@@ -62,6 +62,32 @@ export class FlatMapValuesNode<K, V, V2> extends Processor<K, V, K, V2> {
 	}
 }
 
+/**
+ * mapValues with KTable semantics: the mapper is never invoked for tombstones — a null value is
+ * forwarded unchanged so downstream state retracts the row. The record's oldValue (set by table
+ * state nodes) is mapped the same way so downstream table join nodes can still tell whether a
+ * prior result existed.
+ */
+export class TableMapValuesNode<K, V, V2> extends Processor<K, V, K, V2> {
+	constructor(private readonly fn: (value: V | null) => V2 | null) {
+		super()
+	}
+
+	clone(worker: WorkerContext): Processor<K, V, K, V2> {
+		void worker
+		return new TableMapValuesNode(this.fn)
+	}
+
+	async process(record: StreamRecord<K, V>): Promise<void> {
+		const value = record.value === null ? null : this.fn(record.value)
+		const oldValue =
+			record.oldValue === undefined || record.oldValue === null
+				? record.oldValue
+				: this.fn(record.oldValue as V)
+		await this.forward({ ...record, value, oldValue })
+	}
+}
+
 export class FilterNode<K, V> extends Processor<K, V, K, V> {
 	constructor(private readonly fn: (key: K | null, value: V | null) => boolean) {
 		super()
@@ -76,6 +102,32 @@ export class FilterNode<K, V> extends Processor<K, V, K, V> {
 		if (this.fn(record.key, record.value)) {
 			await this.forward(record)
 		}
+	}
+}
+
+/**
+ * filter with KTable semantics (Kafka Streams KTableFilter): a value failing the predicate is
+ * forwarded as a TOMBSTONE (null) so derived state retracts the row — it is never silently
+ * dropped. Tombstones pass through unchanged without invoking the predicate. The record's
+ * oldValue is filtered the same way for downstream table join retraction logic.
+ */
+export class TableFilterNode<K, V> extends Processor<K, V, K, V> {
+	constructor(private readonly fn: (key: K | null, value: V | null) => boolean) {
+		super()
+	}
+
+	clone(worker: WorkerContext): Processor<K, V, K, V> {
+		void worker
+		return new TableFilterNode(this.fn)
+	}
+
+	async process(record: StreamRecord<K, V>): Promise<void> {
+		const value = record.value !== null && this.fn(record.key, record.value) ? record.value : null
+		let oldValue = record.oldValue
+		if (oldValue !== undefined && oldValue !== null && !this.fn(record.key, oldValue as V)) {
+			oldValue = null
+		}
+		await this.forward({ ...record, value, oldValue })
 	}
 }
 

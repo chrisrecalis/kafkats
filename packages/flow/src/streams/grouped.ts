@@ -361,6 +361,15 @@ export class WindowedKGroupedStreamImpl<K, V> implements WindowedKGroupedStream<
 		aggregator: (key: K, value: V, aggregate: A) => A,
 		options?: Materialized<Windowed<K>, A>
 	): KTable<Windowed<K>, A> {
+		if (this.windows instanceof SessionWindows) {
+			// No session merger in the aggregate() signature, so session semantics cannot be
+			// implemented; building a tumbling window with size = gap silently produces wrong results.
+			throw new Error(
+				'SessionWindows aggregate() is not supported: aggregate() has no session merger parameter. ' +
+					'Use count() or reduce() with SessionWindows, or TimeWindows for aggregate().'
+			)
+		}
+
 		const keyCodec = this.format.keyCodec
 		const valueCodec = options?.value
 

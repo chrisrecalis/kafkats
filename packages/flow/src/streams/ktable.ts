@@ -3,8 +3,8 @@ import type { KeyValueStore, SessionStore, StateStoreProvider, WindowStore } fro
 import type { Codec } from '@/codec.js'
 import {
 	PassThroughNode,
-	MapValuesNode,
-	FilterNode,
+	TableMapValuesNode,
+	TableFilterNode,
 	type StreamFormat,
 	type StreamRecord,
 	type WorkerContext,
@@ -88,13 +88,15 @@ export class KTableImpl<K, V> implements KTable<K, V> {
 	}
 
 	mapValues<V2>(fn: (value: V | null) => V2 | null): KTable<K, V2> {
-		const node = new MapValuesNode<K, V, V2>(fn)
+		// Table semantics: tombstones bypass the mapper and are forwarded as-is.
+		const node = new TableMapValuesNode<K, V, V2>(fn)
 		this.node.connect(node)
 		return new KTableImpl<K, V2>(this.app, node, { keyCodec: this.format.keyCodec })
 	}
 
 	filter(fn: (key: K | null, value: V | null) => boolean): KTable<K, V> {
-		const node = new FilterNode<K, V>(fn)
+		// Table semantics: a failing predicate forwards a tombstone (retraction), never a drop.
+		const node = new TableFilterNode<K, V>(fn)
 		this.node.connect(node)
 		return new KTableImpl<K, V>(this.app, node, this.format)
 	}
