@@ -256,11 +256,19 @@ describe('factories and sequences', () => {
 			.toStream()
 			.peek(results.collector())
 
-		await driver.run(async ({ send }) => {
+		await driver.run(async ({ send, producer, consumer }) => {
 			// Generate and send 6 orders
 			const orders = orderFactory.createMany(6)
 			for (const order of orders) {
 				await send('orders', order, { key: Buffer.from(order.id) })
+			}
+
+			// groupBy() routes through an internal repartition topic; deliver the repartitioned
+			// records back like Kafka would before asserting the aggregation.
+			const repartitioned = producer.messages.filter(msg => msg.topic.endsWith('-repartition'))
+			expect(repartitioned).toHaveLength(6)
+			for (const msg of repartitioned) {
+				await consumer.sendMessage(msg.topic, msg.value!, { key: msg.key })
 			}
 
 			// Should have counts for 3 customers (2 orders each)

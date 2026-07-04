@@ -65,3 +65,7 @@ export {
 	SourceTopicNotFoundError,
 } from '@/changelog.js'
 export type { ChangelogConfig, ChangelogTopicSpec } from '@/changelog.js'
+
+// Internal repartition topics and global tables
+export { buildRepartitionTopicName } from '@/changelog.js'
+export { GlobalTableTailer } from '@/flow.js'

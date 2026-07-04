@@ -62,6 +62,12 @@ export interface Produced<K, V> {
 export interface Grouped<K, V> {
 	key?: Codec<K>
 	value?: Codec<V>
+	/**
+	 * Base name for the internal repartition topic created by groupBy():
+	 * `{applicationId}-{name}-repartition`. Defaults to a stable auto-generated name derived from
+	 * the topology build order.
+	 */
+	name?: string
 }
 
 export interface Materialized<K, V> {

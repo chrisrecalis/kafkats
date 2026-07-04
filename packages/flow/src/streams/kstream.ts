@@ -10,9 +10,11 @@ import {
 	SelectKeyNode,
 	BranchNode,
 	ProduceNode,
+	SourceNode,
 	type StreamFormat,
 } from '@/processors/index.js'
 import { TableStateNode } from '@/processors/table.js'
+import { buildRepartitionTopicName } from '@/changelog.js'
 import { StreamTableJoinNode, StreamTableLeftJoinNode } from '@/processors/joins/stream-table.js'
 import {
 	StreamStreamJoinNode,
@@ -22,6 +24,17 @@ import {
 import { joinWindowMs as resolveJoinWindowMs } from '@/helpers.js'
 import { KTableImpl, type FlowAppInterface } from '@/streams/ktable.js'
 import { KGroupedStreamImpl } from '@/streams/grouped.js'
+
+/**
+ * Internal FlowApp surface (implemented by FlowAppImpl) used to wire through()/groupBy()
+ * intermediate topics as real sources on the group consumer. Kept out of FlowAppInterface to
+ * keep the public app contract minimal.
+ */
+type InternalFlowApp = FlowAppInterface & {
+	config: { applicationId: string }
+	registerInternalSource<K2, V2>(topic: string, format: StreamFormat<K2, V2>): SourceNode<K2, V2>
+	registerRepartitionTopic(topicName: string, sourceTopics: Set<string>): void
+}
 
 export class KStreamImpl<K, V> implements KStream<K, V> {
 	constructor(
@@ -101,11 +114,19 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 	}
 
 	through(topic: string, options?: Produced<K, V>): KStream<K, V> {
-		// FlowAppInterface satisfies ProduceNode's FlowAppInterface (both have sendToTopic)
-		const node = new ProduceNode<K, V>(this.app, topic, options, this.format, true)
-		this.node.connect(node)
-		// After going through a repartition topic, the new source is the through topic
-		return new KStreamImpl<K, V>(this.app, node, this.format, new Set([topic]))
+		// Produce to the topic WITHOUT forwarding in-process, then consume it back as a real
+		// source: records genuinely round-trip through the broker, so the topic repartitions by
+		// the current key and downstream state is co-partitioned with (and restorable from) it.
+		const produceNode = new ProduceNode<K, V>(this.app, topic, options, this.format, false)
+		this.node.connect(produceNode)
+
+		// The consumed format must equal the produced format (Produced overrides win on both sides).
+		const format: StreamFormat<K, V> = {
+			keyCodec: options?.key ?? this.format.keyCodec,
+			valueCodec: options?.value ?? this.format.valueCodec,
+		}
+		const sourceNode = (this.app as InternalFlowApp).registerInternalSource<K, V>(topic, format)
+		return new KStreamImpl<K, V>(this.app, sourceNode, format, new Set([topic]))
 	}
 
 	toTable(options?: Materialized<K, V>): KTable<K, V> {
@@ -133,15 +154,35 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 	}
 
 	groupBy<K2>(fn: (key: K | null, value: V | null) => K2, options?: Grouped<K2, V>): KGroupedStream<K2, V> {
-		// Add a selectKey node to re-key the stream
+		const keyCodec = options?.key
+		if (!keyCodec) {
+			throw new Error(
+				'groupBy() requires a key codec to serialize the re-keyed records for repartitioning. ' +
+					'Provide one via Grouped options ({ key }).'
+			)
+		}
+		const valueCodec = options?.value ?? this.format.valueCodec
+
+		const app = this.app as InternalFlowApp
+		const name = options?.name ?? `repartition-${app.nextStoreId()}`
+		const repartitionTopic = buildRepartitionTopicName(app.config.applicationId, name)
+
+		// Re-key in process, then route through an auto-created internal repartition topic so all
+		// records with the same new key land on the same partition (and instance) before
+		// aggregation - regardless of the original partitioning.
 		const selectNode = new SelectKeyNode<K, V, K2>((value, key) => fn(key, value))
 		this.node.connect(selectNode)
 
-		const keyCodec = options?.key
-		const valueCodec = options?.value ?? this.format.valueCodec
+		const format: StreamFormat<K2, V> = { keyCodec, valueCodec }
+		const produceNode = new ProduceNode<K2, V>(this.app, repartitionTopic, undefined, format, false)
+		selectNode.connect(produceNode)
 
-		// Re-keyed: don't restrict changelog restoration to source partitions
-		return new KGroupedStreamImpl(this.app, selectNode, { keyCodec, valueCodec }, this.sourceTopics, false)
+		app.registerRepartitionTopic(repartitionTopic, this.sourceTopics)
+		const sourceNode = app.registerInternalSource<K2, V>(repartitionTopic, format)
+
+		// Repartitioning restores key/partition affinity, so downstream changelog restoration can
+		// be restricted to the assigned repartition-topic partitions again.
+		return new KGroupedStreamImpl(this.app, sourceNode, format, new Set([repartitionTopic]), true)
 	}
 
 	groupByKey(options?: Grouped<K, V>): KGroupedStream<K, V> {

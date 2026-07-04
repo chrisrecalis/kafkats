@@ -23,6 +23,7 @@ import { InMemoryStateStoreProvider } from '@/state/memory.js'
 import {
 	type ChangelogConfig,
 	type ChangelogTopicSpec,
+	type ChangelogRestorationOptions,
 	ChangelogWriter,
 	ChangelogRestorer,
 	ChangelogPartitionMismatchError,
@@ -83,6 +84,170 @@ export const workerContextStorage = new AsyncLocalStorage<WorkerContext>()
 /** Default transaction commit interval for exactly_once mode (100ms) */
 const DEFAULT_COMMIT_INTERVAL_MS = 100
 
+/**
+ * Continuously materializes ALL partitions of a topic into a local store, independent of any
+ * consumer group, so every instance sees every key (global table semantics).
+ *
+ * start() resolves once the store has caught up to the end offsets captured at startup, then the
+ * tailer keeps consuming until stop(). Partitions are assigned manually from the earliest offset,
+ * mirroring the ChangelogRestorer; the source topic itself acts as the changelog, so global
+ * stores never write one.
+ */
+export class GlobalTableTailer<K = unknown, V = unknown> {
+	private consumer: Consumer | null = null
+	private runPromise: Promise<void> | null = null
+
+	constructor(
+		private readonly client: KafkaClient,
+		private readonly topic: string,
+		private readonly format: StreamFormat<K, V>,
+		private readonly store: KeyValueStore<K, V>,
+		private readonly options?: ChangelogRestorationOptions,
+		private readonly onError?: (error: Error) => void
+	) {}
+
+	async start(): Promise<void> {
+		const metadata = await this.client.getMetadata([this.topic])
+		const topicMeta = metadata.topics.get(this.topic)
+		if (!topicMeta) {
+			throw new Error(`Global table topic "${this.topic}" does not exist`)
+		}
+		const partitions = [...topicMeta.partitions.keys()].sort((a, b) => a - b)
+
+		const admin = this.client.admin()
+		const [startOffsets, endOffsets] = await Promise.all([
+			admin.fetchTopicOffsets(this.topic, partitions, 'earliest', { isolationLevel: 'read_committed' }),
+			admin.fetchTopicOffsets(this.topic, partitions, 'latest', { isolationLevel: 'read_committed' }),
+		])
+
+		const pending = new Set<number>()
+		const assignment = partitions.map(partition => {
+			const startOffset = startOffsets.get(partition)
+			const endOffset = endOffsets.get(partition)
+			if (startOffset === undefined || endOffset === undefined) {
+				throw new Error(`Missing offset information for ${this.topic}-${partition}`)
+			}
+			if (startOffset < endOffset) {
+				pending.add(partition)
+			}
+			return { topic: this.topic, partition, offset: startOffset }
+		})
+
+		// Unique groupId: with a manual assignment no group is joined, this only namespaces metrics.
+		const uniqueGroupId = `${this.topic}-global-${Date.now()}-${Math.random().toString(36).slice(2)}`
+		const consumer = this.client.consumer({
+			groupId: uniqueGroupId,
+			autoOffsetReset: 'earliest',
+			...(this.options?.consumerMaxWaitMs !== undefined ? { maxWaitMs: this.options.consumerMaxWaitMs } : {}),
+		})
+		this.consumer = consumer
+
+		let caughtUp!: () => void
+		let failed!: (err: Error) => void
+		const catchUpGate = new Promise<void>((resolve, reject) => {
+			caughtUp = resolve
+			failed = reject
+		})
+		// The gate can settle after start() returned (tail-phase errors go to onError instead).
+		catchUpGate.catch(() => {})
+
+		let isRunning = false
+		let hasConsumedMessage = false
+		let lastProgressTime = Date.now()
+		consumer.once('running', () => {
+			isRunning = true
+			lastProgressTime = Date.now()
+		})
+
+		// Same LSO caveat as changelog restoration: on read_committed transactional topics the
+		// consumer may never reach the captured end offset (control markers sit past the last user
+		// record), so idle-after-progress during catch-up counts as caught up.
+		const idleTimeoutMs = this.options?.idleTimeoutMs ?? 5000
+		const initialIdleTimeoutMs = this.options?.initialIdleTimeoutMs ?? idleTimeoutMs
+		const checkIntervalMs = this.options?.checkIntervalMs ?? 1000
+		const checkIdle = setInterval(() => {
+			if (!isRunning || pending.size === 0) return
+			const timeoutMs = hasConsumedMessage ? idleTimeoutMs : initialIdleTimeoutMs
+			if (Date.now() - lastProgressTime > timeoutMs) {
+				if (hasConsumedMessage) {
+					pending.clear()
+					caughtUp()
+				} else {
+					failed(
+						new Error(
+							`Timed out catching up global table "${this.topic}" (pending partitions: ${[
+								...pending,
+							].join(', ')})`
+						)
+					)
+				}
+			}
+		}, checkIntervalMs)
+
+		this.runPromise = consumer
+			.runEach(
+				[this.topic],
+				async message => {
+					lastProgressTime = Date.now()
+					hasConsumedMessage = true
+
+					if (message.key !== null) {
+						const keyCodec = this.format.keyCodec
+						const key = keyCodec ? keyCodec.decode(message.key) : (message.key as unknown as K)
+						if (message.value === null) {
+							await this.store.delete(key)
+						} else {
+							const valueCodec = this.format.valueCodec
+							const value = valueCodec
+								? valueCodec.decode(message.value)
+								: (message.value as unknown as V)
+							await this.store.put(key, value)
+						}
+					}
+
+					if (pending.has(message.partition)) {
+						const endOffset = endOffsets.get(message.partition)
+						if (endOffset !== undefined && message.offset + 1n >= endOffset) {
+							pending.delete(message.partition)
+							if (pending.size === 0) {
+								caughtUp()
+							}
+						}
+					}
+				},
+				{ commitOffsets: false, assignment }
+			)
+			.then(
+				() => {
+					// Consumer stopped: only an error if we are still catching up (no-op afterwards).
+					failed(new Error(`Global table consumer for "${this.topic}" stopped before catching up`))
+				},
+				err => {
+					const error = err instanceof Error ? err : new Error(String(err))
+					failed(error)
+					this.onError?.(error)
+				}
+			)
+
+		try {
+			if (pending.size > 0) {
+				await catchUpGate
+			}
+		} finally {
+			clearInterval(checkIdle)
+		}
+	}
+
+	async stop(): Promise<void> {
+		this.consumer?.stop()
+		if (this.runPromise) {
+			await this.runPromise
+		}
+		this.consumer = null
+		this.runPromise = null
+	}
+}
+
 class FlowAppImpl implements FlowApp {
 	private readonly client: KafkaClient
 	private readonly ownsClient: boolean
@@ -97,6 +262,15 @@ class FlowAppImpl implements FlowApp {
 	private readonly changelogTopics = new Map<string, ChangelogTopicSpec>()
 	private readonly changelogWriters = new Map<string, ChangelogWriter<unknown, unknown>>()
 	private readonly logger: Logger
+	/** Internal repartition topics to auto-create on start, keyed by topic name. */
+	private readonly repartitionTopics = new Map<string, { topicName: string; sourceTopics: Set<string> }>()
+	/** Global tables materialized by a dedicated (group-less) consumer per instance. */
+	private readonly globalTables: Array<{
+		topic: string
+		format: StreamFormat<unknown, unknown>
+		store: KeyValueStore<unknown, unknown>
+		tailer: GlobalTableTailer | null
+	}> = []
 	private lastCheckpointErrorMessage: string | null = null
 	private currentState: StreamState = 'CREATED'
 	private workers: WorkerContext[] = []
@@ -343,6 +517,32 @@ class FlowAppImpl implements FlowApp {
 		return store
 	}
 
+	/**
+	 * Register a topic as a real source on the group consumer and return its SourceNode.
+	 * Used by through()/groupBy() so intermediate topics are consumed back (true repartitioning)
+	 * instead of forwarding records in-process with their original partitioning.
+	 */
+	registerInternalSource<K, V>(topic: string, format: StreamFormat<K, V>): SourceNode<K, V> {
+		const node = new SourceNode<K, V>(topic, format)
+		this.registerSource(topic, node as SourceNode<unknown, unknown>)
+		return node
+	}
+
+	/**
+	 * Register an internal repartition topic for auto-creation on start. Partition count is
+	 * inferred from the given upstream source topics (max), keeping state co-partitioned.
+	 */
+	registerRepartitionTopic(topicName: string, sourceTopics: Set<string>): void {
+		const existing = this.repartitionTopics.get(topicName)
+		if (existing) {
+			for (const topic of sourceTopics) {
+				existing.sourceTopics.add(topic)
+			}
+			return
+		}
+		this.repartitionTopics.set(topicName, { topicName, sourceTopics: new Set(sourceTopics) })
+	}
+
 	stream<K = Buffer, V = Buffer>(source: string | Topic<K, V>, options?: Consumed<K, V>): KStream<K, V> {
 		const resolved = this.resolveSource(source, options)
 		const node = new SourceNode<K, V>(resolved.topic, resolved.format)
@@ -390,8 +590,6 @@ class FlowAppImpl implements FlowApp {
 		options?: Consumed<K, V> & { materialized?: Materialized<K, V> }
 	): KTable<K, V> {
 		const resolved = this.resolveSource(source, options)
-		const sourceNode = new SourceNode<K, V>(resolved.topic, resolved.format)
-		this.registerSource(resolved.topic, sourceNode, resolved.offsetReset)
 
 		// Create state store for global table - prefer materialized codecs
 		const keyCodec = options?.materialized?.key ?? resolved.format.keyCodec
@@ -401,21 +599,21 @@ class FlowAppImpl implements FlowApp {
 		}
 
 		const storeName = options?.materialized?.storeName ?? `global-table-${resolved.topic}-${this.nextStoreId()}`
-		// Pass source topic for changelog partition inference
-		const sourceTopics = new Set([resolved.topic])
-		const store = this.getOrCreateStore<K, V>(
-			storeName,
-			keyCodec,
-			valueCodec,
-			options?.materialized?.changelog,
-			sourceTopics
-		)
+		// The topic is deliberately NOT registered as a group source: group assignment would split
+		// its partitions across instances. A dedicated group-less tailer (started in start())
+		// materializes ALL partitions on every instance instead. Global stores never write a
+		// changelog - the source topic IS the changelog.
+		const store = this.getOrCreateStore<K, V>(storeName, keyCodec, valueCodec, false)
 		const storeRef = { store }
+		this.globalTables.push({
+			topic: resolved.topic,
+			format: { keyCodec, valueCodec } as StreamFormat<unknown, unknown>,
+			store: store as KeyValueStore<unknown, unknown>,
+			tailer: null,
+		})
 
-		// Create table state node that maintains state
+		// The node satisfies the KTable contract; the global tailer writes the store directly.
 		const tableStateNode = new TableStateNode<K, V>(storeName, storeRef)
-		sourceNode.connect(tableStateNode)
-
 		return new KTableImpl<K, V>(this, tableStateNode, resolved.format, storeRef)
 	}
 
@@ -427,6 +625,10 @@ class FlowAppImpl implements FlowApp {
 		this.currentState = 'RUNNING'
 		await this.client.connect()
 
+		// Create internal repartition topics first: changelog partition inference below reads
+		// their partition counts as source topics, and the group consumer subscribes to them.
+		await this.createRepartitionTopics()
+
 		// Validate and create changelog topics (returns false if skipped due to no brokers)
 		const changelogTopicsCreated = await this.validateAndCreateChangelogTopics()
 		this.changelogRestorationEnabled = changelogTopicsCreated
@@ -434,6 +636,17 @@ class FlowAppImpl implements FlowApp {
 		// Initialize all state stores
 		for (const store of this.stateStores.values()) {
 			await store.init()
+		}
+
+		// Materialize global tables to their end offsets before any processing starts
+		// (Kafka Streams semantics), then keep tailing in the background.
+		try {
+			await this.startGlobalTables()
+		} catch (err) {
+			this.lastError = err as Error
+			this.currentState = 'ERROR'
+			await this.stopGlobalTables()
+			throw err
 		}
 
 		const topics = [...this.sourcesByTopic.keys()]
@@ -651,6 +864,8 @@ class FlowAppImpl implements FlowApp {
 			await worker.producer.disconnect()
 		}
 
+		await this.stopGlobalTables()
+
 		// Close all state stores
 		await this.stateStoreProvider.close()
 
@@ -753,6 +968,161 @@ class FlowAppImpl implements FlowApp {
 			throw new Error('Multiple offsetReset values detected. Use a separate flow for each offset policy.')
 		}
 		return values.size === 1 ? [...values][0] : this.config.consumer?.autoOffsetReset
+	}
+
+	/**
+	 * Create internal repartition topics (from groupBy()) that don't exist yet.
+	 *
+	 * Partition count = max partition count of the repartitioned stream's upstream source topics,
+	 * which may themselves be pending repartition topics - those resolve in topology build order
+	 * because the map preserves registration order.
+	 *
+	 * Existing topics are left as-is (their actual partition count then drives downstream
+	 * changelog inference, keeping state co-partitioned either way).
+	 */
+	private async createRepartitionTopics(): Promise<void> {
+		if (this.repartitionTopics.size === 0) {
+			return
+		}
+
+		const allTopics = new Set<string>()
+		for (const spec of this.repartitionTopics.values()) {
+			allTopics.add(spec.topicName)
+			for (const topic of spec.sourceTopics) {
+				allTopics.add(topic)
+			}
+		}
+
+		let metadata
+		try {
+			metadata = await this.client.getMetadata([...allTopics])
+		} catch (err) {
+			const error = err as Error
+			if (error.message?.includes('No brokers available')) {
+				// Skip creation - same degraded mode as changelog topic creation (e.g. mocked clients)
+				return
+			}
+			throw err
+		}
+
+		const partitionCounts = new Map<string, number>()
+		for (const [name, topicMeta] of metadata.topics) {
+			partitionCounts.set(name, topicMeta.partitions.size)
+		}
+
+		const topicsToCreate: Array<{
+			name: string
+			numPartitions: number
+			replicationFactor?: number
+			configs: Record<string, string>
+		}> = []
+
+		for (const spec of this.repartitionTopics.values()) {
+			let requiredPartitions = 0
+			for (const sourceTopic of spec.sourceTopics) {
+				const count = partitionCounts.get(sourceTopic)
+				if (count === undefined) {
+					throw new Error(
+						`Source topic "${sourceTopic}" does not exist. Cannot determine partition count ` +
+							`for repartition topic "${spec.topicName}". Create the source topic first.`
+					)
+				}
+				requiredPartitions = Math.max(requiredPartitions, count)
+			}
+			if (requiredPartitions === 0) {
+				requiredPartitions = 1
+			}
+
+			if (partitionCounts.has(spec.topicName)) {
+				// Exists - leave as-is
+				continue
+			}
+
+			// Make this topic's count visible to downstream repartition specs that source from it
+			partitionCounts.set(spec.topicName, requiredPartitions)
+			topicsToCreate.push({
+				name: spec.topicName,
+				numPartitions: requiredPartitions,
+				replicationFactor: this.config.changelog?.replicationFactor,
+				// Repartition records are transient: consumed once by this application
+				configs: { 'cleanup.policy': 'delete' },
+			})
+		}
+
+		if (topicsToCreate.length === 0) {
+			return
+		}
+		await this.client.createTopics(topicsToCreate)
+
+		// Wait until the new topics are visible with leaders: changelog inference and the group
+		// consumer subscription depend on them immediately after.
+		const deadline = Date.now() + 15_000
+		const pendingNames = new Set(topicsToCreate.map(t => t.name))
+		while (pendingNames.size > 0 && Date.now() < deadline) {
+			const meta = await this.client.getMetadata([...pendingNames])
+			for (const name of [...pendingNames]) {
+				const topicMeta = meta.topics.get(name)
+				if (!topicMeta || topicMeta.partitions.size === 0) {
+					continue
+				}
+				let ready = true
+				for (const partition of topicMeta.partitions.values()) {
+					if (partition.leaderId < 0) {
+						ready = false
+						break
+					}
+				}
+				if (ready) {
+					pendingNames.delete(name)
+				}
+			}
+			if (pendingNames.size > 0) {
+				await new Promise(resolve => setTimeout(resolve, 100))
+			}
+		}
+		if (pendingNames.size > 0) {
+			throw new Error(`Timed out waiting for repartition topics to become ready: ${[...pendingNames].join(', ')}`)
+		}
+	}
+
+	/**
+	 * Start a group-less tailer per global table and block until each is caught up.
+	 */
+	private async startGlobalTables(): Promise<void> {
+		for (const globalTable of this.globalTables) {
+			const tailer = new GlobalTableTailer(
+				this.client,
+				globalTable.topic,
+				globalTable.format,
+				globalTable.store,
+				this.config.changelog?.restoration,
+				error => {
+					this.lastError = error
+					this.currentState = 'ERROR'
+				}
+			)
+			globalTable.tailer = tailer
+			try {
+				await tailer.start()
+			} catch (err) {
+				const error = err as Error
+				if (error.message?.includes('No brokers available')) {
+					// Skip - same degraded mode as changelog topic creation (e.g. mocked clients)
+					globalTable.tailer = null
+					continue
+				}
+				throw err
+			}
+		}
+	}
+
+	private async stopGlobalTables(): Promise<void> {
+		for (const globalTable of this.globalTables) {
+			if (globalTable.tailer) {
+				await globalTable.tailer.stop().catch(() => {})
+				globalTable.tailer = null
+			}
+		}
 	}
 
 	/**

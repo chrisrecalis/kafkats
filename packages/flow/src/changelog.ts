@@ -105,6 +105,13 @@ export function buildChangelogTopicName(appId: string, storeName: string): strin
 }
 
 /**
+ * Builds the internal repartition topic name for a re-keyed stream.
+ */
+export function buildRepartitionTopicName(appId: string, name: string): string {
+	return `${appId}-${name}-repartition`
+}
+
+/**
  * Returns the default topic configs for changelog topics.
  */
 export function getDefaultTopicConfigs(overrides?: Record<string, string>): Record<string, string> {
