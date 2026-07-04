@@ -7,6 +7,11 @@ import type { KeyValue } from '@/types.js'
 const DELTA_OP_HEADER = '__kafkats_delta_op'
 const DELTA_ADD = Buffer.from('add')
 const DELTA_SUB = Buffer.from('sub')
+// Same-grouped-key update: subtractor + adder must be applied atomically, emitting ONE update
+// (the retracted value rides on record.oldValue). Kafka Streams semantics — a two-record SUB/ADD
+// flow for an unchanged grouped key would emit a transient dip (n -> n-1 -> n) and, at n=1, a
+// spurious tombstone followed by a re-insert.
+const DELTA_UPDATE = Buffer.from('update')
 
 export function isDeltaAdd(record: StreamRecord<unknown, unknown>): boolean {
 	return record.headers[DELTA_OP_HEADER]?.equals(DELTA_ADD) ?? false
@@ -14,6 +19,10 @@ export function isDeltaAdd(record: StreamRecord<unknown, unknown>): boolean {
 
 export function isDeltaSub(record: StreamRecord<unknown, unknown>): boolean {
 	return record.headers[DELTA_OP_HEADER]?.equals(DELTA_SUB) ?? false
+}
+
+export function isDeltaUpdate(record: StreamRecord<unknown, unknown>): boolean {
+	return record.headers[DELTA_OP_HEADER]?.equals(DELTA_UPDATE) ?? false
 }
 
 /**
@@ -149,6 +158,23 @@ export class TableGroupByNode<K, V, K2> extends Processor<K, V, K2, V> {
 
 		// Retract old mapping if it exists
 		if (previousMapping !== undefined) {
+			const sameGroupedKey = this.groupedKeyCodec
+				.encode(previousMapping.groupedKey)
+				.equals(this.groupedKeyCodec.encode(newGroupedKey))
+			if (sameGroupedKey) {
+				// Unchanged grouped key: emit ONE combined UPDATE record (old value on oldValue) so
+				// downstream delta nodes apply subtractor+adder atomically — no transient dip and no
+				// spurious tombstone at group size 1. Key-change updates keep the two-record SUB/ADD
+				// flow below because the records target different grouped keys.
+				await this.forward({
+					...record,
+					key: newGroupedKey,
+					value: newValue,
+					oldValue: previousMapping.value,
+					headers: { ...record.headers, [DELTA_OP_HEADER]: DELTA_UPDATE },
+				})
+				return
+			}
 			await this.forward({
 				...record,
 				key: previousMapping.groupedKey,
@@ -197,7 +223,11 @@ export class TableDeltaCountNode<K, V> extends Processor<K, V, K, number> {
 		const current = (await store.get(key)) ?? 0
 
 		let newCount: number
-		if (isDeltaSub(record)) {
+		if (isDeltaUpdate(record)) {
+			// Same grouped key: subtract the old member and add the new one atomically (-1 +1),
+			// emitting a single unchanged count instead of a transient dip / spurious tombstone.
+			newCount = current > 0 ? current : 1
+		} else if (isDeltaSub(record)) {
 			newCount = current - 1
 		} else {
 			newCount = current + 1
@@ -246,7 +276,19 @@ export class TableDeltaReduceNode<K, V> extends Processor<K, V> {
 		const current = await store.get(key)
 
 		let newAggregate: V
-		if (isDeltaSub(record)) {
+		if (isDeltaUpdate(record)) {
+			// Same grouped key: apply subtractor (for the old value on record.oldValue) and adder
+			// atomically before emitting once — no intermediate n-1 emission.
+			const oldValue = record.oldValue as V | null | undefined
+			let intermediate: V | null | undefined = current
+			if (intermediate !== undefined && oldValue !== undefined && oldValue !== null) {
+				intermediate = this.subtractor(intermediate, oldValue)
+			}
+			newAggregate =
+				intermediate === undefined || intermediate === null
+					? record.value
+					: this.adder(intermediate, record.value)
+		} else if (isDeltaSub(record)) {
 			if (current === undefined) return
 			newAggregate = this.subtractor(current, record.value)
 		} else {
@@ -306,7 +348,20 @@ export class TableDeltaAggregateNode<K, V, A> extends Processor<K, V, K, A> {
 		const current = await store.get(key)
 
 		let newAggregate: A
-		if (isDeltaSub(record)) {
+		if (isDeltaUpdate(record)) {
+			// Same grouped key: apply subtractor (for the old value on record.oldValue) and
+			// aggregator atomically before emitting once — no intermediate emission.
+			const oldValue = record.oldValue as V | null | undefined
+			let aggregate = current ?? this.initializer()
+			if (current !== undefined && oldValue !== undefined && oldValue !== null) {
+				aggregate = this.subtractor(key, oldValue, aggregate)
+			}
+			newAggregate = this.aggregator(
+				key,
+				record.value,
+				aggregate === null || aggregate === undefined ? this.initializer() : aggregate
+			)
+		} else if (isDeltaSub(record)) {
 			if (current === undefined) return
 			newAggregate = this.subtractor(key, record.value, current)
 		} else {

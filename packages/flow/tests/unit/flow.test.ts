@@ -162,8 +162,14 @@ describe('flow', () => {
 		const producer = producers[0]!
 		await consumer.emitMessage('input', Buffer.from(JSON.stringify({ id: 'a1' })))
 
-		const topics = producer.messages.map(msg => msg.topic)
-		expect(topics).toEqual(['audit', 'output'])
+		// through() only produces to the intermediate topic; downstream continues once the topic
+		// is consumed back (real repartitioning), so deliver the produced record like Kafka would.
+		expect(producer.messages.map(msg => msg.topic)).toEqual(['audit'])
+		const audit = producer.messages[0]!
+		await consumer.emitMessage('audit', audit.value, audit.key ?? null)
+
+		expect(producer.messages.map(msg => msg.topic)).toEqual(['audit', 'output'])
+		expect(JSON.parse(producer.messages[1]!.value.toString())).toEqual({ id: 'a1', tagged: true })
 
 		await app.close()
 	})
@@ -481,7 +487,7 @@ describe('stream-stream joins', () => {
 		await app.close()
 	})
 
-	it('left joins streams - left side always emits', async () => {
+	it('left joins streams - unmatched left emits null-padded result at window close', async () => {
 		const { app, consumers } = createTestApp()
 
 		type Click = { page: string }
@@ -512,11 +518,11 @@ describe('stream-stream joins', () => {
 		await app.start()
 		const consumer = consumers[0]!
 
-		// Click without matching impression - should emit with null
+		// Click without matching impression - nothing yet: the null-padded result is only
+		// emitted once the join window closes without a match (no eager spurious results).
 		await consumer.emitMessage('clicks', Buffer.from(JSON.stringify({ page: 'home' })), Buffer.from('user1'), 1000n)
 
-		expect(results).toHaveLength(1)
-		expect(results[0]).toEqual({ key: 'user1', value: { page: 'home', ad: null } })
+		expect(results).toHaveLength(0)
 
 		// Add impression, then click - should join
 		await consumer.emitMessage(
@@ -532,14 +538,25 @@ describe('stream-stream joins', () => {
 			2500n
 		)
 
-		// Exactly 2 results: click without match (null ad) + click with matching impression
+		expect(results).toHaveLength(1)
+		expect(results[0]).toEqual({ key: 'user2', value: { page: 'products', ad: 'banner1' } })
+
+		// Advance stream time past user1's window close (1000 + 5000): exactly one
+		// null-padded result for the never-matched click.
+		await consumer.emitMessage(
+			'clicks',
+			Buffer.from(JSON.stringify({ page: 'late' })),
+			Buffer.from('user3'),
+			20000n
+		)
+
 		expect(results).toHaveLength(2)
-		expect(results[1]).toEqual({ key: 'user2', value: { page: 'products', ad: 'banner1' } })
+		expect(results[1]).toEqual({ key: 'user1', value: { page: 'home', ad: null } })
 
 		await app.close()
 	})
 
-	it('outer joins streams - both sides emit', async () => {
+	it('outer joins streams - both unmatched sides emit null-padded results at window close', async () => {
 		const { app, consumers } = createTestApp()
 
 		type Click = { page: string }
@@ -570,13 +587,9 @@ describe('stream-stream joins', () => {
 		await app.start()
 		const consumer = consumers[0]!
 
-		// Click alone - should emit with null ad
+		// Click alone, then impression alone - nothing yet: null-padded results are only
+		// emitted once each join window closes without a match (no eager spurious results).
 		await consumer.emitMessage('clicks', Buffer.from(JSON.stringify({ page: 'home' })), Buffer.from('user1'), 1000n)
-
-		expect(results).toHaveLength(1)
-		expect(results[0]).toEqual({ key: 'user1', value: { page: 'home', ad: null } })
-
-		// Impression alone - should emit with null page
 		await consumer.emitMessage(
 			'impressions',
 			Buffer.from(JSON.stringify({ ad: 'banner1' })),
@@ -584,7 +597,18 @@ describe('stream-stream joins', () => {
 			2000n
 		)
 
+		expect(results).toHaveLength(0)
+
+		// Advance stream time past both window closes: one null-padded result per unmatched side.
+		await consumer.emitMessage(
+			'clicks',
+			Buffer.from(JSON.stringify({ page: 'late' })),
+			Buffer.from('user3'),
+			20000n
+		)
+
 		expect(results).toHaveLength(2)
+		expect(results[0]).toEqual({ key: 'user1', value: { page: 'home', ad: null } })
 		expect(results[1]).toEqual({ key: 'user2', value: { page: null, ad: 'banner1' } })
 
 		await app.close()
@@ -1589,7 +1613,7 @@ describe('aggregations', () => {
 	})
 
 	it('groups by a different key with groupBy()', async () => {
-		const { app, consumers } = createTestApp()
+		const { app, consumers, producers } = createTestApp()
 
 		type Event = { category: string; value: number }
 		const results: Array<{ key: string; count: number }> = []
@@ -1631,6 +1655,16 @@ describe('aggregations', () => {
 			Buffer.from(JSON.stringify({ category: 'electronics', value: 200 })),
 			Buffer.from('item3')
 		)
+
+		// groupBy() now routes through an internal repartition topic instead of aggregating
+		// in-process; deliver the repartitioned records back like Kafka would.
+		const producer = producers[0]!
+		const repartitioned = producer.messages.filter(msg => msg.topic.endsWith('-repartition'))
+		expect(repartitioned).toHaveLength(3)
+		expect(results).toHaveLength(0)
+		for (const msg of repartitioned) {
+			await consumer.emitMessage(msg.topic, msg.value, msg.key ?? null)
+		}
 
 		expect(results).toHaveLength(3)
 		expect(results[0]).toEqual({ key: 'electronics', count: 1 })
@@ -1754,14 +1788,17 @@ describe('windowed/session store changelog wiring', () => {
 			.windowedBy(TimeWindows.of('10s'))
 			.count({ storeName: 'by-key' })
 
-		// groupBy() re-keys -> restoration must NOT be restricted to source partitions.
+		// groupBy() re-keys through a repartition topic, which restores key/partition affinity ->
+		// restoration is restricted again, to the repartition topic's partitions.
 		app.stream('events2', { key: codec.string(), value: codec.json<{ region: string }>() })
-			.groupBy((_key, value) => value!.region, { key: codec.string() })
+			.groupBy((_key, value) => value!.region, { key: codec.string(), name: 'by-region' })
 			.windowedBy(TimeWindows.of('10s'))
 			.count({ storeName: 'by-region' })
 
 		const { changelogTopics } = internals(app)
 		expect(changelogTopics.get('by-key').restrictRestorationToSourcePartitions).toBe(true)
-		expect(changelogTopics.get('by-region').restrictRestorationToSourcePartitions).toBe(false)
+		const byRegion = changelogTopics.get('by-region')
+		expect(byRegion.restrictRestorationToSourcePartitions).toBe(true)
+		expect([...byRegion.sourceTopics]).toEqual(['test-app-by-region-repartition'])
 	})
 })

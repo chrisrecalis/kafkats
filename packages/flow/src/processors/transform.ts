@@ -81,9 +81,7 @@ export class TableMapValuesNode<K, V, V2> extends Processor<K, V, K, V2> {
 	async process(record: StreamRecord<K, V>): Promise<void> {
 		const value = record.value === null ? null : this.fn(record.value)
 		const oldValue =
-			record.oldValue === undefined || record.oldValue === null
-				? record.oldValue
-				: this.fn(record.oldValue as V)
+			record.oldValue === undefined || record.oldValue === null ? record.oldValue : this.fn(record.oldValue as V)
 		await this.forward({ ...record, value, oldValue })
 	}
 }
