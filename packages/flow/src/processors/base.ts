@@ -29,7 +29,13 @@ export type StreamFormat<K, V> = {
 export type ActiveTransaction = {
 	send(
 		topic: string,
-		messages: { key?: Buffer | null; value: Buffer | null; headers?: Record<string, Buffer>; partition?: number }
+		messages: {
+			key?: Buffer | null
+			value: Buffer | null
+			headers?: Record<string, Buffer>
+			partition?: number
+			timestamp?: Date
+		}
 	): Promise<SendResult>
 	sendOffsets(params: {
 		groupId?: string

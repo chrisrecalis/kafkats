@@ -151,6 +151,25 @@ export interface ChangelogTopicSpec {
 	restrictRestorationToSourcePartitions?: boolean
 	/** If true, only validate existing topics, don't create new ones. */
 	validateOnly: boolean
+	/**
+	 * Actual partition count of the changelog topic, resolved during startup validation. Used to
+	 * guard partition pinning: a write is only pinned when the source partition exists on the
+	 * changelog topic (re-keyed stores may have fewer changelog partitions than the source).
+	 */
+	numPartitions?: number
+}
+
+/**
+ * Per-record context threaded from the message currently being processed into changelog writes.
+ * The source (task) partition pins the write to the matching changelog partition — restoration
+ * reads exactly the task's source-partition numbers, so writes must land there. The record's
+ * event timestamp is stamped on the changelog record (Kafka Streams semantics).
+ */
+export interface ChangelogRecordContext {
+	/** Changelog partition to pin the write to; omitted when pinning is not possible. */
+	partition?: number
+	/** Event timestamp (ms since epoch) of the record being processed. */
+	timestamp?: bigint
 }
 
 /**
@@ -160,7 +179,13 @@ export interface ChangelogTopicSpec {
 interface TransactionLike {
 	send(
 		topic: string,
-		messages: { key?: Buffer | null; value: Buffer | null; headers?: Record<string, Buffer>; partition?: number }
+		messages: {
+			key?: Buffer | null
+			value: Buffer | null
+			headers?: Record<string, Buffer>
+			partition?: number
+			timestamp?: Date
+		}
 	): Promise<SendResult>
 }
 
@@ -174,46 +199,50 @@ export class ChangelogWriter<K, V> {
 		private readonly valueCodec: Codec<V>,
 		private readonly getProducer: () => Producer,
 		private readonly getTransaction: () => TransactionLike | null,
-		private readonly onWriteAck?: (result: SendResult) => void | Promise<void>
+		private readonly onWriteAck?: (result: SendResult) => void | Promise<void>,
+		private readonly getRecordContext?: () => ChangelogRecordContext | null
 	) {}
 
 	/**
 	 * Write a key-value pair to the changelog.
 	 */
 	async write(key: K, value: V): Promise<void> {
-		const keyBuffer = this.keyCodec.encode(key)
-		const valueBuffer = this.valueCodec.encode(value)
-		const transaction = this.getTransaction()
-
-		if (transaction) {
-			const result = await transaction.send(this.topicName, {
-				key: keyBuffer,
-				value: valueBuffer,
-			})
-			await this.onWriteAck?.(result)
-		} else {
-			const result = await this.getProducer().send(this.topicName, {
-				key: keyBuffer,
-				value: valueBuffer,
-			})
-			await this.onWriteAck?.(result)
-		}
+		await this.send(this.keyCodec.encode(key), this.valueCodec.encode(value))
 	}
 
 	/**
 	 * Write a tombstone (null value) to the changelog.
 	 */
 	async writeTombstone(key: K): Promise<void> {
-		const keyBuffer = this.keyCodec.encode(key)
-		const transaction = this.getTransaction()
+		await this.send(this.keyCodec.encode(key), null)
+	}
 
-		if (transaction) {
-			const result = await transaction.send(this.topicName, { key: keyBuffer, value: null })
-			await this.onWriteAck?.(result)
-		} else {
-			const result = await this.getProducer().send(this.topicName, { key: keyBuffer, value: null })
-			await this.onWriteAck?.(result)
+	/**
+	 * Encode a key with this writer's key codec. Exposed so the changelog-backed store wrappers can
+	 * identify keys (e.g. in the per-transaction overlay) without duplicating the codec.
+	 */
+	encodeKey(key: K): Buffer {
+		return this.keyCodec.encode(key)
+	}
+
+	private async send(keyBuffer: Buffer, valueBuffer: Buffer | null): Promise<void> {
+		const message: { key: Buffer; value: Buffer | null; partition?: number; timestamp?: Date } = {
+			key: keyBuffer,
+			value: valueBuffer,
 		}
+		const ctx = this.getRecordContext?.()
+		if (ctx?.partition !== undefined) {
+			message.partition = ctx.partition
+		}
+		if (ctx?.timestamp !== undefined && ctx.timestamp >= 0n) {
+			message.timestamp = new Date(Number(ctx.timestamp))
+		}
+
+		const transaction = this.getTransaction()
+		const result = transaction
+			? await transaction.send(this.topicName, message)
+			: await this.getProducer().send(this.topicName, message)
+		await this.onWriteAck?.(result)
 	}
 }
 
@@ -278,6 +307,7 @@ export class ChangelogRestorer<K, V> {
 			: new Map<number, bigint>()
 
 		const pendingPartitions = new Set<number>()
+		const resumedFromCheckpoint = new Set<number>()
 		const assignment = assigned.flatMap(partition => {
 			const earliestOffset = startOffsets.get(partition)
 			const endOffset = endOffsets.get(partition)
@@ -296,14 +326,22 @@ export class ChangelogRestorer<K, V> {
 			}
 
 			pendingPartitions.add(partition)
+			if (startOffset === checkpointOffset) {
+				resumedFromCheckpoint.add(partition)
+			}
 			return [{ topic: this.topicName, partition, offset: startOffset }]
 		})
+		const initiallyPending = new Set(pendingPartitions)
 
 		if (pendingPartitions.size === 0) {
 			return 0
 		}
 
 		let restoredCount = 0
+		/** Highest changelog offset actually applied per partition — drives checkpoint bounding. */
+		const lastAppliedOffsets = new Map<number, bigint>()
+		/** Partitions that reached the captured end offset (fully restored). */
+		const completedPartitions = new Set<number>()
 
 		const abortController = new AbortController()
 
@@ -330,7 +368,14 @@ export class ChangelogRestorer<K, V> {
 				if (hasConsumedMessage) {
 					// Idle after progress = topic drained. On read_committed transactional changelogs the
 					// consumer can't reach endOffset because control markers sit past the last user record
-					// (LSO = lastUserOffset + N). Gracefully complete instead of erroring (F7b).
+					// (LSO = lastUserOffset + N). Gracefully complete instead of erroring (F7b). The
+					// checkpoint below is bounded to the last APPLIED offset per partition, so if the
+					// idleness was a stall rather than a drain, nothing is skipped on the next restart.
+					abortController.abort(restoreCompleteReason)
+				} else if ([...pendingPartitions].every(partition => resumedFromCheckpoint.has(partition))) {
+					// Resuming from a checkpoint can legitimately yield zero records: the checkpoint may
+					// sit at the control-marker tail of a transactional changelog (only markers between
+					// it and the LSO). Complete gracefully; checkpoints are not advanced without progress.
 					abortController.abort(restoreCompleteReason)
 				} else {
 					abortController.abort(
@@ -357,6 +402,7 @@ export class ChangelogRestorer<K, V> {
 					// Ignore any records that arrive beyond the captured end offset (e.g. concurrent writers).
 					if (message.offset >= endOffset) {
 						pendingPartitions.delete(message.partition)
+						completedPartitions.add(message.partition)
 						if (!pausedPartitions.has(message.partition)) {
 							pausedPartitions.add(message.partition)
 							consumer.pause([{ topic: message.topic, partition: message.partition }])
@@ -369,6 +415,7 @@ export class ChangelogRestorer<K, V> {
 
 					lastProgressTime = Date.now()
 					hasConsumedMessage = true
+					lastAppliedOffsets.set(message.partition, message.offset)
 
 					if (message.key !== null) {
 						const key = this.keyCodec.decode(message.key)
@@ -385,6 +432,7 @@ export class ChangelogRestorer<K, V> {
 
 					if (message.offset + 1n >= endOffset) {
 						pendingPartitions.delete(message.partition)
+						completedPartitions.add(message.partition)
 						if (!pausedPartitions.has(message.partition)) {
 							pausedPartitions.add(message.partition)
 							consumer.pause([{ topic: message.topic, partition: message.partition }])
@@ -422,8 +470,29 @@ export class ChangelogRestorer<K, V> {
 					if (endOffset === undefined) {
 						return
 					}
+
+					// Checkpoint only what was actually restored. Advancing to endOffset for a
+					// partition that never reached it (idle escape) would permanently skip the
+					// unrestored range on the next restart.
+					let nextOffset: bigint
+					if (!initiallyPending.has(partition) || completedPartitions.has(partition)) {
+						// Already at (or restored to) the captured end offset.
+						nextOffset = endOffset
+						const prior = checkpointOffsets.get(partition)
+						if (prior !== undefined && prior > nextOffset) {
+							return
+						}
+					} else {
+						const lastApplied = lastAppliedOffsets.get(partition)
+						if (lastApplied === undefined) {
+							// No progress on this partition: leave any existing checkpoint untouched.
+							return
+						}
+						nextOffset = lastApplied + 1n
+					}
+
 					try {
-						await checkpointStore.set(this.topicName, partition, endOffset)
+						await checkpointStore.set(this.topicName, partition, nextOffset)
 					} catch (err) {
 						// Restored state is in memory regardless; failing to record this means a future restart
 						// will re-restore (idempotent but wasteful). Log so a stuck checkpoint store is visible.

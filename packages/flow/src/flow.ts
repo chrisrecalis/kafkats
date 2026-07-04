@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { randomUUID } from 'node:crypto'
 import {
 	KafkaClient,
 	type Consumer,
@@ -23,6 +24,7 @@ import { InMemoryStateStoreProvider } from '@/state/memory.js'
 import {
 	type ChangelogConfig,
 	type ChangelogTopicSpec,
+	type ChangelogRecordContext,
 	type ChangelogRestorationOptions,
 	ChangelogWriter,
 	ChangelogRestorer,
@@ -37,6 +39,8 @@ import {
 	ChangelogBackedKeyValueStore,
 	ChangelogBackedWindowStore,
 	ChangelogBackedSessionStore,
+	isTransactionalStateStore,
+	type EosStoreSupport,
 } from '@/state/changelog.js'
 
 // Public types
@@ -80,6 +84,14 @@ const DEFAULT_BUFFER_CODEC: Codec<Buffer> = bufferCodec()
  * Used by changelog writers to access the correct producer/transaction.
  */
 export const workerContextStorage = new AsyncLocalStorage<WorkerContext>()
+
+/**
+ * AsyncLocalStorage for the record currently being processed (its source partition and event
+ * timestamp). Changelog writers read it to pin writes to the task partition and stamp the record
+ * timestamp (state written while processing source partition N must land on changelog partition N,
+ * because restoration reads exactly the assigned source-partition numbers).
+ */
+const recordContextStorage = new AsyncLocalStorage<{ partition: number; timestamp: bigint }>()
 
 /** Default transaction commit interval for exactly_once mode (100ms) */
 const DEFAULT_COMMIT_INTERVAL_MS = 100
@@ -272,6 +284,14 @@ class FlowAppImpl implements FlowApp {
 		tailer: GlobalTableTailer | null
 	}> = []
 	private lastCheckpointErrorMessage: string | null = null
+	/**
+	 * Per-instance unique component of the EOS transactionalId. Two instances sharing an
+	 * applicationId + clientId must NOT share a transactionalId, or they permanently fence each
+	 * other in a crash-loop. Zombie protection does not rely on a stable id: offsets ride the
+	 * transaction via sendOffsets with consumer group metadata (KIP-447-style generation fencing),
+	 * so a fenced-out zombie's commit is rejected by the group coordinator.
+	 */
+	private readonly instanceId = randomUUID().slice(0, 8)
 	private currentState: StreamState = 'CREATED'
 	private workers: WorkerContext[] = []
 	private runPromises: Promise<void>[] = []
@@ -333,7 +353,10 @@ class FlowAppImpl implements FlowApp {
 					restrictRestorationToSourcePartitions
 				)
 				// Wrap with changelog-backed store
-				store = new ChangelogBackedKeyValueStore(innerStore, writer) as KeyValueStore<unknown, unknown>
+				store = new ChangelogBackedKeyValueStore(innerStore, writer, this.eosStoreSupport()) as KeyValueStore<
+					unknown,
+					unknown
+				>
 			} else {
 				store = innerStore
 			}
@@ -341,6 +364,22 @@ class FlowAppImpl implements FlowApp {
 			this.stateStores.set(storeName, store)
 		}
 		return store as KeyValueStore<K, V>
+	}
+
+	/**
+	 * Hooks handed to changelog-backed store wrappers so writes inside an exactly_once transaction
+	 * are buffered per transaction (and only applied to the local store on commit).
+	 */
+	private eosStoreSupport(): EosStoreSupport | undefined {
+		if (!this.eosEnabled) {
+			return undefined
+		}
+		return {
+			getTransactionalWorker: () => {
+				const worker = workerContextStorage.getStore()
+				return worker?.transactionActive ? worker : null
+			},
+		}
 	}
 
 	/**
@@ -430,6 +469,20 @@ class FlowAppImpl implements FlowApp {
 				} catch (err) {
 					this.recordCheckpointError(err, { topic: result.topic, partition: result.partition })
 				}
+			},
+			(): ChangelogRecordContext | null => {
+				const ctx = recordContextStorage.getStore()
+				if (!ctx) {
+					return null
+				}
+				// Pin the write to the task partition so restoration (which reads the assigned
+				// source-partition numbers) finds it. Only pin when the changelog actually has that
+				// partition — re-keyed stores (restoration reads ALL partitions) may have fewer.
+				// spec.numPartitions is resolved at start(); when unknown, the counts were inferred
+				// from the same source topics, so the source partition is in range by construction.
+				const partition =
+					spec.numPartitions === undefined || ctx.partition < spec.numPartitions ? ctx.partition : undefined
+				return { partition, timestamp: ctx.timestamp }
 			}
 		)
 		this.changelogWriters.set(storeName, writer as ChangelogWriter<unknown, unknown>)
@@ -470,7 +523,7 @@ class FlowAppImpl implements FlowApp {
 				restrictRestorationToSourcePartitions,
 				windowOptions.retentionMs
 			)
-			store = new ChangelogBackedWindowStore(inner, writer)
+			store = new ChangelogBackedWindowStore(inner, writer, this.eosStoreSupport())
 		}
 
 		this.stateStores.set(storeName, store as unknown as KeyValueStore<unknown, unknown>)
@@ -510,7 +563,7 @@ class FlowAppImpl implements FlowApp {
 				restrictRestorationToSourcePartitions,
 				sessionOptions.retentionMs
 			)
-			store = new ChangelogBackedSessionStore(inner, writer)
+			store = new ChangelogBackedSessionStore(inner, writer, this.eosStoreSupport())
 		}
 
 		this.stateStores.set(storeName, store as unknown as KeyValueStore<unknown, unknown>)
@@ -769,13 +822,20 @@ class FlowAppImpl implements FlowApp {
 							await this.processInTransaction(message, ctx, sources, worker)
 						}
 
+						// Record context: source partition + event timestamp for changelog writes.
+						const recordContext = { partition: message.partition, timestamp: message.timestamp }
+
 						if (!this.eosEnabled) {
 							// Run within worker context for changelog writes
-							await workerContextStorage.run(worker, handler)
+							await recordContextStorage.run(recordContext, () =>
+								workerContextStorage.run(worker, handler)
+							)
 							return
 						}
 
-						await this.enqueueEosTask(worker, () => workerContextStorage.run(worker, handler))
+						await this.enqueueEosTask(worker, () =>
+							recordContextStorage.run(recordContext, () => workerContextStorage.run(worker, handler))
+						)
 					},
 					this.buildRunEachOptions()
 				)
@@ -794,18 +854,26 @@ class FlowAppImpl implements FlowApp {
 		// messages before state is fully restored.
 		try {
 			if (changelogTopicsCreated) {
-				const assigned: Array<{ topic: string; partition: number }> = []
-				const seen = new Set<string>()
-				for (const worker of this.workers) {
-					for (const tp of worker.assignedPartitions.values()) {
-						const key = `${tp.topic}:${tp.partition}`
-						if (seen.has(key)) continue
-						seen.add(key)
-						assigned.push(tp)
+				// Rebalances can assign additional partitions WHILE the initial restore runs (the
+				// handler pauses them but does not enqueue a restore until restorationComplete).
+				// Loop until no unrestored assignment remains so those partitions are restored
+				// before the finally block resumes everything.
+				const restored = new Set<string>()
+				for (;;) {
+					const delta: Array<{ topic: string; partition: number }> = []
+					for (const worker of this.workers) {
+						for (const tp of worker.assignedPartitions.values()) {
+							const key = `${tp.topic}:${tp.partition}`
+							if (restored.has(key)) continue
+							restored.add(key)
+							delta.push(tp)
+						}
 					}
+					if (delta.length === 0) {
+						break
+					}
+					await this.enqueueChangelogRestoration(delta)
 				}
-
-				await this.enqueueChangelogRestoration(assigned)
 			}
 		} catch (err) {
 			this.lastError = err as Error
@@ -813,6 +881,11 @@ class FlowAppImpl implements FlowApp {
 			await this.close().catch(() => {})
 			throw err
 		} finally {
+			// Flip restorationComplete BEFORE resuming, in the same synchronous block as the final
+			// empty-delta check: assignments arriving from here on take the queued-restoration path
+			// in the partitionsAssigned handler (pause -> restore -> resume) instead of relying on
+			// this resume loop.
+			this.restorationComplete = true
 			for (const worker of this.workers) {
 				const partitions = [...worker.assignedPartitions.values()]
 				if (partitions.length > 0) {
@@ -823,7 +896,6 @@ class FlowAppImpl implements FlowApp {
 					}
 				}
 			}
-			this.restorationComplete = true
 		}
 	}
 
@@ -907,6 +979,10 @@ class FlowAppImpl implements FlowApp {
 			? await this.resolvePartition(topic, record.key, record.value, options.partitioner)
 			: undefined
 
+		// Propagate the record's event time so downstream event-time windowing keeps working
+		// (Kafka Streams semantics); without it every output gets broker wall-clock produce time.
+		const timestamp = record.timestamp >= 0n ? new Date(Number(record.timestamp)) : undefined
+
 		if (this.eosEnabled) {
 			if (!worker.activeTransaction) {
 				throw new Error('exactly_once requires a transactional context')
@@ -916,6 +992,7 @@ class FlowAppImpl implements FlowApp {
 				value,
 				headers: record.headers,
 				partition,
+				timestamp,
 			})
 			return
 		}
@@ -925,6 +1002,7 @@ class FlowAppImpl implements FlowApp {
 			value,
 			headers: record.headers,
 			partition,
+			timestamp,
 		})
 	}
 
@@ -1202,8 +1280,11 @@ class FlowAppImpl implements FlowApp {
 					])
 				}
 				// Exists with correct partitions, skip creation
+				spec.numPartitions = actualPartitions
 				continue
 			}
+
+			spec.numPartitions = requiredPartitions
 
 			// Need to create (unless validateOnly)
 			if (!spec.validateOnly) {
@@ -1341,7 +1422,8 @@ class FlowAppImpl implements FlowApp {
 		if (!clientId) {
 			throw new Error('exactly_once requires a clientId to derive transactionalId')
 		}
-		return `${this.config.applicationId}-${clientId}`
+		// See instanceId: unique per instance so identical app/client ids never mutually fence.
+		return `${this.config.applicationId}-${clientId}-${this.instanceId}`
 	}
 
 	private buildGroupInstanceId(workerId: number, threadCount: number): string | undefined {
@@ -1526,11 +1608,16 @@ class FlowAppImpl implements FlowApp {
 			// Wait for the transaction commit to succeed before checkpointing.
 			await txPromise
 
+			// The transaction is durable: apply the per-transaction store overlay to local state
+			// BEFORE advancing checkpoints, so a crash in between is healed by changelog replay.
+			await this.flushStoreTransactionBuffers(worker)
+
 			await this.flushChangelogCheckpoints(worker)
 		} catch (err) {
 			const txWithReject = tx as ActiveTransaction & { _reject?: (err: Error) => void }
 			txWithReject._reject?.(err instanceof Error ? err : new Error(String(err)))
 			await txPromise.catch(() => {})
+			this.discardStoreTransactionBuffers(worker)
 			throw err
 		} finally {
 			// Reset state for next batch
@@ -1545,6 +1632,10 @@ class FlowAppImpl implements FlowApp {
 
 	private async abortTransactionBatch(worker: WorkerContext, error: unknown): Promise<void> {
 		this.cancelCommitTimer(worker)
+
+		// Aborted: drop the per-transaction store overlay so local state stays at its last
+		// committed value (redelivery must not re-aggregate on top of uncommitted mutations).
+		this.discardStoreTransactionBuffers(worker)
 
 		if (!worker.transactionActive || !worker.activeTransaction || !worker.activeTransactionPromise) {
 			worker.pendingOffsets.clear()
@@ -1568,6 +1659,24 @@ class FlowAppImpl implements FlowApp {
 		worker.activeTransactionPromise = null
 		worker.transactionActive = false
 		worker.lastCommitTime = Date.now()
+	}
+
+	/** Apply all stores' per-transaction overlays for this worker (post-commit only). */
+	private async flushStoreTransactionBuffers(worker: WorkerContext): Promise<void> {
+		for (const store of this.stateStores.values()) {
+			if (isTransactionalStateStore(store)) {
+				await store.flushTransactionBuffer(worker)
+			}
+		}
+	}
+
+	/** Drop all stores' per-transaction overlays for this worker (abort path). */
+	private discardStoreTransactionBuffers(worker: WorkerContext): void {
+		for (const store of this.stateStores.values()) {
+			if (isTransactionalStateStore(store)) {
+				store.discardTransactionBuffer(worker)
+			}
+		}
 	}
 
 	private async flushChangelogCheckpoints(worker: WorkerContext): Promise<void> {

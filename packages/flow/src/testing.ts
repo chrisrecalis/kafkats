@@ -129,12 +129,16 @@ export class MockProducer {
 
 	private currentTxMessages: Array<TestRecord<Buffer, Buffer>> = []
 
-	send(topic: string, message: { key?: Buffer | null; value: Buffer | null; partition?: number }): Promise<void> {
+	send(
+		topic: string,
+		message: { key?: Buffer | null; value: Buffer | null; partition?: number; timestamp?: Date }
+	): Promise<void> {
 		const record: TestRecord<Buffer, Buffer> = {
 			topic,
 			key: message.key ?? null,
 			value: message.value,
 			partition: message.partition,
+			timestamp: message.timestamp !== undefined ? BigInt(message.timestamp.getTime()) : undefined,
 		}
 		this.messages.push(record)
 		this.currentTxMessages.push(record)
@@ -145,7 +149,7 @@ export class MockProducer {
 		fn: (tx: {
 			send: (
 				topic: string,
-				message: { key?: Buffer | null; value: Buffer | null; partition?: number }
+				message: { key?: Buffer | null; value: Buffer | null; partition?: number; timestamp?: Date }
 			) => Promise<void>
 			sendOffsets: (params: {
 				groupId?: string
