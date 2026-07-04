@@ -740,7 +740,11 @@ describe('stream-stream joins', () => {
 		await output.start()
 		await app.start()
 
+		// Unmatched left/outer results emit only when stream time closes the join window
+		// (KIP-633 semantics), so a second record must advance stream time past the
+		// warmup record's window before its null-padded result flushes.
 		await producer.send(leftTopic, { key: '__warmup__', value: numberCodec.encode(1), timestamp: new Date(1_000) })
+		await producer.send(leftTopic, { key: '__warmup2__', value: numberCodec.encode(1), timestamp: new Date(5_000) })
 		await output.waitFor(outLeft, m => m.key === '__warmup__', 15_000)
 	})
 
@@ -768,8 +772,10 @@ describe('stream-stream joins', () => {
 		await expect(output.waitFor(outInner, m => m.key === 'k3', 400)).rejects.toThrow('Timed out')
 	})
 
-	it('leftJoin emits with null when no match exists', async () => {
+	it('leftJoin emits with null when no match exists (at window close)', async () => {
 		await producer.send(leftTopic, { key: 'k4', value: numberCodec.encode(9), timestamp: new Date(50_000) })
+		// Advance stream time past k4's window so the null-padded result flushes.
+		await producer.send(leftTopic, { key: 'k4-advance', value: numberCodec.encode(1), timestamp: new Date(52_000) })
 		await output.waitFor(outLeft, m => m.key === 'k4' && m.value === 9)
 	})
 
@@ -779,13 +785,15 @@ describe('stream-stream joins', () => {
 		await output.waitFor(outLeft, m => m.key === 'k5' && m.value === 3)
 	})
 
-	it('outerJoin emits when left record has no match', async () => {
+	it('outerJoin emits when left record has no match (at window close)', async () => {
 		await producer.send(leftTopic, { key: 'k6', value: numberCodec.encode(7), timestamp: new Date(70_000) })
+		await producer.send(leftTopic, { key: 'k6-advance', value: numberCodec.encode(1), timestamp: new Date(72_000) })
 		await output.waitFor(outOuter, m => m.key === 'k6' && m.value === 7)
 	})
 
-	it('outerJoin emits when right record has no match', async () => {
+	it('outerJoin emits when right record has no match (at window close)', async () => {
 		await producer.send(rightTopic, { key: 'k7', value: numberCodec.encode(8), timestamp: new Date(80_000) })
+		await producer.send(leftTopic, { key: 'k7-advance', value: numberCodec.encode(1), timestamp: new Date(82_000) })
 		await output.waitFor(outOuter, m => m.key === 'k7' && m.value === 8)
 	})
 
