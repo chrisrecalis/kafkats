@@ -41,7 +41,8 @@
 		"build": "pnpm clean && tsc -p tsconfig.build.json",
 		"typecheck": "tsc -p tsconfig.json --noEmit",
 		"clean": "rm -rf dist",
-		"prepack": "pnpm -w turbo run build --filter=$npm_package_name"
+		"prepack": "pnpm -w turbo run build --filter=$npm_package_name",
+		"test": "vitest run tests"
 	},
 	"dependencies": {
 		"@kafkats/client": "workspace:^"
@@ -52,6 +53,7 @@
 	"devDependencies": {
 		"@types/node": "^24.10.1",
 		"typescript": "^5.9.3",
-		"zod": "^4.1.11"
+		"zod": "^4.1.11",
+		"vitest": "^4.0.12"
 	}
 }
