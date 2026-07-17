@@ -38,6 +38,28 @@ import { sleep } from '@/utils/sleep.js'
 const DEFAULT_REQUEST_TIMEOUT_MS = 30000
 
 /**
+ * Map a coordinator lookup/request failure to an error code for per-group results
+ */
+function errorCodeFor(error: unknown): ErrorCode {
+	return isKafkaError(error) ? error.errorCode : ErrorCode.UnknownServerError
+}
+
+/**
+ * Build a ConsumerGroupDescription entry for a group whose coordinator step failed,
+ * so the failure is surfaced in results instead of the group being silently omitted
+ */
+function failedGroupDescription(groupId: string, error: unknown): ConsumerGroupDescription {
+	return {
+		groupId,
+		state: '',
+		protocolType: '',
+		protocol: '',
+		members: [],
+		errorCode: errorCodeFor(error),
+	}
+}
+
+/**
  * Parse consumer protocol assignment from binary format
  */
 function parseConsumerAssignment(buffer: Buffer): TopicPartition[] {
@@ -438,6 +460,8 @@ export class Admin {
 	async describeGroups(groupIds: string[]): Promise<ConsumerGroupDescription[]> {
 		this.logger.debug('describing groups', { groupIds })
 
+		const descriptions: ConsumerGroupDescription[] = []
+
 		// Group requests by coordinator
 		const groupsByCoordinator = new Map<number, string[]>()
 
@@ -454,10 +478,9 @@ export class Admin {
 					groupId,
 					error: (error as Error).message,
 				})
+				descriptions.push(failedGroupDescription(groupId, error))
 			}
 		}
-
-		const descriptions: ConsumerGroupDescription[] = []
 
 		// Send requests to each coordinator
 		for (const [nodeId, groups] of groupsByCoordinator) {
@@ -496,6 +519,9 @@ export class Admin {
 					groups,
 					error: (error as Error).message,
 				})
+				for (const groupId of groups) {
+					descriptions.push(failedGroupDescription(groupId, error))
+				}
 			}
 		}
 
@@ -515,6 +541,8 @@ export class Admin {
 	async deleteGroups(groupIds: string[]): Promise<DeleteGroupsResult[]> {
 		this.logger.debug('deleting groups', { groupIds })
 
+		const results: DeleteGroupsResult[] = []
+
 		// Group requests by coordinator
 		const groupsByCoordinator = new Map<number, string[]>()
 
@@ -531,10 +559,9 @@ export class Admin {
 					groupId,
 					error: (error as Error).message,
 				})
+				results.push({ groupId, errorCode: errorCodeFor(error) })
 			}
 		}
-
-		const results: DeleteGroupsResult[] = []
 
 		// Send requests to each coordinator
 		for (const [nodeId, groups] of groupsByCoordinator) {
@@ -562,6 +589,9 @@ export class Admin {
 					groups,
 					error: (error as Error).message,
 				})
+				for (const groupId of groups) {
+					results.push({ groupId, errorCode: errorCodeFor(error) })
+				}
 			}
 		}
 

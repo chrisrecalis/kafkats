@@ -129,7 +129,7 @@ export const FLEXIBLE_VERSION_MIN: Partial<Record<ApiKey, number>> = {
 	[ApiKey.IncrementalAlterConfigs]: 1,
 	[ApiKey.AlterPartitionReassignments]: 0,
 	[ApiKey.ListPartitionReassignments]: 0,
-	[ApiKey.OffsetDelete]: 0,
+	// OffsetDelete is intentionally absent: OffsetDeleteRequest.json has flexibleVersions "none"
 	[ApiKey.DescribeClientQuotas]: 1,
 	[ApiKey.AlterClientQuotas]: 1,
 	[ApiKey.DescribeUserScramCredentials]: 0,

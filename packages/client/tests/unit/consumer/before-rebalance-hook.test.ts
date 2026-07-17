@@ -29,11 +29,11 @@ function buildProvider() {
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		consumerGroup: consumerGroup as any,
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		cluster: { getLogger: () => null } as any,
+		cluster: { getLogger: () => null, getCoordinator: vi.fn().mockResolvedValue({}) } as any,
 		groupId: 'g',
 		autoOffsetReset: 'latest',
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		offsetManager: {} as any,
+		offsetManager: { updateGroupState: vi.fn() } as any,
 		logger: noopLogger,
 		isRunning: () => true,
 	})
@@ -79,7 +79,7 @@ describe('GroupPartitionProvider.checkAndHandleRebalance awaits onRebalance', ()
 		expect(consumerGroup.rejoin).toHaveBeenCalledTimes(1)
 	})
 
-	it('stops the consumer group and surfaces the error when onRebalance throws', async () => {
+	it('stops the consumer group and rethrows the error when onRebalance throws', async () => {
 		const { provider, consumerGroup } = buildProvider()
 
 		const failure = new Error('eos commit failed')
@@ -96,10 +96,11 @@ describe('GroupPartitionProvider.checkAndHandleRebalance awaits onRebalance', ()
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		;(provider as any).rebalancePending = true
 
-		await provider.checkAndHandleRebalance()
+		// The failure is fatal: it must reject so the poll loop driving
+		// checkAndHandleRebalance exits instead of fetching after LeaveGroup.
+		await expect(provider.checkAndHandleRebalance()).rejects.toBe(failure)
 
 		expect(consumerGroup.rejoin).not.toHaveBeenCalled()
 		expect(consumerGroup.stop).toHaveBeenCalledTimes(1)
-		expect(callbacks.onError).toHaveBeenCalledWith(failure)
 	})
 })

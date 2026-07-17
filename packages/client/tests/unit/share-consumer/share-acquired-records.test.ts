@@ -27,6 +27,16 @@ function decoded(offsets: number[]) {
 	}))
 }
 
+// decodeRecords result for a fully decoded (non-truncated) buffer whose batches cover up to
+// `maxDecodedOffset` (defaults to the highest decoded record offset).
+function decodedResult(offsets: number[], maxDecodedOffset?: bigint) {
+	return {
+		records: decoded(offsets),
+		maxDecodedOffset: maxDecodedOffset ?? (offsets.length > 0 ? BigInt(Math.max(...offsets)) : null),
+		truncated: false,
+	}
+}
+
 function response(acquiredRecords: Array<{ firstOffset: bigint; lastOffset: bigint; deliveryCount: number }>) {
 	return {
 		errorCode: ErrorCode.None,
@@ -55,7 +65,7 @@ describe('ShareConsumer acquiredRecords filtering', () => {
 		const consumer = makeConsumer()
 		// The batch physically spans offsets 0..4, but the broker only acquired (locked) 2..3 for us
 		// (e.g. 0..1 were already acked and held the share-partition start offset back).
-		consumer.decodeRecords = vi.fn().mockResolvedValue(decoded([0, 1, 2, 3, 4]))
+		consumer.decodeRecords = vi.fn().mockResolvedValue(decodedResult([0, 1, 2, 3, 4]))
 
 		const items = await consumer.collectShareFetchWorkItems(
 			{ nodeId: 1 },
@@ -73,7 +83,7 @@ describe('ShareConsumer acquiredRecords filtering', () => {
 
 	it('delivers nothing when acquiredRecords is empty even though the batch has records', async () => {
 		const consumer = makeConsumer()
-		consumer.decodeRecords = vi.fn().mockResolvedValue(decoded([0, 1]))
+		consumer.decodeRecords = vi.fn().mockResolvedValue(decodedResult([0, 1]))
 
 		const items = await consumer.collectShareFetchWorkItems(
 			{ nodeId: 1 },
@@ -88,7 +98,7 @@ describe('ShareConsumer acquiredRecords filtering', () => {
 	it('gap-acks acquired offsets that have no delivered record (compaction hole / control offset)', async () => {
 		const consumer = makeConsumer()
 		// Acquired offsets 0..3, but only 0 and 2 decoded as records (1 and 3 are holes/control).
-		consumer.decodeRecords = vi.fn().mockResolvedValue(decoded([0, 2]))
+		consumer.decodeRecords = vi.fn().mockResolvedValue(decodedResult([0, 2], 3n))
 		const ackManager = ackMgr()
 
 		const items = await consumer.collectShareFetchWorkItems(
@@ -111,7 +121,7 @@ describe('ShareConsumer acquiredRecords filtering', () => {
 
 	it('swallows a failing gap-ack (no throw, no unhandled rejection)', async () => {
 		const consumer = makeConsumer()
-		consumer.decodeRecords = vi.fn().mockResolvedValue(decoded([0]))
+		consumer.decodeRecords = vi.fn().mockResolvedValue(decodedResult([0], 1n))
 		// Gap-ack for offset 1 fails (e.g. lock expired); it must not escape as an unhandled rejection.
 		const ackManager = { enqueue: vi.fn().mockRejectedValue(new Error('gap ack flush failed')) }
 		const unhandled = vi.fn()
@@ -134,7 +144,7 @@ describe('ShareConsumer acquiredRecords filtering', () => {
 
 	it('gap-acks a control-only response (no decoded records) so the SPSO still advances', async () => {
 		const consumer = makeConsumer()
-		consumer.decodeRecords = vi.fn().mockResolvedValue([])
+		consumer.decodeRecords = vi.fn().mockResolvedValue(decodedResult([], 11n))
 		const ackManager = ackMgr()
 
 		const items = await consumer.collectShareFetchWorkItems(

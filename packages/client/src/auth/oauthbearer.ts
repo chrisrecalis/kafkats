@@ -7,6 +7,7 @@
 
 import type { OAuthBearerProviderContext, OAuthBearerToken } from '@/network/types.js'
 import type { SaslMechanism } from './sasl-mechanism.js'
+import { SaslAuthenticationError } from '@/client/errors.js'
 
 export interface OAuthBearerMechanismConfig {
 	provider: (context: OAuthBearerProviderContext) => OAuthBearerToken | Promise<OAuthBearerToken>
@@ -60,8 +61,18 @@ export class OAuthBearerMechanism implements SaslMechanism {
 		const token = await this.provider(this.context)
 		const authBytes = buildClientFirstMessage(token)
 
-		// Yield the initial client response, then complete after one round trip.
-		// Successful auth typically returns empty authBytes.
-		yield authBytes
+		// Yield the initial client response. On success the broker replies with an
+		// empty server-final message and the exchange is complete.
+		const serverResponse = yield authBytes
+
+		// Per KIP-255/RFC 7628 §3.2.2 a rejected token is NOT reported via the SASL
+		// error code on this round: the broker sends its JSON error document as a
+		// challenge (errorCode=NONE). The client must answer with a single %x01 byte,
+		// after which the broker fails the exchange. Treating the non-empty challenge
+		// as success would report an unauthenticated connection as authenticated.
+		if (serverResponse && serverResponse.length > 0) {
+			yield Buffer.from([0x01])
+			throw new SaslAuthenticationError(this.name, serverResponse.toString('utf8'))
+		}
 	}
 }

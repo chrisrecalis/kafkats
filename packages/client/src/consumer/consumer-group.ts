@@ -124,7 +124,10 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 	): Array<{ name: string; metadata: Buffer }> {
 		const strategy = this.config.partitionAssignmentStrategy
 
-		// Build metadata for cooperative (v1 with ownedPartitions)
+		// Build metadata with ownedPartitions (v1). Used for the sticky assignors —
+		// cooperative-sticky AND (eager) sticky both read ownership from
+		// member.metadata.ownedPartitions, so encoding v0 for 'sticky' would silently
+		// disable stickiness. v1 is backward compatible: v0 decoders ignore the suffix.
 		const v1Metadata = encodeSubscriptionMetadata({
 			version: 1,
 			topics,
@@ -132,7 +135,7 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 			ownedPartitions,
 		})
 
-		// Build metadata for eager (v0 without ownedPartitions)
+		// Build metadata without ownedPartitions (v0) for assignors that don't need it
 		const v0Metadata = encodeSubscriptionMetadata({
 			version: 0,
 			topics,
@@ -145,14 +148,14 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 				// Broker picks the first mutually-supported protocol
 				return [
 					{ name: 'cooperative-sticky', metadata: v1Metadata },
-					{ name: 'sticky', metadata: v0Metadata },
+					{ name: 'sticky', metadata: v1Metadata },
 					{ name: 'range', metadata: v0Metadata },
 				]
 
 			case 'sticky':
 				// Propose sticky → range (no cooperative)
 				return [
-					{ name: 'sticky', metadata: v0Metadata },
+					{ name: 'sticky', metadata: v1Metadata },
 					{ name: 'range', metadata: v0Metadata },
 				]
 

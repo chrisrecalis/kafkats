@@ -43,7 +43,12 @@ export function createMockBroker(nodeId: number): MockBroker {
 export function buildProduceResponse(
 	topics: Array<{
 		name: string
-		partitions: Array<{ partitionIndex: number; errorCode: ErrorCode; baseOffset?: bigint }>
+		partitions: Array<{
+			partitionIndex: number
+			errorCode: ErrorCode
+			baseOffset?: bigint
+			logAppendTimeMs?: bigint
+		}>
 	}>
 ): ProduceResponse {
 	return {
@@ -53,7 +58,7 @@ export function buildProduceResponse(
 				partitionIndex: p.partitionIndex,
 				errorCode: p.errorCode,
 				baseOffset: p.baseOffset ?? 0n,
-				logAppendTimeMs: BigInt(Date.now()),
+				logAppendTimeMs: p.logAppendTimeMs ?? BigInt(Date.now()),
 				logStartOffset: 0n,
 				recordErrors: [],
 				errorMessage: null,

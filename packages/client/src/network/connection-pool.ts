@@ -55,6 +55,8 @@ export class ConnectionPool {
 
 	private idleCleanupInterval: NodeJS.Timeout | null = null
 	private closed = false
+	/** Connections being created, counted against maxConnections to prevent overshoot */
+	private pendingCreations = 0
 
 	constructor(
 		private readonly address: BrokerAddress,
@@ -106,7 +108,11 @@ export class ConnectionPool {
 			return available.connection
 		}
 
-		if (this.connections.length < this.maxConnections) {
+		// Reserve the slot synchronously (pendingCreations) BEFORE awaiting creation —
+		// otherwise N concurrent acquirers all pass this check while no connection
+		// exists yet and the pool overshoots maxConnections.
+		if (this.connections.length + this.pendingCreations < this.maxConnections) {
+			this.pendingCreations++
 			try {
 				// Pass forImmediateUse so the new entry is marked inUse atomically with
 				// the push — otherwise a second acquirer could enter the find() at the
@@ -120,6 +126,8 @@ export class ConnectionPool {
 				newConn.inUse = false
 			} catch {
 				// Fall through to wait queue
+			} finally {
+				this.pendingCreations--
 			}
 		}
 
@@ -249,6 +257,15 @@ export class ConnectionPool {
 		})
 
 		await connection.connect()
+
+		// The connection may have dropped between connect() resolving and this point
+		// (its 'disconnect' fired before the entry was registered, so handleDisconnection
+		// found nothing to remove). Registering it would leave a dead entry in the pool.
+		if (!connection.isConnected) {
+			throw new NetworkError(
+				`Connection to ${this.address.host}:${this.address.port} dropped before pool registration`
+			)
+		}
 
 		const pooled: PooledConnection = {
 			connection,

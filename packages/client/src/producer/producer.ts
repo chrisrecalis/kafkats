@@ -188,6 +188,9 @@ export class Producer extends EventEmitter<ProducerEvents> {
 
 	// Transaction state (only used when transactionalId is set)
 	private transactionState: TransactionState = 'idle'
+	// First definitive failure of a transactional send in the current transaction.
+	// While set, commitTransaction() must abort instead of committing partial data.
+	private transactionAbortCause: Error | null = null
 	private partitionsInTransaction = new Set<string>() // "topic:partition"
 	private offsetsToCommit = new Map<string, { offsets: TopicPartitionOffset[]; groupMetadata?: GroupMetadata }>() // groupId -> { offsets, groupMetadata }
 
@@ -321,6 +324,9 @@ export class Producer extends EventEmitter<ProducerEvents> {
 					// already queued for this partition, or per-partition order would break
 					// (the later batch would get a lower sequence than the remainder).
 					this.pendingBatches.unshift(remainingBatch)
+					// The remainder never went through flushBatch(), but its send will call
+					// batchCompleted() — account for it or the pending counter goes negative.
+					this.accumulator.batchEnqueued()
 					this.scheduleDrain()
 					recordCount = reservation.reservedCount
 				}
@@ -540,12 +546,18 @@ export class Producer extends EventEmitter<ProducerEvents> {
 
 				if (!partitionResponse) {
 					// Broker responded but omitted this partition: the outcome is ambiguous
-					// (the request was transmitted), so fence + reinit like a connection failure.
-					const ambiguousError = new Error(
-						`Ambiguous produce outcome (no broker response for ${batch.topic}-${batch.partition}) — fencing producer`
-					)
-					this.fenceAndReinit(ambiguousError, allPendingBatches)
-					return { retryBatches: [], stop: true }
+					// (the request was transmitted). Only an idempotent producer has sequence
+					// state to protect — fence + reinit like a connection failure. Otherwise
+					// treat it as retriable and let the retry budget decide.
+					if (this.config.idempotent) {
+						const ambiguousError = new Error(
+							`Ambiguous produce outcome (no broker response for ${batch.topic}-${batch.partition}) — fencing producer`
+						)
+						this.fenceAndReinit(ambiguousError, allPendingBatches)
+						return { retryBatches: [], stop: true }
+					}
+					retryBatches.push(prepared)
+					continue
 				}
 
 				if (partitionResponse.errorCode !== ErrorCode.None) {
@@ -637,6 +649,9 @@ export class Producer extends EventEmitter<ProducerEvents> {
 			for (const msg of batch.messages) {
 				msg.reject(error)
 			}
+			// Every queued batch holds a pendingBatches count (flushBatch or batchEnqueued)
+			// and will never reach batchCompleted() — settle the accounting here.
+			this.accumulator.batchCompleted()
 		}
 		this.pendingBatches = []
 	}
@@ -701,14 +716,17 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	): void {
 		const { batch, recordCount, batchId, messagesToSend } = prepared
 		const baseOffset = partitionResponse.baseOffset
-		const timestamp = new Date(Number(partitionResponse.logAppendTimeMs))
+		// logAppendTimeMs is -1 for CreateTime topics — fall back to the timestamp
+		// encoded into each record (Java parity).
+		const logAppendTimeMs = partitionResponse.logAppendTimeMs
 
 		for (let i = 0; i < messagesToSend.length; i++) {
-			messagesToSend[i]!.resolve({
+			const message = messagesToSend[i]!
+			message.resolve({
 				topic: batch.topic,
 				partition: batch.partition,
 				offset: baseOffset + BigInt(i),
-				timestamp,
+				timestamp: new Date(Number(logAppendTimeMs === -1n ? message.timestamp : logAppendTimeMs)),
 			})
 		}
 
@@ -1109,8 +1127,10 @@ export class Producer extends EventEmitter<ProducerEvents> {
 			return
 		}
 
-		// Throw if transaction is active - caller must await transaction() first
-		if (this.config.transactionalId && this.transactionState !== 'idle') {
+		// Throw if transaction is active - caller must await transaction() first.
+		// A fatally-errored producer (failed abort) has no active transaction to
+		// wait for and must still be closeable.
+		if (this.config.transactionalId && this.transactionState !== 'idle' && this.transactionState !== 'error') {
 			throw new Error(
 				`Cannot disconnect while transaction is in state '${this.transactionState}'. ` +
 					`Await producer.transaction() before calling disconnect().`
@@ -1174,6 +1194,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		await this.ensureInitialized()
 
 		this.transactionState = 'in_transaction'
+		this.transactionAbortCause = null
 		this.partitionsInTransaction.clear()
 		this.offsetsToCommit.clear()
 
@@ -1202,7 +1223,10 @@ export class Producer extends EventEmitter<ProducerEvents> {
 							} satisfies TopicDefinition<Buffer, Buffer>)
 						: topic
 
-				return this.trackSend(this.transactionalSend(topicDef, messages))
+				const promise = this.trackSend(this.transactionalSend(topicDef, messages))
+				// Even a fire-and-forget failure must poison the transaction so commit aborts.
+				promise.catch(error => this.recordTransactionalSendFailure(error))
+				return promise
 			},
 
 			sendOffsets: async (params: SendOffsetsParams): Promise<void> => {
@@ -1414,6 +1438,19 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	}
 
 	/**
+	 * Remember the first definitive failure of a transactional send so that
+	 * commitTransaction() aborts instead of committing a partial transaction
+	 * (Java abortable-error parity). Rejections that arrive once the abort is
+	 * already underway are expected and not recorded.
+	 */
+	private recordTransactionalSendFailure(error: unknown): void {
+		if (this.transactionState !== 'in_transaction' && this.transactionState !== 'committing') {
+			return
+		}
+		this.transactionAbortCause ??= error instanceof Error ? error : new Error(String(error))
+	}
+
+	/**
 	 * Commit the current transaction
 	 */
 	private async commitTransaction(): Promise<void> {
@@ -1427,9 +1464,23 @@ export class Producer extends EventEmitter<ProducerEvents> {
 			// Flush any pending messages to ensure all are sent
 			await this.flush()
 
+			// A transactional send failed definitively — committing now would expose a
+			// partial transaction. Surface the failure so transaction() aborts instead.
+			if (this.transactionAbortCause) {
+				throw this.transactionAbortCause
+			}
+
 			// Commit offsets for each consumer group
 			for (const [groupId, { offsets, groupMetadata }] of this.offsetsToCommit) {
 				await this.commitTransactionOffsets(groupId, offsets, groupMetadata)
+			}
+
+			// Nothing was produced and no offsets were prepared: the transaction never
+			// started broker-side, and classic coordinators reject EndTxn for it with
+			// INVALID_TXN_STATE — just reset local state.
+			if (this.partitionsInTransaction.size === 0 && this.offsetsToCommit.size === 0) {
+				this.transactionState = 'idle'
+				return
 			}
 
 			// End transaction with commit (with retry for transient errors)
@@ -1487,31 +1538,68 @@ export class Producer extends EventEmitter<ProducerEvents> {
 
 		this.transactionState = 'aborting'
 
+		const abortError = new TransactionAbortedError(this.config.transactionalId!)
+		this.accumulator.clearWithRejection(abortError)
+
+		// Drain in-flight sends before EndTxn(abort): a transactional ProduceRequest must
+		// not race the abort marker. Failures are expected — the sends are being aborted.
+		await Promise.allSettled(this.activeSends)
+
 		try {
-			const abortError = new TransactionAbortedError(this.config.transactionalId!)
-			this.accumulator.clearWithRejection(abortError)
-
-			const coordinator = await this.cluster.getCoordinator('TRANSACTION', this.config.transactionalId!)
-			const response = await coordinator.endTxn({
-				transactionalId: this.config.transactionalId!,
-				producerId: this.producerId,
-				producerEpoch: this.producerEpoch,
-				committed: false,
-			})
-
-			if (response.errorCode !== ErrorCode.None) {
-				const error = new KafkaProtocolError(response.errorCode, 'EndTxn abort failed')
-				this.logger.error('EndTxn abort failed', { errorCode: response.errorCode })
-				// Emit error so operators can monitor abort failures
-				this.emitError(error)
-				// Don't throw - abort should succeed even if RPC fails
+			// Nothing was added to the transaction: it never started broker-side, and
+			// classic coordinators reject EndTxn for it with INVALID_TXN_STATE — just
+			// reset local state.
+			if (this.partitionsInTransaction.size === 0 && this.offsetsToCommit.size === 0) {
+				this.transactionState = 'idle'
+				return
 			}
 
+			// End transaction with abort (with retry for transient errors)
+			let coordinator = await this.cluster.getCoordinator('TRANSACTION', this.config.transactionalId!)
+
+			await retry(
+				async () => {
+					const response = await coordinator.endTxn({
+						transactionalId: this.config.transactionalId!,
+						producerId: this.producerId,
+						producerEpoch: this.producerEpoch,
+						committed: false,
+					})
+
+					if (response.errorCode === ErrorCode.None) {
+						return
+					}
+
+					// Handle coordinator move - invalidate cache and re-fetch
+					if (isCoordinatorErrorCode(response.errorCode)) {
+						this.cluster.invalidateCoordinator('TRANSACTION', this.config.transactionalId!)
+						coordinator = await this.cluster.getCoordinator('TRANSACTION', this.config.transactionalId!)
+					}
+
+					throw new KafkaProtocolError(response.errorCode, 'EndTxn abort failed')
+				},
+				{
+					...createRetryStrategyOptions(this.config),
+					shouldRetry: error => error instanceof KafkaProtocolError && error.retriable,
+				}
+			)
+
+			this.transactionState = 'idle'
 			this.logger.info('transaction aborted', {
 				transactionalId: this.config.transactionalId,
 			})
+		} catch (error) {
+			// The abort marker was never written: resetting to idle would let the open
+			// transaction silently merge into the next one. Enter a fatal state instead
+			// (Java FATAL_ERROR parity) so the next transaction() refuses to start.
+			this.transactionState = 'error'
+			const failure = error instanceof Error ? error : new Error(String(error))
+			this.logger.error('EndTxn abort failed — producer entering fatal transaction state', {
+				error: failure.message,
+			})
+			// Emit error so operators can monitor abort failures
+			this.emitError(failure)
 		} finally {
-			this.transactionState = 'idle'
 			this.partitionsInTransaction.clear()
 			this.offsetsToCommit.clear()
 		}

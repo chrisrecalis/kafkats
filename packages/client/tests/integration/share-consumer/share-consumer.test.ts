@@ -185,7 +185,7 @@ describe('ShareConsumer (integration) - Apache Kafka 4.1 share groups', () => {
 		const run1 = c1.runEach(
 			testTopic,
 			async message => {
-				consumed1.push(message.value)
+				consumed1.push(message.value!)
 				await message.ack()
 				stopBothIfDone()
 			},
@@ -195,7 +195,7 @@ describe('ShareConsumer (integration) - Apache Kafka 4.1 share groups', () => {
 		const run2 = c2.runEach(
 			testTopic,
 			async message => {
-				consumed2.push(message.value)
+				consumed2.push(message.value!)
 				await message.ack()
 				stopBothIfDone()
 			},
@@ -227,6 +227,63 @@ describe('ShareConsumer (integration) - Apache Kafka 4.1 share groups', () => {
 		expect(all).toHaveLength(10)
 		expect(new Set(all).size).toBe(10)
 
+		await client.disconnect()
+	})
+
+	it('delivers a pre-existing backlog promptly (warm-up prefetch must not abandon acquired records)', async () => {
+		const client = new KafkaClient({
+			clientId: `it-share-${randomUUID()}`,
+			brokers: [runtime.brokers],
+			logLevel: 'error',
+		})
+		await client.connect()
+
+		const topicName = `it-share-topic-${randomUUID()}`
+		await createTopicWithAdmin(client, topicName)
+
+		const testTopic = topic<string, string>(topicName, { value: string() })
+		const groupId = `it-share-group-${randomUUID()}`
+
+		// Session 1: initialize the share-partition start offset for the group (at the current log
+		// end), then leave. No records exist yet.
+		const warmup = client.shareConsumer({ groupId })
+		const warmupAssigned = once(warmup, 'partitionsAssigned')
+		const warmupRun = warmup.runEach(testTopic, async () => {}, { concurrency: 1 })
+		await warmupAssigned
+		await warmup.stop()
+		await warmupRun
+
+		// Produce a backlog BEFORE the next member joins.
+		const producer = client.producer({ lingerMs: 0 })
+		for (let i = 0; i < 5; i++) {
+			await producer.send(testTopic, { value: `backlog-${i}` })
+		}
+		await producer.flush()
+		await producer.disconnect()
+
+		// Session 2: the warm-up prefetch on the first assignment acquires the backlog. If those
+		// records were abandoned instead of released, the first delivery would wait out the broker's
+		// acquisition-lock timeout (30s by default); they must arrive well under that.
+		const share = client.shareConsumer({ groupId })
+		const consumed: string[] = []
+		const run = share.runEach(
+			testTopic,
+			async message => {
+				consumed.push(message.value!)
+				await message.ack()
+			},
+			{ concurrency: 1 }
+		)
+
+		await vi.waitFor(
+			() => {
+				expect(new Set(consumed).size).toBe(5)
+			},
+			{ timeout: 15_000, interval: 25 }
+		)
+
+		share.stop()
+		await run
 		await client.disconnect()
 	})
 

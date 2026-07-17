@@ -371,6 +371,12 @@ export interface TopicPartitionOffset extends TopicPartition {
  */
 export interface PartitionBatch extends TopicPartition {
 	records: DecodedRecord[]
+	/**
+	 * FetchManager assignment epoch captured when the batch was buffered. Used to detect
+	 * stale batches drained before a rebalance removed (and possibly re-added) the
+	 * partition — such batches must not be delivered. See FetchManager.isBatchAssigned.
+	 */
+	assignmentEpoch?: number
 }
 
 export interface ManualAssignment extends TopicPartition {

@@ -325,7 +325,7 @@ describe('Connection', () => {
 			setTimeoutSpy.mockRestore()
 		})
 
-		it('refreshes OAUTHBEARER session before expiry', async () => {
+		it('refreshes OAUTHBEARER session before expiry (SaslHandshake first, per KIP-368)', async () => {
 			const oauthBearerProvider = vi.fn().mockResolvedValue({ value: 'token-1' })
 
 			const connection = new Connection({
@@ -362,26 +362,165 @@ describe('Connection', () => {
 
 			await vi.advanceTimersByTimeAsync(5)
 
-			const request = mockSocket.writtenData[mockSocket.writtenData.length - 1]!
-			expect(request.readInt16BE(4)).toBe(ApiKey.SaslAuthenticate)
+			const reauthPromise = (connection as unknown as { saslReauthPromise: Promise<void> | null })
+				.saslReauthPromise
+			expect(reauthPromise).not.toBeNull()
 
-			const correlationId = mockSocket.getLastCorrelationId()!
+			// KIP-368: the broker only enters re-authentication mode after receiving a
+			// SaslHandshake request on the already-authenticated channel. A SaslAuthenticate
+			// sent directly is answered with ILLEGAL_SASL_STATE and the connection dies.
+			const handshakeFrame = mockSocket.writtenData[mockSocket.writtenData.length - 1]!
+			expect(handshakeFrame.readInt16BE(4)).toBe(ApiKey.SaslHandshake)
 
+			const handshakeCorrelationId = mockSocket.getLastCorrelationId()!
+			const handshakeEncoder = new Encoder()
+			handshakeEncoder.writeInt16(ErrorCode.None)
+			handshakeEncoder.writeArray(['OAUTHBEARER'], (mechanism, e) => e.writeString(mechanism))
+			mockSocket.simulateResponse(handshakeCorrelationId, handshakeEncoder.toBuffer())
+
+			await vi.advanceTimersByTimeAsync(1)
+
+			// Then the SaslAuthenticate exchange follows, mirroring the initial flow.
+			const authFrame = mockSocket.writtenData[mockSocket.writtenData.length - 1]!
+			expect(authFrame.readInt16BE(4)).toBe(ApiKey.SaslAuthenticate)
+
+			const authCorrelationId = mockSocket.getLastCorrelationId()!
 			const encoder = new Encoder()
 			encoder.writeInt16(ErrorCode.None)
 			encoder.writeNullableString(null)
 			encoder.writeBytes(Buffer.alloc(0))
 			encoder.writeInt64(0n) // no further reauth scheduling
 
-			const reauthPromise = (connection as unknown as { saslReauthPromise: Promise<void> | null })
-				.saslReauthPromise
-			expect(reauthPromise).not.toBeNull()
-
-			mockSocket.simulateResponse(correlationId, encoder.toBuffer())
+			mockSocket.simulateResponse(authCorrelationId, encoder.toBuffer())
 
 			await reauthPromise
 
 			expect(oauthBearerProvider).toHaveBeenCalledTimes(1)
+		})
+
+		it('drains already-queued requests before reauth and does not interleave them with the exchange', async () => {
+			const oauthBearerProvider = vi.fn().mockResolvedValue({ value: 'token-1' })
+
+			const connection = new Connection({
+				host: 'localhost',
+				port: 9092,
+				clientId: 'test-client',
+				maxInFlightRequests: 1,
+				sasl: {
+					mechanism: 'OAUTHBEARER',
+					oauthBearerProvider,
+					reauthenticationThresholdMs: 0,
+				},
+			})
+
+			const internalSocket = mockSocket as unknown as net.Socket
+			;(connection as unknown as { _state: string })._state = 'connected'
+			;(connection as unknown as { socket: net.Socket }).socket = internalSocket
+
+			const requestQueue = (
+				connection as unknown as { requestQueue: { setSendFunction: (fn: (data: Buffer) => void) => void } }
+			).requestQueue
+			requestQueue.setSendFunction((data: Buffer) => {
+				mockSocket.write(data)
+			})
+
+			const handleData = (connection as unknown as { handleData: (data: Buffer) => void }).handleData.bind(
+				connection
+			)
+			mockSocket.on('data', handleData)
+
+			// A goes in-flight; B is queued behind maxInFlight=1 BEFORE reauth starts.
+			const promiseA = connection.send(ApiKey.Metadata, 0, e => e.writeInt32(0))
+			const corrA = mockSocket.getLastCorrelationId()!
+			const promiseB = connection.send(ApiKey.Metadata, 0, e => e.writeInt32(1))
+			expect(connection.queuedRequests).toBe(1)
+
+			// Trigger reauthentication while B is still queued.
+			;(
+				connection as unknown as { scheduleSaslReauthentication: (ms: bigint) => void }
+			).scheduleSaslReauthentication(1n)
+			await vi.advanceTimersByTimeAsync(1)
+
+			// Complete A: B gets dispatched; reauth must wait for the queue to drain.
+			mockSocket.simulateResponse(corrA, Buffer.from([0, 0, 0, 0]))
+			await vi.advanceTimersByTimeAsync(20)
+			await expect(promiseA).resolves.toBeInstanceOf(Buffer)
+
+			// Complete B: only now may the SaslHandshake go out.
+			const corrB = mockSocket.getLastCorrelationId()!
+			mockSocket.simulateResponse(corrB, Buffer.from([0, 0, 0, 0]))
+			await vi.advanceTimersByTimeAsync(20)
+			await expect(promiseB).resolves.toBeInstanceOf(Buffer)
+
+			const handshakeCorrelationId = mockSocket.getLastCorrelationId()!
+			const handshakeEncoder = new Encoder()
+			handshakeEncoder.writeInt16(ErrorCode.None)
+			handshakeEncoder.writeArray(['OAUTHBEARER'], (mechanism, e) => e.writeString(mechanism))
+			mockSocket.simulateResponse(handshakeCorrelationId, handshakeEncoder.toBuffer())
+			await vi.advanceTimersByTimeAsync(1)
+
+			const authCorrelationId = mockSocket.getLastCorrelationId()!
+			const authEncoder = new Encoder()
+			authEncoder.writeInt16(ErrorCode.None)
+			authEncoder.writeNullableString(null)
+			authEncoder.writeBytes(Buffer.alloc(0))
+			authEncoder.writeInt64(0n)
+			mockSocket.simulateResponse(authCorrelationId, authEncoder.toBuffer())
+
+			await (connection as unknown as { saslReauthPromise: Promise<void> | null }).saslReauthPromise
+
+			// Full wire order: A, B (drained), then handshake + authenticate with
+			// no normal request interleaved inside the reauth exchange.
+			const apiKeys = mockSocket.writtenData.map(frame => frame.readInt16BE(4))
+			expect(apiKeys).toEqual([ApiKey.Metadata, ApiKey.Metadata, ApiKey.SaslHandshake, ApiKey.SaslAuthenticate])
+		})
+	})
+
+	describe('connect/close race', () => {
+		it('does not resurrect a connection closed during an in-flight connect', async () => {
+			const connection = new Connection({
+				host: 'localhost',
+				port: 9092,
+				clientId: 'test-client',
+			})
+
+			let resolveSocket: (socket: net.Socket) => void
+			const socketPromise = new Promise<net.Socket>(resolve => {
+				resolveSocket = resolve
+			})
+			;(
+				connection as unknown as { socketFactory: { connect: () => Promise<net.Socket> } }
+			).socketFactory.connect = () => socketPromise
+
+			const connectPromise = connection.connect()
+			expect(connection.state).toBe('connecting')
+
+			// close() lands while the socket factory is still dialing.
+			await connection.close(false)
+			expect(connection.state).toBe('closed')
+
+			// The dial finally completes — the fresh socket must be destroyed, not adopted.
+			resolveSocket!(mockSocket as unknown as net.Socket)
+
+			await expect(connectPromise).rejects.toBeInstanceOf(ConnectionClosedError)
+			expect(connection.state).toBe('closed')
+			expect(connection.isConnected).toBe(false)
+			expect(mockSocket.destroyed).toBe(true)
+		})
+
+		it('connect() refuses while the connection is closing', async () => {
+			const connection = new Connection({
+				host: 'localhost',
+				port: 9092,
+				clientId: 'test-client',
+			})
+			;(
+				connection as unknown as { socketFactory: { connect: () => Promise<net.Socket> } }
+			).socketFactory.connect = async () => mockSocket as unknown as net.Socket
+			;(connection as unknown as { _state: string })._state = 'closing'
+
+			await expect(connection.connect()).rejects.toBeInstanceOf(ConnectionClosedError)
+			expect(connection.state).toBe('closing')
 		})
 	})
 

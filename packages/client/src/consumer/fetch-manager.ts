@@ -25,6 +25,23 @@ import { noopLogger, type Logger } from '@/logger.js'
 import { tpKey, formatPartitions } from '@/utils/topic-partition.js'
 import { sleep } from '@/utils/sleep.js'
 
+/**
+ * True when the bytes at the decoder's position cannot hold the batch they declare: either the
+ * 12-byte preamble (baseOffset + batchLength) is cut off, or fewer than `12 + batchLength` bytes
+ * remain. The broker may legally cut the trailing batch at maxBytes; only that case may be
+ * skipped - decode failures on a fully-present batch are corruption.
+ */
+function isTruncatedTrailingBatch(decoder: Decoder): boolean {
+	if (decoder.remaining() < 12) {
+		return true
+	}
+	const batchStart = decoder.offset()
+	decoder.seek(batchStart + 8) // skip baseOffset(int64)
+	const batchLength = decoder.readInt32()
+	decoder.seek(batchStart)
+	return decoder.remaining() < 12 + batchLength
+}
+
 function filterRecordsFromOffset(records: DecodedRecord[], minOffset: bigint): DecodedRecord[] {
 	if (records.length === 0) {
 		return records
@@ -50,6 +67,10 @@ interface CompletedFetch {
 	partition: number
 	records: DecodedRecord[]
 	byteSize: number
+	// Assignment epoch of the partition when the fetch was buffered (see
+	// FetchManager.assignmentEpochs). Stale batches are fenced by comparing this
+	// against the current epoch at delivery time.
+	assignmentEpoch: number
 }
 
 /**
@@ -302,6 +323,10 @@ export class FetchManager {
 	private readonly cluster: Cluster
 	private readonly config: FetchManagerConfig
 	private readonly partitionStates: Map<string, PartitionState> = new Map()
+	// Per-partition assignment epoch, bumped whenever a partition is removed. Survives
+	// remove/re-add cycles (eager rebalance), so a batch drained before the rebalance can
+	// be told apart from one fetched under the new assignment of the same partition.
+	private readonly assignmentEpochs: Map<string, number> = new Map()
 	private readonly logger: Logger
 	private readonly autoOffsetReset?: AutoOffsetReset
 	private readonly offsetManager?: OffsetManager
@@ -340,8 +365,9 @@ export class FetchManager {
 			partitions: formatPartitions(partitions),
 		})
 		// Abort all existing partition loops
-		for (const state of this.partitionStates.values()) {
+		for (const [key, state] of this.partitionStates) {
 			state.abortController.abort()
+			this.bumpAssignmentEpoch(key)
 		}
 		this.partitionStates.clear()
 
@@ -417,6 +443,10 @@ export class FetchManager {
 				// Abort the partition's fetch loop
 				state.abortController.abort()
 				this.partitionStates.delete(key)
+				// Fence batches already drained by poll(): if the partition is re-added
+				// (eager rebalance keeps some partitions), those stale batches must not be
+				// delivered — their records are re-fetched from the committed offset.
+				this.bumpAssignmentEpoch(key)
 			}
 		}
 
@@ -526,6 +556,34 @@ export class FetchManager {
 	 */
 	isPartitionAssigned(topic: string, partition: number): boolean {
 		return this.partitionStates.has(tpKey(topic, partition))
+	}
+
+	private bumpAssignmentEpoch(key: string): void {
+		this.assignmentEpochs.set(key, (this.assignmentEpochs.get(key) ?? 0) + 1)
+	}
+
+	/**
+	 * Current assignment epoch for a partition (0 if it was never removed)
+	 */
+	getAssignmentEpoch(topic: string, partition: number): number {
+		return this.assignmentEpochs.get(tpKey(topic, partition)) ?? 0
+	}
+
+	/**
+	 * Check whether a drained batch is still deliverable: its partition must be assigned
+	 * AND its assignment epoch must match the current one. A mismatch means the partition
+	 * was removed (and possibly re-added by an eager rebalance) after the batch was
+	 * buffered — delivering it would duplicate records re-fetched from the committed
+	 * offset under the new assignment.
+	 */
+	isBatchAssigned(batch: PartitionBatch): boolean {
+		if (!this.partitionStates.has(tpKey(batch.topic, batch.partition))) {
+			return false
+		}
+		return (
+			batch.assignmentEpoch === undefined ||
+			batch.assignmentEpoch === this.getAssignmentEpoch(batch.topic, batch.partition)
+		)
 	}
 
 	/**
@@ -836,6 +894,7 @@ export class FetchManager {
 							partition: state.partition,
 							records,
 							byteSize,
+							assignmentEpoch: this.getAssignmentEpoch(state.topic, state.partition),
 						})
 					}
 
@@ -935,6 +994,14 @@ export class FetchManager {
 		// Try synchronous decoding first (faster, no promise overhead)
 		let needsAsync = false
 		while (decoder.remaining() > 0) {
+			// A maxBytes-truncated trailing batch is legal and detected structurally (framing
+			// underflow). The broker always returns the FIRST batch complete, so underflow with
+			// nothing decoded is corruption; and any decode failure on a fully-present batch
+			// (e.g. CRC mismatch) is corruption too - treating either as truncation would
+			// silently drop records and leave the partition re-fetching the same data forever.
+			if (batches.length > 0 && isTruncatedTrailingBatch(decoder)) {
+				break
+			}
 			try {
 				// Hot-path decode options:
 				// - Assume sequential offsets to avoid per-record BigInt conversions
@@ -949,15 +1016,7 @@ export class FetchManager {
 					needsAsync = true
 					break
 				}
-				// A decode failure AFTER at least one batch is the expected maxBytes-truncated
-				// trailing batch â stop and re-fetch it next round. A failure with NO batch
-				// decoded is genuine corruption (the broker always returns at least one
-				// complete batch), so surface it instead of silently dropping the partition's
-				// records.
-				if (batches.length === 0) {
-					throw new Error(`Failed to decode record batch (corrupt data): ${(e as Error).message}`)
-				}
-				break
+				throw new Error(`Failed to decode record batch (corrupt data): ${(e as Error).message}`)
 			}
 		}
 
@@ -988,6 +1047,14 @@ export class FetchManager {
 		}> = []
 
 		while (decoder.remaining() > 0) {
+			// A maxBytes-truncated trailing batch is legal and detected structurally (framing
+			// underflow). The broker always returns the FIRST batch complete, so underflow with
+			// nothing decoded is corruption; and any decode failure on a fully-present batch
+			// (e.g. CRC mismatch) is corruption too - treating either as truncation would
+			// silently drop records and leave the partition re-fetching the same data forever.
+			if (batches.length > 0 && isTruncatedTrailingBatch(decoder)) {
+				break
+			}
 			try {
 				// Hot-path decode options:
 				// - Assume sequential offsets to avoid per-record BigInt conversions
@@ -997,12 +1064,7 @@ export class FetchManager {
 				})
 				batches.push(batch)
 			} catch (e) {
-				// See decodeRecords: a failure with no batch decoded is genuine corruption,
-				// not a truncated trailing batch â surface it rather than dropping records.
-				if (batches.length === 0) {
-					throw new Error(`Failed to decode record batch (corrupt data): ${(e as Error).message}`)
-				}
-				break
+				throw new Error(`Failed to decode record batch (corrupt data): ${(e as Error).message}`)
 			}
 		}
 
