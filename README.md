@@ -49,6 +49,14 @@ await consumer.runEach('events', async (message, ctx) => {
 })
 ```
 
+## Documentation
+
+Full documentation at [chrisrecalis.github.io/kafkats](https://chrisrecalis.github.io/kafkats)
+
+> **For AI agents / LLMs**: fetch <https://chrisrecalis.github.io/kafkats/llms.txt> for an index of all
+> documentation pages, or <https://chrisrecalis.github.io/kafkats/llms-full.txt> for the complete
+> documentation as one file. Every docs page is also available as markdown by replacing `.html` with `.md`.
+
 ## License
 
 MIT
