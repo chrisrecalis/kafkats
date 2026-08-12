@@ -50,6 +50,13 @@ import type {
 
 const EMPTY_BUFFER = Buffer.alloc(0)
 
+// Producers whose transaction callback is running in the current async context.
+// Detects producer.transaction() called from inside that same producer's own
+// callback, which would otherwise deadlock on the transaction queue. Module-level
+// (rather than per-producer) so producer instances stay collectible without an
+// explicit AsyncLocalStorage#disable() on disconnect.
+const activeTransactionScopes = new AsyncLocalStorage<ReadonlySet<Producer>>()
+
 type PreparedProduceBatch = {
 	batch: PartitionBatch
 	encodedBatch: Buffer
@@ -194,9 +201,6 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	private transactionTail: Promise<void> = Promise.resolve()
 	// Number of transaction() calls admitted (active + waiting).
 	private transactionQueueDepth = 0
-	// Detects producer.transaction() called from inside this producer's own
-	// transaction callback, which would otherwise deadlock on the queue.
-	private readonly transactionScope = new AsyncLocalStorage<true>()
 	// First definitive failure of a transactional send in the current transaction.
 	// While set, commitTransaction() must abort instead of committing partial data.
 	private transactionAbortCause: Error | null = null
@@ -1209,7 +1213,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 			throw new Error('transaction() requires transactionalId to be configured')
 		}
 
-		if (this.transactionScope.getStore()) {
+		if (activeTransactionScopes.getStore()?.has(this)) {
 			throw new Error(
 				'producer.transaction() was called from inside an active transaction callback. ' +
 					'Nested transactions are not supported — use tx.send()/tx.sendOffsets() instead.'
@@ -1221,18 +1225,26 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		this.transactionTail = new Promise(resolve => {
 			release = resolve
 		})
-
-		if (this.transactionQueueDepth > 0) {
-			this.logger.debug('transaction queued behind active transaction', {
-				queued: this.transactionQueueDepth,
-			})
-			this.emit('transaction:queued', { queued: this.transactionQueueDepth })
-		}
+		const queuedAhead = this.transactionQueueDepth
 		this.transactionQueueDepth++
 
 		try {
+			if (queuedAhead > 0) {
+				this.logger.debug('transaction queued behind active transaction', { queued: queuedAhead })
+				// Observability only - a throwing listener must not corrupt queue state.
+				try {
+					this.emit('transaction:queued', { queued: queuedAhead })
+				} catch (error) {
+					this.logger.warn('transaction:queued listener threw', {
+						error: error instanceof Error ? error.message : String(error),
+					})
+				}
+			}
+
 			await previous
-			return await this.transactionScope.run(true, () => this.runTransaction(fn, options))
+			const scope = new Set(activeTransactionScopes.getStore())
+			scope.add(this)
+			return await activeTransactionScopes.run(scope, () => this.runTransaction(fn, options))
 		} finally {
 			this.transactionQueueDepth--
 			release()

@@ -113,6 +113,34 @@ describe('Producer transaction queueing', () => {
 		expect(queuedEvents).toEqual([{ queued: 1 }, { queued: 2 }])
 	})
 
+	it('does not wedge the queue when a transaction:queued listener throws', async () => {
+		const producer = makeProducer()
+		producer.on('transaction:queued', () => {
+			throw new Error('bad listener')
+		})
+
+		let release!: () => void
+		const gate = new Promise<void>(resolve => {
+			release = resolve
+		})
+
+		const first = producer.transaction(async () => {
+			await gate
+		})
+		// This call fires transaction:queued; the throwing listener must not
+		// leave the queue permanently blocked or fail the transaction.
+		const second = producer.transaction(async tx => {
+			await tx.send(TOPIC, { value: Buffer.from('two') })
+		})
+
+		release()
+		await expect(first).resolves.toBeUndefined()
+		await expect(second).resolves.toBeUndefined()
+
+		// The queue must still be usable afterwards.
+		await expect(producer.transaction(async () => {})).resolves.toBeUndefined()
+	})
+
 	it('runs a queued transaction after the previous one aborts', async () => {
 		const producer = makeProducer()
 
@@ -174,6 +202,24 @@ describe('Producer transaction queueing', () => {
 				})
 			})
 		).resolves.toBeUndefined()
+	})
+
+	it('detects re-entry through another producer’s callback (A → B → A)', async () => {
+		const producerA = makeProducer()
+		const producerB = new Producer(mockCluster, {
+			lingerMs: 0,
+			retries: 2,
+			retryBackoffMs: 1,
+			transactionalId: 'tx-2',
+		})
+
+		await expect(
+			producerA.transaction(async () => {
+				await producerB.transaction(async () => {
+					await producerA.transaction(async () => {})
+				})
+			})
+		).rejects.toThrow(/inside an active transaction callback/)
 	})
 
 	it('refuses to disconnect while transactions are queued', async () => {

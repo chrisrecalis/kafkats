@@ -134,14 +134,18 @@ await consumer.runBatch(
 		await producer.transaction(async txn => {
 			await txn.send('output', results)
 			await txn.sendOffsets({
-				groupId: 'my-group',
+				consumerGroupMetadata, // group id + generation id + member id (KIP-447 zombie fencing)
 				offsets: [{ topic: ctx.topic, partition: ctx.partition, offset: ctx.offset + 1n }],
 			})
 		})
 	},
-	{ autoCommit: false, partitionConcurrency: 3 }
+	// commitOffsets: false — offsets must only be committed through the
+	// transaction, never by the consumer itself (e.g. during revoke/shutdown).
+	{ autoCommit: false, commitOffsets: false, partitionConcurrency: 3 }
 )
 ```
+
+For strict exactly-once semantics, pass `consumerGroupMetadata` rather than a bare `groupId` — without the generation and member id, a zombie consumer's offset commits are not fenced (see the tip in [Consume-Transform-Produce](#consume-transform-produce)).
 
 Things to know:
 
