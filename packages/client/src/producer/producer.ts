@@ -852,7 +852,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	): void {
 		const { batch } = prepared
 
-		this.logger.info('producer fenced', {
+		this.logger.warn('producer fenced', {
 			topic: batch.topic,
 			partition: batch.partition,
 			producerId: this.producerId.toString(),
@@ -1616,7 +1616,8 @@ export class Producer extends EventEmitter<ProducerEvents> {
 				}
 			)
 
-			this.logger.info('transaction committed', {
+			// debug, not info: EOS loops commit per batch, so this fires at batch rate.
+			this.logger.debug('transaction committed', {
 				transactionalId: this.config.transactionalId,
 				partitionCount: this.partitionsInTransaction.size,
 				groupCount: this.offsetsToCommit.size,
@@ -1688,7 +1689,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 			)
 
 			this.transactionState = 'idle'
-			this.logger.info('transaction aborted', {
+			this.logger.debug('transaction aborted', {
 				transactionalId: this.config.transactionalId,
 			})
 		} catch (error) {
@@ -2047,7 +2048,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		if (baseSequence + recordCount - 1 > MAX_SEQUENCE) {
 			// Only reserve up to the boundary
 			reservedCount = MAX_SEQUENCE - baseSequence + 1
-			this.logger.info('sequence wrap - splitting batch', {
+			this.logger.debug('sequence wrap - splitting batch', {
 				topic,
 				partition,
 				baseSequence,
