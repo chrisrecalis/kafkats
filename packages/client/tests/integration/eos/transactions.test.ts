@@ -101,6 +101,92 @@ describe.concurrent('EOS (integration) - transactions', () => {
 		await client.disconnect()
 	})
 
+	it('commits consumed offsets with the membership carried by ConsumeContext', async () => {
+		const client = createClient('it-tx-consume-context')
+		await client.connect()
+
+		const inputName = uniqueName('tx-context-input')
+		const outputName = uniqueName('tx-context-output')
+		const input = topic<string>(inputName, { value: codec.string() })
+		const output = topic<string>(outputName, { value: codec.string() })
+		const groupId = uniqueName('tx-context-group')
+
+		await client.createTopics([
+			{ name: inputName, numPartitions: 1, replicationFactor: 1 },
+			{ name: outputName, numPartitions: 1, replicationFactor: 1 },
+		])
+
+		const seedProducer = client.producer()
+		await seedProducer.send(input, { value: 'one' })
+
+		const transactionProducer = client.producer({
+			transactionalId: uniqueName('tx-context'),
+			retries: 10,
+			retryBackoffMs: 250,
+			maxRetryBackoffMs: 1000,
+		})
+		const consumer = client.consumer({ groupId, autoOffsetReset: 'earliest' })
+
+		await consumer.runEach(
+			input,
+			async (message, context) => {
+				expect(context.groupId).toBe(groupId)
+				expect(context.consumerGroupMetadata).toEqual(
+					expect.objectContaining({
+						groupId,
+						generationId: expect.any(Number),
+						memberId: expect.any(String),
+					})
+				)
+				await transactionProducer.transaction(async tx => {
+					await tx.send(output, { value: `processed-${message.value}` })
+					await tx.sendOffsets(context)
+				})
+				consumer.stop()
+			},
+			{ autoCommit: false, commitOffsets: false }
+		)
+
+		const outputConsumer = client.consumer({
+			groupId: uniqueName('tx-context-output-group'),
+			autoOffsetReset: 'earliest',
+			isolationLevel: 'read_committed',
+		})
+		const outputValues: string[] = []
+		await outputConsumer.runEach(
+			output,
+			async message => {
+				outputValues.push(message.value)
+				outputConsumer.stop()
+			},
+			{ autoCommit: false }
+		)
+		expect(outputValues).toEqual(['processed-one'])
+
+		const resumedConsumer = client.consumer({ groupId, autoOffsetReset: 'earliest' })
+		const replayedValues: string[] = []
+		const abortController = new AbortController()
+		const resumedRun = resumedConsumer.runEach(
+			input,
+			async message => {
+				replayedValues.push(message.value)
+			},
+			{ autoCommit: false, signal: abortController.signal }
+		)
+		await new Promise<void>((resolve, reject) => {
+			resumedConsumer.once('running', resolve)
+			resumedConsumer.once('error', reject)
+		})
+		await sleep(500)
+		abortController.abort()
+		await resumedRun
+		expect(replayedValues).toEqual([])
+
+		await seedProducer.disconnect()
+		await transactionProducer.disconnect()
+		await client.disconnect()
+	})
+
 	it('aborts instead of committing when a transactional send fails definitively', async () => {
 		const client = createClient('it-tx-failed-send')
 		await client.connect()

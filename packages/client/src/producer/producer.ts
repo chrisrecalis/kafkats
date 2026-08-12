@@ -21,6 +21,7 @@ import { ReconnectionStrategy } from '@/network/reconnection.js'
 import { noopLogger, type Logger } from '@/logger.js'
 import { sleep as sleepMs } from '@/utils/sleep.js'
 import { createRetryStrategyOptions, retry } from '@/utils/retry.js'
+import type { ConsumeContext } from '@/consumer/types.js'
 import { RecordAccumulator } from './accumulator.js'
 import { murmur2Partitioner } from './partitioners/murmur2.js'
 import { createRoundRobinPartitioner } from './partitioners/round-robin.js'
@@ -1299,13 +1300,16 @@ export class Producer extends EventEmitter<ProducerEvents> {
 				return promise
 			},
 
-			sendOffsets: async (params: SendOffsetsParams): Promise<void> => {
+			sendOffsets: async (
+				contextOrParams: ConsumeContext | SendOffsetsParams,
+				offsets?: TopicPartitionOffset[]
+			): Promise<void> => {
 				if (this.transactionState !== 'in_transaction') {
 					throw new InvalidTxnStateError(this.config.transactionalId!, this.transactionState, [
 						'in_transaction',
 					])
 				}
-				await this.prepareOffsetsForCommit(params)
+				await this.prepareOffsetsForCommit(this.resolveSendOffsetsParams(contextOrParams, offsets))
 			},
 		}
 
@@ -1450,6 +1454,35 @@ export class Producer extends EventEmitter<ProducerEvents> {
 				shouldRetry: error => error instanceof KafkaProtocolError && error.retriable,
 			}
 		)
+	}
+
+	/**
+	 * Resolve the public context-bound API into the existing low-level offset commit shape.
+	 */
+	private resolveSendOffsetsParams(
+		contextOrParams: ConsumeContext | SendOffsetsParams,
+		offsets?: TopicPartitionOffset[]
+	): SendOffsetsParams {
+		if ('offsets' in contextOrParams) {
+			if (offsets !== undefined) {
+				throw new Error('sendOffsets does not accept a second offsets argument with SendOffsetsParams')
+			}
+			return contextOrParams
+		}
+
+		const resolvedOffsets = offsets ?? [
+			{
+				topic: contextOrParams.topic,
+				partition: contextOrParams.partition,
+				offset: contextOrParams.offset + 1n,
+			},
+		]
+
+		if (contextOrParams.consumerGroupMetadata) {
+			return { consumerGroupMetadata: contextOrParams.consumerGroupMetadata, offsets: resolvedOffsets }
+		}
+
+		return { groupId: contextOrParams.groupId, offsets: resolvedOffsets }
 	}
 
 	/**
