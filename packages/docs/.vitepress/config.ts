@@ -1,9 +1,18 @@
 import { defineConfig } from 'vitepress'
+import llmstxt from 'vitepress-plugin-llms'
 
 export default defineConfig({
 	title: 'kafkats',
 	description: 'Pure-protocol Kafka client and streams library for TypeScript',
 	base: '/kafkats/',
+
+	vite: {
+		plugins: [
+			llmstxt({
+				domain: 'https://chrisrecalis.github.io',
+			}),
+		],
+	},
 
 	head: [
 		['link', { rel: 'icon', href: '/favicon.ico' }],

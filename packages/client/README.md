@@ -62,9 +62,28 @@ await admin.connect()
 await admin.createTopics([{ name: 'events', partitions: 3 }])
 ```
 
+## Compression
+
+GZIP works out of the box. For Snappy, LZ4, or Zstd, install a supported library — it is detected
+and registered automatically, no registration code needed:
+
+```bash
+npm install snappy   # or: lz4-napi, @mongodb-js/zstd
+```
+
+```typescript
+const producer = client.producer({ compression: 'snappy' })
+```
+
+Consumers decompress automatically. See the [compression docs](https://chrisrecalis.github.io/kafkats/client/compression) for supported libraries and manual registration.
+
 ## Documentation
 
 Full documentation at [chrisrecalis.github.io/kafkats](https://chrisrecalis.github.io/kafkats)
+
+> **For AI agents / LLMs**: fetch <https://chrisrecalis.github.io/kafkats/llms.txt> for an index of all
+> documentation pages, or <https://chrisrecalis.github.io/kafkats/llms-full.txt> for the complete
+> documentation as one file. Every docs page is also available as markdown by replacing `.html` with `.md`.
 
 ## License
 

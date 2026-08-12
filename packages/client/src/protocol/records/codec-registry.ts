@@ -165,7 +165,8 @@ export function missingCodecError(type: CompressionType): Error {
 	const sources = autoCodecSources[type]
 	const hint = sources?.length
 		? ` Install one of: ${sources.map(s => s.module).join(', ')} (used automatically when installed), ` +
-			`or register a codec via compressionCodecs.register().`
+			`or register a codec via compressionCodecs.register(). ` +
+			`See https://chrisrecalis.github.io/kafkats/client/compression`
 		: ''
 	return new Error(`Compression codec not registered: ${getCompressionTypeName(type)}.${hint}`)
 }

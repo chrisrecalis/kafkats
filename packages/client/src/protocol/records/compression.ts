@@ -312,7 +312,7 @@ export function createLz4Codec(lz4: Lz4Lib): CompressionCodec {
 		throw new Error(
 			'lz4-napi >= 2.x exposing compressFrame/decompressFrame is required for Kafka LZ4 ' +
 				'(raw-block LZ4 is rejected by the broker). ' +
-				'Install lz4-napi@2.x or later.'
+				'Install lz4-napi@2.x or later. See https://chrisrecalis.github.io/kafkats/client/compression'
 		)
 	}
 
