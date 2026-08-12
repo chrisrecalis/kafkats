@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events'
 import { describe, expect, it, vi, afterEach } from 'vitest'
-import { KafkaClient, type Message } from '@kafkats/client'
+import { KafkaClient, type Message, type ProducerConfig } from '@kafkats/client'
 import { codec, flow, TimeWindows, SessionWindows } from '../../src/index.js'
 import { ChangelogBackedWindowStore, ChangelogBackedSessionStore } from '../../src/state/changelog.js'
 
@@ -116,6 +116,7 @@ function createTestApp(overrides: Partial<Parameters<typeof flow>[0]> = {}) {
 	const client = new KafkaClient({ clientId: 'test-app', brokers: ['localhost:9092'] })
 	const consumers: TestConsumer[] = []
 	const producers: TestProducer[] = []
+	const producerConfigs: Array<ProducerConfig | undefined> = []
 
 	vi.spyOn(client, 'connect').mockResolvedValue()
 	vi.spyOn(client, 'disconnect').mockResolvedValue()
@@ -124,14 +125,15 @@ function createTestApp(overrides: Partial<Parameters<typeof flow>[0]> = {}) {
 		consumers.push(consumer)
 		return consumer as unknown as never
 	})
-	vi.spyOn(client, 'producer').mockImplementation(() => {
+	vi.spyOn(client, 'producer').mockImplementation(config => {
 		const producer = new TestProducer()
 		producers.push(producer)
+		producerConfigs.push(config)
 		return producer as unknown as never
 	})
 
 	const app = flow({ applicationId: 'test-app', client, ...overrides })
-	return { app, consumers, producers }
+	return { app, consumers, producers, producerConfigs }
 }
 
 afterEach(() => {
@@ -309,7 +311,10 @@ describe('flow', () => {
 	})
 
 	it('spawns one worker per stream thread', async () => {
-		const { app, consumers, producers } = createTestApp({ numStreamThreads: 2 })
+		const { app, consumers, producers, producerConfigs } = createTestApp({
+			numStreamThreads: 2,
+			processingGuarantee: 'exactly_once',
+		})
 
 		app.stream('events')
 
@@ -317,6 +322,43 @@ describe('flow', () => {
 
 		expect(consumers).toHaveLength(2)
 		expect(producers).toHaveLength(2)
+		const transactionalIds = producerConfigs.map(config => config?.transactionalId)
+		expect(transactionalIds[0]).toMatch(/^test-app-[0-9a-f-]{36}-w0$/)
+		expect(transactionalIds[1]).toBe(transactionalIds[0]?.replace(/-w0$/, '-w1'))
+
+		await app.close()
+	})
+
+	it('derives unique transactional IDs for separate application instances', async () => {
+		const first = createTestApp({ processingGuarantee: 'exactly_once' })
+		const second = createTestApp({ processingGuarantee: 'exactly_once' })
+
+		first.app.stream('events')
+		second.app.stream('events')
+
+		await first.app.start()
+		await second.app.start()
+
+		const firstId = first.producerConfigs[0]?.transactionalId
+		const secondId = second.producerConfigs[0]?.transactionalId
+		expect(firstId).toMatch(/^test-app-[0-9a-f-]{36}-w0$/)
+		expect(secondId).toMatch(/^test-app-[0-9a-f-]{36}-w0$/)
+		expect(firstId).not.toBe(secondId)
+
+		await first.app.close()
+		await second.app.close()
+	})
+
+	it('preserves an explicit transactional ID for a single stream thread', async () => {
+		const { app, producerConfigs } = createTestApp({
+			processingGuarantee: 'exactly_once',
+			producer: { transactionalId: 'orders-pod-0' },
+		})
+
+		app.stream('events')
+		await app.start()
+
+		expect(producerConfigs[0]?.transactionalId).toBe('orders-pod-0')
 
 		await app.close()
 	})

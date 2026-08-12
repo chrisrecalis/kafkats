@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { randomUUID } from 'node:crypto'
 import {
 	KafkaClient,
 	type Consumer,
@@ -86,6 +87,8 @@ const DEFAULT_COMMIT_INTERVAL_MS = 100
 class FlowAppImpl implements FlowApp {
 	private readonly client: KafkaClient
 	private readonly ownsClient: boolean
+	/** Internal instance identity used to keep derived transactional IDs unique across replicas. */
+	private readonly processId = randomUUID()
 	private readonly sourcesByTopic = new Map<string, SourceNode<unknown, unknown>[]>()
 	private readonly offsetResetByTopic = new Map<string, 'earliest' | 'latest' | 'none'>()
 	private readonly partitionCounts = new Map<string, number>()
@@ -128,7 +131,9 @@ class FlowAppImpl implements FlowApp {
 		}
 		this.stateStoreProvider = config.stateStoreProvider ?? new InMemoryStateStoreProvider()
 		this.changelogCheckpointStore = this.stateStoreProvider.getChangelogCheckpointStore?.() ?? null
-		this.logger = this.client.cluster.getLogger().child({ component: 'flow', applicationId: config.applicationId })
+		this.logger = this.client.cluster
+			.getLogger()
+			.child({ component: 'flow', applicationId: config.applicationId, processId: this.processId })
 	}
 
 	getOrCreateStore<K, V>(
@@ -966,8 +971,11 @@ class FlowAppImpl implements FlowApp {
 		}
 
 		const base = this.config.producer ?? {}
-		const baseTransactionalId = base.transactionalId ?? this.buildTransactionalId()
-		const transactionalId = threadCount > 1 ? `${baseTransactionalId}-w${workerId}` : baseTransactionalId
+		const transactionalId = base.transactionalId
+			? threadCount > 1
+				? `${base.transactionalId}-w${workerId}`
+				: base.transactionalId
+			: `${this.config.applicationId}-${this.processId}-w${workerId}`
 		return {
 			...base,
 			transactionalId,
@@ -976,27 +984,12 @@ class FlowAppImpl implements FlowApp {
 		}
 	}
 
-	private buildTransactionalId(): string {
-		const clientId = this.getClientId()
-		if (!clientId) {
-			throw new Error('exactly_once requires a clientId to derive transactionalId')
-		}
-		return `${this.config.applicationId}-${clientId}`
-	}
-
 	private buildGroupInstanceId(workerId: number, threadCount: number): string | undefined {
 		const base = this.config.consumer?.groupInstanceId
 		if (!base) {
 			return undefined
 		}
 		return threadCount > 1 ? `${base}-w${workerId}` : base
-	}
-
-	private getClientId(): string {
-		if (this.config.client instanceof KafkaClient) {
-			return this.config.client.getConfig().clientId
-		}
-		return this.config.client.clientId
 	}
 
 	private getConsumerGroupMetadata(
