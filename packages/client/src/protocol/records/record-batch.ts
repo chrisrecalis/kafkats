@@ -29,7 +29,8 @@ import {
 	type KafkaRecord,
 	type DecodedRecord,
 } from '@/protocol/records/record.js'
-import { CompressionType, compressionCodecs, missingCodecError } from '@/protocol/records/compression.js'
+import { CompressionType } from '@/protocol/records/compression.js'
+import { compressionCodecs, missingCodecError } from '@/protocol/records/codec-registry.js'
 
 // Attribute bit masks
 export const COMPRESSION_CODEC_MASK = 0x07 // bits 0-2

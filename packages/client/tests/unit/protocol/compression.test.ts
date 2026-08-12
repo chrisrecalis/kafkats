@@ -1,16 +1,21 @@
 import { describe, expect, it } from 'vitest'
 
+import { createRequire } from 'node:module'
+
 import {
-	CodecRegistry,
-	compressionCodecs,
 	CompressionType,
 	createLz4Codec,
 	createSnappyCodec,
 	createZstdCodec,
 	getCompressionTypeName,
+	type SnappyNativeLib,
+} from '@/protocol/records/compression.js'
+import {
+	CodecRegistry,
+	compressionCodecs,
 	missingCodecError,
 	type ModuleLoader,
-} from '@/protocol/records/compression.js'
+} from '@/protocol/records/codec-registry.js'
 
 describe('compression registry', () => {
 	it('registers and retrieves codecs', async () => {
@@ -105,14 +110,79 @@ describe('compression registry', () => {
 	})
 
 	it('returns undefined for unknown codec', () => {
-		// Disable auto-registration so the result doesn't depend on which
-		// compression libraries happen to be installed in the workspace.
+		// Keep the result independent of which libraries are installed in the workspace
 		compressionCodecs.autoRegister = false
 		try {
 			expect(compressionCodecs.get(CompressionType.Zstd)).toBeUndefined()
 		} finally {
 			compressionCodecs.autoRegister = true
 		}
+	})
+})
+
+describe('snappy Xerial framing', () => {
+	// Loaded with require like the production module loader; a static import
+	// trips on snappy's WASI fallback in vitest's ESM transform.
+	const snappy = createRequire(import.meta.url)('snappy') as SnappyNativeLib & {
+		compressSync: (data: Buffer) => Buffer
+	}
+
+	function int32(n: number): Buffer {
+		const b = Buffer.alloc(4)
+		b.writeInt32BE(n)
+		return b
+	}
+
+	const XERIAL_HEADER = Buffer.concat([
+		Buffer.from([0x82, 0x53, 0x4e, 0x41, 0x50, 0x50, 0x59, 0x00]),
+		int32(1),
+		int32(1),
+	])
+
+	function xerialFrame(...blocks: Buffer[]): Buffer {
+		return Buffer.concat([XERIAL_HEADER, ...blocks.flatMap(b => [int32(b.length), b])])
+	}
+
+	it('decodes Xerial-framed payloads produced by Java clients (real snappy)', async () => {
+		const codec = createSnappyCodec(snappy)
+		const part1 = Buffer.from('hello ')
+		const part2 = Buffer.from('xerial world')
+		const framed = xerialFrame(snappy.compressSync(part1), snappy.compressSync(part2))
+
+		expect(await codec.decompress(framed)).toEqual(Buffer.concat([part1, part2]))
+	})
+
+	it('round-trips raw blocks with the real snappy library', async () => {
+		const codec = createSnappyCodec(snappy)
+		const payload = Buffer.from('raw snappy round-trip')
+
+		expect(await codec.decompress(await codec.compress(payload))).toEqual(payload)
+	})
+
+	it('decodes Xerial-framed payloads with a sync (snappyjs-style) library', async () => {
+		const codec = createSnappyCodec({
+			compress: (data: ArrayBuffer | Buffer | Uint8Array) => Buffer.from(data as Uint8Array),
+			uncompress: (data: ArrayBuffer | Buffer | Uint8Array) => Buffer.from(data as Uint8Array),
+		})
+		const framed = xerialFrame(Buffer.from('chunk1-'), Buffer.from('chunk2'))
+
+		expect((await codec.decompress(framed)).toString()).toBe('chunk1-chunk2')
+	})
+
+	it('passes payloads without the Xerial magic straight to the library', async () => {
+		const codec = createSnappyCodec(snappy)
+		const raw = await snappy.compress(Buffer.from('no framing'))
+
+		expect((await codec.decompress(raw)).toString()).toBe('no framing')
+	})
+
+	it('rejects malformed Xerial chunks instead of over-reading', async () => {
+		const codec = createSnappyCodec(snappy)
+		const oversized = Buffer.concat([XERIAL_HEADER, int32(1000), Buffer.from('short')])
+		const truncated = Buffer.concat([XERIAL_HEADER, Buffer.from([0x00, 0x00])])
+
+		await expect(codec.decompress(oversized)).rejects.toThrow('Invalid Xerial-framed Snappy data')
+		await expect(codec.decompress(truncated)).rejects.toThrow('Invalid Xerial-framed Snappy data')
 	})
 })
 
@@ -134,6 +204,15 @@ describe('automatic codec registration', () => {
 		compress: (data: ArrayBuffer | Buffer | Uint8Array) => Buffer.from(data as Uint8Array),
 		uncompress: (data: ArrayBuffer | Buffer | Uint8Array) => Buffer.from(data as Uint8Array),
 	}
+
+	it('auto-registers the real snappy library via the default loader', async () => {
+		const registry = new CodecRegistry()
+		const codec = registry.get(CompressionType.Snappy)
+		expect(codec).toBeDefined()
+
+		const payload = Buffer.from('default-loader')
+		expect(await codec!.decompress(await codec!.compress(payload))).toEqual(payload)
+	})
 
 	it('auto-registers snappy when installed', async () => {
 		const { loader } = fakeLoader({ snappy: fakeSnappyJs })

@@ -58,6 +58,7 @@
 		"@node-rs/crc32": "^1.10.6",
 		"@testcontainers/kafka": "^11.8.1",
 		"@types/node": "^24.10.1",
+		"snappy": "7.3.3",
 		"testcontainers": "^11.8.1",
 		"tsdown": "^0.22.14",
 		"tsx": "^4.20.6",
@@ -66,10 +67,38 @@
 		"vitest-mock-extended": "^4.0.0"
 	},
 	"peerDependencies": {
-		"@node-rs/crc32": "^1.10.6"
+		"@mongodb-js/zstd": ">=1.0.0",
+		"@node-rs/crc32": "^1.10.6",
+		"lz4": "^0.6.0",
+		"lz4-napi": ">=2.0.0",
+		"lz4js": "^0.2.0",
+		"snappy": "^7.0.0",
+		"snappyjs": ">=0.6.0 <1.0.0",
+		"zstd-napi": ">=0.0.7 <0.1.0"
 	},
 	"peerDependenciesMeta": {
+		"@mongodb-js/zstd": {
+			"optional": true
+		},
 		"@node-rs/crc32": {
+			"optional": true
+		},
+		"lz4": {
+			"optional": true
+		},
+		"lz4-napi": {
+			"optional": true
+		},
+		"lz4js": {
+			"optional": true
+		},
+		"snappy": {
+			"optional": true
+		},
+		"snappyjs": {
+			"optional": true
+		},
+		"zstd-napi": {
 			"optional": true
 		}
 	}

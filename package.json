@@ -27,5 +27,12 @@
 		"oxfmt": "^0.63.0",
 		"oxlint": "^1.78.0",
 		"turbo": "^2.7.2"
+	},
+	"pnpm": {
+		"neverBuiltDependencies": [
+			"@mongodb-js/zstd",
+			"lz4",
+			"zstd-napi"
+		]
 	}
 }
