@@ -323,4 +323,85 @@ describe.concurrent('EOS (integration) - transactions', () => {
 		await producer.disconnect()
 		await client.disconnect()
 	})
+
+	it('runs parallel transactions when transactionConcurrency > 1', async () => {
+		const client = createClient('it-tx-concurrency')
+		await client.connect()
+
+		const topicName = uniqueName('it-tx-concurrency')
+		const testTopic = topic<string>(topicName, { value: codec.string() })
+
+		await client.createTopics([{ name: topicName, numPartitions: 2, replicationFactor: 1 }])
+
+		const producer = client.producer({
+			transactionalId: uniqueName('tx'),
+			transactionConcurrency: 3,
+			retries: 10,
+			retryBackoffMs: 250,
+			maxRetryBackoffMs: 1000,
+		})
+
+		// Hold one transaction open while another begins and commits. With a
+		// single transactional ID the second call would queue forever behind the
+		// parked one and the test would time out.
+		let releaseParked!: () => void
+		const parkedGate = new Promise<void>(resolve => {
+			releaseParked = resolve
+		})
+
+		const parked = producer.transaction(async tx => {
+			await tx.send(testTopic, { value: 'parked' })
+			await parkedGate
+		})
+
+		await producer.transaction(async tx => {
+			await tx.send(testTopic, { value: 'overlapping' })
+		})
+
+		releaseParked()
+		await parked
+
+		// An aborted transaction on one lane stays invisible and leaves the pool usable.
+		await expect(
+			producer.transaction(async tx => {
+				await tx.send(testTopic, { value: 'aborted' })
+				throw new Error('user abort')
+			})
+		).rejects.toThrow()
+
+		// A burst beyond the pool size: callers queue FIFO and all commit.
+		await Promise.all(
+			Array.from({ length: 10 }, (_, i) =>
+				producer.transaction(async tx => {
+					await tx.send(testTopic, { value: `burst-${i}` })
+				})
+			)
+		)
+
+		const expected = ['parked', 'overlapping', ...Array.from({ length: 10 }, (_, i) => `burst-${i}`)]
+
+		const consumer = client.consumer({
+			groupId: uniqueName('it-group'),
+			autoOffsetReset: 'earliest',
+			isolationLevel: 'read_committed',
+		})
+
+		const received: string[] = []
+		await consumer.runEach(
+			testTopic,
+			async message => {
+				received.push(message.value)
+				if (received.length >= expected.length) {
+					consumer.stop()
+				}
+			},
+			{ autoCommit: false }
+		)
+
+		expect([...received].sort()).toEqual([...expected].sort())
+		expect(received).not.toContain('aborted')
+
+		await producer.disconnect()
+		await client.disconnect()
+	})
 })

@@ -71,6 +71,22 @@ export interface ProducerConfig {
 	/** Transactional ID for transactional producer (optional) */
 	transactionalId?: string
 	/**
+	 * Number of transactions that may be in flight at once (default: 1)
+	 *
+	 * The Kafka protocol allows one open transaction per transactional ID, so
+	 * values above 1 make this producer manage a pool of N internal transactional
+	 * producers ("lanes"). Lane 0 uses `transactionalId` verbatim; lanes 1..N-1
+	 * append `-1`..`-{N-1}`. transaction() calls are admitted first-in first-out:
+	 * each call takes a free lane and waits when all lanes are busy.
+	 *
+	 * - Transactions begin in call order but may commit in any order.
+	 * - Transactional-ID zombie fencing applies per lane. For consume-transform-produce,
+	 *   pass `consumerGroupMetadata` to sendOffsets() (KIP-447) so zombie commits are
+	 *   fenced by consumer group generation regardless of which lane they ran on.
+	 * - Requires transactionalId. Only affects transaction().
+	 */
+	transactionConcurrency?: number
+	/**
 	 * Optional trace hook for lightweight benchmarking instrumentation.
 	 * Intended for diagnostics only and may be omitted in production usage.
 	 */
@@ -123,6 +139,7 @@ export interface ResolvedProducerConfig {
 	partitioner: PartitionerFunction
 	requestTimeoutMs: number
 	transactionalId: string | null
+	transactionConcurrency: number
 	idempotent: boolean
 	maxInFlight: number
 	transactionTimeoutMs: number

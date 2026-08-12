@@ -16,6 +16,7 @@ function createConfig(overrides: Partial<ResolvedProducerConfig> = {}): Resolved
 		partitioner: () => 0,
 		requestTimeoutMs: 30000,
 		transactionalId: null,
+		transactionConcurrency: 1,
 		idempotent: false,
 		maxInFlight: 5,
 		transactionTimeoutMs: 60000,
