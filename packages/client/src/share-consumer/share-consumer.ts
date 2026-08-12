@@ -819,7 +819,7 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 				response.errorCode === ErrorCode.FencedMemberEpoch ||
 				response.errorCode === ErrorCode.UnknownMemberId
 			) {
-				this.logger.info('share group member fenced; abandoning assignment and rejoining', {
+				this.logger.warn('share group member fenced; abandoning assignment and rejoining', {
 					errorCode: response.errorCode,
 					memberId: this.memberId,
 				})
