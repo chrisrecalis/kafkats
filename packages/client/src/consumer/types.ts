@@ -120,13 +120,29 @@ export interface Message<V = Buffer, K = Buffer> {
 }
 
 /**
- * Context provided to message handlers
+ * Consumer-group membership snapshot captured when a record is delivered.
+ */
+export interface ConsumerGroupMetadata {
+	readonly groupId: string
+	readonly generationId: number
+	readonly memberId: string
+	readonly groupInstanceId?: string | null
+}
+
+/**
+ * Context provided to message handlers.
+ *
+ * Pass this object to a transactional producer's `sendOffsets()` method
+ * to commit offsets under the consumer-group membership that delivered them.
  */
 export interface ConsumeContext {
 	signal: AbortSignal
 	topic: string
 	partition: number
 	offset: bigint
+	groupId: string
+	/** Present for consumer-group delivery. Captured when the record or batch is delivered. */
+	consumerGroupMetadata?: Readonly<ConsumerGroupMetadata>
 }
 
 // ==================== Handler Types ====================

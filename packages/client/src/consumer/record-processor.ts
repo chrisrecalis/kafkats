@@ -67,7 +67,8 @@ export class EachRecordProcessor implements RecordProcessor {
 		private readonly handler: MessageHandler<unknown, unknown>,
 		private readonly offsetManager: OffsetManager,
 		private readonly commitOffsets: boolean,
-		private readonly onError: ProcessorErrorHandler
+		private readonly onError: ProcessorErrorHandler,
+		private readonly groupId: string
 	) {}
 
 	async processBatch(
@@ -87,6 +88,7 @@ export class EachRecordProcessor implements RecordProcessor {
 				topic,
 				partition,
 				offset: message.offset,
+				groupId: this.groupId,
 			}
 
 			try {
@@ -111,7 +113,8 @@ export class BatchRecordProcessor implements RecordProcessor {
 		private readonly handler: BatchHandler<unknown, unknown>,
 		private readonly offsetManager: OffsetManager,
 		private readonly commitOffsets: boolean,
-		private readonly onError: ProcessorErrorHandler
+		private readonly onError: ProcessorErrorHandler,
+		private readonly groupId: string
 	) {}
 
 	async processBatch(
@@ -130,6 +133,7 @@ export class BatchRecordProcessor implements RecordProcessor {
 			topic,
 			partition,
 			offset: lastMessage.offset,
+			groupId: this.groupId,
 		}
 
 		try {

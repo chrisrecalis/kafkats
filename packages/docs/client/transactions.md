@@ -96,27 +96,23 @@ await consumer.runEach(
 		// Atomically: send output + commit input offset
 		await producer.transaction(async txn => {
 			await txn.send('output', [{ value: result }])
-
-			await txn.sendOffsets({
-				groupId: 'my-group',
-				offsets: [
-					{
-						topic: ctx.topic,
-						partition: ctx.partition,
-						offset: ctx.offset + 1n,
-					},
-				],
-			})
+			await txn.sendOffsets(ctx)
 		})
 	},
-	{ autoCommit: false }
+	{ autoCommit: false, commitOffsets: false }
 )
 ```
 
-::: tip Full EOS with consumers
-For strict exactly-once consume-transform-produce you should provide `consumerGroupMetadata` (group id + generation id + member id). That information is required to atomically commit offsets with the consumer's current group membership.
+`sendOffsets(ctx)` commits `ctx.offset + 1` for the context's topic and partition. The context contains a
+delivery-time snapshot of the consumer-group membership that delivered the record, so a rebalance makes a stale
+transaction fail instead of committing offsets under a newer generation.
 
-**Recommended:** Use `@kafkats/flow` with `processingGuarantee: 'exactly_once'` for automatic exactly-once handling. Flow batches multiple messages into transactions and commits them periodically, which is more efficient than per-message transactions. See [Flow Processing Guarantees](/flow/getting-started#processing-guarantees) for details.
+::: tip Batched processing
+Pass explicit accumulated offsets as the second argument: `txn.sendOffsets(ctx, offsets)`. Use the first context
+that opened the transaction so the entire batch remains bound to that consumer-group generation.
+
+`@kafkats/flow` with `processingGuarantee: 'exactly_once'` handles this batching automatically. See
+[Flow Processing Guarantees](/flow/getting-started#processing-guarantees) for details.
 :::
 
 ## Transaction API
@@ -130,6 +126,8 @@ interface ProducerTransaction {
 	send<V, K>(topicDef: TopicDefinition<V, K>, messages: ProducerMessage<V, K>[]): Promise<SendResult[]>
 
 	// Commit consumer offsets (for exactly-once)
+	sendOffsets(ctx: ConsumeContext): Promise<void>
+	sendOffsets(ctx: ConsumeContext, offsets: TopicPartitionOffset[]): Promise<void>
 	sendOffsets(params: SendOffsetsParams): Promise<void>
 
 	// Abort signal (fires on timeout or error)
@@ -141,10 +139,10 @@ interface ProducerTransaction {
 
 ```typescript
 interface SendOffsetsParams {
-	// Simple: just the group ID
+	// Low-level, unfenced form
 	groupId?: string
 
-	// Full EOS: include consumer metadata
+	// Advanced escape hatch for callers managing raw group metadata
 	consumerGroupMetadata?: {
 		groupId: string
 		generationId: number
@@ -160,6 +158,11 @@ interface SendOffsetsParams {
 	}>
 }
 ```
+
+A context from a manually assigned consumer automatically uses the `groupId`-only form because there is no group
+generation to fence. The object form remains available for standalone producer transactions and other low-level
+callers without a consume context. For normal `runEach()`, `runBatch()`, and `stream()` processing, pass the
+`ConsumeContext` supplied to the handler.
 
 ## Idempotent Producer
 

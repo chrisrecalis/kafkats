@@ -100,8 +100,21 @@ interface ConsumeContext {
 	topic: string // Current message topic
 	partition: number // Current message partition
 	offset: bigint // Current message offset
+	groupId: string // Consumer group whose offsets are being tracked
+	consumerGroupMetadata?: Readonly<{
+		groupId: string
+		generationId: number
+		memberId: string
+		groupInstanceId?: string | null
+	}> // Present for consumer-group delivery; captured when the record or batch is delivered
 }
 ```
+
+Pass the context to `transaction.sendOffsets(ctx)` when atomically committing consumed offsets with produced
+records. Its consumer-group metadata is a delivery-time snapshot, so a transaction committed after a rebalance is
+fenced using the membership that actually delivered the records. The fields are public and survive object spread.
+
+Manually assigned consumers have a `groupId` but no `consumerGroupMetadata`, because they do not join the group.
 
 Use the signal to cancel long-running operations:
 

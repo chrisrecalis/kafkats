@@ -1,4 +1,4 @@
-import type { Consumer, Producer, SendResult } from '@kafkats/client'
+import type { ConsumeContext, Consumer, Producer, SendResult } from '@kafkats/client'
 import type { Codec } from '@/codec.js'
 
 // Internal types (not exported from public API)
@@ -27,20 +27,15 @@ export type StreamFormat<K, V> = {
 }
 
 export type ActiveTransaction = {
+	readonly signal: AbortSignal
 	send(
 		topic: string,
 		messages: { key?: Buffer | null; value: Buffer | null; headers?: Record<string, Buffer>; partition?: number }
 	): Promise<SendResult>
-	sendOffsets(params: {
-		groupId?: string
-		consumerGroupMetadata?: {
-			groupId: string
-			generationId: number
-			memberId: string
-			groupInstanceId?: string | null
-		}
+	sendOffsets(
+		context: ConsumeContext,
 		offsets: Array<{ topic: string; partition: number; offset: bigint }>
-	}): Promise<void>
+	): Promise<void>
 }
 
 export type TopicPartitionKey = `${string}:${number}`
@@ -51,7 +46,7 @@ export type WorkerContext = {
 	consumer: Consumer
 	activeTransaction: ActiveTransaction | null
 	activeTransactionPromise: Promise<void> | null
-	groupInstanceId?: string | null
+	offsetCommitContext: ConsumeContext | null
 	sourcesByTopic: Map<string, SourceNode<unknown, unknown>[]>
 	assignedPartitions: Map<TopicPartitionKey, { topic: string; partition: number }>
 	// Transaction batching state for EOS

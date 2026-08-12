@@ -157,6 +157,33 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		return normalized
 	}
 
+	private createConsumeContext(
+		signal: AbortSignal,
+		topic: string,
+		partition: number,
+		offset: bigint
+	): ConsumeContext {
+		const consumerGroup = this.consumerGroup
+
+		if (!consumerGroup) {
+			return { signal, topic, partition, offset, groupId: this.config.groupId }
+		}
+
+		return {
+			signal,
+			topic,
+			partition,
+			offset,
+			groupId: this.config.groupId,
+			consumerGroupMetadata: {
+				groupId: this.config.groupId,
+				generationId: consumerGroup.currentGenerationId,
+				memberId: consumerGroup.currentMemberId,
+				groupInstanceId: this.config.groupInstanceId ?? null,
+			},
+		}
+	}
+
 	private initComponents(partitionConcurrency: number, useConsumerGroup: boolean, logger?: Logger): void {
 		this.partitionTracker = new PartitionTracker({ logger })
 
@@ -546,12 +573,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 					if (ctx.signal.aborted) return
 
 					const message = decodeRecord(topic, partition, record, decoders)
-					const consumeCtx: ConsumeContext = {
-						signal: ctx.signal,
-						topic,
-						partition,
-						offset: record.offset,
-					}
+					const consumeCtx = this.createConsumeContext(ctx.signal, topic, partition, record.offset)
 
 					await handler(message as Message<MsgOf<S>, KeyOf<S>>, consumeCtx)
 
@@ -604,12 +626,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 
 				const messages = records.map(r => decodeRecord(topic, partition, r, decoders))
 				const lastRecord = records[records.length - 1]!
-				const consumeCtx: ConsumeContext = {
-					signal: ctx.signal,
-					topic,
-					partition,
-					offset: lastRecord.offset,
-				}
+				const consumeCtx = this.createConsumeContext(ctx.signal, topic, partition, lastRecord.offset)
 
 				await handler(messages as Message<MsgOf<S>, KeyOf<S>>[], consumeCtx)
 
@@ -732,12 +749,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 					try {
 						for (const record of records) {
 							const message = decodeRecord(topic, partition, record, decoders)
-							const ctx: ConsumeContext = {
-								signal,
-								topic,
-								partition,
-								offset: record.offset,
-							}
+							const ctx = this.createConsumeContext(signal, topic, partition, record.offset)
 
 							yield { message, ctx } as { message: Message<MsgOf<S>, KeyOf<S>>; ctx: ConsumeContext }
 
