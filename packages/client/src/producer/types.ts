@@ -223,6 +223,13 @@ export type IdempotentState = 'idle' | 'initializing' | 'running' | 'fenced' | '
  */
 export interface ProducerEvents {
 	error: [error: Error]
+	/**
+	 * Emitted when transaction() has to wait for capacity behind other
+	 * transactions. `queued` is the number of transactions ahead of this one
+	 * (including the active one). Sustained queueing means throughput is
+	 * commit-latency-bound.
+	 */
+	'transaction:queued': [info: { queued: number }]
 }
 
 // ==================== Transaction Types ====================
