@@ -118,6 +118,8 @@ class FlowAppImpl implements FlowApp {
 	private stoppedThreads = 0
 	private totalThreads = 0
 	private lastError: Error | null = null
+	/** Set when a store is created downstream of a key change, so its keys are not partition-affine. */
+	private hasPartitionUnalignedState = false
 	private storeCounter = 0
 	private startupProducer: Producer | null = null
 
@@ -154,6 +156,9 @@ class FlowAppImpl implements FlowApp {
 		sourceTopics?: Set<string>,
 		restrictRestorationToSourcePartitions = true
 	): KeyValueStore<K, V> {
+		if (!restrictRestorationToSourcePartitions) {
+			this.hasPartitionUnalignedState = true
+		}
 		const storeName = name ?? `store-${this.nextStoreId()}`
 		let store = this.stateStores.get(storeName)
 		if (!store) {
@@ -287,6 +292,9 @@ class FlowAppImpl implements FlowApp {
 		sourceTopics?: Set<string>,
 		restrictRestorationToSourcePartitions = true
 	): WindowStore<K, V> {
+		if (!restrictRestorationToSourcePartitions) {
+			this.hasPartitionUnalignedState = true
+		}
 		const storeName = name ?? `window-store-${this.nextStoreId()}`
 		const existing = this.stateStores.get(storeName)
 		if (existing) {
@@ -328,6 +336,9 @@ class FlowAppImpl implements FlowApp {
 		sourceTopics?: Set<string>,
 		restrictRestorationToSourcePartitions = true
 	): SessionStore<K, V> {
+		if (!restrictRestorationToSourcePartitions) {
+			this.hasPartitionUnalignedState = true
+		}
 		const storeName = name ?? `session-store-${this.nextStoreId()}`
 		const existing = this.stateStores.get(storeName)
 		if (existing) {
@@ -460,6 +471,18 @@ class FlowAppImpl implements FlowApp {
 
 		const threadCount = Math.max(1, this.config.numStreamThreads ?? 1)
 		const laneCount = this.laneCount
+		// Lanes are only safe because a state key reaches exactly one lane, which holds when the
+		// key still determines the partition. A key change breaks that (no repartition topic is
+		// inserted), so two lanes could interleave a read-modify-write on the same key.
+		if (laneCount > 1 && this.hasPartitionUnalignedState) {
+			throw new Error(
+				'transactionConcurrency > 1 requires state that is aligned with the source partitioning, ' +
+					'but this topology creates a state store downstream of a key change ' +
+					'(groupBy, selectKey or map before a stateful operator). Route the re-keyed stream ' +
+					'through a repartition topic and consume it in a separate application, ' +
+					'or leave transactionConcurrency at 1.'
+			)
+		}
 		this.threads = []
 		this.workers = []
 		this.runPromises = []
@@ -695,6 +718,12 @@ class FlowAppImpl implements FlowApp {
 
 		if (this.runPromises.length > 0) {
 			await Promise.allSettled(this.runPromises)
+		}
+
+		// Drain each lane behind anything the 'stopped' handler queued, so disconnect() is not
+		// called while an abort is still in flight.
+		for (const worker of this.workers) {
+			await this.enqueueEosTask(worker, async () => {}).catch(() => {})
 		}
 
 		for (const worker of this.workers) {
@@ -1411,6 +1440,18 @@ class FlowAppImpl implements FlowApp {
 			// Cancel any pending commit timers
 			for (const lane of thread.lanes) {
 				this.cancelCommitTimer(lane)
+			}
+			// close() commits every lane before stopping, so anything still open here belongs to
+			// an abnormal stop — one lane's handler threw and tore down the shared consumer.
+			// Abort the siblings rather than leaving their transactions open until the broker
+			// times them out, blocking read_committed consumers on those output partitions.
+			for (const lane of thread.lanes) {
+				if (!lane.transactionActive) continue
+				void this.enqueueEosTask(lane, () =>
+					this.abortTransactionBatch(lane, this.lastError ?? new Error('consumer stopped'))
+				).catch(() => {
+					// Best effort - the consumer is already down.
+				})
 			}
 			this.stoppedThreads += 1
 			if (this.currentState !== 'ERROR' && this.stoppedThreads >= this.totalThreads) {

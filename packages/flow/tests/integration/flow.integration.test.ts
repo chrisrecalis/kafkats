@@ -1552,12 +1552,7 @@ describe('transaction concurrency', () => {
 
 			await withTimeout(
 				'wait for counts',
-				out.waitForCount<string, number>(
-					outputTopic,
-					() => true,
-					keyCount * recordsPerKey,
-					30_000
-				),
+				out.waitForCount<string, number>(outputTopic, () => true, keyCount * recordsPerKey, 30_000),
 				35_000
 			)
 

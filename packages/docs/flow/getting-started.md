@@ -143,15 +143,38 @@ This is a different knob from `numStreamThreads`: threads add consumer group mem
 heartbeats separately), while lanes add producers behind a single member. Total producers is
 `numStreamThreads * transactionConcurrency`.
 
-::: warning
-Raising `transactionConcurrency` appends a `-l<lane>` suffix to the derived transactional IDs. The IDs used
-before the change are no longer claimed on restart, so any transaction left open under an old ID stays open
-until the broker's `transactional.id.expiration.ms` elapses. Downstream `read_committed` consumers block on
-those partitions until then.
-:::
-
 Ordering is unchanged: each lane serializes the partitions it owns, and a partition is only ever handled by
 one lane.
+
+##### State must be aligned with the source partitioning
+
+Lanes are only safe because a given state key reaches exactly one lane, which holds as long as the key still
+determines the partition. Flow never auto-inserts a repartition topic, so a key change breaks that: after
+`groupBy()`, or `selectKey()` / `map()` ahead of a stateful operator, the same key can arrive on any
+partition and two lanes could interleave a read-modify-write on it.
+
+`start()` rejects that combination rather than silently losing updates:
+
+```
+transactionConcurrency > 1 requires state that is aligned with the source partitioning, but this
+topology creates a state store downstream of a key change ...
+```
+
+To use lanes with a re-keyed aggregation, write the re-keyed stream to a repartition topic and consume that
+topic in a separate application, which is the same shape Kafka Streams builds automatically.
+
+##### Changing the setting
+
+::: warning
+Changing `transactionConcurrency` (like changing `numStreamThreads`) changes which transactional IDs the
+application claims — a `-l<lane>` suffix is appended once it is above 1. A restart under new IDs therefore
+does **not** fence the producers that used the old IDs. If a producer was stopped after its offsets were
+prepared but before its `EndTxn`, it can still commit that transaction after its partitions have been
+reassigned and reprocessed, which duplicates output for `read_committed` consumers.
+
+Drain the application cleanly (`close()` resolves) before rolling out a change to this setting, or leave it
+stopped for longer than the broker's `transaction.max.timeout.ms` before starting under the new value.
+:::
 
 #### Consumer Configuration
 

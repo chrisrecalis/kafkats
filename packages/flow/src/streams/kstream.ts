@@ -29,43 +29,61 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 		readonly node: OutputProcessor<K, V>,
 		readonly format: StreamFormat<K, V>,
 		/** Source topics that feed into this stream. Used for changelog partition inference. */
-		readonly sourceTopics: Set<string> = new Set()
+		readonly sourceTopics: Set<string> = new Set(),
+		/**
+		 * Whether an upstream operator replaced the key. The library never auto-inserts a
+		 * repartition topic, so downstream state is no longer aligned with the source
+		 * partitioning: a key can arrive on any partition.
+		 */
+		readonly keyChanged: boolean = false
 	) {}
 
 	map<K2, V2>(fn: (key: K | null, value: V | null) => KeyValue<K2, V2>): KStream<K2, V2> {
 		const node = new MapNode<K, V, K2, V2>(fn)
 		this.node.connect(node)
-		return new KStreamImpl<K2, V2>(this.app, node, {}, this.sourceTopics)
+		return new KStreamImpl<K2, V2>(this.app, node, {}, this.sourceTopics, true)
 	}
 
 	mapValues<V2>(fn: (value: V | null) => V2 | null): KStream<K, V2> {
 		const node = new MapValuesNode<K, V, V2>(fn)
 		this.node.connect(node)
-		return new KStreamImpl<K, V2>(this.app, node, { keyCodec: this.format.keyCodec }, this.sourceTopics)
+		return new KStreamImpl<K, V2>(
+			this.app,
+			node,
+			{ keyCodec: this.format.keyCodec },
+			this.sourceTopics,
+			this.keyChanged
+		)
 	}
 
 	flatMapValues<V2>(fn: (value: V | null) => Iterable<V2>): KStream<K, V2> {
 		const node = new FlatMapValuesNode<K, V, V2>(fn)
 		this.node.connect(node)
-		return new KStreamImpl<K, V2>(this.app, node, { keyCodec: this.format.keyCodec }, this.sourceTopics)
+		return new KStreamImpl<K, V2>(
+			this.app,
+			node,
+			{ keyCodec: this.format.keyCodec },
+			this.sourceTopics,
+			this.keyChanged
+		)
 	}
 
 	filter(fn: (key: K | null, value: V | null) => boolean): KStream<K, V> {
 		const node = new FilterNode<K, V>(fn)
 		this.node.connect(node)
-		return new KStreamImpl<K, V>(this.app, node, this.format, this.sourceTopics)
+		return new KStreamImpl<K, V>(this.app, node, this.format, this.sourceTopics, this.keyChanged)
 	}
 
 	peek(fn: (key: K | null, value: V | null) => void): KStream<K, V> {
 		const node = new PeekNode<K, V>(fn)
 		this.node.connect(node)
-		return new KStreamImpl<K, V>(this.app, node, this.format, this.sourceTopics)
+		return new KStreamImpl<K, V>(this.app, node, this.format, this.sourceTopics, this.keyChanged)
 	}
 
 	selectKey<K2>(fn: (value: V | null, key: K | null) => K2): KStream<K2, V> {
 		const node = new SelectKeyNode<K, V, K2>(fn)
 		this.node.connect(node)
-		return new KStreamImpl<K2, V>(this.app, node, { valueCodec: this.format.valueCodec }, this.sourceTopics)
+		return new KStreamImpl<K2, V>(this.app, node, { valueCodec: this.format.valueCodec }, this.sourceTopics, true)
 	}
 
 	merge(other: KStream<K, V>): KStream<K, V> {
@@ -80,7 +98,13 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 		// Merge source topics from both streams
 		const mergedTopics = new Set([...this.sourceTopics, ...otherStream.sourceTopics])
 
-		return new KStreamImpl<K, V>(this.app, node, { keyCodec, valueCodec }, mergedTopics)
+		return new KStreamImpl<K, V>(
+			this.app,
+			node,
+			{ keyCodec, valueCodec },
+			mergedTopics,
+			this.keyChanged || otherStream.keyChanged
+		)
 	}
 
 	branch(...predicates: Array<(key: K | null, value: V | null) => boolean>): KStream<K, V>[] {
@@ -90,7 +114,7 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 		return predicates.map(predicate => {
 			const branchNode = new PassThroughNode<K, V>()
 			node.addBranch(predicate, branchNode)
-			return new KStreamImpl<K, V>(this.app, branchNode, this.format, this.sourceTopics)
+			return new KStreamImpl<K, V>(this.app, branchNode, this.format, this.sourceTopics, this.keyChanged)
 		})
 	}
 
@@ -104,8 +128,9 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 		// FlowAppInterface satisfies ProduceNode's FlowAppInterface (both have sendToTopic)
 		const node = new ProduceNode<K, V>(this.app, topic, options, this.format, true)
 		this.node.connect(node)
-		// After going through a repartition topic, the new source is the through topic
-		return new KStreamImpl<K, V>(this.app, node, this.format, new Set([topic]))
+		// After going through a repartition topic, the new source is the through topic. The record
+		// is still forwarded in-process on its original partition, so a changed key stays changed.
+		return new KStreamImpl<K, V>(this.app, node, this.format, new Set([topic]), this.keyChanged)
 	}
 
 	toTable(options?: Materialized<K, V>): KTable<K, V> {
@@ -121,7 +146,8 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 			keyCodec,
 			valueCodec,
 			options?.changelog,
-			this.sourceTopics
+			this.sourceTopics,
+			!this.keyChanged
 		)
 		const storeRef = { store }
 
@@ -148,8 +174,14 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 		const keyCodec = options?.key ?? this.format.keyCodec
 		const valueCodec = options?.value ?? this.format.valueCodec
 
-		// Same key: restrict changelog restoration to source partitions
-		return new KGroupedStreamImpl(this.app, this.node, { keyCodec, valueCodec }, this.sourceTopics, true)
+		// Same key as upstream, but an earlier map()/selectKey() may already have replaced it.
+		return new KGroupedStreamImpl(
+			this.app,
+			this.node,
+			{ keyCodec, valueCodec },
+			this.sourceTopics,
+			!this.keyChanged
+		)
 	}
 
 	join<V2, VR>(
@@ -168,7 +200,13 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 			this.node.connect(joinNode)
 
 			// Stream-table join: only stream's source topics affect partitioning
-			return new KStreamImpl<K, VR>(this.app, joinNode, { keyCodec: this.format.keyCodec }, this.sourceTopics)
+			return new KStreamImpl<K, VR>(
+				this.app,
+				joinNode,
+				{ keyCodec: this.format.keyCodec },
+				this.sourceTopics,
+				this.keyChanged
+			)
 		}
 
 		// Stream-Stream join requires windowing
@@ -212,7 +250,8 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 			valueCodec,
 			windowOptions,
 			options?.changelog,
-			this.sourceTopics
+			this.sourceTopics,
+			!this.keyChanged
 		)
 		const rightStore = this.app.getOrCreateWindowStore<K, V2>(
 			rightStoreName,
@@ -220,7 +259,8 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 			otherValueCodec,
 			windowOptions,
 			options?.changelog,
-			otherStream.sourceTopics
+			otherStream.sourceTopics,
+			!otherStream.keyChanged
 		)
 
 		const leftStoreRef = { store: leftStore }
@@ -245,7 +285,13 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 		otherStream.node.connect(rightJoinNode)
 		rightJoinNode.connect(mergeNode)
 
-		return new KStreamImpl<K, VR>(this.app, mergeNode, { keyCodec: this.format.keyCodec }, mergedTopics)
+		return new KStreamImpl<K, VR>(
+			this.app,
+			mergeNode,
+			{ keyCodec: this.format.keyCodec },
+			mergedTopics,
+			this.keyChanged || otherStream.keyChanged
+		)
 	}
 
 	leftJoin<V2, VR>(
@@ -264,7 +310,13 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 			this.node.connect(joinNode)
 
 			// Stream-table join: only stream's source topics affect partitioning
-			return new KStreamImpl<K, VR>(this.app, joinNode, { keyCodec: this.format.keyCodec }, this.sourceTopics)
+			return new KStreamImpl<K, VR>(
+				this.app,
+				joinNode,
+				{ keyCodec: this.format.keyCodec },
+				this.sourceTopics,
+				this.keyChanged
+			)
 		}
 
 		// Stream-Stream left join
@@ -308,7 +360,8 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 			valueCodec,
 			windowOptions,
 			options?.changelog,
-			this.sourceTopics
+			this.sourceTopics,
+			!this.keyChanged
 		)
 		const rightStore = this.app.getOrCreateWindowStore<K, V2>(
 			rightStoreName,
@@ -316,7 +369,8 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 			otherValueCodec,
 			windowOptions,
 			options?.changelog,
-			otherStream.sourceTopics
+			otherStream.sourceTopics,
+			!otherStream.keyChanged
 		)
 
 		const leftStoreRef = { store: leftStore }
@@ -346,7 +400,13 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 		otherStream.node.connect(rightJoinNode)
 		rightJoinNode.connect(mergeNode)
 
-		return new KStreamImpl<K, VR>(this.app, mergeNode, { keyCodec: this.format.keyCodec }, mergedTopics)
+		return new KStreamImpl<K, VR>(
+			this.app,
+			mergeNode,
+			{ keyCodec: this.format.keyCodec },
+			mergedTopics,
+			this.keyChanged || otherStream.keyChanged
+		)
 	}
 
 	outerJoin<V2, VR>(
@@ -391,7 +451,8 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 			valueCodec,
 			windowOptions,
 			options?.changelog,
-			this.sourceTopics
+			this.sourceTopics,
+			!this.keyChanged
 		)
 		const rightStore = this.app.getOrCreateWindowStore<K, V2>(
 			rightStoreName,
@@ -399,7 +460,8 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 			otherValueCodec,
 			windowOptions,
 			options?.changelog,
-			otherStream.sourceTopics
+			otherStream.sourceTopics,
+			!otherStream.keyChanged
 		)
 
 		const leftStoreRef = { store: leftStore }
@@ -431,7 +493,13 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 
 		// Merge source topics from both streams for partition inference
 		const mergedTopics = new Set([...this.sourceTopics, ...otherStream.sourceTopics])
-		return new KStreamImpl<K, VR>(this.app, mergeNode, { keyCodec: this.format.keyCodec }, mergedTopics)
+		return new KStreamImpl<K, VR>(
+			this.app,
+			mergeNode,
+			{ keyCodec: this.format.keyCodec },
+			mergedTopics,
+			this.keyChanged || otherStream.keyChanged
+		)
 	}
 }
 

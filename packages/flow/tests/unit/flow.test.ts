@@ -447,6 +447,42 @@ describe('transaction concurrency', () => {
 		await app.close()
 	})
 
+	it('rejects lanes when a state store sits downstream of a key change', async () => {
+		for (const build of [
+			(app: ReturnType<typeof createTestApp>['app']) =>
+				app
+					.stream('events', { key: codec.string(), value: codec.string() })
+					.groupBy(key => key ?? '', { key: codec.string() })
+					.count(),
+			(app: ReturnType<typeof createTestApp>['app']) =>
+				app
+					.stream('events', { key: codec.string(), value: codec.string() })
+					.selectKey(value => value ?? '')
+					.groupByKey({ key: codec.string() })
+					.count(),
+		]) {
+			const { app } = createTestApp({
+				processingGuarantee: 'exactly_once',
+				transactionConcurrency: 2,
+			})
+			build(app)
+			await expect(app.start()).rejects.toThrow(/transactionConcurrency > 1 requires state/)
+			await app.close()
+		}
+	})
+
+	it('allows lanes for partition-aligned state', async () => {
+		const { app } = createTestApp({
+			processingGuarantee: 'exactly_once',
+			transactionConcurrency: 2,
+		})
+
+		app.stream('events', { key: codec.string(), value: codec.string() }).groupByKey().count()
+
+		await expect(app.start()).resolves.toBeUndefined()
+		await app.close()
+	})
+
 	it('routes each partition to one lane and commits its offsets there', async () => {
 		const { app, consumers, producers } = createTestApp({
 			processingGuarantee: 'exactly_once',
