@@ -1494,3 +1494,84 @@ describe('changelog topics and restoration', () => {
 		}
 	}, 60_000)
 })
+
+describe('transaction concurrency', () => {
+	it('counts exactly once with partitions sharded across lanes', async () => {
+		const partitionCount = 8
+		const laneCount = 4
+		const keyCount = 16
+		const recordsPerKey = 10
+
+		const input = uniqueTopicName('flow-it-lanes-src')
+		const outputTopic = uniqueTopicName('flow-it-lanes-out')
+		const appId = `flow-it-lanes-${Date.now()}`
+
+		await createTopics(client, [
+			{ name: input, partitions: partitionCount },
+			{ name: outputTopic, partitions: partitionCount },
+		])
+
+		const app = flow({
+			applicationId: appId,
+			client,
+			processingGuarantee: 'exactly_once',
+			transactionConcurrency: laneCount,
+			commitIntervalMs: 50,
+			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 100 },
+			producer: { lingerMs: 0 },
+		})
+
+		app.stream(input, { key: stringCodec, value: numberCodec })
+			.groupByKey()
+			.count({ storeName: 'lane-counts', key: stringCodec, value: numberCodec })
+			.toStream()
+			.to(outputTopic)
+
+		const out = new MultiTopicCollector({
+			client,
+			groupId: `${appId}-collector-${Date.now()}`,
+			topics: [{ topic: outputTopic, keyCodec: stringCodec, valueCodec: numberCodec }],
+		})
+
+		try {
+			await withTimeout('output collector start', out.start(), 15_000)
+			await withTimeout('app.start', app.start(), 20_000)
+
+			// Key n lives on partition n % partitionCount, so keys land on every lane.
+			const records = []
+			for (let round = 0; round < recordsPerKey; round += 1) {
+				for (let keyIndex = 0; keyIndex < keyCount; keyIndex += 1) {
+					records.push({
+						key: `key-${keyIndex}`,
+						value: numberCodec.encode(round),
+						partition: keyIndex % partitionCount,
+					})
+				}
+			}
+			await withTimeout('produce input', producer.send(input, records), 20_000)
+
+			await withTimeout(
+				'wait for counts',
+				out.waitForCount<string, number>(
+					outputTopic,
+					() => true,
+					keyCount * recordsPerKey,
+					30_000
+				),
+				35_000
+			)
+
+			expect(app.state()).not.toBe('ERROR')
+
+			const committed = out.getTopicMessages<string, number>(outputTopic)
+			expect(committed).toHaveLength(keyCount * recordsPerKey)
+			for (let keyIndex = 0; keyIndex < keyCount; keyIndex += 1) {
+				const counts = committed.filter(m => m.key === `key-${keyIndex}`).map(m => m.value)
+				expect(counts).toEqual(Array.from({ length: recordsPerKey }, (_, index) => index + 1))
+			}
+		} finally {
+			await withTimeout('app.close', app.close(), 20_000).catch(() => {})
+			await withTimeout('output collector stop', out.stop(), 15_000).catch(() => {})
+		}
+	}, 90_000)
+})

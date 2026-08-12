@@ -23,6 +23,21 @@ export interface FlowConfig {
 	 * Default: 100ms
 	 */
 	commitIntervalMs?: number
+	/**
+	 * Number of concurrent transactions per stream thread in exactly_once mode.
+	 *
+	 * A producer can only have one open transaction at a time, so one producer processes its
+	 * whole assignment serially. Raising this creates that many producers per stream thread,
+	 * each with its own transactional ID, and shards assigned partitions across them by
+	 * `partition % transactionConcurrency` — so a partition index always maps to one lane and
+	 * co-partitioned topics stay together.
+	 *
+	 * Raising this appends a `-l<lane>` suffix to the derived transactional IDs, so the
+	 * previous IDs are left to expire via the broker's `transactional.id.expiration.ms`.
+	 *
+	 * Ignored under `at_least_once`. Default: 1
+	 */
+	transactionConcurrency?: number
 	stateDir?: string
 	stateStoreProvider?: StateStoreProvider
 	consumer?: Omit<ConsumerConfig, 'groupId'>

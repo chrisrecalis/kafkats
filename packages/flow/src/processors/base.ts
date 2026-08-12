@@ -40,8 +40,15 @@ export type ActiveTransaction = {
 
 export type TopicPartitionKey = `${string}:${number}`
 
+/**
+ * A transaction lane: one producer, one processor graph, one transaction at a time. A stream
+ * thread owns `transactionConcurrency` lanes; `consumer` and `assignedPartitions` belong to
+ * that thread and are shared by reference across its lanes, everything else is lane-private.
+ */
 export type WorkerContext = {
+	/** Stream thread index this lane belongs to. */
 	id: number
+	laneId: number
 	producer: Producer
 	consumer: Consumer
 	activeTransaction: ActiveTransaction | null

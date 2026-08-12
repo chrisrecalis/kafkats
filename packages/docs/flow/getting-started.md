@@ -23,19 +23,20 @@ const app = flow({
 
 ### Configuration Options
 
-| Option                | Type                                | Default           | Description                                                                                   |
-| --------------------- | ----------------------------------- | ----------------- | --------------------------------------------------------------------------------------------- |
-| `applicationId`       | `string`                            | -                 | Required. Also used as the consumer group id                                                  |
-| `client`              | `KafkaClient \| KafkaClientConfig`  | -                 | Required. Pass an existing client or a config object                                          |
-| `numStreamThreads`    | `number`                            | `1`               | Number of parallel stream threads (each has its own producer/consumer)                        |
-| `processingGuarantee` | `'at_least_once' \| 'exactly_once'` | `'at_least_once'` | Enables transactional processing when `'exactly_once'`                                        |
-| `commitIntervalMs`    | `number`                            | `100`             | Transaction commit interval in milliseconds (only applies to `exactly_once`)                  |
-| `stateDir`            | `string`                            | -                 | State directory (used by some store providers)                                                |
-| `stateStoreProvider`  | `StateStoreProvider`                | in-memory         | State store backend (in-memory by default)                                                    |
-| `changelog`           | `object`                            | -                 | Changelog topic settings: `replicationFactor`, `topicConfigs`, `autoCreate`                   |
-| `consumer`            | `Omit<ConsumerConfig, 'groupId'>`   | -                 | Consumer overrides (Flow sets `groupId` to `applicationId`)                                   |
-| `producer`            | `ProducerConfig`                    | -                 | Producer overrides                                                                            |
-| `runEach`             | `RunEachOptions`                    | -                 | Consumer run-loop options (e.g. `partitionConcurrency`, `autoCommitIntervalMs`, `assignment`) |
+| Option                   | Type                                | Default           | Description                                                                                   |
+| ------------------------ | ----------------------------------- | ----------------- | --------------------------------------------------------------------------------------------- |
+| `applicationId`          | `string`                            | -                 | Required. Also used as the consumer group id                                                  |
+| `client`                 | `KafkaClient \| KafkaClientConfig`  | -                 | Required. Pass an existing client or a config object                                          |
+| `numStreamThreads`       | `number`                            | `1`               | Number of parallel stream threads (each has its own producer/consumer)                        |
+| `processingGuarantee`    | `'at_least_once' \| 'exactly_once'` | `'at_least_once'` | Enables transactional processing when `'exactly_once'`                                        |
+| `commitIntervalMs`       | `number`                            | `100`             | Transaction commit interval in milliseconds (only applies to `exactly_once`)                  |
+| `transactionConcurrency` | `number`                            | `1`               | Concurrent transactions per stream thread (only applies to `exactly_once`)                    |
+| `stateDir`               | `string`                            | -                 | State directory (used by some store providers)                                                |
+| `stateStoreProvider`     | `StateStoreProvider`                | in-memory         | State store backend (in-memory by default)                                                    |
+| `changelog`              | `object`                            | -                 | Changelog topic settings: `replicationFactor`, `topicConfigs`, `autoCreate`                   |
+| `consumer`               | `Omit<ConsumerConfig, 'groupId'>`   | -                 | Consumer overrides (Flow sets `groupId` to `applicationId`)                                   |
+| `producer`               | `ProducerConfig`                    | -                 | Producer overrides                                                                            |
+| `runEach`                | `RunEachOptions`                    | -                 | Consumer run-loop options (e.g. `partitionConcurrency`, `autoCommitIntervalMs`, `assignment`) |
 
 #### Client Config (KafkaClientConfig)
 
@@ -96,7 +97,7 @@ open until its transaction timeout expires.
 
 If `producer.transactionalId` is configured explicitly, the caller is responsible for making it unique among
 simultaneously running application instances. Flow appends a worker suffix when `numStreamThreads` is greater
-than one.
+than one, and a lane suffix when `transactionConcurrency` is greater than one.
 
 Transactions are also committed:
 
@@ -115,6 +116,42 @@ The `commitIntervalMs` setting controls the trade-off between latency and throug
 ::: tip
 The default of 100ms provides a good balance for most use cases. Kafka Streams uses a default of 30 seconds, but Flow uses a lower default for more responsive processing.
 :::
+
+#### Transaction Concurrency
+
+A Kafka producer can only have one transaction open at a time, so by default a stream thread processes its
+entire assignment serially — every record waits behind the previous record's commit. On a large assignment
+that caps throughput regardless of how much work each record does.
+
+`transactionConcurrency` gives a stream thread more than one producer:
+
+```typescript
+const app = flow({
+	applicationId: 'my-app',
+	client: { brokers: ['localhost:9092'] },
+	processingGuarantee: 'exactly_once',
+	transactionConcurrency: 8,
+})
+```
+
+Assigned partitions are sharded across lanes by `partition % transactionConcurrency`. Each lane has its own
+producer, its own transactional ID, and its own commit cadence, so eight partitions can be mid-transaction at
+once. Because the shard key is the partition index alone, partitions with the same index across topics always
+land on the same lane — co-partitioned joins and their state stores stay together.
+
+This is a different knob from `numStreamThreads`: threads add consumer group members (each rebalances and
+heartbeats separately), while lanes add producers behind a single member. Total producers is
+`numStreamThreads * transactionConcurrency`.
+
+::: warning
+Raising `transactionConcurrency` appends a `-l<lane>` suffix to the derived transactional IDs. The IDs used
+before the change are no longer claimed on restart, so any transaction left open under an old ID stays open
+until the broker's `transactional.id.expiration.ms` elapses. Downstream `read_committed` consumers block on
+those partitions until then.
+:::
+
+Ordering is unchanged: each lane serializes the partitions it owns, and a partition is only ever handled by
+one lane.
 
 #### Consumer Configuration
 

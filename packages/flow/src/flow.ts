@@ -84,6 +84,14 @@ export const workerContextStorage = new AsyncLocalStorage<WorkerContext>()
 /** Default transaction commit interval for exactly_once mode (100ms) */
 const DEFAULT_COMMIT_INTERVAL_MS = 100
 
+/** One consumer and the lanes that process its assignment. */
+type StreamThread = {
+	id: number
+	consumer: Consumer
+	assignedPartitions: Map<TopicPartitionKey, { topic: string; partition: number }>
+	lanes: WorkerContext[]
+}
+
 class FlowAppImpl implements FlowApp {
 	private readonly client: KafkaClient
 	private readonly ownsClient: boolean
@@ -103,10 +111,12 @@ class FlowAppImpl implements FlowApp {
 	private lastCheckpointErrorMessage: string | null = null
 	private currentState: StreamState = 'CREATED'
 	private closing = false
+	private threads: StreamThread[] = []
+	/** Every lane across every thread, flattened. */
 	private workers: WorkerContext[] = []
 	private runPromises: Promise<void>[] = []
-	private stoppedWorkers = 0
-	private totalWorkers = 0
+	private stoppedThreads = 0
+	private totalThreads = 0
 	private lastError: Error | null = null
 	private storeCounter = 0
 	private startupProducer: Producer | null = null
@@ -449,21 +459,22 @@ class FlowAppImpl implements FlowApp {
 		}
 
 		const threadCount = Math.max(1, this.config.numStreamThreads ?? 1)
+		const laneCount = this.laneCount
+		this.threads = []
 		this.workers = []
 		this.runPromises = []
-		this.totalWorkers = threadCount
-		this.stoppedWorkers = 0
+		this.totalThreads = threadCount
+		this.stoppedThreads = 0
 
 		const workerReady: Promise<void>[] = []
 
 		for (let id = 0; id < threadCount; id += 1) {
-			const producer = this.client.producer(this.buildProducerConfig(id, threadCount))
 			const groupInstanceId = this.buildGroupInstanceId(id, threadCount)
 
 			// Forward reference: the consumer's onBeforeRebalance hook runs at rebalance time,
-			// long after the worker has been constructed below. A holder lets the closure
-			// resolve to the right WorkerContext without depending on let-binding shadowing.
-			const workerRef: { current: WorkerContext | null } = { current: null }
+			// long after the thread has been constructed below. A holder lets the closure
+			// resolve to the right StreamThread without depending on let-binding shadowing.
+			const threadRef: { current: StreamThread | null } = { current: null }
 
 			const userHook = this.config.consumer?.onBeforeRebalance
 			const consumer = this.client.consumer({
@@ -472,7 +483,7 @@ class FlowAppImpl implements FlowApp {
 				autoOffsetReset: this.resolveOffsetReset(),
 				groupInstanceId,
 				isolationLevel: this.eosEnabled ? 'read_committed' : this.config.consumer?.isolationLevel,
-				// EOS: commit the in-flight transaction inside the awaited rebalance window
+				// EOS: commit the in-flight transactions inside the awaited rebalance window
 				// so offsets land before the group rejoins. Compose with any user-supplied
 				// hook (user runs first; their hook can prep state before the EOS commit).
 				// A commit failure rejects this promise → the rebalance protocol's catch
@@ -482,36 +493,57 @@ class FlowAppImpl implements FlowApp {
 						? async () => {
 								if (userHook) await userHook()
 								if (!this.eosEnabled) return
-								const w = workerRef.current
-								if (w?.transactionActive) {
-									await this.enqueueEosTask(w, () => this.commitTransactionBatch(w))
+								const thread = threadRef.current
+								if (!thread) return
+								// allSettled, not all: a lane that fails must not let the rebalance
+								// proceed while the other lanes are still mid-commit.
+								const results = await Promise.allSettled(
+									thread.lanes.map(lane =>
+										lane.transactionActive
+											? this.enqueueEosTask(lane, () => this.commitTransactionBatch(lane))
+											: Promise.resolve()
+									)
+								)
+								const failed = results.find(result => result.status === 'rejected')
+								if (failed) {
+									throw failed.reason
 								}
 							}
 						: undefined,
 			})
 
-			const worker: WorkerContext = {
-				id,
-				producer,
-				consumer,
-				activeTransaction: null,
-				activeTransactionPromise: null,
-				offsetCommitContext: null,
-				sourcesByTopic: new Map(),
-				assignedPartitions: new Map(),
-				// Transaction batching state
-				pendingOffsets: new Map(),
-				pendingChangelogOffsets: new Map(),
-				eosQueue: Promise.resolve(),
-				transactionActive: false,
-				commitTimer: null,
-				lastCommitTime: 0,
+			// Shared by reference across the thread's lanes.
+			const assignedPartitions = new Map<TopicPartitionKey, { topic: string; partition: number }>()
+			const lanes: WorkerContext[] = []
+			for (let laneId = 0; laneId < laneCount; laneId += 1) {
+				const producer = this.client.producer(this.buildProducerConfig(id, threadCount, laneId, laneCount))
+				const lane: WorkerContext = {
+					id,
+					laneId,
+					producer,
+					consumer,
+					activeTransaction: null,
+					activeTransactionPromise: null,
+					offsetCommitContext: null,
+					sourcesByTopic: new Map(),
+					assignedPartitions,
+					// Transaction batching state
+					pendingOffsets: new Map(),
+					pendingChangelogOffsets: new Map(),
+					eosQueue: Promise.resolve(),
+					transactionActive: false,
+					commitTimer: null,
+					lastCommitTime: 0,
+				}
+				lane.sourcesByTopic = this.buildWorkerSources(lane)
+				lanes.push(lane)
+				this.workers.push(lane)
 			}
-			workerRef.current = worker
 
-			worker.sourcesByTopic = this.buildWorkerSources(worker)
-			this.workers.push(worker)
-			this.attachConsumerEvents(consumer, worker)
+			const thread: StreamThread = { id, consumer, assignedPartitions, lanes }
+			threadRef.current = thread
+			this.threads.push(thread)
+			this.attachConsumerEvents(consumer, thread)
 
 			workerReady.push(
 				new Promise<void>((resolve, reject) => {
@@ -555,6 +587,9 @@ class FlowAppImpl implements FlowApp {
 						// Records that were fetched but not started remain uncommitted for the next owner.
 						if (this.closing && this.eosEnabled) return
 
+						// Partition index alone picks the lane so co-partitioned topics land together.
+						const worker = lanes[message.partition % lanes.length]!
+
 						const handler = async () => {
 							const sources = worker.sourcesByTopic.get(message.topic)
 							if (!sources) return
@@ -594,8 +629,8 @@ class FlowAppImpl implements FlowApp {
 			if (changelogTopicsCreated) {
 				const assigned: Array<{ topic: string; partition: number }> = []
 				const seen = new Set<string>()
-				for (const worker of this.workers) {
-					for (const tp of worker.assignedPartitions.values()) {
+				for (const thread of this.threads) {
+					for (const tp of thread.assignedPartitions.values()) {
 						const key = `${tp.topic}:${tp.partition}`
 						if (seen.has(key)) continue
 						seen.add(key)
@@ -611,11 +646,11 @@ class FlowAppImpl implements FlowApp {
 			await this.close().catch(() => {})
 			throw err
 		} finally {
-			for (const worker of this.workers) {
-				const partitions = [...worker.assignedPartitions.values()]
+			for (const thread of this.threads) {
+				const partitions = [...thread.assignedPartitions.values()]
 				if (partitions.length > 0) {
 					try {
-						worker.consumer.resume(partitions)
+						thread.consumer.resume(partitions)
 					} catch {
 						// Ignore - consumer may already be stopping after an error
 					}
@@ -654,8 +689,8 @@ class FlowAppImpl implements FlowApp {
 			})
 		}
 
-		for (const worker of this.workers) {
-			worker.consumer.stop()
+		for (const thread of this.threads) {
+			thread.consumer.stop()
 		}
 
 		if (this.runPromises.length > 0) {
@@ -951,6 +986,14 @@ class FlowAppImpl implements FlowApp {
 		return clonedByTopic
 	}
 
+	/** Transaction lanes per stream thread. Always 1 outside exactly_once. */
+	private get laneCount(): number {
+		if (!this.eosEnabled) {
+			return 1
+		}
+		return Math.max(1, Math.floor(this.config.transactionConcurrency ?? 1))
+	}
+
 	private buildRunEachOptions(): RunEachOptions | undefined {
 		if (!this.eosEnabled) {
 			return this.config.runEach
@@ -961,21 +1004,30 @@ class FlowAppImpl implements FlowApp {
 			...base,
 			autoCommit: false,
 			commitOffsets: false,
-			partitionConcurrency: 1,
+			// Above laneCount the extra partitions would just queue on a lane's eosQueue.
+			partitionConcurrency: this.laneCount,
 		}
 	}
 
-	private buildProducerConfig(workerId: number, threadCount: number): ProducerConfig | undefined {
+	private buildProducerConfig(
+		workerId: number,
+		threadCount: number,
+		laneId: number,
+		laneCount: number
+	): ProducerConfig | undefined {
 		if (!this.eosEnabled) {
 			return this.config.producer
 		}
 
 		const base = this.config.producer ?? {}
-		const transactionalId = base.transactionalId
+		// Suffixes are only appended when needed to disambiguate, so leaving both knobs at
+		// their default keeps an existing app's transactional IDs unchanged.
+		const threadId = base.transactionalId
 			? threadCount > 1
 				? `${base.transactionalId}-w${workerId}`
 				: base.transactionalId
 			: `${this.config.applicationId}-${this.processId}-w${workerId}`
+		const transactionalId = laneCount > 1 ? `${threadId}-l${laneId}` : threadId
 		return {
 			...base,
 			transactionalId,
@@ -1300,7 +1352,7 @@ class FlowAppImpl implements FlowApp {
 		return count
 	}
 
-	private attachConsumerEvents(consumer: Consumer, worker: WorkerContext): void {
+	private attachConsumerEvents(consumer: Consumer, thread: StreamThread): void {
 		// Note: 'rebalance' is a synchronous notification; the actual EOS commit is wired through
 		// onBeforeRebalance (passed to the consumer config) which is awaited by the rebalance protocol.
 		consumer.on('rebalance', () => {
@@ -1308,7 +1360,7 @@ class FlowAppImpl implements FlowApp {
 		})
 		consumer.on('partitionsAssigned', partitions => {
 			for (const tp of partitions) {
-				worker.assignedPartitions.set(`${tp.topic}:${tp.partition}`, tp)
+				thread.assignedPartitions.set(`${tp.topic}:${tp.partition}`, tp)
 			}
 
 			if (this.changelogRestorationEnabled && this.changelogTopics.size > 0) {
@@ -1343,12 +1395,12 @@ class FlowAppImpl implements FlowApp {
 		})
 		consumer.on('partitionsRevoked', partitions => {
 			for (const tp of partitions) {
-				worker.assignedPartitions.delete(`${tp.topic}:${tp.partition}`)
+				thread.assignedPartitions.delete(`${tp.topic}:${tp.partition}`)
 			}
 		})
 		consumer.on('partitionsLost', partitions => {
 			for (const tp of partitions) {
-				worker.assignedPartitions.delete(`${tp.topic}:${tp.partition}`)
+				thread.assignedPartitions.delete(`${tp.topic}:${tp.partition}`)
 			}
 		})
 		consumer.on('error', error => {
@@ -1356,10 +1408,12 @@ class FlowAppImpl implements FlowApp {
 			this.currentState = 'ERROR'
 		})
 		consumer.on('stopped', () => {
-			// Cancel any pending commit timer
-			this.cancelCommitTimer(worker)
-			this.stoppedWorkers += 1
-			if (this.currentState !== 'ERROR' && this.stoppedWorkers >= this.totalWorkers) {
+			// Cancel any pending commit timers
+			for (const lane of thread.lanes) {
+				this.cancelCommitTimer(lane)
+			}
+			this.stoppedThreads += 1
+			if (this.currentState !== 'ERROR' && this.stoppedThreads >= this.totalThreads) {
 				this.currentState = 'STOPPED'
 			}
 		})

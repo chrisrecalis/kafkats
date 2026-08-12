@@ -40,12 +40,22 @@ class TestConsumer extends EventEmitter {
 	}
 
 	async emitMessage(topic: string, value: Buffer | null, key?: Buffer | null, timestamp?: bigint): Promise<void> {
+		await this.emitTo(topic, 0, value, key, timestamp)
+	}
+
+	async emitTo(
+		topic: string,
+		partition: number,
+		value: Buffer | null,
+		key?: Buffer | null,
+		timestamp?: bigint
+	): Promise<void> {
 		if (!this.handler) {
 			throw new Error('consumer not started')
 		}
 		const message: TestMessage = {
 			topic,
-			partition: 0,
+			partition,
 			offset: 0n,
 			timestamp: timestamp ?? 0n,
 			key: key ?? null,
@@ -55,7 +65,7 @@ class TestConsumer extends EventEmitter {
 		const ctx = {
 			signal: new AbortController().signal,
 			topic,
-			partition: 0,
+			partition,
 			offset: 0n,
 			groupId: 'test-app',
 		}
@@ -110,7 +120,10 @@ class TestProducer {
 	}
 }
 
-function createTestApp(overrides: Partial<Parameters<typeof flow>[0]> = {}) {
+function createTestApp(
+	overrides: Partial<Parameters<typeof flow>[0]> = {},
+	onProducer?: (producer: TestProducer, index: number) => void
+) {
 	const client = new KafkaClient({ clientId: 'test-app', brokers: ['localhost:9092'] })
 	const consumers: TestConsumer[] = []
 	const producers: TestProducer[] = []
@@ -125,6 +138,7 @@ function createTestApp(overrides: Partial<Parameters<typeof flow>[0]> = {}) {
 	})
 	vi.spyOn(client, 'producer').mockImplementation(config => {
 		const producer = new TestProducer()
+		onProducer?.(producer, producers.length)
 		producers.push(producer)
 		producerConfigs.push(config)
 		return producer as unknown as never
@@ -377,6 +391,126 @@ describe('flow', () => {
 		expect(producerConfigs[0]?.transactionalId).toBe('orders-pod-0')
 
 		await app.close()
+	})
+})
+
+describe('transaction concurrency', () => {
+	it('creates one producer per lane with a distinct transactional ID', async () => {
+		const { app, consumers, producerConfigs } = createTestApp({
+			processingGuarantee: 'exactly_once',
+			transactionConcurrency: 3,
+			producer: { transactionalId: 'orders-pod-0' },
+		})
+
+		app.stream('events')
+		await app.start()
+
+		expect(consumers).toHaveLength(1)
+		expect(producerConfigs.map(config => config?.transactionalId)).toEqual([
+			'orders-pod-0-l0',
+			'orders-pod-0-l1',
+			'orders-pod-0-l2',
+		])
+
+		await app.close()
+	})
+
+	it('suffixes lanes within each stream thread', async () => {
+		const { app, producerConfigs } = createTestApp({
+			processingGuarantee: 'exactly_once',
+			numStreamThreads: 2,
+			transactionConcurrency: 2,
+			producer: { transactionalId: 'orders-pod-0' },
+		})
+
+		app.stream('events')
+		await app.start()
+
+		expect(producerConfigs.map(config => config?.transactionalId)).toEqual([
+			'orders-pod-0-w0-l0',
+			'orders-pod-0-w0-l1',
+			'orders-pod-0-w1-l0',
+			'orders-pod-0-w1-l1',
+		])
+
+		await app.close()
+	})
+
+	it('ignores transaction concurrency under at_least_once', async () => {
+		const { app, producers } = createTestApp({ transactionConcurrency: 4 })
+
+		app.stream('events').to('out')
+		await app.start()
+
+		expect(producers).toHaveLength(1)
+
+		await app.close()
+	})
+
+	it('routes each partition to one lane and commits its offsets there', async () => {
+		const { app, consumers, producers } = createTestApp({
+			processingGuarantee: 'exactly_once',
+			transactionConcurrency: 2,
+		})
+
+		app.stream('events').to('out')
+		await app.start()
+
+		const consumer = consumers[0]!
+		// Partitions 0 and 2 hash to lane 0, partition 1 to lane 1.
+		await consumer.emitTo('events', 0, Buffer.from('p0'))
+		await consumer.emitTo('events', 2, Buffer.from('p2'))
+		await consumer.emitTo('events', 1, Buffer.from('p1'))
+
+		await app.close()
+
+		expect(producers[0]!.messages.map(message => message.value.toString()).sort()).toEqual(['p0', 'p2'])
+		expect(producers[1]!.messages.map(message => message.value.toString())).toEqual(['p1'])
+
+		const partitionsOf = (producer: TestProducer) =>
+			producer.transactions.flatMap(tx => tx.offsets.map(offset => offset.partition)).sort()
+		expect(partitionsOf(producers[0]!)).toEqual([0, 2])
+		expect(partitionsOf(producers[1]!)).toEqual([1])
+	})
+
+	it('keeps lane transactions in flight concurrently', async () => {
+		// Both lanes park mid-transaction until the other one gets there, so this only
+		// finishes if two transactions are genuinely open at the same time. A single
+		// producer would deadlock here, which the test timeout reports as a failure.
+		let arrived = 0
+		let bothArrived!: () => void
+		const gate = new Promise<void>(resolve => {
+			bothArrived = resolve
+		})
+
+		const { app, consumers, producers } = createTestApp(
+			{ processingGuarantee: 'exactly_once', transactionConcurrency: 2 },
+			producer => {
+				const send = producer.send.bind(producer)
+				producer.send = async (topic, message) => {
+					arrived += 1
+					if (arrived === 2) bothArrived()
+					await gate
+					await send(topic, message)
+				}
+			}
+		)
+
+		app.stream('events').to('out')
+		await app.start()
+		const consumer = consumers[0]!
+
+		await Promise.all([
+			consumer.emitTo('events', 0, Buffer.from('a')),
+			consumer.emitTo('events', 1, Buffer.from('b')),
+		])
+
+		expect(arrived).toBe(2)
+
+		await app.close()
+
+		expect(producers[0]!.transactions).toHaveLength(1)
+		expect(producers[1]!.transactions).toHaveLength(1)
 	})
 })
 

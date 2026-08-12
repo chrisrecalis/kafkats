@@ -326,11 +326,10 @@ export class TestDriver {
 				return consumer
 			},
 			() => {
-				const producer = this.producers[0]
-				if (!producer) {
+				if (this.producers.length === 0) {
 					throw new Error('No producer created - ensure you have defined a topology with output')
 				}
-				return producer
+				return this.producers
 			}
 		)
 	}
@@ -446,11 +445,11 @@ export interface DecodedRecord<K, V> {
 
 class TestContextImpl implements TestContextApi {
 	private readonly _getConsumer: () => MockConsumer
-	private readonly _getProducer: () => MockProducer
+	private readonly _getProducers: () => MockProducer[]
 
-	constructor(getConsumer: () => MockConsumer, getProducer: () => MockProducer) {
+	constructor(getConsumer: () => MockConsumer, getProducers: () => MockProducer[]) {
 		this._getConsumer = getConsumer
-		this._getProducer = getProducer
+		this._getProducers = getProducers
 
 		// Bind all methods to preserve 'this' when destructured
 		this.send = this.send.bind(this)
@@ -465,7 +464,16 @@ class TestContextImpl implements TestContextApi {
 	}
 
 	get producer(): MockProducer {
-		return this._getProducer()
+		return this._getProducers()[0]!
+	}
+
+	/** Output is spread across one producer per stream thread and per transaction lane. */
+	private allMessagesFor(topic: string): Array<TestRecord<Buffer, Buffer>> {
+		const producers = this._getProducers()
+		if (producers.length === 1) {
+			return producers[0]!.messagesFor(topic)
+		}
+		return producers.flatMap(producer => producer.messagesFor(topic))
 	}
 
 	async send<V>(topic: string, value: V, options: SendMessageOptions<V> = {}): Promise<void> {
@@ -499,8 +507,7 @@ class TestContextImpl implements TestContextApi {
 	}
 
 	output<K = Buffer, V = Buffer>(topic: string, options: OutputOptions<K, V> = {}): DecodedRecord<K, V>[] {
-		const messages = this.producer.messagesFor(topic)
-		return messages.map(msg => this.decodeRecord(msg, options))
+		return this.allMessagesFor(topic).map(msg => this.decodeRecord(msg, options))
 	}
 
 	async waitForOutput<K = Buffer, V = Buffer>(
@@ -519,7 +526,7 @@ class TestContextImpl implements TestContextApi {
 			await new Promise(resolve => setTimeout(resolve, interval))
 		}
 
-		const current = this.producer.messagesFor(topic).length
+		const current = this.allMessagesFor(topic).length
 		throw new Error(
 			`Timeout waiting for ${count} messages on topic "${topic}". ` +
 				`Only received ${current} messages after ${timeout}ms.`
@@ -527,7 +534,9 @@ class TestContextImpl implements TestContextApi {
 	}
 
 	clear(): void {
-		this.producer.clear()
+		for (const producer of this._getProducers()) {
+			producer.clear()
+		}
 	}
 
 	private decodeRecord<K, V>(record: TestRecord<Buffer, Buffer>, options: OutputOptions<K, V>): DecodedRecord<K, V> {
@@ -943,9 +952,7 @@ export async function quickTest(
 				return c.sendAll(topic, values, options)
 			},
 			output<K = Buffer, V = Buffer>(topic: string, options?: OutputOptions<K, V>) {
-				const producer = driver.producers[0]
-				if (!producer) return []
-				const messages = producer.messagesFor(topic)
+				const messages = driver.producers.flatMap(producer => producer.messagesFor(topic))
 				return messages.map(m => ({
 					topic: m.topic,
 					key: m.key === null ? null : ((options?.key ? options.key.decode(m.key) : m.key) as K | null),
@@ -961,7 +968,9 @@ export async function quickTest(
 				return c.waitForOutput(topic, count, options)
 			},
 			clear() {
-				driver.producers[0]?.clear()
+				for (const producer of driver.producers) {
+					producer.clear()
+				}
 			},
 			get producer() {
 				return driver.producers[0]!
