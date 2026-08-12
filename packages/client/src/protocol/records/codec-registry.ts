@@ -115,8 +115,13 @@ export class CodecRegistry implements CompressionCodecRegistry {
 			let mod: unknown
 			try {
 				mod = this.moduleLoader(source.module)
-			} catch {
-				continue // not installed
+			} catch (error) {
+				// Installed but broken (native binding, Node version mismatch, ...) must
+				// not be silently conflated with "not installed"
+				if (!isModuleNotFound(error, source.module)) {
+					warnUnusable(source.module, type, error)
+				}
+				continue
 			}
 			try {
 				const codec = source.create(mod)
@@ -124,14 +129,27 @@ export class CodecRegistry implements CompressionCodecRegistry {
 				return codec
 			} catch (error) {
 				// Installed but unusable (e.g. lz4-napi < 2.x): warn and try the next candidate
-				process.emitWarning(
-					`kafkats: found '${source.module}' but could not use it for ${getCompressionTypeName(type)} compression: ` +
-						`${error instanceof Error ? error.message : String(error)}`
-				)
+				warnUnusable(source.module, type, error)
 			}
 		}
 		return undefined
 	}
+}
+
+function isModuleNotFound(error: unknown, id: string): boolean {
+	const code = (error as NodeJS.ErrnoException | null)?.code
+	return (
+		(code === 'MODULE_NOT_FOUND' || code === 'ERR_MODULE_NOT_FOUND') &&
+		error instanceof Error &&
+		error.message.includes(`'${id}'`)
+	)
+}
+
+function warnUnusable(module: string, type: CompressionType, error: unknown): void {
+	process.emitWarning(
+		`kafkats: found '${module}' but could not use it for ${getCompressionTypeName(type)} compression: ` +
+			`${error instanceof Error ? error.message : String(error)}`
+	)
 }
 
 /**

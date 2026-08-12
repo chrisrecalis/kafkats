@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import { createRequire } from 'node:module'
 
@@ -195,7 +195,7 @@ describe('automatic codec registration', () => {
 			if (id in modules) {
 				return modules[id]
 			}
-			throw new Error(`Cannot find module '${id}'`)
+			throw Object.assign(new Error(`Cannot find module '${id}'`), { code: 'MODULE_NOT_FOUND' })
 		}
 		return { loader, requested }
 	}
@@ -274,18 +274,47 @@ describe('automatic codec registration', () => {
 	})
 
 	it('skips an installed library that does not expose the expected API and warns', () => {
-		const warnings: string[] = []
-		const handler = (warning: Error) => warnings.push(warning.message)
-		process.on('warning', handler)
+		const warnSpy = vi.spyOn(process, 'emitWarning').mockImplementation(() => {})
 		try {
 			const { loader } = fakeLoader({ snappy: { notTheApi: true }, snappyjs: fakeSnappyJs })
 			const registry = new CodecRegistry(loader)
 			expect(registry.get(CompressionType.Snappy)).toBeDefined()
+			expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("found 'snappy'"))
 		} finally {
-			process.off('warning', handler)
+			warnSpy.mockRestore()
 		}
-		// process warnings are delivered asynchronously; the emitted message is
-		// still buffered, so just assert the fallback codec was registered above.
+	})
+
+	it('warns when an installed library fails to load (e.g. Node version mismatch) and falls back', () => {
+		const warnSpy = vi.spyOn(process, 'emitWarning').mockImplementation(() => {})
+		try {
+			const loader: ModuleLoader = id => {
+				if (id === 'snappy') {
+					throw new Error('native binding failed to load')
+				}
+				if (id === 'snappyjs') {
+					return fakeSnappyJs
+				}
+				throw Object.assign(new Error(`Cannot find module '${id}'`), { code: 'MODULE_NOT_FOUND' })
+			}
+			const registry = new CodecRegistry(loader)
+			expect(registry.get(CompressionType.Snappy)).toBeDefined()
+			expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("found 'snappy'"))
+		} finally {
+			warnSpy.mockRestore()
+		}
+	})
+
+	it('does not warn about libraries that are simply not installed', () => {
+		const warnSpy = vi.spyOn(process, 'emitWarning').mockImplementation(() => {})
+		try {
+			const { loader } = fakeLoader({})
+			const registry = new CodecRegistry(loader)
+			expect(registry.get(CompressionType.Snappy)).toBeUndefined()
+			expect(warnSpy).not.toHaveBeenCalled()
+		} finally {
+			warnSpy.mockRestore()
+		}
 	})
 
 	it('does not auto-register when autoRegister is disabled', () => {

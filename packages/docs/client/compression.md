@@ -81,6 +81,10 @@ npm install lz4-napi
 npm install @mongodb-js/zstd
 ```
 
+::: warning
+`@mongodb-js/zstd` v7+ requires Node 20.19 or later. On Node 18, install `@mongodb-js/zstd@2` (or `zstd-napi`) instead.
+:::
+
 ### Disabling auto-registration
 
 If you want full control over which codecs are used, turn auto-registration off and register codecs explicitly:
