@@ -581,12 +581,9 @@ await producer.send({
 ### @kafkats/client
 
 ```typescript
-import snappy from 'snappy'
-import { CompressionType, compressionCodecs, createSnappyCodec } from '@kafkats/client'
-
-// GZIP works out of the box; Snappy/LZ4/Zstd require registering a codec.
-compressionCodecs.register(CompressionType.Snappy, createSnappyCodec(snappy))
-
+// GZIP works out of the box. For Snappy/LZ4/Zstd, just install a supported
+// library (e.g. `npm install snappy`) — it is detected and registered
+// automatically, no registration code needed.
 const producer = client.producer({
 	compression: 'snappy', // 'none' | 'gzip' | 'snappy' | 'lz4' | 'zstd'
 })
@@ -698,7 +695,7 @@ process.on('SIGINT', shutdown)
 
 7. **Update compression setup**
     - GZIP works without any packages
-    - For Snappy/LZ4/Zstd: install a compression library (e.g. `npm install snappy`) and register via `compressionCodecs.register(...)` — see [Compression docs](/client/compression)
+    - For Snappy/LZ4/Zstd: install a compression library (e.g. `npm install snappy`) — it is registered automatically. See [Compression docs](/client/compression)
 
 ## Feature Differences
 

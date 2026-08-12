@@ -3,7 +3,8 @@
  *
  * Supports pluggable compression implementations:
  * - GZIP: Built-in using Node.js zlib
- * - Snappy, LZ4, Zstd: Pluggable via external libraries
+ * - Snappy, LZ4, Zstd: Auto-registered when a supported library is installed,
+ *   or pluggable via manual registration
  */
 
 import { gzipSync, gunzipSync } from 'node:zlib'
@@ -90,42 +91,13 @@ export interface CompressionCodecRegistry {
 	 * @returns true if registered
 	 */
 	has(type: CompressionType): boolean
+
+	/**
+	 * Whether missing codecs may be auto-registered from installed libraries.
+	 * Set to false to require explicit registration via register().
+	 */
+	autoRegister?: boolean
 }
-
-class CodecRegistry implements CompressionCodecRegistry {
-	private codecs = new Map<CompressionType, CompressionCodec>()
-
-	constructor() {
-		// Register built-in GZIP codec
-		this.codecs.set(CompressionType.Gzip, gzipCodec)
-	}
-
-	get(type: CompressionType): CompressionCodec | undefined {
-		if (type === CompressionType.None) {
-			return undefined
-		}
-		return this.codecs.get(type)
-	}
-
-	register(type: CompressionType, codec: CompressionCodec): void {
-		if (type === CompressionType.None) {
-			throw new Error('Cannot register codec for CompressionType.None')
-		}
-		this.codecs.set(type, codec)
-	}
-
-	has(type: CompressionType): boolean {
-		if (type === CompressionType.None) {
-			return true // None doesn't need a codec
-		}
-		return this.codecs.has(type)
-	}
-}
-
-/**
- * Global compression codec registry
- */
-export const compressionCodecs = new CodecRegistry()
 
 /**
  * Snappy library interface for native async libraries (e.g., 'snappy' npm package)
@@ -148,12 +120,48 @@ export interface SnappyJsLib {
  */
 export type SnappyLib = SnappyNativeLib | SnappyJsLib
 
+// Xerial stream framing used by the Java Kafka client for Snappy batches:
+// 8-byte magic, int32 BE version, int32 BE min-compatible version, then
+// chunks of [int32 BE compressed length][snappy block].
+const XERIAL_MAGIC = Buffer.from([0x82, 0x53, 0x4e, 0x41, 0x50, 0x50, 0x59, 0x00]) // \x82SNAPPY\0
+const XERIAL_HEADER_SIZE = 16
+
+function hasXerialHeader(data: Buffer): boolean {
+	return data.length >= XERIAL_HEADER_SIZE && data.subarray(0, XERIAL_MAGIC.length).equals(XERIAL_MAGIC)
+}
+
+async function decompressSnappy(data: Buffer, decompressBlock: (block: Buffer) => Promise<Buffer>): Promise<Buffer> {
+	if (!hasXerialHeader(data)) {
+		return decompressBlock(data)
+	}
+	const chunks: Buffer[] = []
+	let offset = XERIAL_HEADER_SIZE
+	while (offset < data.length) {
+		if (offset + 4 > data.length) {
+			throw new Error('Invalid Xerial-framed Snappy data: truncated chunk length')
+		}
+		const size = data.readInt32BE(offset)
+		offset += 4
+		if (size < 0 || offset + size > data.length) {
+			throw new Error(
+				`Invalid Xerial-framed Snappy data: chunk size ${size} exceeds remaining ${data.length - offset} bytes`
+			)
+		}
+		chunks.push(await decompressBlock(data.subarray(offset, offset + size)))
+		offset += size
+	}
+	return Buffer.concat(chunks)
+}
+
 /**
  * Factory function to create a Snappy codec from an external library
  *
  * Supports the following libraries:
  * - **Native**: `snappy` - Fastest Snappy compression library using napi-rs
  * - **Pure JS**: `snappyjs` - Pure JavaScript implementation
+ *
+ * Decompression transparently handles Xerial stream framing (produced by Java
+ * Kafka clients) in addition to raw snappy blocks.
  *
  * @param snappy - The snappy library instance
  * @returns A compression codec
@@ -183,22 +191,23 @@ export function createSnappyCodec(snappy: SnappyLib): CompressionCodec {
 
 		// Native async library (snappy)
 		const asyncLib = snappy as SnappyNativeLib
+		// Compression stays a raw block: xerial's SnappyInputStream falls back to
+		// raw mode when the framing magic is absent, so Java consumers accept it.
 		return {
 			compress: asyncLib.compress,
-			decompress: asyncLib.uncompress,
+			decompress: data => decompressSnappy(data, block => asyncLib.uncompress(block)),
 		}
 	} else {
 		// Pure JS sync library (snappyjs)
 		const syncLib = snappy as SnappyJsLib
+		const decompressBlock = (block: Buffer) =>
+			Promise.resolve(Buffer.from(syncLib.uncompress(block) as ArrayBuffer))
 		return {
 			compress(data: Buffer): Promise<Buffer> {
 				const result = syncLib.compress(data)
 				return Promise.resolve(Buffer.from(result as ArrayBuffer))
 			},
-			decompress(data: Buffer): Promise<Buffer> {
-				const result = syncLib.uncompress(data)
-				return Promise.resolve(Buffer.from(result as ArrayBuffer))
-			},
+			decompress: data => decompressSnappy(data, decompressBlock),
 		}
 	}
 }

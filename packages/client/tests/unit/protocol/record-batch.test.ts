@@ -12,6 +12,7 @@ import {
 	isTransactional,
 } from '@/protocol/records/record-batch.js'
 import { CompressionType } from '@/protocol/records/compression.js'
+import { compressionCodecs } from '@/protocol/records/codec-registry.js'
 import { Decoder } from '@/protocol/primitives/decoder.js'
 
 // Byte offset of the int32 recordCount field within an encoded record batch:
@@ -46,10 +47,16 @@ describe('record batch encoding', () => {
 	})
 
 	it('fails when compression codec is missing', async () => {
-		const batch = baseBatch()
-		await expect(encodeRecordBatch(batch, { compression: CompressionType.Lz4 })).rejects.toThrow(
-			'Compression codec not registered'
-		)
+		// The workspace has real LZ4 libraries installed, which would otherwise be picked up
+		compressionCodecs.autoRegister = false
+		try {
+			const batch = baseBatch()
+			await expect(encodeRecordBatch(batch, { compression: CompressionType.Lz4 })).rejects.toThrow(
+				'Compression codec not registered'
+			)
+		} finally {
+			compressionCodecs.autoRegister = true
+		}
 	})
 
 	it('sets transaction and control flags in attributes', async () => {

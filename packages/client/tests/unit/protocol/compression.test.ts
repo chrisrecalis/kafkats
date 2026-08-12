@@ -1,13 +1,21 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+
+import { createRequire } from 'node:module'
 
 import {
-	compressionCodecs,
 	CompressionType,
 	createLz4Codec,
 	createSnappyCodec,
 	createZstdCodec,
 	getCompressionTypeName,
+	type SnappyNativeLib,
 } from '@/protocol/records/compression.js'
+import {
+	CodecRegistry,
+	compressionCodecs,
+	missingCodecError,
+	type ModuleLoader,
+} from '@/protocol/records/codec-registry.js'
 
 describe('compression registry', () => {
 	it('registers and retrieves codecs', async () => {
@@ -102,7 +110,248 @@ describe('compression registry', () => {
 	})
 
 	it('returns undefined for unknown codec', () => {
-		expect(compressionCodecs.get(CompressionType.Zstd)).toBeUndefined()
+		// Keep the result independent of which libraries are installed in the workspace
+		compressionCodecs.autoRegister = false
+		try {
+			expect(compressionCodecs.get(CompressionType.Zstd)).toBeUndefined()
+		} finally {
+			compressionCodecs.autoRegister = true
+		}
+	})
+})
+
+describe('snappy Xerial framing', () => {
+	// Loaded with require like the production module loader; a static import
+	// trips on snappy's WASI fallback in vitest's ESM transform.
+	const snappy = createRequire(import.meta.url)('snappy') as SnappyNativeLib & {
+		compressSync: (data: Buffer) => Buffer
+	}
+
+	function int32(n: number): Buffer {
+		const b = Buffer.alloc(4)
+		b.writeInt32BE(n)
+		return b
+	}
+
+	const XERIAL_HEADER = Buffer.concat([
+		Buffer.from([0x82, 0x53, 0x4e, 0x41, 0x50, 0x50, 0x59, 0x00]),
+		int32(1),
+		int32(1),
+	])
+
+	function xerialFrame(...blocks: Buffer[]): Buffer {
+		return Buffer.concat([XERIAL_HEADER, ...blocks.flatMap(b => [int32(b.length), b])])
+	}
+
+	it('decodes Xerial-framed payloads produced by Java clients (real snappy)', async () => {
+		const codec = createSnappyCodec(snappy)
+		const part1 = Buffer.from('hello ')
+		const part2 = Buffer.from('xerial world')
+		const framed = xerialFrame(snappy.compressSync(part1), snappy.compressSync(part2))
+
+		expect(await codec.decompress(framed)).toEqual(Buffer.concat([part1, part2]))
+	})
+
+	it('round-trips raw blocks with the real snappy library', async () => {
+		const codec = createSnappyCodec(snappy)
+		const payload = Buffer.from('raw snappy round-trip')
+
+		expect(await codec.decompress(await codec.compress(payload))).toEqual(payload)
+	})
+
+	it('decodes Xerial-framed payloads with a sync (snappyjs-style) library', async () => {
+		const codec = createSnappyCodec({
+			compress: (data: ArrayBuffer | Buffer | Uint8Array) => Buffer.from(data as Uint8Array),
+			uncompress: (data: ArrayBuffer | Buffer | Uint8Array) => Buffer.from(data as Uint8Array),
+		})
+		const framed = xerialFrame(Buffer.from('chunk1-'), Buffer.from('chunk2'))
+
+		expect((await codec.decompress(framed)).toString()).toBe('chunk1-chunk2')
+	})
+
+	it('passes payloads without the Xerial magic straight to the library', async () => {
+		const codec = createSnappyCodec(snappy)
+		const raw = await snappy.compress(Buffer.from('no framing'))
+
+		expect((await codec.decompress(raw)).toString()).toBe('no framing')
+	})
+
+	it('rejects malformed Xerial chunks instead of over-reading', async () => {
+		const codec = createSnappyCodec(snappy)
+		const oversized = Buffer.concat([XERIAL_HEADER, int32(1000), Buffer.from('short')])
+		const truncated = Buffer.concat([XERIAL_HEADER, Buffer.from([0x00, 0x00])])
+
+		await expect(codec.decompress(oversized)).rejects.toThrow('Invalid Xerial-framed Snappy data')
+		await expect(codec.decompress(truncated)).rejects.toThrow('Invalid Xerial-framed Snappy data')
+	})
+})
+
+describe('automatic codec registration', () => {
+	/** A loader that serves fake modules by name and records the ids it was asked for */
+	function fakeLoader(modules: Record<string, unknown>): { loader: ModuleLoader; requested: string[] } {
+		const requested: string[] = []
+		const loader: ModuleLoader = id => {
+			requested.push(id)
+			if (id in modules) {
+				return modules[id]
+			}
+			throw Object.assign(new Error(`Cannot find module '${id}'`), { code: 'MODULE_NOT_FOUND' })
+		}
+		return { loader, requested }
+	}
+
+	const fakeSnappyJs = {
+		compress: (data: ArrayBuffer | Buffer | Uint8Array) => Buffer.from(data as Uint8Array),
+		uncompress: (data: ArrayBuffer | Buffer | Uint8Array) => Buffer.from(data as Uint8Array),
+	}
+
+	it('auto-registers the real snappy library via the default loader', async () => {
+		const registry = new CodecRegistry()
+		const codec = registry.get(CompressionType.Snappy)
+		expect(codec).toBeDefined()
+
+		const payload = Buffer.from('default-loader')
+		expect(await codec!.decompress(await codec!.compress(payload))).toEqual(payload)
+	})
+
+	it('auto-registers snappy when installed', async () => {
+		const { loader } = fakeLoader({ snappy: fakeSnappyJs })
+		const registry = new CodecRegistry(loader)
+
+		expect(registry.has(CompressionType.Snappy)).toBe(true)
+		const codec = registry.get(CompressionType.Snappy)!
+		const payload = Buffer.from('auto-snappy')
+		expect(await codec.decompress(await codec.compress(payload))).toEqual(payload)
+	})
+
+	it('tries candidate libraries in preference order and falls back to the next one', () => {
+		const { loader, requested } = fakeLoader({ snappyjs: fakeSnappyJs })
+		const registry = new CodecRegistry(loader)
+
+		expect(registry.get(CompressionType.Snappy)).toBeDefined()
+		expect(requested).toEqual(['snappy', 'snappyjs'])
+	})
+
+	it('unwraps a default export', () => {
+		const { loader } = fakeLoader({ snappy: { default: fakeSnappyJs } })
+		const registry = new CodecRegistry(loader)
+
+		expect(registry.get(CompressionType.Snappy)).toBeDefined()
+	})
+
+	it('auto-registers lz4 via the node-lz4 encode/decode API', async () => {
+		const { loader } = fakeLoader({ lz4: { encode: (data: Buffer) => data, decode: (data: Buffer) => data } })
+		const registry = new CodecRegistry(loader)
+
+		const codec = registry.get(CompressionType.Lz4)!
+		const payload = Buffer.from('auto-lz4')
+		expect(await codec.decompress(await codec.compress(payload))).toEqual(payload)
+	})
+
+	it('auto-registers zstd via an async compress/decompress API', async () => {
+		const { loader } = fakeLoader({
+			'@mongodb-js/zstd': {
+				compress: async (data: Buffer) => data,
+				decompress: async (data: Buffer) => data,
+			},
+		})
+		const registry = new CodecRegistry(loader)
+
+		const codec = registry.get(CompressionType.Zstd)!
+		const payload = Buffer.from('auto-zstd')
+		expect(await codec.decompress(await codec.compress(payload))).toEqual(payload)
+	})
+
+	it('only attempts auto-registration once per compression type', () => {
+		const { loader, requested } = fakeLoader({})
+		const registry = new CodecRegistry(loader)
+
+		expect(registry.get(CompressionType.Snappy)).toBeUndefined()
+		const attempts = requested.length
+		expect(registry.get(CompressionType.Snappy)).toBeUndefined()
+		expect(registry.has(CompressionType.Snappy)).toBe(false)
+		expect(requested.length).toBe(attempts)
+	})
+
+	it('skips an installed library that does not expose the expected API and warns', () => {
+		const warnSpy = vi.spyOn(process, 'emitWarning').mockImplementation(() => {})
+		try {
+			const { loader } = fakeLoader({ snappy: { notTheApi: true }, snappyjs: fakeSnappyJs })
+			const registry = new CodecRegistry(loader)
+			expect(registry.get(CompressionType.Snappy)).toBeDefined()
+			expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("found 'snappy'"))
+		} finally {
+			warnSpy.mockRestore()
+		}
+	})
+
+	it('warns when an installed library fails to load (e.g. Node version mismatch) and falls back', () => {
+		const warnSpy = vi.spyOn(process, 'emitWarning').mockImplementation(() => {})
+		try {
+			const loader: ModuleLoader = id => {
+				if (id === 'snappy') {
+					throw new Error('native binding failed to load')
+				}
+				if (id === 'snappyjs') {
+					return fakeSnappyJs
+				}
+				throw Object.assign(new Error(`Cannot find module '${id}'`), { code: 'MODULE_NOT_FOUND' })
+			}
+			const registry = new CodecRegistry(loader)
+			expect(registry.get(CompressionType.Snappy)).toBeDefined()
+			expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("found 'snappy'"))
+		} finally {
+			warnSpy.mockRestore()
+		}
+	})
+
+	it('does not warn about libraries that are simply not installed', () => {
+		const warnSpy = vi.spyOn(process, 'emitWarning').mockImplementation(() => {})
+		try {
+			const { loader } = fakeLoader({})
+			const registry = new CodecRegistry(loader)
+			expect(registry.get(CompressionType.Snappy)).toBeUndefined()
+			expect(warnSpy).not.toHaveBeenCalled()
+		} finally {
+			warnSpy.mockRestore()
+		}
+	})
+
+	it('does not auto-register when autoRegister is disabled', () => {
+		const { loader, requested } = fakeLoader({ snappy: fakeSnappyJs })
+		const registry = new CodecRegistry(loader)
+		registry.autoRegister = false
+
+		expect(registry.get(CompressionType.Snappy)).toBeUndefined()
+		expect(requested).toEqual([])
+
+		// Re-enabling makes the next lookup attempt auto-registration
+		registry.autoRegister = true
+		expect(registry.get(CompressionType.Snappy)).toBeDefined()
+	})
+
+	it('manual registration still works after a failed auto-registration attempt', async () => {
+		const { loader } = fakeLoader({})
+		const registry = new CodecRegistry(loader)
+
+		expect(registry.get(CompressionType.Snappy)).toBeUndefined()
+		registry.register(CompressionType.Snappy, createSnappyCodec(fakeSnappyJs))
+		expect(registry.get(CompressionType.Snappy)).toBeDefined()
+	})
+
+	it('does not auto-register gzip or none (no lookup needed)', () => {
+		const { loader, requested } = fakeLoader({})
+		const registry = new CodecRegistry(loader)
+
+		expect(registry.get(CompressionType.Gzip)).toBeDefined()
+		expect(registry.get(CompressionType.None)).toBeUndefined()
+		expect(requested).toEqual([])
+	})
+
+	it('includes an install hint in the missing codec error', () => {
+		expect(missingCodecError(CompressionType.Snappy).message).toMatch(/Install one of: snappy, snappyjs/)
+		expect(missingCodecError(CompressionType.Lz4).message).toMatch(/lz4-napi, lz4, lz4js/)
+		expect(missingCodecError(CompressionType.Zstd).message).toMatch(/@mongodb-js\/zstd, zstd-napi/)
 	})
 })
 
