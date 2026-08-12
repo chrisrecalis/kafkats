@@ -185,6 +185,9 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 				partitionConcurrency,
 				isolationLevel: this.config.isolationLevel,
 				checkCrcs: this.config.checkCrcs,
+				onFetchPosition: (position, recordCount) => {
+					this.emit('fetchPosition', position, recordCount)
+				},
 			},
 			logger
 		)

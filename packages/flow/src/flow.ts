@@ -99,6 +99,7 @@ class FlowAppImpl implements FlowApp {
 	private readonly logger: Logger
 	private lastCheckpointErrorMessage: string | null = null
 	private currentState: StreamState = 'CREATED'
+	private closing = false
 	private workers: WorkerContext[] = []
 	private runPromises: Promise<void>[] = []
 	private stoppedWorkers = 0
@@ -425,6 +426,7 @@ class FlowAppImpl implements FlowApp {
 		}
 
 		this.currentState = 'RUNNING'
+		this.closing = false
 		await this.client.connect()
 
 		// Validate and create changelog topics (returns false if skipped due to no brokers)
@@ -544,6 +546,10 @@ class FlowAppImpl implements FlowApp {
 				.runEach(
 					topics,
 					async (message, ctx) => {
+						// close() first seals message delivery, then commits everything already queued.
+						// Records that were fetched but not started remain uncommitted for the next owner.
+						if (this.closing && this.eosEnabled) return
+
 						const handler = async () => {
 							const sources = worker.sourcesByTopic.get(message.topic)
 							if (!sources) return
@@ -631,6 +637,10 @@ class FlowAppImpl implements FlowApp {
 		if (this.currentState === 'STOPPED') {
 			return
 		}
+
+		// Prevent a buffered record from opening a new transaction after the final commit
+		// has been queued but before the consumer is stopped.
+		this.closing = true
 
 		// Commit any pending transactions before stopping
 		for (const worker of this.workers) {

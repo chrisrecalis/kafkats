@@ -7,6 +7,7 @@ import { createRecordBatch, encodeRecordBatchSync } from '@/protocol/records/ind
 
 function makeFetchManager() {
 	const broker = { nodeId: 1, fetch: vi.fn() }
+	const onFetchPosition = vi.fn()
 	const cluster = {
 		getLeaderForPartition: vi.fn().mockResolvedValue(broker),
 		getLogger: () => null,
@@ -24,13 +25,14 @@ function makeFetchManager() {
 			maxWaitMs: 50,
 			partitionConcurrency: 1,
 			isolationLevel: 'read_uncommitted',
+			onFetchPosition,
 		}
 	)
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	const fmAny = fm as any
 	// Buffer is never appended to in these cases (zero user records), but must be non-null.
 	fmAny.fetchBuffer = { add: vi.fn(), isFull: () => false }
-	return { broker, fm, fmAny }
+	return { broker, fm, fmAny, onFetchPosition }
 }
 
 function fetchResponse(recordsData: Buffer, highWatermark: bigint) {
@@ -60,7 +62,7 @@ function fetchResponse(recordsData: Buffer, highWatermark: bigint) {
 
 describe('FetchManager position advancement past record-less batches', () => {
 	it('advances the fetch position past a control-only batch (no user records)', async () => {
-		const { broker, fm, fmAny } = makeFetchManager()
+		const { broker, fm, fmAny, onFetchPosition } = makeFetchManager()
 
 		// A control batch at offset 10 (e.g. a transaction marker). It carries one control record
 		// but yields zero user records; the position must still advance to 11.
@@ -77,10 +79,11 @@ describe('FetchManager position advancement past record-less batches', () => {
 		// Without advancing here the consumer re-fetches offset 10 forever.
 		expect(state.offset).toBe(11n)
 		expect(fmAny.fetchBuffer.add).not.toHaveBeenCalled()
+		expect(onFetchPosition).toHaveBeenCalledWith({ topic: 't', partition: 0, offset: 11n }, 0)
 	})
 
 	it('advances the fetch position past an empty/compacted batch spanning multiple offsets', async () => {
-		const { broker, fm, fmAny } = makeFetchManager()
+		const { broker, fm, fmAny, onFetchPosition } = makeFetchManager()
 
 		// A batch whose records were all compacted away: baseOffset 20, lastOffsetDelta 4 (covers
 		// 20..24), zero records. The position must jump to 25.
@@ -95,10 +98,11 @@ describe('FetchManager position advancement past record-less batches', () => {
 		await fmAny.fetchFromBrokerToBuffer(broker, [state])
 
 		expect(state.offset).toBe(25n)
+		expect(onFetchPosition).toHaveBeenCalledWith({ topic: 't', partition: 0, offset: 25n }, 0)
 	})
 
 	it('keeps the surviving record of a sparse (compacted) batch instead of skipping it', async () => {
-		const { broker, fm, fmAny } = makeFetchManager()
+		const { broker, fm, fmAny, onFetchPosition } = makeFetchManager()
 
 		// A compacted batch: baseOffset 0, lastOffsetDelta 10 (declares offsets 0..10), but only one
 		// record survived — at offsetDelta 10 (absolute offset 10). recordCount(1) !== lastOffsetDelta+1,
@@ -120,5 +124,6 @@ describe('FetchManager position advancement past record-less batches', () => {
 		const buffered = fmAny.fetchBuffer.add.mock.calls[0][0]
 		expect(buffered.records.map((r: { offset: bigint }) => r.offset)).toEqual([10n])
 		expect(state.offset).toBe(11n)
+		expect(onFetchPosition).toHaveBeenCalledWith({ topic: 't', partition: 0, offset: 11n }, 1)
 	})
 })

@@ -1077,6 +1077,43 @@ describe('changelog topics and restoration', () => {
 		expect(await store.get('aborted-key')).toBeUndefined()
 	}, 60_000)
 
+	it('ChangelogRestorer completes when a partition contains only an aborted transaction', async () => {
+		const changelogTopic = uniqueTopicName('flow-it-changelog-aborted-only')
+		await createTopics(client, [{ name: changelogTopic, partitions: 1 }])
+
+		const txProducer = client.producer({
+			transactionalId: uniqueTopicName('flow-it-restorer-aborted-only-tx'),
+			idempotent: true,
+		})
+		try {
+			await expect(
+				txProducer.transaction(async tx => {
+					await tx.send(changelogTopic, { key: 'aborted-key', value: numberCodec.encode(999) })
+					throw new Error('intentional abort')
+				})
+			).rejects.toThrow()
+		} finally {
+			await txProducer.disconnect()
+		}
+
+		const store = new InMemoryKeyValueStore<string, number>('aborted-only-store', {
+			keyCodec: stringCodec,
+			valueCodec: numberCodec,
+		})
+		await store.init()
+
+		const restorer = new ChangelogRestorer(changelogTopic, stringCodec, numberCodec, store)
+		const restored = await restorer.restore(client, {
+			idleTimeoutMs: 500,
+			initialIdleTimeoutMs: 2_000,
+			checkIntervalMs: 50,
+			consumerMaxWaitMs: 50,
+		})
+
+		expect(restored).toBe(0)
+		expect(await store.get('aborted-key')).toBeUndefined()
+	}, 60_000)
+
 	it('writes changelog checkpoints when checkpoint store is available', async () => {
 		const input = uniqueTopicName('flow-it-checkpoint-src')
 		const outputTopic = uniqueTopicName('flow-it-checkpoint-out')
