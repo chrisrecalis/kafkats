@@ -86,6 +86,17 @@ Flow implements exactly-once semantics using batch-based transaction commits, si
 1. **Batch Processing** - Multiple input messages are processed within a single transaction batch
 2. **Periodic Commits** - Transactions commit at regular intervals (controlled by `commitIntervalMs`)
 3. **Atomic Commits** - Each commit atomically writes output messages and commits consumer offsets
+4. **Replica-Safe IDs** - Flow gives each application instance an internal process UUID and derives each
+   producer's transactional ID as `<applicationId>-<processId>-w<thread>`
+
+The process UUID is generated when the `FlowApp` is created, so replicas can safely share the normal
+`applicationId` and `clientId` configuration. It is not currently persisted: after a process restart, Flow uses a
+new UUID. Exactly-once correctness is preserved, but a transaction left open by the previous process may remain
+open until its transaction timeout expires.
+
+If `producer.transactionalId` is configured explicitly, the caller is responsible for making it unique among
+simultaneously running application instances. Flow appends a worker suffix when `numStreamThreads` is greater
+than one.
 
 Transactions are also committed:
 
