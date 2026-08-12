@@ -299,6 +299,7 @@ export class ChangelogRestorer<K, V> {
 		let restoredCount = 0
 
 		const abortController = new AbortController()
+		const pausedPartitions = new Set<number>()
 
 		let lastProgressTime = Date.now()
 		let isRunning = false
@@ -307,10 +308,32 @@ export class ChangelogRestorer<K, V> {
 		const initialIdleTimeoutMs = options?.initialIdleTimeoutMs ?? idleTimeoutMs
 		const checkIntervalMs = options?.checkIntervalMs ?? 1000
 		const restoreCompleteReason = Symbol('changelogRestoreComplete')
+		const completePartition = (partition: number) => {
+			pendingPartitions.delete(partition)
+			if (pendingPartitions.size === 0) {
+				abortController.abort(restoreCompleteReason)
+			}
+		}
+		const pausePartition = (topic: string, partition: number) => {
+			if (pausedPartitions.has(partition)) return
+			pausedPartitions.add(partition)
+			consumer.pause([{ topic, partition }])
+		}
 
 		consumer.once('running', () => {
 			isRunning = true
 			lastProgressTime = Date.now()
+		})
+		consumer.on('fetchPosition', (position, recordCount) => {
+			if (recordCount !== 0 || position.topic !== this.topicName || !pendingPartitions.has(position.partition)) {
+				return
+			}
+
+			lastProgressTime = Date.now()
+			const endOffset = endOffsets.get(position.partition)
+			if (endOffset === undefined || position.offset < endOffset) return
+
+			completePartition(position.partition)
 		})
 
 		const checkIdle = setInterval(() => {
@@ -337,7 +360,6 @@ export class ChangelogRestorer<K, V> {
 			}
 		}, checkIntervalMs)
 
-		const pausedPartitions = new Set<number>()
 		try {
 			await consumer.runEach(
 				[this.topicName],
@@ -349,14 +371,8 @@ export class ChangelogRestorer<K, V> {
 
 					// Ignore any records that arrive beyond the captured end offset (e.g. concurrent writers).
 					if (message.offset >= endOffset) {
-						pendingPartitions.delete(message.partition)
-						if (!pausedPartitions.has(message.partition)) {
-							pausedPartitions.add(message.partition)
-							consumer.pause([{ topic: message.topic, partition: message.partition }])
-						}
-						if (pendingPartitions.size === 0) {
-							abortController.abort(restoreCompleteReason)
-						}
+						pausePartition(message.topic, message.partition)
+						completePartition(message.partition)
 						return
 					}
 
@@ -377,14 +393,8 @@ export class ChangelogRestorer<K, V> {
 					}
 
 					if (message.offset + 1n >= endOffset) {
-						pendingPartitions.delete(message.partition)
-						if (!pausedPartitions.has(message.partition)) {
-							pausedPartitions.add(message.partition)
-							consumer.pause([{ topic: message.topic, partition: message.partition }])
-						}
-						if (pendingPartitions.size === 0) {
-							abortController.abort(restoreCompleteReason)
-						}
+						pausePartition(message.topic, message.partition)
+						completePartition(message.partition)
 					}
 				},
 				{

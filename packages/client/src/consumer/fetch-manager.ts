@@ -19,7 +19,7 @@ import {
 } from '@/protocol/records/index.js'
 import type { DecodedRecord } from '@/protocol/records/index.js'
 import { Decoder } from '@/protocol/primitives/decoder.js'
-import type { TopicPartition, AutoOffsetReset, IsolationLevel, PartitionBatch } from './types.js'
+import type { TopicPartition, TopicPartitionOffset, AutoOffsetReset, IsolationLevel, PartitionBatch } from './types.js'
 import type { OffsetManager } from './offset-manager.js'
 import { noopLogger, type Logger } from '@/logger.js'
 import { tpKey, formatPartitions } from '@/utils/topic-partition.js'
@@ -284,6 +284,8 @@ export interface FetchManagerConfig {
 	checkCrcs?: boolean
 	/** Maximum bytes to buffer for poll() mode. Default: maxBytesPerPartition * 10 */
 	maxBufferedBytes?: number
+	/** Called whenever a decoded batch range advances the fetch position. */
+	onFetchPosition?: (position: TopicPartitionOffset, recordCount: number) => void
 }
 
 /**
@@ -907,6 +909,10 @@ export class FetchManager {
 						nextOffset ?? (records.length > 0 ? records[records.length - 1]!.offset + 1n : null)
 					if (advanceTo !== null && advanceTo > state.offset) {
 						state.offset = advanceTo
+						this.config.onFetchPosition?.(
+							{ topic: state.topic, partition: state.partition, offset: advanceTo },
+							records.length
+						)
 					}
 				}
 			}

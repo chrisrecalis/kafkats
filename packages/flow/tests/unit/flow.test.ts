@@ -11,6 +11,7 @@ type TestHandler = (message: TestMessage, ctx: TestContext) => Promise<void>
 class TestConsumer extends EventEmitter {
 	private handler: TestHandler | null = null
 	private stopResolve: (() => void) | null = null
+	private messageOnStop: { topic: string; value: Buffer | null; key?: Buffer | null } | null = null
 	consumerGroup = { currentMemberId: 'member-1', currentGenerationId: 1 }
 
 	async runEach(_subscription: string[], handler: TestHandler): Promise<void> {
@@ -25,8 +26,19 @@ class TestConsumer extends EventEmitter {
 	}
 
 	stop(): void {
-		this.stopResolve?.()
+		const resolve = this.stopResolve
 		this.stopResolve = null
+		if (this.messageOnStop) {
+			const message = this.messageOnStop
+			this.messageOnStop = null
+			void this.emitMessage(message.topic, message.value, message.key).then(() => resolve?.())
+			return
+		}
+		resolve?.()
+	}
+
+	queueMessageOnStop(topic: string, value: Buffer | null, key?: Buffer | null): void {
+		this.messageOnStop = { topic, value, key }
 	}
 
 	async emitMessage(topic: string, value: Buffer | null, key?: Buffer | null, timestamp?: bigint): Promise<void> {
@@ -55,6 +67,7 @@ class TestConsumer extends EventEmitter {
 class TestProducer {
 	messages: Array<{ topic: string; key?: Buffer | null; value: Buffer; partition?: number }> = []
 	transactions: Array<{ offsets: Array<{ topic: string; partition: number; offset: bigint }> }> = []
+	private activeTransactions = 0
 
 	async send(topic: string, message: { key?: Buffer | null; value: Buffer; partition?: number }): Promise<void> {
 		this.messages.push({ topic, key: message.key, value: message.value, partition: message.partition })
@@ -76,19 +89,26 @@ class TestProducer {
 		}) => Promise<void>
 	): Promise<void> {
 		const offsets: Array<{ topic: string; partition: number; offset: bigint }> = []
-		await fn({
-			send: async (topic, message) => {
-				await this.send(topic, message)
-			},
-			sendOffsets: async params => {
-				offsets.push(...params.offsets)
-			},
-		})
-		this.transactions.push({ offsets })
+		this.activeTransactions += 1
+		try {
+			await fn({
+				send: async (topic, message) => {
+					await this.send(topic, message)
+				},
+				sendOffsets: async params => {
+					offsets.push(...params.offsets)
+				},
+			})
+			this.transactions.push({ offsets })
+		} finally {
+			this.activeTransactions -= 1
+		}
 	}
 
 	async disconnect(): Promise<void> {
-		return
+		if (this.activeTransactions > 0) {
+			throw new Error('cannot disconnect with an active transaction')
+		}
 	}
 }
 
@@ -253,6 +273,39 @@ describe('flow', () => {
 				offset: 1n,
 			},
 		])
+	})
+
+	it('does not start a new transaction from a buffered record while closing', async () => {
+		const { app, consumers, producers } = createTestApp({ processingGuarantee: 'exactly_once' })
+
+		app.stream('events').to('out')
+
+		await app.start()
+		const consumer = consumers[0]!
+		const producer = producers[0]!
+
+		await consumer.emitMessage('events', Buffer.from('before-close'))
+		consumer.queueMessageOnStop('events', Buffer.from('buffered-during-close'))
+
+		await app.close()
+
+		expect(producer.messages.map(message => message.value.toString())).toEqual(['before-close'])
+		expect(producer.transactions).toHaveLength(1)
+	})
+
+	it('finishes a buffered at-least-once record while closing', async () => {
+		const { app, consumers, producers } = createTestApp()
+
+		app.stream('events').to('out')
+
+		await app.start()
+		const consumer = consumers[0]!
+		const producer = producers[0]!
+
+		consumer.queueMessageOnStop('events', Buffer.from('buffered-during-close'))
+		await app.close()
+
+		expect(producer.messages.map(message => message.value.toString())).toEqual(['buffered-during-close'])
 	})
 
 	it('spawns one worker per stream thread', async () => {

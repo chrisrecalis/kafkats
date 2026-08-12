@@ -415,6 +415,8 @@ export interface ConsumerEvents {
 	partitionsRevoked: [partitions: TopicPartition[]]
 	/** Emitted on fatal session loss - offsets cannot be committed for these partitions */
 	partitionsLost: [partitions: TopicPartition[]]
+	/** Emitted when fetching advances; offset is the next fetch position after this range. */
+	fetchPosition: [position: TopicPartitionOffset, recordCount: number]
 }
 
 export interface InternalConsumerContext {
