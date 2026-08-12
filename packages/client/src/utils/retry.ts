@@ -17,6 +17,13 @@ export type RetryOptions = ReconnectionStrategyOptions & {
 	 * error is rethrown even if attempts remain. Leave undefined for purely attempt-bounded retries.
 	 */
 	maxElapsedMs?: number
+	/**
+	 * Return a delay (ms) to retry this error without consuming the attempt budget or growing the
+	 * backoff — for expected transient states that shouldn't count as failures (e.g.
+	 * CONCURRENT_TRANSACTIONS). Free retries require maxElapsedMs; without a deadline (or once
+	 * past it) the error falls through to the normal shouldRetry/backoff handling.
+	 */
+	freeRetry?: (error: unknown) => number | undefined
 }
 
 export function createRetryStrategyOptions(config: RetryBackoffConfig): ReconnectionStrategyOptions {
@@ -28,7 +35,7 @@ export function createRetryStrategyOptions(config: RetryBackoffConfig): Reconnec
 }
 
 export async function retry<T>(fn: (attempt: number) => Promise<T>, options: RetryOptions = {}): Promise<T> {
-	const { signal, resolveOnAbort, shouldRetry, onRetry, maxElapsedMs, ...strategyOptions } = options
+	const { signal, resolveOnAbort, shouldRetry, onRetry, maxElapsedMs, freeRetry, ...strategyOptions } = options
 	const strategy = new ReconnectionStrategy(strategyOptions)
 	const startedAt = Date.now()
 
@@ -37,6 +44,17 @@ export async function retry<T>(fn: (attempt: number) => Promise<T>, options: Ret
 		try {
 			return await fn(attempt)
 		} catch (error) {
+			const freeDelayMs = freeRetry?.(error)
+			if (
+				freeDelayMs !== undefined &&
+				maxElapsedMs !== undefined &&
+				Date.now() - startedAt + freeDelayMs < maxElapsedMs
+			) {
+				await onRetry?.({ attempt, delayMs: freeDelayMs, error })
+				await sleep(freeDelayMs, { signal, resolveOnAbort })
+				continue
+			}
+
 			if (shouldRetry && !shouldRetry(error)) {
 				throw error
 			}

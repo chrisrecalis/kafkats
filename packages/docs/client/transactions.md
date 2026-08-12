@@ -149,13 +149,53 @@ Things to know:
 - **No ordering guarantee** between independent transactions. Per-partition ordering is preserved because `runEach`/`runBatch` don't deliver the next record for a partition until the handler returns.
 - **The transaction timeout does not include queue time.** It starts when the transaction actually begins.
 - **Nested transactions throw.** Calling `producer.transaction()` from inside the same producer's transaction callback throws immediately instead of deadlocking.
-- **Watch for commit-bound throughput.** The producer emits `transaction:queued` (with the number of transactions ahead) whenever a call has to wait. If this fires sustainedly, your throughput ceiling is transaction commit latency — increase batch sizes to lower the transaction rate.
+- **Watch for commit-bound throughput.** The producer emits `transaction:queued` (with the number of transactions ahead) whenever a call has to wait. If this fires sustainedly, your throughput ceiling is transaction commit latency — increase batch sizes to lower the transaction rate, or raise `transactionConcurrency` (below) so transactions actually overlap.
 
 ```typescript
 producer.on('transaction:queued', ({ queued }) => {
 	metrics.gauge('kafka.txn.queue_depth', queued)
 })
 ```
+
+## Parallel Transactions
+
+The one-open-transaction limit is per transactional ID. `transactionConcurrency` lets a single producer run up to N transactions at once by managing a pool of N internal transactional producers ("lanes") behind the same `transaction()` API:
+
+```typescript
+const producer = client.producer({
+	transactionalId: 'orders-processor',
+	transactionConcurrency: 3, // up to 3 transactions in flight
+})
+
+await consumer.runBatch(
+	'input',
+	async (messages, ctx) => {
+		const results = await transform(messages)
+
+		// With transactionConcurrency: 3, transactions from the 3 concurrent
+		// partition handlers genuinely overlap instead of queueing.
+		await producer.transaction(async txn => {
+			await txn.send('output', results)
+			await txn.sendOffsets({
+				consumerGroupMetadata,
+				offsets: [{ topic: ctx.topic, partition: ctx.partition, offset: ctx.offset + 1n }],
+			})
+		})
+	},
+	{ autoCommit: false, commitOffsets: false, partitionConcurrency: 3 }
+)
+```
+
+How it works:
+
+- Lane 0 uses `transactionalId` verbatim; lanes 1..N-1 append `-1`..`-{N-1}` (e.g. `orders-processor`, `orders-processor-1`, `orders-processor-2`). Each lane initializes lazily on first use and fences its predecessor with the same ID.
+- `transaction()` calls are admitted **first-in first-out**: a call takes a free lane immediately, or waits for the next one released. `transaction:queued` fires only when all lanes are busy.
+- Transactions begin in call order but **may commit in any order** — same guarantee as independent transactions today. Per-partition input ordering is unaffected (`runEach`/`runBatch` still deliver one record/batch per partition at a time).
+- `flush()` and `disconnect()` cover all lanes; disconnect still refuses while any transaction is active or queued.
+
+::: warning Fencing and transactional IDs
+Transactional-ID zombie fencing applies **per lane**. For consume-transform-produce, always pass `consumerGroupMetadata` to `sendOffsets()` (KIP-447) so a zombie's offset commits are fenced by consumer-group generation regardless of which lane they ran on. Also note that changing `transactionConcurrency` changes the set of transactional IDs in use: a transaction left open under an ID that is no longer used stays open until the broker's `transactional.id.expiration.ms` elapses.
+:::
 
 ## Transaction API
 
