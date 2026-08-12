@@ -31,14 +31,11 @@ export function buildTopology(app: FlowApp): void {
 	// ============================================
 	// Stream-Table Join: Enrich events with user data
 	// ============================================
-	const enrichedEvents = events.leftJoin(
-		usersTable,
-		(event, user): EnrichedEvent => ({
-			...event,
-			userTier: user?.tier ?? 'free',
-			country: user?.country ?? 'unknown',
-		})
-	)
+	const enrichedEvents = events.leftJoin(usersTable, (event, user): EnrichedEvent => ({
+		...event,
+		userTier: user?.tier ?? 'free',
+		country: user?.country ?? 'unknown',
+	}))
 
 	// ============================================
 	// Branching: Route by user tier
@@ -94,16 +91,14 @@ export function buildTopology(app: FlowApp): void {
 			{ value: codec.json<SessionSummary>() }
 		)
 		.toStream()
-		.map(
-			(windowed: Windowed<string>, session): KeyValue<string, SessionSummary> => [
-				windowed.key,
-				{
-					...session,
-					sessionStart: windowed.window.start,
-					sessionEnd: windowed.window.end,
-				},
-			]
-		)
+		.map((windowed: Windowed<string>, session): KeyValue<string, SessionSummary> => [
+			windowed.key,
+			{
+				...session,
+				sessionStart: windowed.window.start,
+				sessionEnd: windowed.window.end,
+			},
+		])
 		.to(TOPICS.USER_SESSIONS, {
 			key: codec.string(),
 			value: codec.json<SessionSummary>(),
@@ -118,16 +113,14 @@ export function buildTopology(app: FlowApp): void {
 		.windowedBy(TimeWindows.of('1m'))
 		.count()
 		.toStream()
-		.map(
-			(windowed: Windowed<string>, count): KeyValue<string, PageStats> => [
-				windowed.key,
-				{
-					page: windowed.key,
-					windowStart: windowed.window.start,
-					viewCount: count,
-				},
-			]
-		)
+		.map((windowed: Windowed<string>, count): KeyValue<string, PageStats> => [
+			windowed.key,
+			{
+				page: windowed.key,
+				windowStart: windowed.window.start,
+				viewCount: count,
+			},
+		])
 		.to(TOPICS.PAGE_METRICS, {
 			key: codec.string(),
 			value: codec.json<PageStats>(),

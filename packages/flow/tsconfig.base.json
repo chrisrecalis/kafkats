@@ -3,13 +3,13 @@
 		"target": "ES2022",
 		"module": "NodeNext",
 		"moduleResolution": "NodeNext",
-		"baseUrl": ".",
 		"paths": {
-			"@/*": ["src/*"],
-			"@kafkats/flow": ["src/index.ts"],
-			"@kafkats/flow/testing": ["src/testing.ts"]
+			"@/*": ["./src/*"],
+			"@kafkats/flow": ["./src/index.ts"],
+			"@kafkats/flow/testing": ["./src/testing.ts"]
 		},
 		"lib": ["ES2022"],
+		"types": ["node"],
 		"allowJs": false,
 		"strict": true,
 		"noImplicitOverride": true,

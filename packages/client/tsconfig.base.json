@@ -3,11 +3,11 @@
 		"target": "ES2022",
 		"module": "NodeNext",
 		"moduleResolution": "NodeNext",
-		"baseUrl": ".",
 		"paths": {
-			"@/*": ["src/*"]
+			"@/*": ["./src/*"]
 		},
 		"lib": ["ES2022"],
+		"types": ["node"],
 		"allowJs": false,
 		"strict": true,
 		"noImplicitOverride": true,
