@@ -119,6 +119,44 @@ For strict exactly-once consume-transform-produce you should provide `consumerGr
 **Recommended:** Use `@kafkats/flow` with `processingGuarantee: 'exactly_once'` for automatic exactly-once handling. Flow batches multiple messages into transactions and commits them periodically, which is more efficient than per-message transactions. See [Flow Processing Guarantees](/flow/getting-started#processing-guarantees) for details.
 :::
 
+## Concurrent Transactions
+
+A producer can have one open transaction at a time — this is a Kafka protocol constraint, not a library limit. Concurrent `transaction()` calls **queue and wait for capacity** instead of throwing, so a single transactional producer is safe to share across handlers running with `partitionConcurrency` greater than 1:
+
+```typescript
+await consumer.runBatch(
+	'input',
+	async (messages, ctx) => {
+		const results = await transform(messages)
+
+		// Safe with partitionConcurrency > 1: transactions from concurrent
+		// partition handlers wait their turn on the producer.
+		await producer.transaction(async txn => {
+			await txn.send('output', results)
+			await txn.sendOffsets({
+				groupId: 'my-group',
+				offsets: [{ topic: ctx.topic, partition: ctx.partition, offset: ctx.offset + 1n }],
+			})
+		})
+	},
+	{ autoCommit: false, partitionConcurrency: 3 }
+)
+```
+
+Things to know:
+
+- **Only the transaction section serializes.** Message processing before `transaction()` still overlaps across partitions.
+- **No ordering guarantee** between independent transactions. Per-partition ordering is preserved because `runEach`/`runBatch` don't deliver the next record for a partition until the handler returns.
+- **The transaction timeout does not include queue time.** It starts when the transaction actually begins.
+- **Nested transactions throw.** Calling `producer.transaction()` from inside the same producer's transaction callback throws immediately instead of deadlocking.
+- **Watch for commit-bound throughput.** The producer emits `transaction:queued` (with the number of transactions ahead) whenever a call has to wait. If this fires sustainedly, your throughput ceiling is transaction commit latency — increase batch sizes to lower the transaction rate.
+
+```typescript
+producer.on('transaction:queued', ({ queued }) => {
+	metrics.gauge('kafka.txn.queue_depth', queued)
+})
+```
+
 ## Transaction API
 
 ### ProducerTransaction

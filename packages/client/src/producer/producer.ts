@@ -3,6 +3,7 @@
  */
 
 import { EventEmitter } from 'node:events'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import type { Cluster } from '@/client/cluster.js'
 import type { Broker } from '@/client/broker.js'
 import type { ProduceRequest } from '@/protocol/messages/requests/produce.js'
@@ -188,6 +189,14 @@ export class Producer extends EventEmitter<ProducerEvents> {
 
 	// Transaction state (only used when transactionalId is set)
 	private transactionState: TransactionState = 'idle'
+	// FIFO queue serializing transaction() calls: the protocol allows one open
+	// transaction per producer, so concurrent callers wait instead of throwing.
+	private transactionTail: Promise<void> = Promise.resolve()
+	// Number of transaction() calls admitted (active + waiting).
+	private transactionQueueDepth = 0
+	// Detects producer.transaction() called from inside this producer's own
+	// transaction callback, which would otherwise deadlock on the queue.
+	private readonly transactionScope = new AsyncLocalStorage<true>()
 	// First definitive failure of a transactional send in the current transaction.
 	// While set, commitTransaction() must abort instead of committing partial data.
 	private transactionAbortCause: Error | null = null
@@ -1127,13 +1136,16 @@ export class Producer extends EventEmitter<ProducerEvents> {
 			return
 		}
 
-		// Throw if transaction is active - caller must await transaction() first.
-		// A fatally-errored producer (failed abort) has no active transaction to
-		// wait for and must still be closeable.
-		if (this.config.transactionalId && this.transactionState !== 'idle' && this.transactionState !== 'error') {
+		// Throw if a transaction is active or queued - caller must await
+		// producer.transaction() first. A fatally-errored producer (failed abort)
+		// has no active transaction to wait for and must still be closeable.
+		if (
+			this.config.transactionalId &&
+			(this.transactionQueueDepth > 0 || (this.transactionState !== 'idle' && this.transactionState !== 'error'))
+		) {
 			throw new Error(
-				`Cannot disconnect while transaction is in state '${this.transactionState}'. ` +
-					`Await producer.transaction() before calling disconnect().`
+				`Cannot disconnect while transactions are active or queued (state '${this.transactionState}', ` +
+					`queued ${this.transactionQueueDepth}). Await producer.transaction() before calling disconnect().`
 			)
 		}
 
@@ -1167,6 +1179,16 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	 * The transaction is automatically committed if the function resolves,
 	 * or aborted if it throws an error.
 	 *
+	 * A producer can have one open transaction at a time (a Kafka protocol
+	 * constraint). Concurrent transaction() calls wait for capacity instead of
+	 * throwing, so this is safe to call from handlers running with
+	 * partitionConcurrency > 1. Independent transactions have no ordering
+	 * guarantee relative to each other. Calling transaction() from inside this
+	 * producer's own transaction callback throws.
+	 *
+	 * The transaction timeout starts when the transaction begins, not while it
+	 * waits in the queue.
+	 *
 	 * @param fn - Function containing transaction operations
 	 * @param options - Transaction options
 	 * @returns Result of the transaction function
@@ -1187,8 +1209,44 @@ export class Producer extends EventEmitter<ProducerEvents> {
 			throw new Error('transaction() requires transactionalId to be configured')
 		}
 
+		if (this.transactionScope.getStore()) {
+			throw new Error(
+				'producer.transaction() was called from inside an active transaction callback. ' +
+					'Nested transactions are not supported — use tx.send()/tx.sendOffsets() instead.'
+			)
+		}
+
+		const previous = this.transactionTail
+		let release!: () => void
+		this.transactionTail = new Promise(resolve => {
+			release = resolve
+		})
+
+		if (this.transactionQueueDepth > 0) {
+			this.logger.debug('transaction queued behind active transaction', {
+				queued: this.transactionQueueDepth,
+			})
+			this.emit('transaction:queued', { queued: this.transactionQueueDepth })
+		}
+		this.transactionQueueDepth++
+
+		try {
+			await previous
+			return await this.transactionScope.run(true, () => this.runTransaction(fn, options))
+		} finally {
+			this.transactionQueueDepth--
+			release()
+		}
+	}
+
+	private async runTransaction<T>(
+		fn: (tx: ProducerTransaction) => Promise<T>,
+		options: TransactionOptions
+	): Promise<T> {
+		// Only a producer in a fatal state can be non-idle here: concurrent
+		// transactions queue on transactionTail and never observe each other.
 		if (this.transactionState !== 'idle') {
-			throw new InvalidTxnStateError(this.config.transactionalId, this.transactionState, ['idle'])
+			throw new InvalidTxnStateError(this.config.transactionalId!, this.transactionState, ['idle'])
 		}
 
 		await this.ensureInitialized()
@@ -1264,7 +1322,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 				throw error
 			}
 			throw new TransactionAbortedError(
-				this.config.transactionalId,
+				this.config.transactionalId!,
 				error instanceof Error ? error : new Error(String(error))
 			)
 		}
