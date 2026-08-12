@@ -4,28 +4,29 @@ kafkats supports multiple compression algorithms for reducing network bandwidth 
 
 ## Quick Start
 
+Install a supported compression library and use it — kafkats detects and registers it automatically:
+
+```bash
+npm install snappy
+```
+
 ```typescript
-import { KafkaClient, CompressionType, compressionCodecs, createSnappyCodec } from '@kafkats/client'
-import snappy from 'snappy'
-
-// Register a compression codec
-compressionCodecs.register(CompressionType.Snappy, createSnappyCodec(snappy))
-
-// Use compression in producer
 const producer = client.producer({
 	compression: 'snappy',
 })
 ```
 
+No registration call is needed. When a codec is first looked up, kafkats checks for the supported libraries (see below) and registers the first one it finds.
+
 ## Compression Types
 
-| Type       | Speed     | Ratio | Built-in | Notes                        |
-| ---------- | --------- | ----- | -------- | ---------------------------- |
-| `'none'`   | Fastest   | 1:1   | Yes      | No compression               |
-| `'gzip'`   | Slow      | Best  | Yes      | Uses Node.js zlib            |
-| `'snappy'` | Fast      | Good  | No       | Balanced choice              |
-| `'lz4'`    | Very fast | Good  | No       | Best for high throughput     |
-| `'zstd'`   | Medium    | Best  | No       | Modern, efficient, versatile |
+| Type       | Speed     | Ratio | Built-in | Notes                                       |
+| ---------- | --------- | ----- | -------- | ------------------------------------------- |
+| `'none'`   | Fastest   | 1:1   | Yes      | No compression                              |
+| `'gzip'`   | Slow      | Best  | Yes      | Uses Node.js zlib                           |
+| `'snappy'` | Fast      | Good  | No       | Balanced choice, auto-detected library      |
+| `'lz4'`    | Very fast | Good  | No       | Best for throughput, auto-detected library  |
+| `'zstd'`   | Medium    | Best  | No       | Modern and efficient, auto-detected library |
 
 ## Built-in Codecs
 
@@ -37,125 +38,93 @@ const producer = client.producer({
 })
 ```
 
-## Pluggable Compression Libraries
+## Automatic Codec Registration
 
-For Snappy, LZ4, and Zstd, you must install a compression library and register it. kafkats supports multiple libraries for each algorithm.
+For Snappy, LZ4, and Zstd, install one of the supported libraries and kafkats picks it up automatically — no registration code required. When several are installed, the first match in the table below (fastest first) wins.
 
 ### Snappy
 
-| Library    | Type    | Performance |
-| ---------- | ------- | ----------- |
-| `snappy`   | Native  | Fastest     |
-| `snappyjs` | Pure JS | Good        |
-
-#### snappy (Recommended)
+| Library    | Type    | Performance | Auto-detected |
+| ---------- | ------- | ----------- | ------------- |
+| `snappy`   | Native  | Fastest     | Yes (1st)     |
+| `snappyjs` | Pure JS | Good        | Yes (2nd)     |
 
 ```bash
 npm install snappy
 ```
 
-```typescript
-import snappy from 'snappy'
-import { CompressionType, compressionCodecs, createSnappyCodec } from '@kafkats/client'
-
-compressionCodecs.register(CompressionType.Snappy, createSnappyCodec(snappy))
-```
-
-#### snappyjs
-
-```bash
-npm install snappyjs
-```
-
-```typescript
-import * as SnappyJS from 'snappyjs'
-import { CompressionType, compressionCodecs, createSnappyCodec } from '@kafkats/client'
-
-compressionCodecs.register(CompressionType.Snappy, createSnappyCodec(SnappyJS))
-```
-
 ### LZ4
 
-| Library    | Type    | Performance |
-| ---------- | ------- | ----------- |
-| `lz4-napi` | Native  | Fastest     |
-| `lz4`      | Native  | Fast        |
-| `lz4js`    | Pure JS | Good        |
-
-#### lz4-napi (Recommended)
+| Library    | Type    | Performance | Auto-detected |
+| ---------- | ------- | ----------- | ------------- |
+| `lz4-napi` | Native  | Fastest     | Yes (1st)     |
+| `lz4`      | Native  | Fast        | Yes (2nd)     |
+| `lz4js`    | Pure JS | Good        | Yes (3rd)     |
 
 ```bash
 npm install lz4-napi
 ```
 
-```typescript
-import * as lz4 from 'lz4-napi'
-import { CompressionType, compressionCodecs, createLz4Codec } from '@kafkats/client'
-
-compressionCodecs.register(CompressionType.Lz4, createLz4Codec(lz4))
-```
-
-#### node-lz4
-
-```bash
-npm install lz4
-```
-
-```typescript
-import lz4 from 'lz4'
-import { CompressionType, compressionCodecs, createLz4Codec } from '@kafkats/client'
-
-compressionCodecs.register(CompressionType.Lz4, createLz4Codec(lz4))
-```
-
-#### lz4js
-
-```bash
-npm install lz4js
-```
-
-```typescript
-import * as lz4js from 'lz4js'
-import { CompressionType, compressionCodecs, createLz4Codec } from '@kafkats/client'
-
-compressionCodecs.register(CompressionType.Lz4, createLz4Codec(lz4js))
-```
+::: warning
+`lz4-napi` 2.x or later is required — Kafka needs the LZ4 frame format, which older versions don't expose.
+:::
 
 ### Zstd
 
-| Library            | Type   | Performance |
-| ------------------ | ------ | ----------- |
-| `@mongodb-js/zstd` | Native | Fastest     |
-| `zstd-napi`        | Native | Fastest     |
-| `zstd-codec`       | WASM   | Good        |
-
-#### @mongodb-js/zstd (Recommended)
+| Library            | Type   | Performance | Auto-detected |
+| ------------------ | ------ | ----------- | ------------- |
+| `@mongodb-js/zstd` | Native | Fastest     | Yes (1st)     |
+| `zstd-napi`        | Native | Fastest     | Yes (2nd)     |
+| `zstd-codec`       | WASM   | Good        | No (manual)   |
 
 ```bash
 npm install @mongodb-js/zstd
 ```
 
+### Disabling auto-registration
+
+If you want full control over which codecs are used, turn auto-registration off and register codecs explicitly:
+
 ```typescript
-import { compress, decompress } from '@mongodb-js/zstd'
+import { compressionCodecs } from '@kafkats/client'
+
+compressionCodecs.autoRegister = false
+```
+
+## Manual Registration
+
+Manual registration is still available — it always takes precedence over auto-detection. Use it for custom codecs, for `zstd-codec` (which needs async initialization), or to pass options like the Zstd compression level.
+
+### Snappy
+
+```typescript
+import snappy from 'snappy' // or: import * as SnappyJS from 'snappyjs'
+import { CompressionType, compressionCodecs, createSnappyCodec } from '@kafkats/client'
+
+compressionCodecs.register(CompressionType.Snappy, createSnappyCodec(snappy))
+```
+
+### LZ4
+
+```typescript
+import * as lz4 from 'lz4-napi' // or: 'lz4', 'lz4js'
+import { CompressionType, compressionCodecs, createLz4Codec } from '@kafkats/client'
+
+compressionCodecs.register(CompressionType.Lz4, createLz4Codec(lz4))
+```
+
+### Zstd
+
+```typescript
+import { compress, decompress } from '@mongodb-js/zstd' // or: 'zstd-napi'
 import { CompressionType, compressionCodecs, createZstdCodec } from '@kafkats/client'
 
 compressionCodecs.register(CompressionType.Zstd, createZstdCodec({ compress, decompress }))
 ```
 
-#### zstd-napi
+#### zstd-codec (WASM, manual only)
 
-```bash
-npm install zstd-napi
-```
-
-```typescript
-import { compress, decompress } from 'zstd-napi'
-import { CompressionType, compressionCodecs, createZstdCodec } from '@kafkats/client'
-
-compressionCodecs.register(CompressionType.Zstd, createZstdCodec({ compress, decompress }))
-```
-
-#### zstd-codec
+`zstd-codec` initializes asynchronously, so it cannot be auto-detected and must be registered manually:
 
 ```bash
 npm install zstd-codec
@@ -201,7 +170,7 @@ for await (const { message } of consumer.stream('my-topic')) {
 ```
 
 ::: tip
-Make sure the compression codec is registered before consuming messages that use that compression type. GZIP works out of the box, but Snappy/LZ4/Zstd codecs must be registered.
+Make sure a compression library for the topic's compression type is installed (or a codec manually registered) before consuming. GZIP works out of the box; Snappy/LZ4/Zstd need one of the supported libraries installed.
 :::
 
 ## Performance Considerations

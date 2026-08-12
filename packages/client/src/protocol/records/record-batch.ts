@@ -29,7 +29,7 @@ import {
 	type KafkaRecord,
 	type DecodedRecord,
 } from '@/protocol/records/record.js'
-import { CompressionType, compressionCodecs, getCompressionTypeName } from '@/protocol/records/compression.js'
+import { CompressionType, compressionCodecs, missingCodecError } from '@/protocol/records/compression.js'
 
 // Attribute bit masks
 export const COMPRESSION_CODEC_MASK = 0x07 // bits 0-2
@@ -224,7 +224,7 @@ export async function encodeRecordBatch(batch: RecordBatch, options: EncodeRecor
 
 	const codec = compressionCodecs.get(compression)
 	if (!codec) {
-		throw new Error(`Compression codec not registered: ${getCompressionTypeName(compression)}`)
+		throw missingCodecError(compression)
 	}
 	recordsBuffer = await codec.compress(recordsBuffer)
 
@@ -424,7 +424,7 @@ export async function decodeRecordBatchFrom(
 	if (compressionType !== CompressionType.None) {
 		const codec = compressionCodecs.get(compressionType)
 		if (!codec) {
-			throw new Error(`Compression codec not registered: ${getCompressionTypeName(compressionType)}`)
+			throw missingCodecError(compressionType)
 		}
 		recordsBuffer = await codec.decompress(recordsBuffer)
 	}

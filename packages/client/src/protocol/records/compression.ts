@@ -3,9 +3,11 @@
  *
  * Supports pluggable compression implementations:
  * - GZIP: Built-in using Node.js zlib
- * - Snappy, LZ4, Zstd: Pluggable via external libraries
+ * - Snappy, LZ4, Zstd: Auto-registered when a supported library is installed,
+ *   or pluggable via manual registration
  */
 
+import { createRequire } from 'node:module'
 import { gzipSync, gunzipSync } from 'node:zlib'
 
 /**
@@ -92,10 +94,86 @@ export interface CompressionCodecRegistry {
 	has(type: CompressionType): boolean
 }
 
-class CodecRegistry implements CompressionCodecRegistry {
-	private codecs = new Map<CompressionType, CompressionCodec>()
+/**
+ * Loads a module by id, returning its exports. Injectable for testing.
+ */
+export type ModuleLoader = (id: string) => unknown
 
-	constructor() {
+let nodeRequire: NodeJS.Require | undefined
+const defaultModuleLoader: ModuleLoader = id => {
+	nodeRequire ??= createRequire(import.meta.url)
+	return nodeRequire(id)
+}
+
+/**
+ * A known compression library that can be auto-registered when installed
+ */
+interface AutoCodecSource {
+	module: string
+	create: (mod: unknown) => CompressionCodec
+}
+
+/**
+ * Return the export object (the module itself or its `default`) that exposes
+ * all of the given functions. Throws if neither does, so auto-registration
+ * moves on to the next candidate library.
+ */
+function pickExports<T>(mod: unknown, fns: string[]): T {
+	for (const candidate of [mod, (mod as { default?: unknown } | undefined)?.default]) {
+		if (candidate && fns.every(fn => typeof (candidate as Record<string, unknown>)[fn] === 'function')) {
+			return candidate as T
+		}
+	}
+	throw new Error(`module does not expose the expected functions: ${fns.join(', ')}`)
+}
+
+/**
+ * Known libraries per compression type, in preference order (fastest first).
+ *
+ * `zstd-codec` (WASM) is intentionally absent: it requires asynchronous
+ * initialization via ZstdCodec.run() and must be registered manually.
+ */
+const autoCodecSources: Partial<Record<CompressionType, readonly AutoCodecSource[]>> = {
+	[CompressionType.Snappy]: [
+		{ module: 'snappy', create: mod => createSnappyCodec(pickExports<SnappyLib>(mod, ['compress', 'uncompress'])) },
+		{
+			module: 'snappyjs',
+			create: mod => createSnappyCodec(pickExports<SnappyLib>(mod, ['compress', 'uncompress'])),
+		},
+	],
+	[CompressionType.Lz4]: [
+		{ module: 'lz4-napi', create: mod => createLz4Codec(pickExports<Lz4Lib>(mod, ['compress', 'uncompress'])) },
+		{ module: 'lz4', create: mod => createLz4Codec(pickExports<Lz4Lib>(mod, ['encode', 'decode'])) },
+		{ module: 'lz4js', create: mod => createLz4Codec(pickExports<Lz4Lib>(mod, ['compress', 'decompress'])) },
+	],
+	[CompressionType.Zstd]: [
+		{
+			module: '@mongodb-js/zstd',
+			create: mod => createZstdCodec(pickExports<ZstdLib>(mod, ['compress', 'decompress'])),
+		},
+		{ module: 'zstd-napi', create: mod => createZstdCodec(pickExports<ZstdLib>(mod, ['compress', 'decompress'])) },
+	],
+}
+
+/**
+ * Compression codec registry with automatic codec discovery.
+ *
+ * When a codec is looked up for a type that has no registered codec, the
+ * registry tries to load a known compression library (see the compression
+ * docs) and registers it automatically. Manual registration always takes
+ * precedence and remains available for custom codecs.
+ */
+export class CodecRegistry implements CompressionCodecRegistry {
+	/**
+	 * Whether missing codecs may be auto-registered from installed libraries.
+	 * Set to false to require explicit registration via register().
+	 */
+	autoRegister = true
+
+	private codecs = new Map<CompressionType, CompressionCodec>()
+	private autoLoadAttempted = new Set<CompressionType>()
+
+	constructor(private moduleLoader: ModuleLoader = defaultModuleLoader) {
 		// Register built-in GZIP codec
 		this.codecs.set(CompressionType.Gzip, gzipCodec)
 	}
@@ -104,7 +182,7 @@ class CodecRegistry implements CompressionCodecRegistry {
 		if (type === CompressionType.None) {
 			return undefined
 		}
-		return this.codecs.get(type)
+		return this.codecs.get(type) ?? this.tryAutoRegister(type)
 	}
 
 	register(type: CompressionType, codec: CompressionCodec): void {
@@ -118,7 +196,40 @@ class CodecRegistry implements CompressionCodecRegistry {
 		if (type === CompressionType.None) {
 			return true // None doesn't need a codec
 		}
-		return this.codecs.has(type)
+		return this.codecs.has(type) || this.tryAutoRegister(type) !== undefined
+	}
+
+	/**
+	 * Try each known library for the type once. Missing libraries are skipped
+	 * silently; an installed library that fails to produce a codec emits a
+	 * process warning (so e.g. an incompatible lz4-napi < 2.x doesn't fail
+	 * completely silently) and the next candidate is tried.
+	 */
+	private tryAutoRegister(type: CompressionType): CompressionCodec | undefined {
+		if (!this.autoRegister || this.autoLoadAttempted.has(type)) {
+			return undefined
+		}
+		this.autoLoadAttempted.add(type)
+
+		for (const source of autoCodecSources[type] ?? []) {
+			let mod: unknown
+			try {
+				mod = this.moduleLoader(source.module)
+			} catch {
+				continue // Not installed
+			}
+			try {
+				const codec = source.create(mod)
+				this.codecs.set(type, codec)
+				return codec
+			} catch (error) {
+				process.emitWarning(
+					`kafkats: found '${source.module}' but could not use it for ${getCompressionTypeName(type)} compression: ` +
+						`${error instanceof Error ? error.message : String(error)}`
+				)
+			}
+		}
+		return undefined
 	}
 }
 
@@ -424,4 +535,17 @@ export function createZstdCodec(zstd: ZstdLib, options?: ZstdCodecOptions): Comp
  */
 export function getCompressionTypeName(type: CompressionType): string {
 	return CompressionType[type] ?? `Unknown(${type})`
+}
+
+/**
+ * Build the error thrown when no codec is available for a compression type,
+ * including an install hint for types that support auto-registration.
+ */
+export function missingCodecError(type: CompressionType): Error {
+	const sources = autoCodecSources[type]
+	const hint = sources?.length
+		? ` Install one of: ${sources.map(s => s.module).join(', ')} (used automatically when installed), ` +
+			`or register a codec via compressionCodecs.register().`
+		: ''
+	return new Error(`Compression codec not registered: ${getCompressionTypeName(type)}.${hint}`)
 }
