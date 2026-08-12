@@ -16,10 +16,10 @@ Many operations accept an `options` object. These are the common ones:
 
 ### Produced (for `to(...)`, `through(...)`)
 
-| Option        | Type       | Description                                        |
+| Option | Type | Description |
 | ------------- | ---------- | -------------------------------------------------- | --------------------------------------- |
-| `key`         | `Codec<K>` | Encode keys                                        |
-| `value`       | `Codec<V>` | Encode values                                      |
+| `key` | `Codec<K>` | Encode keys |
+| `value` | `Codec<V>` | Encode values |
 | `partitioner` | `(key: K   | null, value: V, partitionCount: number) => number` | Choose a partition for produced records |
 
 ### Grouped (for `groupBy(...)`, `groupByKey(...)`)

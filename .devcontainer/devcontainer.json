@@ -24,8 +24,7 @@
 			"extensions": [
 				"anthropic.claude-code",
 				"openai.chatgpt",
-				"dbaeumer.vscode-eslint",
-				"esbenp.prettier-vscode"
+				"oxc.oxc-vscode"
 			]
 		}
 	},

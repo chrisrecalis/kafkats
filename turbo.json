@@ -9,7 +9,7 @@
 		"lint": {
 			"dependsOn": ["^build"],
 			"outputs": [],
-			"inputs": ["src/**", "eslint.config.*", "tsconfig*.json"]
+			"inputs": ["src/**", ".oxlintrc.json", "tsconfig*.json"]
 		},
 		"typecheck": {
 			"dependsOn": ["^build"],
