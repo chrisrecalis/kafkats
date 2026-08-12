@@ -103,8 +103,8 @@ function isCoordinatorErrorCode(errorCode: ErrorCode): boolean {
 	return errorCode === ErrorCode.NotCoordinator || errorCode === ErrorCode.CoordinatorNotAvailable
 }
 
-/** Poll interval for CONCURRENT_TRANSACTIONS — see transactionalRetryOptions(). */
-const CONCURRENT_TRANSACTIONS_POLL_MS = 10
+/** Poll interval for CONCURRENT_TRANSACTIONS — matches the Java client's ADD_PARTITIONS_RETRY_BACKOFF_MS. */
+const CONCURRENT_TRANSACTIONS_POLL_MS = 20
 
 /**
  * Default producer configuration values
