@@ -4,16 +4,29 @@
 	"version": "0.9.1",
 	"description": "Flow-level APIs built on top of @kafkats/client.",
 	"type": "module",
-	"main": "dist/index.js",
-	"types": "dist/index.d.ts",
+	"main": "dist/index.cjs",
+	"module": "dist/index.js",
+	"types": "dist/index.d.cts",
 	"exports": {
 		".": {
-			"import": "./dist/index.js",
-			"types": "./dist/index.d.ts"
+			"import": {
+				"types": "./dist/index.d.ts",
+				"default": "./dist/index.js"
+			},
+			"require": {
+				"types": "./dist/index.d.cts",
+				"default": "./dist/index.cjs"
+			}
 		},
 		"./testing": {
-			"import": "./dist/testing.js",
-			"types": "./dist/testing.d.ts"
+			"import": {
+				"types": "./dist/testing.d.ts",
+				"default": "./dist/testing.js"
+			},
+			"require": {
+				"types": "./dist/testing.d.cts",
+				"default": "./dist/testing.cjs"
+			}
 		}
 	},
 	"files": [
@@ -44,7 +57,7 @@
 		"node": ">=18"
 	},
 	"scripts": {
-		"build": "pnpm clean && tsc -p tsconfig.build.json && tsc-alias -p tsconfig.build.json",
+		"build": "pnpm clean && tsdown --config-loader native",
 		"test": "vitest run tests",
 		"test:integration": "vitest run -c vitest.integration.config.ts",
 		"test:unit": "vitest run tests/unit",
@@ -59,7 +72,7 @@
 		"@testcontainers/kafka": "^11.8.1",
 		"@types/node": "^24.10.1",
 		"testcontainers": "^11.8.1",
-		"tsc-alias": "^1.8.16",
+		"tsdown": "^0.22.14",
 		"tsx": "^4.20.6",
 		"typescript": "^7.0.2",
 		"vitest": "^4.0.12"
