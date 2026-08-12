@@ -96,28 +96,66 @@ await consumer.runEach(
 		// Atomically: send output + commit input offset
 		await producer.transaction(async txn => {
 			await txn.send('output', [{ value: result }])
-
-			await txn.sendOffsets({
-				groupId: 'my-group',
-				offsets: [
-					{
-						topic: ctx.topic,
-						partition: ctx.partition,
-						offset: ctx.offset + 1n,
-					},
-				],
-			})
+			await txn.sendOffsets(ctx)
 		})
 	},
-	{ autoCommit: false }
+	{ autoCommit: false, commitOffsets: false }
 )
 ```
 
-::: tip Full EOS with consumers
-For strict exactly-once consume-transform-produce you should provide `consumerGroupMetadata` (group id + generation id + member id). That information is required to atomically commit offsets with the consumer's current group membership.
+`sendOffsets(ctx)` commits `ctx.offset + 1` for the context's topic and partition. The context contains a
+delivery-time snapshot of the consumer-group membership that delivered the record, so a rebalance makes a stale
+transaction fail instead of committing offsets under a newer generation.
 
-**Recommended:** Use `@kafkats/flow` with `processingGuarantee: 'exactly_once'` for automatic exactly-once handling. Flow batches multiple messages into transactions and commits them periodically, which is more efficient than per-message transactions. See [Flow Processing Guarantees](/flow/getting-started#processing-guarantees) for details.
+::: tip Batched processing
+Pass explicit accumulated offsets as the second argument: `txn.sendOffsets(ctx, offsets)`. Use the first context
+that opened the transaction so the entire batch remains bound to that consumer-group generation.
+
+`@kafkats/flow` with `processingGuarantee: 'exactly_once'` handles this batching automatically. See
+[Flow Processing Guarantees](/flow/getting-started#processing-guarantees) for details.
 :::
+
+## Concurrent Transactions
+
+A producer can have one open transaction at a time — this is a Kafka protocol constraint, not a library limit. Concurrent `transaction()` calls **queue and wait for capacity** instead of throwing, so a single transactional producer is safe to share across handlers running with `partitionConcurrency` greater than 1:
+
+```typescript
+await consumer.runBatch(
+	'input',
+	async (messages, ctx) => {
+		const results = await transform(messages)
+
+		// Safe with partitionConcurrency > 1: transactions from concurrent
+		// partition handlers wait their turn on the producer.
+		await producer.transaction(async txn => {
+			await txn.send('output', results)
+			await txn.sendOffsets({
+				consumerGroupMetadata, // group id + generation id + member id (KIP-447 zombie fencing)
+				offsets: [{ topic: ctx.topic, partition: ctx.partition, offset: ctx.offset + 1n }],
+			})
+		})
+	},
+	// commitOffsets: false — offsets must only be committed through the
+	// transaction, never by the consumer itself (e.g. during revoke/shutdown).
+	{ autoCommit: false, commitOffsets: false, partitionConcurrency: 3 }
+)
+```
+
+For strict exactly-once semantics, pass `consumerGroupMetadata` rather than a bare `groupId` — without the generation and member id, a zombie consumer's offset commits are not fenced (see the tip in [Consume-Transform-Produce](#consume-transform-produce)).
+
+Things to know:
+
+- **Only the transaction section serializes.** Message processing before `transaction()` still overlaps across partitions.
+- **No ordering guarantee** between independent transactions. Per-partition ordering is preserved because `runEach`/`runBatch` don't deliver the next record for a partition until the handler returns.
+- **The transaction timeout does not include queue time.** It starts when the transaction actually begins.
+- **Nested transactions throw.** Calling `producer.transaction()` from inside the same producer's transaction callback throws immediately instead of deadlocking.
+- **Watch for commit-bound throughput.** The producer emits `transaction:queued` (with the number of transactions ahead) whenever a call has to wait. If this fires sustainedly, your throughput ceiling is transaction commit latency — increase batch sizes to lower the transaction rate.
+
+```typescript
+producer.on('transaction:queued', ({ queued }) => {
+	metrics.gauge('kafka.txn.queue_depth', queued)
+})
+```
 
 ## Transaction API
 
@@ -130,6 +168,8 @@ interface ProducerTransaction {
 	send<V, K>(topicDef: TopicDefinition<V, K>, messages: ProducerMessage<V, K>[]): Promise<SendResult[]>
 
 	// Commit consumer offsets (for exactly-once)
+	sendOffsets(ctx: ConsumeContext): Promise<void>
+	sendOffsets(ctx: ConsumeContext, offsets: TopicPartitionOffset[]): Promise<void>
 	sendOffsets(params: SendOffsetsParams): Promise<void>
 
 	// Abort signal (fires on timeout or error)
@@ -141,10 +181,10 @@ interface ProducerTransaction {
 
 ```typescript
 interface SendOffsetsParams {
-	// Simple: just the group ID
+	// Low-level, unfenced form
 	groupId?: string
 
-	// Full EOS: include consumer metadata
+	// Advanced escape hatch for callers managing raw group metadata
 	consumerGroupMetadata?: {
 		groupId: string
 		generationId: number
@@ -160,6 +200,11 @@ interface SendOffsetsParams {
 	}>
 }
 ```
+
+A context from a manually assigned consumer automatically uses the `groupId`-only form because there is no group
+generation to fence. The object form remains available for standalone producer transactions and other low-level
+callers without a consume context. For normal `runEach()`, `runBatch()`, and `stream()` processing, pass the
+`ConsumeContext` supplied to the handler.
 
 ## Idempotent Producer
 

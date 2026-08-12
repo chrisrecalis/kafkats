@@ -13,6 +13,15 @@ const client = new KafkaClient({
 })
 ```
 
+::: tip Module formats
+All `@kafkats/*` packages ship both ESM and CommonJS builds. In a CJS project, use `require` instead:
+
+```js
+const { KafkaClient } = require('@kafkats/client')
+```
+
+:::
+
 ### Client Options
 
 | Option                      | Type         | Description                                         |

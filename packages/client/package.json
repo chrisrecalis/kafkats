@@ -4,12 +4,19 @@
 	"version": "0.9.1",
 	"description": "Pure-protocol Kafka client, consumer/producer, and EOS patterns in TypeScript.",
 	"type": "module",
-	"main": "dist/index.js",
-	"types": "dist/index.d.ts",
+	"main": "dist/index.cjs",
+	"module": "dist/index.js",
+	"types": "dist/index.d.cts",
 	"exports": {
 		".": {
-			"import": "./dist/index.js",
-			"types": "./dist/index.d.ts"
+			"import": {
+				"types": "./dist/index.d.ts",
+				"default": "./dist/index.js"
+			},
+			"require": {
+				"types": "./dist/index.d.cts",
+				"default": "./dist/index.cjs"
+			}
 		}
 	},
 	"files": [
@@ -38,7 +45,7 @@
 		"node": ">=18"
 	},
 	"scripts": {
-		"build": "pnpm clean && tsc -p tsconfig.build.json && tsc-alias -p tsconfig.build.json",
+		"build": "pnpm clean && tsdown --config-loader native",
 		"test": "vitest run --config vitest.unit.config.ts tests",
 		"test:unit": "vitest run --config vitest.unit.config.ts tests/unit",
 		"test:integration": "VITEST_INTEGRATION=1 vitest run --config vitest.integration.config.ts tests/integration",
@@ -48,27 +55,13 @@
 		"prepack": "pnpm -w turbo run build --filter=$npm_package_name"
 	},
 	"devDependencies": {
-		"@eslint/js": "^9.39.1",
 		"@node-rs/crc32": "^1.10.6",
 		"@testcontainers/kafka": "^11.8.1",
 		"@types/node": "^24.10.1",
-		"@typescript-eslint/eslint-plugin": "^8.47.0",
-		"@typescript-eslint/parser": "^8.47.0",
-		"eslint": "^9.39.1",
-		"eslint-config-prettier": "^10.1.8",
-		"eslint-import-resolver-typescript": "^4.4.4",
-		"eslint-plugin-import": "^2.32.0",
-		"eslint-plugin-jsdoc": "^61.3.0",
-		"eslint-plugin-node": "^11.1.0",
-		"eslint-plugin-prettier": "^5.5.4",
-		"eslint-plugin-promise": "^7.2.1",
-		"globals": "^16.5.0",
-		"prettier": "^3.6.2",
 		"testcontainers": "^11.8.1",
-		"tsc-alias": "^1.8.16",
+		"tsdown": "^0.22.14",
 		"tsx": "^4.20.6",
-		"typescript": "^5.9.3",
-		"typescript-eslint": "^8.47.0",
+		"typescript": "^7.0.2",
 		"vitest": "^4.0.12",
 		"vitest-mock-extended": "^4.0.0"
 	},

@@ -4,12 +4,19 @@
 	"version": "0.9.1",
 	"description": "LMDB state store provider for @kafkats/flow",
 	"type": "module",
-	"main": "dist/index.js",
-	"types": "dist/index.d.ts",
+	"main": "dist/index.cjs",
+	"module": "dist/index.js",
+	"types": "dist/index.d.cts",
 	"exports": {
 		".": {
-			"import": "./dist/index.js",
-			"types": "./dist/index.d.ts"
+			"import": {
+				"types": "./dist/index.d.ts",
+				"default": "./dist/index.js"
+			},
+			"require": {
+				"types": "./dist/index.d.cts",
+				"default": "./dist/index.cjs"
+			}
 		}
 	},
 	"files": [
@@ -38,7 +45,7 @@
 		"node": ">=18"
 	},
 	"scripts": {
-		"build": "pnpm clean && tsc -p tsconfig.build.json && tsc-alias -p tsconfig.build.json",
+		"build": "pnpm clean && tsdown --config-loader native",
 		"test": "vitest run tests",
 		"typecheck": "tsc -p tsconfig.json --noEmit",
 		"clean": "rm -rf dist",
@@ -53,8 +60,8 @@
 	"devDependencies": {
 		"@kafkats/flow": "workspace:^",
 		"@types/node": "^24.10.1",
-		"tsc-alias": "^1.8.16",
-		"typescript": "^5.9.3",
+		"tsdown": "^0.22.14",
+		"typescript": "^7.0.2",
 		"vitest": "^4.0.12"
 	}
 }

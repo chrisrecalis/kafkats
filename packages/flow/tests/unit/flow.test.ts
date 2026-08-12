@@ -1,19 +1,17 @@
 import { EventEmitter } from 'node:events'
 import { describe, expect, it, vi, afterEach } from 'vitest'
-import { KafkaClient, type Message, type ProducerConfig } from '@kafkats/client'
+import { KafkaClient, type ConsumeContext, type Message, type ProducerConfig } from '@kafkats/client'
 import { codec, flow, TimeWindows, SessionWindows } from '../../src/index.js'
 import { ChangelogBackedWindowStore, ChangelogBackedSessionStore } from '../../src/state/changelog.js'
 
 type TestMessage = Omit<Message<Buffer>, 'value'> & { value: Buffer | null }
-type TestContext = { signal: AbortSignal; topic: string; partition: number; offset: bigint }
+type TestContext = ConsumeContext
 type TestHandler = (message: TestMessage, ctx: TestContext) => Promise<void>
 
 class TestConsumer extends EventEmitter {
 	private handler: TestHandler | null = null
 	private stopResolve: (() => void) | null = null
 	private messageOnStop: { topic: string; value: Buffer | null; key?: Buffer | null } | null = null
-	consumerGroup = { currentMemberId: 'member-1', currentGenerationId: 1 }
-
 	async runEach(_subscription: string[], handler: TestHandler): Promise<void> {
 		this.handler = handler
 		this.emit('running')
@@ -59,6 +57,7 @@ class TestConsumer extends EventEmitter {
 			topic,
 			partition: 0,
 			offset: 0n,
+			groupId: 'test-app',
 		}
 		await this.handler(message, ctx)
 	}
@@ -66,7 +65,10 @@ class TestConsumer extends EventEmitter {
 
 class TestProducer {
 	messages: Array<{ topic: string; key?: Buffer | null; value: Buffer; partition?: number }> = []
-	transactions: Array<{ offsets: Array<{ topic: string; partition: number; offset: bigint }> }> = []
+	transactions: Array<{
+		offsetContext: ConsumeContext | null
+		offsets: Array<{ topic: string; partition: number; offset: bigint }>
+	}> = []
 	private activeTransactions = 0
 
 	async send(topic: string, message: { key?: Buffer | null; value: Buffer; partition?: number }): Promise<void> {
@@ -76,30 +78,26 @@ class TestProducer {
 	async transaction(
 		fn: (tx: {
 			send: (topic: string, message: { key?: Buffer | null; value: Buffer; partition?: number }) => Promise<void>
-			sendOffsets: (params: {
-				groupId?: string
-				consumerGroupMetadata?: {
-					groupId: string
-					generationId: number
-					memberId: string
-					groupInstanceId?: string | null
-				}
+			sendOffsets: (
+				context: ConsumeContext,
 				offsets: Array<{ topic: string; partition: number; offset: bigint }>
-			}) => Promise<void>
+			) => Promise<void>
 		}) => Promise<void>
 	): Promise<void> {
 		const offsets: Array<{ topic: string; partition: number; offset: bigint }> = []
+		let offsetContext: ConsumeContext | null = null
 		this.activeTransactions += 1
 		try {
 			await fn({
 				send: async (topic, message) => {
 					await this.send(topic, message)
 				},
-				sendOffsets: async params => {
-					offsets.push(...params.offsets)
+				sendOffsets: async (context, offsetsToCommit) => {
+					offsetContext = context
+					offsets.push(...offsetsToCommit)
 				},
 			})
-			this.transactions.push({ offsets })
+			this.transactions.push({ offsetContext, offsets })
 		} finally {
 			this.activeTransactions -= 1
 		}
@@ -275,6 +273,24 @@ describe('flow', () => {
 				offset: 1n,
 			},
 		])
+	})
+
+	it('binds a batched transaction to the first consume context that opened it', async () => {
+		const { app, consumers, producers } = createTestApp({ processingGuarantee: 'exactly_once' })
+
+		app.stream('first')
+		app.stream('second')
+
+		await app.start()
+		const consumer = consumers[0]!
+		const producer = producers[0]!
+
+		await consumer.emitMessage('first', Buffer.from('one'))
+		await consumer.emitMessage('second', Buffer.from('two'))
+		await app.close()
+
+		expect(producer.transactions[0]!.offsetContext?.topic).toBe('first')
+		expect(producer.transactions[0]!.offsets).toHaveLength(2)
 	})
 
 	it('does not start a new transaction from a buffered record while closing', async () => {

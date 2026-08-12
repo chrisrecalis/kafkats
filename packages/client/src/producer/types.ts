@@ -4,6 +4,7 @@
 
 import type { CompressionType } from '@/protocol/records/compression.js'
 import type { TopicDefinition as TopicDefinitionImport } from '@/topic.js'
+import type { ConsumeContext, ConsumerGroupMetadata } from '@/consumer/types.js'
 
 // Re-export topic types from shared module
 export type { Decoder, DecoderLike, TopicDefinition, TopicOptions } from '@/topic.js'
@@ -223,6 +224,13 @@ export type IdempotentState = 'idle' | 'initializing' | 'running' | 'fenced' | '
  */
 export interface ProducerEvents {
 	error: [error: Error]
+	/**
+	 * Emitted when transaction() has to wait for capacity behind other
+	 * transactions. `queued` is the number of transactions ahead of this one
+	 * (including the active one). Sustained queueing means throughput is
+	 * commit-latency-bound.
+	 */
+	'transaction:queued': [info: { queued: number }]
 }
 
 // ==================== Transaction Types ====================
@@ -262,16 +270,7 @@ export interface TopicPartitionOffset {
  * include the consumer's group metadata to ensure offsets are committed atomically
  * with the consumer's current group membership.
  */
-export interface GroupMetadata {
-	/** Consumer group ID */
-	groupId: string
-	/** Consumer's current generation ID */
-	generationId: number
-	/** Consumer's member ID */
-	memberId: string
-	/** Consumer's static group instance ID (optional) */
-	groupInstanceId?: string | null
-}
+export type GroupMetadata = ConsumerGroupMetadata
 
 /**
  * Parameters for sendOffsets within a transaction
@@ -313,6 +312,8 @@ export interface ProducerTransaction {
 	 * Commit consumer offsets as part of the transaction
 	 * (for consume-transform-produce patterns)
 	 */
+	sendOffsets(context: ConsumeContext): Promise<void>
+	sendOffsets(context: ConsumeContext, offsets: TopicPartitionOffset[]): Promise<void>
 	sendOffsets(params: SendOffsetsParams): Promise<void>
 
 	/**

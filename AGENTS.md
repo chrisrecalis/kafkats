@@ -61,6 +61,7 @@ General notes:
 
 ## Code Style
 
-- **Formatting**: Prettier with tabs, 120 char width, single quotes, no semicolons
+- **Formatting**: oxfmt (Prettier-compatible) with tabs, 120 char width, single quotes, no semicolons
+- **Linting**: oxlint (config in `.oxlintrc.json`)
 - **Path aliases**: `@/*` maps to `src/*` in each package
 - **Module system**: ESM (`"type": "module"`)

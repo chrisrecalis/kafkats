@@ -24,7 +24,7 @@
 
 import { EventEmitter } from 'node:events'
 import { vi } from 'vitest'
-import { KafkaClient, type Message } from '@kafkats/client'
+import { KafkaClient, type ConsumeContext, type Message } from '@kafkats/client'
 import type { Codec } from '@/codec.js'
 import { flow, type FlowApp, type FlowConfig, type Consumed } from '@/flow.js'
 
@@ -59,7 +59,7 @@ export interface TestDriverConfig extends Partial<Omit<FlowConfig, 'client' | 'a
 // ============================================================================
 
 type TestHandler = (message: Message<Buffer>, ctx: TestContext) => Promise<void>
-type TestContext = { signal: AbortSignal; topic: string; partition: number; offset: bigint }
+type TestContext = ConsumeContext
 
 /**
  * Mock consumer that allows programmatic message emission
@@ -68,8 +68,6 @@ export class MockConsumer extends EventEmitter {
 	private handler: TestHandler | null = null
 	private stopResolve: (() => void) | null = null
 	private offsetCounter = 0n
-
-	consumerGroup = { currentMemberId: 'member-1', currentGenerationId: 1 }
 
 	async runEach(_subscription: string[], handler: TestHandler): Promise<void> {
 		this.handler = handler
@@ -111,6 +109,7 @@ export class MockConsumer extends EventEmitter {
 			topic,
 			partition: options.partition ?? 0,
 			offset,
+			groupId: 'test-group',
 		}
 
 		await this.handler(message, ctx)
@@ -147,16 +146,10 @@ export class MockProducer {
 				topic: string,
 				message: { key?: Buffer | null; value: Buffer | null; partition?: number }
 			) => Promise<void>
-			sendOffsets: (params: {
-				groupId?: string
-				consumerGroupMetadata?: {
-					groupId: string
-					generationId: number
-					memberId: string
-					groupInstanceId?: string | null
-				}
+			sendOffsets: (
+				context: ConsumeContext,
 				offsets: Array<{ topic: string; partition: number; offset: bigint }>
-			}) => Promise<void>
+			) => Promise<void>
 		}) => Promise<void>
 	): Promise<void> {
 		this.currentTxMessages = []
@@ -164,8 +157,8 @@ export class MockProducer {
 
 		await fn({
 			send: (topic, message) => this.send(topic, message),
-			sendOffsets: params => {
-				offsets.push(...params.offsets)
+			sendOffsets: (_context, offsetsToCommit) => {
+				offsets.push(...offsetsToCommit)
 				return Promise.resolve()
 			},
 		})

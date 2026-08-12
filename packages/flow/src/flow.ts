@@ -496,7 +496,7 @@ class FlowAppImpl implements FlowApp {
 				consumer,
 				activeTransaction: null,
 				activeTransactionPromise: null,
-				groupInstanceId: groupInstanceId ?? null,
+				offsetCommitContext: null,
 				sourcesByTopic: new Map(),
 				assignedPartitions: new Map(),
 				// Transaction batching state
@@ -992,30 +992,6 @@ class FlowAppImpl implements FlowApp {
 		return threadCount > 1 ? `${base}-w${workerId}` : base
 	}
 
-	private getConsumerGroupMetadata(
-		consumer: Consumer,
-		groupInstanceId?: string | null
-	): {
-		groupId: string
-		generationId: number
-		memberId: string
-		groupInstanceId?: string | null
-	} | null {
-		const owner = consumer as unknown as {
-			consumerGroup?: { currentMemberId: string; currentGenerationId: number }
-		}
-		const group = owner?.consumerGroup
-		if (!group) {
-			return null
-		}
-		return {
-			groupId: this.config.applicationId,
-			generationId: group.currentGenerationId,
-			memberId: group.currentMemberId,
-			groupInstanceId: groupInstanceId ?? null,
-		}
-	}
-
 	private enqueueEosTask<T>(worker: WorkerContext, fn: () => Promise<T>): Promise<T> {
 		const run = worker.eosQueue.then(fn, fn)
 		worker.eosQueue = run.then(
@@ -1045,6 +1021,7 @@ class FlowAppImpl implements FlowApp {
 			// Start a new transaction if one isn't active
 			if (!worker.transactionActive) {
 				await this.beginTransaction(worker)
+				worker.offsetCommitContext = ctx
 			}
 
 			// Process the message within the current transaction
@@ -1140,16 +1117,12 @@ class FlowAppImpl implements FlowApp {
 
 		try {
 			if (offsets.length > 0) {
-				const groupMetadata = this.getConsumerGroupMetadata(worker.consumer, worker.groupInstanceId)
-				if (!groupMetadata || groupMetadata.generationId < 0) {
-					throw new Error('exactly_once requires active consumer group metadata')
+				if (!worker.offsetCommitContext) {
+					throw new Error('exactly_once requires a consume context for transactional offset commits')
 				}
 
 				// Send all accumulated offsets
-				await tx.sendOffsets({
-					consumerGroupMetadata: groupMetadata,
-					offsets,
-				})
+				await tx.sendOffsets(worker.offsetCommitContext, offsets)
 			}
 
 			// Complete the transaction by resolving the gate promise (commit happens inside producer.transaction()).
@@ -1171,6 +1144,7 @@ class FlowAppImpl implements FlowApp {
 			worker.pendingChangelogOffsets.clear()
 			worker.activeTransaction = null
 			worker.activeTransactionPromise = null
+			worker.offsetCommitContext = null
 			worker.transactionActive = false
 			worker.lastCommitTime = Date.now()
 		}
@@ -1184,6 +1158,7 @@ class FlowAppImpl implements FlowApp {
 			worker.pendingChangelogOffsets.clear()
 			worker.activeTransaction = null
 			worker.activeTransactionPromise = null
+			worker.offsetCommitContext = null
 			worker.transactionActive = false
 			worker.lastCommitTime = Date.now()
 			return
@@ -1199,6 +1174,7 @@ class FlowAppImpl implements FlowApp {
 		worker.pendingChangelogOffsets.clear()
 		worker.activeTransaction = null
 		worker.activeTransactionPromise = null
+		worker.offsetCommitContext = null
 		worker.transactionActive = false
 		worker.lastCommitTime = Date.now()
 	}
