@@ -1490,65 +1490,62 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	private async addPartitionsToTransaction(topic: string, partitions: number[]): Promise<void> {
 		let coordinator = await this.cluster.getCoordinator('TRANSACTION', this.config.transactionalId!)
 
-		await retry(
-			async () => {
-				const response = await coordinator.addPartitionsToTxn({
-					transactionalId: this.config.transactionalId!,
-					producerId: this.producerId,
-					producerEpoch: this.producerEpoch,
-					topics: [
-						{
-							name: topic,
-							partitions,
-						},
-					],
-				})
+		await retry(async () => {
+			const response = await coordinator.addPartitionsToTxn({
+				transactionalId: this.config.transactionalId!,
+				producerId: this.producerId,
+				producerEpoch: this.producerEpoch,
+				topics: [
+					{
+						name: topic,
+						partitions,
+					},
+				],
+			})
 
-				// A top-level error (v4+) means the broker rejected the whole request; the
-				// per-partition results are empty/meaningless, so check it before they are.
-				if (response.errorCode !== ErrorCode.None) {
-					if (isCoordinatorErrorCode(response.errorCode)) {
+			// A top-level error (v4+) means the broker rejected the whole request; the
+			// per-partition results are empty/meaningless, so check it before they are.
+			if (response.errorCode !== ErrorCode.None) {
+				if (isCoordinatorErrorCode(response.errorCode)) {
+					this.cluster.invalidateCoordinator('TRANSACTION', this.config.transactionalId!)
+					coordinator = await this.cluster.getCoordinator('TRANSACTION', this.config.transactionalId!)
+				}
+
+				throw new KafkaProtocolError(
+					response.errorCode,
+					`AddPartitionsToTxn failed for transaction ${this.config.transactionalId}`
+				)
+			}
+
+			for (const topicResult of response.results) {
+				for (const partitionResult of topicResult.resultsByPartition) {
+					if (partitionResult.errorCode === ErrorCode.None) {
+						continue
+					}
+
+					if (isCoordinatorErrorCode(partitionResult.errorCode)) {
 						this.cluster.invalidateCoordinator('TRANSACTION', this.config.transactionalId!)
 						coordinator = await this.cluster.getCoordinator('TRANSACTION', this.config.transactionalId!)
 					}
 
 					throw new KafkaProtocolError(
-						response.errorCode,
-						`AddPartitionsToTxn failed for transaction ${this.config.transactionalId}`
+						partitionResult.errorCode,
+						`AddPartitionsToTxn failed for ${topicResult.name}-${partitionResult.partitionIndex}`
 					)
 				}
+			}
 
-				for (const topicResult of response.results) {
-					for (const partitionResult of topicResult.resultsByPartition) {
-						if (partitionResult.errorCode === ErrorCode.None) {
-							continue
-						}
+			// Success - mark partitions as part of this transaction
+			for (const partition of partitions) {
+				this.partitionsInTransaction.add(`${topic}:${partition}`)
+			}
 
-						if (isCoordinatorErrorCode(partitionResult.errorCode)) {
-							this.cluster.invalidateCoordinator('TRANSACTION', this.config.transactionalId!)
-							coordinator = await this.cluster.getCoordinator('TRANSACTION', this.config.transactionalId!)
-						}
-
-						throw new KafkaProtocolError(
-							partitionResult.errorCode,
-							`AddPartitionsToTxn failed for ${topicResult.name}-${partitionResult.partitionIndex}`
-						)
-					}
-				}
-
-				// Success - mark partitions as part of this transaction
-				for (const partition of partitions) {
-					this.partitionsInTransaction.add(`${topic}:${partition}`)
-				}
-
-				this.logger.debug('added partitions to transaction', {
-					transactionalId: this.config.transactionalId,
-					topic,
-					partitions,
-				})
-			},
-			this.transactionalRetryOptions()
-		)
+			this.logger.debug('added partitions to transaction', {
+				transactionalId: this.config.transactionalId,
+				topic,
+				partitions,
+			})
+		}, this.transactionalRetryOptions())
 	}
 
 	/**
@@ -1592,30 +1589,27 @@ export class Producer extends EventEmitter<ProducerEvents> {
 
 		let coordinator = await this.cluster.getCoordinator('TRANSACTION', this.config.transactionalId!)
 
-		await retry(
-			async () => {
-				// Register the group with the transaction coordinator
-				const response = await coordinator.addOffsetsToTxn({
-					transactionalId: this.config.transactionalId!,
-					producerId: this.producerId,
-					producerEpoch: this.producerEpoch,
-					groupId,
-				})
+		await retry(async () => {
+			// Register the group with the transaction coordinator
+			const response = await coordinator.addOffsetsToTxn({
+				transactionalId: this.config.transactionalId!,
+				producerId: this.producerId,
+				producerEpoch: this.producerEpoch,
+				groupId,
+			})
 
-				if (response.errorCode === ErrorCode.None) {
-					return
-				}
+			if (response.errorCode === ErrorCode.None) {
+				return
+			}
 
-				// Handle coordinator move - invalidate cache and re-fetch
-				if (isCoordinatorErrorCode(response.errorCode)) {
-					this.cluster.invalidateCoordinator('TRANSACTION', this.config.transactionalId!)
-					coordinator = await this.cluster.getCoordinator('TRANSACTION', this.config.transactionalId!)
-				}
+			// Handle coordinator move - invalidate cache and re-fetch
+			if (isCoordinatorErrorCode(response.errorCode)) {
+				this.cluster.invalidateCoordinator('TRANSACTION', this.config.transactionalId!)
+				coordinator = await this.cluster.getCoordinator('TRANSACTION', this.config.transactionalId!)
+			}
 
-				throw new KafkaProtocolError(response.errorCode, `AddOffsetsToTxn failed for group ${groupId}`)
-			},
-			this.transactionalRetryOptions()
-		)
+			throw new KafkaProtocolError(response.errorCode, `AddOffsetsToTxn failed for group ${groupId}`)
+		}, this.transactionalRetryOptions())
 
 		// Store offsets and group metadata for commit during transaction commit phase
 		const existing = this.offsetsToCommit.get(groupId)
@@ -1701,29 +1695,26 @@ export class Producer extends EventEmitter<ProducerEvents> {
 			// End transaction with commit (with retry for transient errors)
 			let coordinator = await this.cluster.getCoordinator('TRANSACTION', this.config.transactionalId!)
 
-			await retry(
-				async () => {
-					const response = await coordinator.endTxn({
-						transactionalId: this.config.transactionalId!,
-						producerId: this.producerId,
-						producerEpoch: this.producerEpoch,
-						committed: true,
-					})
+			await retry(async () => {
+				const response = await coordinator.endTxn({
+					transactionalId: this.config.transactionalId!,
+					producerId: this.producerId,
+					producerEpoch: this.producerEpoch,
+					committed: true,
+				})
 
-					if (response.errorCode === ErrorCode.None) {
-						return
-					}
+				if (response.errorCode === ErrorCode.None) {
+					return
+				}
 
-					// Handle coordinator move - invalidate cache and re-fetch
-					if (isCoordinatorErrorCode(response.errorCode)) {
-						this.cluster.invalidateCoordinator('TRANSACTION', this.config.transactionalId!)
-						coordinator = await this.cluster.getCoordinator('TRANSACTION', this.config.transactionalId!)
-					}
+				// Handle coordinator move - invalidate cache and re-fetch
+				if (isCoordinatorErrorCode(response.errorCode)) {
+					this.cluster.invalidateCoordinator('TRANSACTION', this.config.transactionalId!)
+					coordinator = await this.cluster.getCoordinator('TRANSACTION', this.config.transactionalId!)
+				}
 
-					throw new KafkaProtocolError(response.errorCode, 'EndTxn commit failed')
-				},
-				this.transactionalRetryOptions()
-			)
+				throw new KafkaProtocolError(response.errorCode, 'EndTxn commit failed')
+			}, this.transactionalRetryOptions())
 
 			// debug, not info: EOS loops commit per batch, so this fires at batch rate.
 			this.logger.debug('transaction committed', {
@@ -1770,29 +1761,26 @@ export class Producer extends EventEmitter<ProducerEvents> {
 			// End transaction with abort (with retry for transient errors)
 			let coordinator = await this.cluster.getCoordinator('TRANSACTION', this.config.transactionalId!)
 
-			await retry(
-				async () => {
-					const response = await coordinator.endTxn({
-						transactionalId: this.config.transactionalId!,
-						producerId: this.producerId,
-						producerEpoch: this.producerEpoch,
-						committed: false,
-					})
+			await retry(async () => {
+				const response = await coordinator.endTxn({
+					transactionalId: this.config.transactionalId!,
+					producerId: this.producerId,
+					producerEpoch: this.producerEpoch,
+					committed: false,
+				})
 
-					if (response.errorCode === ErrorCode.None) {
-						return
-					}
+				if (response.errorCode === ErrorCode.None) {
+					return
+				}
 
-					// Handle coordinator move - invalidate cache and re-fetch
-					if (isCoordinatorErrorCode(response.errorCode)) {
-						this.cluster.invalidateCoordinator('TRANSACTION', this.config.transactionalId!)
-						coordinator = await this.cluster.getCoordinator('TRANSACTION', this.config.transactionalId!)
-					}
+				// Handle coordinator move - invalidate cache and re-fetch
+				if (isCoordinatorErrorCode(response.errorCode)) {
+					this.cluster.invalidateCoordinator('TRANSACTION', this.config.transactionalId!)
+					coordinator = await this.cluster.getCoordinator('TRANSACTION', this.config.transactionalId!)
+				}
 
-					throw new KafkaProtocolError(response.errorCode, 'EndTxn abort failed')
-				},
-				this.transactionalRetryOptions()
-			)
+				throw new KafkaProtocolError(response.errorCode, 'EndTxn abort failed')
+			}, this.transactionalRetryOptions())
 
 			this.transactionState = 'idle'
 			this.logger.debug('transaction aborted', {
@@ -1863,40 +1851,37 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		// TxnOffsetCommit goes to the GROUP coordinator (not transaction coordinator)
 		let groupCoordinator = await this.cluster.getCoordinator('GROUP', groupId)
 
-		await retry(
-			async () => {
-				const response = await groupCoordinator.txnOffsetCommit({
-					transactionalId: this.config.transactionalId!,
-					groupId,
-					producerId: this.producerId,
-					producerEpoch: this.producerEpoch,
-					generationId,
-					memberId,
-					groupInstanceId,
-					topics: Array.from(topicMap.entries()).map(([name, partitions]) => ({
-						name,
-						partitions,
-					})),
-				})
+		await retry(async () => {
+			const response = await groupCoordinator.txnOffsetCommit({
+				transactionalId: this.config.transactionalId!,
+				groupId,
+				producerId: this.producerId,
+				producerEpoch: this.producerEpoch,
+				generationId,
+				memberId,
+				groupInstanceId,
+				topics: Array.from(topicMap.entries()).map(([name, partitions]) => ({
+					name,
+					partitions,
+				})),
+			})
 
-				for (const topic of response.topics) {
-					for (const partition of topic.partitions) {
-						if (partition.errorCode === ErrorCode.None) continue
+			for (const topic of response.topics) {
+				for (const partition of topic.partitions) {
+					if (partition.errorCode === ErrorCode.None) continue
 
-						if (isCoordinatorErrorCode(partition.errorCode)) {
-							this.cluster.invalidateCoordinator('GROUP', groupId)
-							groupCoordinator = await this.cluster.getCoordinator('GROUP', groupId)
-						}
-
-						throw new KafkaProtocolError(
-							partition.errorCode,
-							`TxnOffsetCommit failed for ${topic.name}-${partition.partitionIndex}`
-						)
+					if (isCoordinatorErrorCode(partition.errorCode)) {
+						this.cluster.invalidateCoordinator('GROUP', groupId)
+						groupCoordinator = await this.cluster.getCoordinator('GROUP', groupId)
 					}
+
+					throw new KafkaProtocolError(
+						partition.errorCode,
+						`TxnOffsetCommit failed for ${topic.name}-${partition.partitionIndex}`
+					)
 				}
-			},
-			this.transactionalRetryOptions()
-		)
+			}
+		}, this.transactionalRetryOptions())
 	}
 
 	/**

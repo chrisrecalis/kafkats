@@ -172,7 +172,9 @@ export async function runEosBenchmark(): Promise<void> {
 		printEosResult(pooled)
 
 		const speedup = pooled.messagesPerSecond / baseline.messagesPerSecond
-		console.log(`\n  speedup: ${speedup.toFixed(2)}x (${baseline.messagesPerSecond.toFixed(0)} -> ${pooled.messagesPerSecond.toFixed(0)} msg/s)`)
+		console.log(
+			`\n  speedup: ${speedup.toFixed(2)}x (${baseline.messagesPerSecond.toFixed(0)} -> ${pooled.messagesPerSecond.toFixed(0)} msg/s)`
+		)
 	} finally {
 		await cluster.stop()
 	}
