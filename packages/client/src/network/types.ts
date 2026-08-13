@@ -5,6 +5,8 @@
 import type { ApiKey } from '@/protocol/messages/api-keys.js'
 import type { Logger } from '@/logger.js'
 
+export const DEFAULT_REQUEST_TIMEOUT_MS = 30000
+
 /**
  * TLS configuration options
  */

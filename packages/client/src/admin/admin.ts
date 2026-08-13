@@ -34,8 +34,7 @@ import { KafkaProtocolError, isKafkaError, shouldRefreshMetadata } from '@/clien
 import type { Logger } from '@/logger.js'
 import { noopLogger } from '@/logger.js'
 import { sleep } from '@/utils/sleep.js'
-
-const DEFAULT_REQUEST_TIMEOUT_MS = 30000
+import { DEFAULT_REQUEST_TIMEOUT_MS } from '@/network/types.js'
 
 /**
  * Map a coordinator lookup/request failure to an error code for per-group results

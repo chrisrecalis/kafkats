@@ -73,11 +73,20 @@ interface CompletedFetch {
 	assignmentEpoch: number
 }
 
+interface BufferedFetch {
+	topic: string
+	partition: number
+	records: Array<DecodedRecord | null>
+	byteSize: number
+	assignmentEpoch: number
+	nextRecord: number
+}
+
 /**
  * Buffer for completed fetches with memory bounding and wait/signal
  */
 class FetchBuffer {
-	private queue: CompletedFetch[] = []
+	private queue: BufferedFetch[] = []
 	private bufferedBytes = 0
 	private reservedBytes = 0
 	private readonly maxBytes: number
@@ -92,40 +101,66 @@ class FetchBuffer {
 	 * Add a completed fetch to the buffer and signal any waiters
 	 */
 	add(fetch: CompletedFetch): void {
-		this.queue.push(fetch)
+		this.queue.push({ ...fetch, nextRecord: 0 })
 		this.bufferedBytes += fetch.byteSize
 		this.signalWaiters()
 	}
 
 	/**
-	 * Drain all buffered fetches, coalescing responses for the same partition and
-	 * assignment epoch. Background prefetch may complete several requests while a
-	 * handler is running; exposing each response as a separate runBatch invocation
-	 * would turn those implementation-level fetch boundaries into separate EOS
-	 * transactions.
+	 * Drain up to maxRecords, coalescing responses for the same partition and
+	 * assignment epoch so prefetch boundaries do not create extra batch handlers.
+	 * Excess records remain buffered for the next poll.
 	 */
-	drain(): CompletedFetch[] {
-		const queue = this.queue
-		this.queue = []
-		this.bufferedBytes = 0
-		this.signalCapacityWaiter()
+	drain(maxRecords: number): CompletedFetch[] {
+		const drained = new Map<string, CompletedFetch>()
+		const retained: BufferedFetch[] = []
+		let partial: BufferedFetch | null = null
+		let remainingRecords = maxRecords
+		let drainedBytes = 0
 
-		if (queue.length < 2) {
-			return queue
-		}
-
-		const byPartitionAndEpoch = new Map<string, CompletedFetch>()
-		for (const fetch of queue) {
-			const key = `${tpKey(fetch.topic, fetch.partition)}\0${fetch.assignmentEpoch}`
-			const existing = byPartitionAndEpoch.get(key)
-			if (existing) {
-				existing.records = existing.records.concat(fetch.records)
-				existing.byteSize += fetch.byteSize
-			} else {
-				byPartitionAndEpoch.set(key, fetch)
+		for (const fetch of this.queue) {
+			const availableRecords = fetch.records.length - fetch.nextRecord
+			const recordCount = Math.min(remainingRecords, availableRecords)
+			if (recordCount === 0) {
+				retained.push(fetch)
+				continue
 			}
+
+			const byteSize = Math.floor((fetch.byteSize * recordCount) / availableRecords)
+			const records: DecodedRecord[] = []
+			for (let index = fetch.nextRecord; index < fetch.nextRecord + recordCount; index++) {
+				records.push(fetch.records[index]!)
+				fetch.records[index] = null
+			}
+			const key = `${tpKey(fetch.topic, fetch.partition)}\0${fetch.assignmentEpoch}`
+			const existing = drained.get(key)
+			if (existing) {
+				for (const record of records) existing.records.push(record)
+				existing.byteSize += byteSize
+			} else {
+				drained.set(key, {
+					topic: fetch.topic,
+					partition: fetch.partition,
+					records,
+					byteSize,
+					assignmentEpoch: fetch.assignmentEpoch,
+				})
+			}
+
+			fetch.nextRecord += recordCount
+			fetch.byteSize -= byteSize
+			drainedBytes += byteSize
+			remainingRecords -= recordCount
+			if (fetch.nextRecord < fetch.records.length) partial = fetch
 		}
-		return Array.from(byPartitionAndEpoch.values())
+
+		// A partially served partition moves behind the other buffered partitions so a
+		// hot partition cannot monopolize every maxRecords-limited poll.
+		if (partial) retained.push(partial)
+		this.queue = retained
+		this.bufferedBytes -= drainedBytes
+		this.signalCapacityWaiter()
+		return Array.from(drained.values())
 	}
 
 	isEmpty(): boolean {
@@ -256,7 +291,7 @@ class FetchBuffer {
 	 */
 	removePartitionsNotIn(validKeys: Set<string>): void {
 		let newBytes = 0
-		const filtered: CompletedFetch[] = []
+		const filtered: BufferedFetch[] = []
 		for (const f of this.queue) {
 			if (validKeys.has(tpKey(f.topic, f.partition))) {
 				filtered.push(f)
@@ -275,7 +310,7 @@ class FetchBuffer {
 		if (partitions.length === 0) return
 		const keysToRemove = new Set(partitions.map(p => tpKey(p.topic, p.partition)))
 		let newBytes = 0
-		const filtered: CompletedFetch[] = []
+		const filtered: BufferedFetch[] = []
 		for (const f of this.queue) {
 			if (!keysToRemove.has(tpKey(f.topic, f.partition))) {
 				filtered.push(f)
@@ -298,7 +333,7 @@ class FetchBuffer {
 		if (partitions.length === 0) return earliest
 		const keysToRemove = new Set(partitions.map(p => tpKey(p.topic, p.partition)))
 		let newBytes = 0
-		const filtered: CompletedFetch[] = []
+		const filtered: BufferedFetch[] = []
 		for (const f of this.queue) {
 			const key = tpKey(f.topic, f.partition)
 			if (!keysToRemove.has(key)) {
@@ -306,7 +341,8 @@ class FetchBuffer {
 				newBytes += f.byteSize
 				continue
 			}
-			for (const record of f.records) {
+			for (let index = f.nextRecord; index < f.records.length; index++) {
+				const record = f.records[index]!
 				const current = earliest.get(key)
 				if (current === undefined || record.offset < current) {
 					earliest.set(key, record.offset)
@@ -341,13 +377,18 @@ interface PartitionState {
  */
 export interface FetchManagerConfig {
 	maxBytesPerPartition: number
+	/** Maximum records returned by one poll across all partitions (default: 500). */
+	maxRecords: number
 	minBytes: number
 	maxWaitMs: number
 	partitionConcurrency: number
 	isolationLevel: IsolationLevel
 	/** Verify the CRC32C of each fetched batch (default true). See ConsumerConfig.checkCrcs. */
 	checkCrcs?: boolean
-	/** Maximum bytes to buffer for poll() mode. Default: maxBytesPerPartition * 10 */
+	/**
+	 * Target maximum bytes to buffer for poll() mode. Kafka may return one oversized first
+	 * record batch per in-flight broker request. Default: maxBytesPerPartition * 10.
+	 */
 	maxBufferedBytes?: number
 	/** Called whenever a decoded batch range advances the fetch position. */
 	onFetchPosition?: (position: TopicPartitionOffset, recordCount: number) => void
@@ -358,6 +399,7 @@ export interface FetchManagerConfig {
  */
 export const DEFAULT_FETCH_CONFIG: FetchManagerConfig = {
 	maxBytesPerPartition: 1048576, // 1MB
+	maxRecords: 500,
 	minBytes: 1,
 	maxWaitMs: 5000,
 	partitionConcurrency: 1,
@@ -791,7 +833,7 @@ export class FetchManager {
 				for (let index = 0; index < availableBrokers.length; index++) {
 					const [brokerId, { broker, partitions }] = availableBrokers[index]!
 					const remainingBrokers = availableBrokers.length - index
-					const fairShare = Math.max(1, Math.floor(fetchBuffer.remainingCapacity() / remainingBrokers))
+					const fairShare = Math.floor(fetchBuffer.remainingCapacity() / remainingBrokers)
 					const naturalMaxBytes = this.config.maxBytesPerPartition * partitions.length
 					const reservedBytes = fetchBuffer.reserveCapacity(Math.min(naturalMaxBytes, fairShare))
 					if (reservedBytes === 0) break
@@ -1060,7 +1102,7 @@ export class FetchManager {
 	 */
 	private drainBuffer(): PartitionBatch[] {
 		if (!this.fetchBuffer) return []
-		return this.fetchBuffer.drain()
+		return this.fetchBuffer.drain(this.config.maxRecords)
 	}
 
 	/**

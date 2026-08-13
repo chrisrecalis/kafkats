@@ -3,99 +3,40 @@
  */
 
 /**
- * Execute async functions on items with concurrency limit (fire-and-forget).
+ * Execute async functions with a concurrency limit, pausing admission when requested.
  *
- * Optimized for void-returning handlers where results aren't needed.
- * Stops processing on first error or abort signal.
- *
- * @param items - Array of items to process
- * @param fn - Async function to apply to each item
- * @param concurrency - Maximum concurrent operations
- * @param signal - Optional abort signal
+ * Already-started functions are allowed to finish. The return value is the number of
+ * items claimed from the start of `items`; callers can resume with the remaining suffix
+ * after handling the condition that requested the pause.
  */
-export async function pmapVoid<T>(
+export async function pmapVoidUntilPaused<T>(
 	items: readonly T[],
 	fn: (item: T) => Promise<void>,
 	concurrency: number,
+	shouldPause: () => boolean,
 	signal?: AbortSignal
-): Promise<void> {
-	const len = items.length
-	if (len === 0 || signal?.aborted) return
-
-	const limit = Math.max(1, concurrency)
-
-	// Fast path: sequential execution
-	if (limit === 1) {
-		for (const item of items) {
-			if (signal?.aborted) return
-			await fn(item)
-		}
-		return
-	}
-
-	// Fast path: unlimited concurrency
-	if (limit >= len) {
-		await Promise.all(items.map(fn))
-		return
-	}
-
-	// Concurrent execution with limit
+): Promise<number> {
 	let nextIndex = 0
-	let active = 0
 	let error: Error | null = null
-	let resolvePromise: () => void
-	let rejectPromise: (err: Error) => void
 
-	const promise = new Promise<void>((resolve, reject) => {
-		resolvePromise = resolve
-		rejectPromise = reject
-	})
-
-	const runNext = () => {
-		while (error === null && !signal?.aborted && nextIndex < len && active < limit) {
+	async function worker(): Promise<void> {
+		while (error === null && !signal?.aborted && !shouldPause()) {
+			if (nextIndex >= items.length) return
 			const item = items[nextIndex++]!
-			active++
 
-			fn(item)
-				.then(() => {
-					active--
-					if (error === null && !signal?.aborted) {
-						if (nextIndex < len) {
-							runNext()
-						} else if (active === 0) {
-							resolvePromise()
-						}
-					} else if (active === 0) {
-						if (error) {
-							rejectPromise(error)
-						} else {
-							resolvePromise()
-						}
-					}
-				})
-				.catch(err => {
-					active--
-					if (error === null) {
-						error = err instanceof Error ? err : new Error(String(err))
-					}
-					if (active === 0) {
-						rejectPromise(error)
-					}
-				})
-		}
-
-		// Check immediate completion
-		if (active === 0) {
-			if (error) {
-				rejectPromise(error)
-			} else {
-				resolvePromise()
+			try {
+				await fn(item)
+			} catch (cause) {
+				error ??= cause instanceof Error ? cause : new Error(String(cause))
 			}
 		}
 	}
 
-	runNext()
-	return promise
+	const requestedWorkers = Number.isFinite(concurrency) ? Math.floor(concurrency) : 1
+	const workerCount = Math.min(Math.max(1, requestedWorkers), items.length)
+	await Promise.all(Array.from({ length: workerCount }, worker))
+	if (error) throw error
+	return nextIndex
 }
 
 /**

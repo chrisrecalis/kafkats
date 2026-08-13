@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { FetchManager } from '@/consumer/fetch-manager.js'
 import { OffsetManager } from '@/consumer/offset-manager.js'
 
-function makeFetchManager(maxBufferedBytes = 100): FetchManager {
+function makeFetchManager(maxBufferedBytes = 100, maxRecords = 500): FetchManager {
 	const cluster = {
 		getLeaderForPartition: vi.fn(),
 		getLogger: () => null,
@@ -17,6 +17,7 @@ function makeFetchManager(maxBufferedBytes = 100): FetchManager {
 		'earliest',
 		{
 			maxBytesPerPartition: 1024,
+			maxRecords,
 			minBytes: 1,
 			maxWaitMs: 1,
 			partitionConcurrency: 1,
@@ -39,6 +40,26 @@ function completedFetch(topic: string, partition: number, offsets: bigint[], byt
 }
 
 describe('FetchManager bounded prefetch', () => {
+	it('rotates a partially drained partition behind other buffered partitions', async () => {
+		const manager = makeFetchManager(100, 3)
+		await manager.poll()
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const buffer = (manager as any).fetchBuffer
+
+		buffer.add(completedFetch('topic-a', 0, [0n, 1n, 2n, 3n], 60))
+		buffer.add(completedFetch('topic-b', 0, [5n, 6n], 40))
+
+		const first = await manager.poll()
+		expect(first.flatMap(batch => batch.records.map(record => record.offset))).toEqual([0n, 1n, 2n])
+		expect(buffer.remainingCapacity()).toBe(45)
+
+		const second = await manager.poll()
+		expect(second.flatMap(batch => batch.records.map(record => record.offset))).toEqual([5n, 6n, 3n])
+		expect(buffer.remainingCapacity()).toBe(100)
+
+		manager.stop()
+	})
+
 	it('coalesces prefetched responses for the same partition and assignment epoch', async () => {
 		const manager = makeFetchManager()
 		// Lazily create the real FetchBuffer without assigning partitions (so the

@@ -5,7 +5,12 @@
 import type * as net from 'node:net'
 import type * as tls from 'node:tls'
 import { EventEmitter } from 'node:events'
-import type { ConnectionConfig, ConnectionState, SaslConfig } from '@/network/types.js'
+import {
+	DEFAULT_REQUEST_TIMEOUT_MS,
+	type ConnectionConfig,
+	type ConnectionState,
+	type SaslConfig,
+} from '@/network/types.js'
 import { ApiKey } from '@/protocol/messages/api-keys.js'
 import { SocketFactory, type SocketFactoryOptions } from '@/network/socket-factory.js'
 import { RequestQueue, type RequestQueueOptions } from '@/network/request-queue.js'
@@ -94,7 +99,7 @@ export class Connection extends EventEmitter<ConnectionEvents> {
 
 		const queueOptions: RequestQueueOptions = {
 			maxInFlight: options.maxInFlightRequests ?? 5,
-			defaultTimeoutMs: options.requestTimeoutMs ?? 30000,
+			defaultTimeoutMs: options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
 		}
 		this.requestQueue = new RequestQueue(queueOptions)
 	}

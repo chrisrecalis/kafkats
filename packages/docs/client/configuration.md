@@ -133,6 +133,7 @@ const consumer = client.consumer({
 | `rebalanceTimeoutMs`          | `number`                                      | `60000`                | Rebalance timeout (ms)                                |
 | `heartbeatIntervalMs`         | `number`                                      | `3000`                 | Heartbeat interval (ms)                               |
 | `maxBytesPerPartition`        | `number`                                      | `1048576`              | Max fetch bytes per partition                         |
+| `maxRecords`                  | `number`                                      | `500`                  | Max records returned by one poll across partitions    |
 | `minBytes`                    | `number`                                      | `1`                    | Min bytes to fetch                                    |
 | `maxWaitMs`                   | `number`                                      | `5000`                 | Max fetch wait time (ms)                              |
 | `autoOffsetReset`             | `'earliest' \| 'latest' \| 'none'`            | `'latest'`             | Offset reset strategy                                 |

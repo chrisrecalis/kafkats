@@ -3,7 +3,7 @@
  */
 
 import type { ApiKey } from '@/protocol/messages/api-keys.js'
-import type { PendingRequest, QueuedRequest } from '@/network/types.js'
+import { DEFAULT_REQUEST_TIMEOUT_MS, type PendingRequest, type QueuedRequest } from '@/network/types.js'
 import { RequestTimeoutError, ConnectionClosedError } from '@/network/errors.js'
 
 export interface RequestQueueOptions {
@@ -33,7 +33,7 @@ export class RequestQueue {
 
 	constructor(options: RequestQueueOptions = {}) {
 		this.maxInFlight = options.maxInFlight ?? 5
-		this.defaultTimeoutMs = options.defaultTimeoutMs ?? 30000
+		this.defaultTimeoutMs = options.defaultTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
 	}
 
 	/**
