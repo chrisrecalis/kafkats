@@ -72,7 +72,8 @@ describe('failed rebalance stops the consumer', () => {
 		const cluster = { getLogger: () => null } as any
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const consumer = new Consumer(cluster, { groupId: 'g' } as any)
-		consumer.on('error', () => {})
+		const errorListener = vi.fn()
+		consumer.on('error', errorListener)
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const consumerAny = consumer as any
 
@@ -84,10 +85,14 @@ describe('failed rebalance stops the consumer', () => {
 		consumerAny.offsetManager = { startAutoCommit: vi.fn() }
 		consumerAny.partitionTracker = {}
 		consumerAny.partitionProvider = {
+			hasPendingRebalance: () => false,
 			checkAndHandleRebalance: vi.fn().mockRejectedValue(failure),
 		}
 
 		// The poll loop must terminate with the rebalance failure instead of looping on.
 		await expect(consumerAny.runPollLoop([], vi.fn(), 1, 5000, false)).rejects.toBe(failure)
+		// The public run wrapper owns error emission. Emitting here as well reports one
+		// rebalance failure twice.
+		expect(errorListener).not.toHaveBeenCalled()
 	})
 })

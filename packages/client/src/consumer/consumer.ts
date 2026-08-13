@@ -88,6 +88,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			rebalanceTimeoutMs: config.rebalanceTimeoutMs ?? DEFAULT_CONSUMER_CONFIG.rebalanceTimeoutMs,
 			heartbeatIntervalMs: config.heartbeatIntervalMs ?? DEFAULT_CONSUMER_CONFIG.heartbeatIntervalMs,
 			maxBytesPerPartition: config.maxBytesPerPartition ?? DEFAULT_CONSUMER_CONFIG.maxBytesPerPartition,
+			maxRecords: config.maxRecords ?? DEFAULT_CONSUMER_CONFIG.maxRecords,
 			minBytes: config.minBytes ?? DEFAULT_CONSUMER_CONFIG.minBytes,
 			maxWaitMs: config.maxWaitMs ?? DEFAULT_CONSUMER_CONFIG.maxWaitMs,
 			autoOffsetReset: config.autoOffsetReset ?? DEFAULT_CONSUMER_CONFIG.autoOffsetReset,
@@ -98,6 +99,8 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			defaultApiTimeoutMs: config.defaultApiTimeoutMs ?? DEFAULT_CONSUMER_CONFIG.defaultApiTimeoutMs,
 			onBeforeRebalance: config.onBeforeRebalance,
 		}
+		if (!Number.isInteger(this.config.maxRecords) || this.config.maxRecords <= 0)
+			throw new Error('maxRecords must be a positive integer')
 	}
 
 	private startRun(commitOffsets: boolean, externalSignal?: AbortSignal): void {
@@ -207,6 +210,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			this.config.autoOffsetReset,
 			{
 				maxBytesPerPartition: this.config.maxBytesPerPartition,
+				maxRecords: this.config.maxRecords,
 				minBytes: this.config.minBytes,
 				maxWaitMs: this.config.maxWaitMs,
 				partitionConcurrency,
@@ -432,9 +436,12 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 				}
 			}
 
-			try {
-				await pmapVoid(
-					Array.from(batchesByPartition.values()),
+			const partitionGroups = Array.from(batchesByPartition.values())
+			let nextPartitionGroup = 0
+
+			while (nextPartitionGroup < partitionGroups.length && this.state === 'running' && !signal.aborted) {
+				const claimed = await pmapVoid(
+					partitionGroups.slice(nextPartitionGroup),
 					async partitionBatches => {
 						for (const batch of partitionBatches) {
 							if (signal.aborted) {
@@ -464,11 +471,15 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 						}
 					},
 					concurrency,
+					() => partitionProvider.hasPendingRebalance(),
 					signal
 				)
-			} catch (error) {
-				this.emitError(error)
-				throw error
+				nextPartitionGroup += claimed
+
+				// A heartbeat can request a rebalance while handlers are running. Stop
+				// admitting new partition work, let the active handlers finish, then
+				// rejoin before resuming any still-valid batches from this poll.
+				await partitionProvider.checkAndHandleRebalance()
 			}
 		}
 	}

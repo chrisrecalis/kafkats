@@ -184,6 +184,7 @@ import {
 	type ShareAcknowledgeResponse,
 } from '@/protocol/messages/responses/share-acknowledge.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
+import { DEFAULT_REQUEST_TIMEOUT_MS } from '@/network/request-queue.js'
 import { UnsupportedVersionError, KafkaProtocolError } from './errors.js'
 import type { BrokerConfig, VersionRange } from './types.js'
 
@@ -235,12 +236,14 @@ export class Broker {
 	private apiVersions: Map<ApiKey, VersionRange> = new Map()
 	private versionsFetchedAt: number = 0
 	private readonly logger: Logger
+	private readonly requestTimeoutMs: number
 
 	constructor(config: BrokerConfig) {
 		this.host = config.host
 		this.port = config.port
 		this.nodeId = config.nodeId
 		this.logger = config.logger?.child({ component: 'broker', nodeId: config.nodeId }) ?? noopLogger
+		this.requestTimeoutMs = config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
 
 		const connectionOptions: ConnectionOptions = {
 			host: config.host,
@@ -410,9 +413,14 @@ export class Broker {
 			return synthesized
 		}
 
-		const responseBuffer = await this.connection.send(ApiKey.Produce, version, encoder => {
-			encodeProduceRequest(encoder, version, request)
-		})
+		const responseBuffer = await this.connection.send(
+			ApiKey.Produce,
+			version,
+			encoder => {
+				encodeProduceRequest(encoder, version, request)
+			},
+			request.timeoutMs + this.requestTimeoutMs
+		)
 
 		const decoder = new Decoder(responseBuffer)
 		decodeResponseHeader(decoder, ApiKey.Produce, version)
@@ -428,9 +436,14 @@ export class Broker {
 		const startTime = Date.now()
 		this.logger.debug('sending request', { api: 'Fetch', version, maxWaitMs: request.maxWaitMs })
 
-		const responseBuffer = await this.fetchConnection.send(ApiKey.Fetch, version, encoder => {
-			encodeFetchRequest(encoder, version, request)
-		})
+		const responseBuffer = await this.fetchConnection.send(
+			ApiKey.Fetch,
+			version,
+			encoder => {
+				encodeFetchRequest(encoder, version, request)
+			},
+			request.maxWaitMs + this.requestTimeoutMs
+		)
 
 		const decoder = new Decoder(responseBuffer)
 		decodeResponseHeader(decoder, ApiKey.Fetch, version)
@@ -487,9 +500,14 @@ export class Broker {
 			memberId: request.memberId,
 		})
 
-		const responseBuffer = await this.connection.send(ApiKey.JoinGroup, version, encoder => {
-			encodeJoinGroupRequest(encoder, version, request)
-		})
+		const responseBuffer = await this.connection.send(
+			ApiKey.JoinGroup,
+			version,
+			encoder => {
+				encodeJoinGroupRequest(encoder, version, request)
+			},
+			request.rebalanceTimeoutMs + this.requestTimeoutMs
+		)
 
 		const decoder = new Decoder(responseBuffer)
 		decodeResponseHeader(decoder, ApiKey.JoinGroup, version)
@@ -500,7 +518,7 @@ export class Broker {
 		return response
 	}
 
-	async syncGroup(request: SyncGroupRequest): Promise<SyncGroupResponse> {
+	async syncGroup(request: SyncGroupRequest, rebalanceTimeoutMs: number): Promise<SyncGroupResponse> {
 		const version = this.getApiVersion(ApiKey.SyncGroup)
 		const startTime = Date.now()
 		this.logger.debug('sending request', {
@@ -510,9 +528,14 @@ export class Broker {
 			generationId: request.generationId,
 		})
 
-		const responseBuffer = await this.connection.send(ApiKey.SyncGroup, version, encoder => {
-			encodeSyncGroupRequest(encoder, version, request)
-		})
+		const responseBuffer = await this.connection.send(
+			ApiKey.SyncGroup,
+			version,
+			encoder => {
+				encodeSyncGroupRequest(encoder, version, request)
+			},
+			rebalanceTimeoutMs + this.requestTimeoutMs
+		)
 
 		const decoder = new Decoder(responseBuffer)
 		decodeResponseHeader(decoder, ApiKey.SyncGroup, version)
@@ -952,9 +975,14 @@ export class Broker {
 		const startTime = Date.now()
 		this.logger.debug('sending request', { api: 'ShareFetch', version })
 
-		const responseBuffer = await this.fetchConnection.send(ApiKey.ShareFetch, version, encoder => {
-			encodeShareFetchRequest(encoder, version, request)
-		})
+		const responseBuffer = await this.fetchConnection.send(
+			ApiKey.ShareFetch,
+			version,
+			encoder => {
+				encodeShareFetchRequest(encoder, version, request)
+			},
+			request.maxWaitMs + this.requestTimeoutMs
+		)
 
 		const decoder = new Decoder(responseBuffer)
 		decodeResponseHeader(decoder, ApiKey.ShareFetch, version)

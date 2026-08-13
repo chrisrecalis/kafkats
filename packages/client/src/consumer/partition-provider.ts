@@ -33,6 +33,7 @@ export interface PartitionProviderCallbacks {
 export interface PartitionProvider {
 	start(topics: string[], callbacks: PartitionProviderCallbacks): Promise<TopicPartition[]>
 	stop(): Promise<void>
+	hasPendingRebalance(): boolean
 	/**
 	 * Check for and handle any pending rebalance synchronously.
 	 * Called by the poll loop before processing batches to ensure
@@ -82,6 +83,10 @@ export class ManualPartitionProvider implements PartitionProvider {
 	}
 
 	async stop(): Promise<void> {}
+
+	hasPendingRebalance(): boolean {
+		return false
+	}
 
 	async checkAndHandleRebalance(): Promise<void> {
 		// Manual assignment doesn't do rebalancing
@@ -195,6 +200,10 @@ export class GroupPartitionProvider implements PartitionProvider {
 	private onRebalanceEvent(): void {
 		this.logger.debug('rebalance event received')
 		this.rebalancePending = true
+	}
+
+	hasPendingRebalance(): boolean {
+		return this.rebalancePending
 	}
 
 	async checkAndHandleRebalance(): Promise<void> {

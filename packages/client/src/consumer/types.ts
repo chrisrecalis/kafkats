@@ -245,6 +245,11 @@ export interface ConsumerConfig {
 	rebalanceTimeoutMs?: number
 	heartbeatIntervalMs?: number
 	maxBytesPerPartition?: number
+	/**
+	 * Maximum number of records returned by one poll across all assigned partitions.
+	 * Additional fetched records remain buffered for the next poll (default: 500).
+	 */
+	maxRecords?: number
 	minBytes?: number
 	maxWaitMs?: number
 	/**
@@ -310,6 +315,7 @@ export interface ResolvedConsumerConfig {
 	rebalanceTimeoutMs: number
 	heartbeatIntervalMs: number
 	maxBytesPerPartition: number
+	maxRecords: number
 	minBytes: number
 	maxWaitMs: number
 	autoOffsetReset: AutoOffsetReset
@@ -342,6 +348,7 @@ export const DEFAULT_CONSUMER_CONFIG = {
 	rebalanceTimeoutMs: 60000,
 	heartbeatIntervalMs: 3000,
 	maxBytesPerPartition: 1048576, // 1MB
+	maxRecords: 500,
 	minBytes: 1,
 	maxWaitMs: 5000,
 	autoOffsetReset: 'latest' as AutoOffsetReset,

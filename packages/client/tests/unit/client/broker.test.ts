@@ -12,7 +12,7 @@ import { Encoder } from '@/protocol/primitives/encoder.js'
  */
 function createMockConnection() {
 	let isConnected = false
-	let sendHandler: ((apiKey: ApiKey, apiVersion: number) => Promise<Buffer>) | null = null
+	let sendHandler: ((apiKey: ApiKey, apiVersion: number, timeoutMs?: number) => Promise<Buffer>) | null = null
 
 	const mockConnection = {
 		get isConnected() {
@@ -27,12 +27,17 @@ function createMockConnection() {
 		send: vi
 			.fn()
 			.mockImplementation(
-				async (apiKey: ApiKey, apiVersion: number, _encodePayload: (encoder: Encoder) => void) => {
+				async (
+					apiKey: ApiKey,
+					apiVersion: number,
+					_encodePayload: (encoder: Encoder) => void,
+					timeoutMs?: number
+				) => {
 					if (!isConnected) {
 						throw new ConnectionClosedError('Connection closed')
 					}
 					if (sendHandler) {
-						return sendHandler(apiKey, apiVersion)
+						return sendHandler(apiKey, apiVersion, timeoutMs)
 					}
 					throw new Error('No send handler configured')
 				}
@@ -46,7 +51,7 @@ function createMockConnection() {
 					}
 				}
 			),
-		setSendHandler(handler: (apiKey: ApiKey, apiVersion: number) => Promise<Buffer>) {
+		setSendHandler(handler: (apiKey: ApiKey, apiVersion: number, timeoutMs?: number) => Promise<Buffer>) {
 			sendHandler = handler
 		},
 		simulateDisconnect() {
@@ -447,6 +452,136 @@ describe('Broker', () => {
 
 			// Verify fetch used fetchConnection
 			expect(fetchConnection.send).toHaveBeenCalled()
+		})
+	})
+
+	describe('broker-controlled wait timeouts', () => {
+		it('allows group coordination to wait for the rebalance timeout plus the configured request timeout', async () => {
+			const controlConnection = createMockConnection()
+			const fetchConnection = createMockConnection()
+			const broker = new Broker({
+				host: 'localhost',
+				port: 9092,
+				nodeId: 1,
+				clientId: 'test-client',
+				requestTimeoutMs: 12000,
+			})
+
+			;(broker as unknown as { connection: typeof controlConnection }).connection = controlConnection
+			;(broker as unknown as { fetchConnection: typeof fetchConnection }).fetchConnection = fetchConnection
+
+			controlConnection.setSendHandler(async apiKey => {
+				if (apiKey === ApiKey.ApiVersions) {
+					return buildApiVersionsResponse([
+						{ apiKey: ApiKey.ApiVersions, minVersion: 0, maxVersion: 3 },
+						{ apiKey: ApiKey.Produce, minVersion: 9, maxVersion: 9 },
+						{ apiKey: ApiKey.JoinGroup, minVersion: 5, maxVersion: 5 },
+						{ apiKey: ApiKey.SyncGroup, minVersion: 3, maxVersion: 3 },
+					])
+				}
+				throw new Error('Unexpected request')
+			})
+
+			await broker.connect()
+
+			await expect(
+				broker.joinGroup({
+					groupId: 'test-group',
+					sessionTimeoutMs: 30000,
+					rebalanceTimeoutMs: 60000,
+					memberId: '',
+					protocolType: 'consumer',
+					protocols: [],
+				})
+			).rejects.toThrow('Unexpected request')
+
+			expect(controlConnection.send).toHaveBeenLastCalledWith(ApiKey.JoinGroup, 5, expect.any(Function), 72000)
+
+			await expect(
+				broker.syncGroup(
+					{
+						groupId: 'test-group',
+						generationId: 1,
+						memberId: 'test-member',
+						assignments: [],
+					},
+					60000
+				)
+			).rejects.toThrow('Unexpected request')
+
+			expect(controlConnection.send).toHaveBeenLastCalledWith(ApiKey.SyncGroup, 3, expect.any(Function), 72000)
+
+			await expect(
+				broker.produce({
+					acks: -1,
+					timeoutMs: 45000,
+					topics: [],
+				})
+			).rejects.toThrow('Unexpected request')
+
+			expect(controlConnection.send).toHaveBeenLastCalledWith(ApiKey.Produce, 9, expect.any(Function), 57000)
+		})
+
+		it('allows Fetch to wait for maxWaitMs plus the default request timeout', async () => {
+			const controlConnection = createMockConnection()
+			const fetchConnection = createMockConnection()
+			const broker = new Broker({
+				host: 'localhost',
+				port: 9092,
+				nodeId: 1,
+				clientId: 'test-client',
+			})
+
+			;(broker as unknown as { connection: typeof controlConnection }).connection = controlConnection
+			;(broker as unknown as { fetchConnection: typeof fetchConnection }).fetchConnection = fetchConnection
+
+			controlConnection.setSendHandler(async apiKey => {
+				if (apiKey === ApiKey.ApiVersions) {
+					return buildApiVersionsResponse([
+						{ apiKey: ApiKey.ApiVersions, minVersion: 0, maxVersion: 3 },
+						{ apiKey: ApiKey.Fetch, minVersion: 11, maxVersion: 11 },
+						{ apiKey: ApiKey.ShareFetch, minVersion: 1, maxVersion: 1 },
+					])
+				}
+				throw new Error(`Unexpected API key: ${apiKey}`)
+			})
+			fetchConnection.setSendHandler(async () => {
+				throw new Error('Unexpected request')
+			})
+
+			await broker.connect()
+
+			await expect(
+				broker.fetch({
+					maxWaitMs: 45000,
+					minBytes: 1,
+					maxBytes: 1024,
+					isolationLevel: 0,
+					sessionId: 0,
+					sessionEpoch: -1,
+					topics: [],
+					forgottenTopicsData: [],
+					rackId: '',
+				})
+			).rejects.toThrow('Unexpected request')
+
+			expect(fetchConnection.send).toHaveBeenLastCalledWith(ApiKey.Fetch, 11, expect.any(Function), 75000)
+
+			await expect(
+				broker.shareFetch({
+					groupId: 'test-group',
+					memberId: 'test-member',
+					shareSessionEpoch: 0,
+					maxWaitMs: 45000,
+					minBytes: 1,
+					maxBytes: 1024,
+					maxRecords: 500,
+					batchSize: 500,
+					topics: [],
+				})
+			).rejects.toThrow('Unexpected request')
+
+			expect(fetchConnection.send).toHaveBeenLastCalledWith(ApiKey.ShareFetch, 1, expect.any(Function), 75000)
 		})
 	})
 

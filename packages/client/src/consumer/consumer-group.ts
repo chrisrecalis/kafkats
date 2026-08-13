@@ -87,6 +87,7 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 			rebalanceTimeoutMs: config.rebalanceTimeoutMs ?? DEFAULT_CONSUMER_CONFIG.rebalanceTimeoutMs,
 			heartbeatIntervalMs: config.heartbeatIntervalMs ?? DEFAULT_CONSUMER_CONFIG.heartbeatIntervalMs,
 			maxBytesPerPartition: config.maxBytesPerPartition ?? DEFAULT_CONSUMER_CONFIG.maxBytesPerPartition,
+			maxRecords: config.maxRecords ?? DEFAULT_CONSUMER_CONFIG.maxRecords,
 			minBytes: config.minBytes ?? DEFAULT_CONSUMER_CONFIG.minBytes,
 			maxWaitMs: config.maxWaitMs ?? DEFAULT_CONSUMER_CONFIG.maxWaitMs,
 			autoOffsetReset: config.autoOffsetReset ?? DEFAULT_CONSUMER_CONFIG.autoOffsetReset,
@@ -660,15 +661,18 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 			this.leaderAssignments = null
 		}
 
-		const response = await this.coordinator!.syncGroup({
-			groupId: this.config.groupId,
-			generationId: this.generationId,
-			memberId: this.memberId,
-			groupInstanceId: this.config.groupInstanceId ?? null,
-			protocolType: CONSUMER_PROTOCOL_TYPE,
-			protocolName: this.selectedProtocolName ?? this.assignor.name,
-			assignments,
-		})
+		const response = await this.coordinator!.syncGroup(
+			{
+				groupId: this.config.groupId,
+				generationId: this.generationId,
+				memberId: this.memberId,
+				groupInstanceId: this.config.groupInstanceId ?? null,
+				protocolType: CONSUMER_PROTOCOL_TYPE,
+				protocolName: this.selectedProtocolName ?? this.assignor.name,
+				assignments,
+			},
+			this.config.rebalanceTimeoutMs
+		)
 
 		// Handle errors
 		if (response.errorCode !== ErrorCode.None) {

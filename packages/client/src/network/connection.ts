@@ -8,7 +8,7 @@ import { EventEmitter } from 'node:events'
 import type { ConnectionConfig, ConnectionState, SaslConfig } from '@/network/types.js'
 import { ApiKey } from '@/protocol/messages/api-keys.js'
 import { SocketFactory, type SocketFactoryOptions } from '@/network/socket-factory.js'
-import { RequestQueue, type RequestQueueOptions } from '@/network/request-queue.js'
+import { DEFAULT_REQUEST_TIMEOUT_MS, RequestQueue, type RequestQueueOptions } from '@/network/request-queue.js'
 import { ConnectionClosedError, NetworkError } from '@/network/errors.js'
 import { KafkaFrameDecoder, DEFAULT_MAX_FRAME_SIZE } from '@/network/kafka-frame-decoder.js'
 import { Decoder, Encoder } from '@/protocol/primitives/index.js'
@@ -94,7 +94,7 @@ export class Connection extends EventEmitter<ConnectionEvents> {
 
 		const queueOptions: RequestQueueOptions = {
 			maxInFlight: options.maxInFlightRequests ?? 5,
-			defaultTimeoutMs: options.requestTimeoutMs ?? 30000,
+			defaultTimeoutMs: options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
 		}
 		this.requestQueue = new RequestQueue(queueOptions)
 	}
