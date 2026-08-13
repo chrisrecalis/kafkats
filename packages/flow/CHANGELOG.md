@@ -1,5 +1,13 @@
 # @kafkats/flow
 
+## 0.11.2
+
+### Patch Changes
+
+- a554163: Allow JoinGroup, SyncGroup, Fetch, ShareFetch, and acknowledged Produce requests to wait for their request-declared protocol wait in addition to the client connection timeout. Rejoin promptly when a heartbeat reports a rebalance instead of admitting every partition batch already returned by the current poll, and fairly bound each consumer poll to a configurable `maxRecords` (default 500), retaining excess prefetched records for the next poll.
+- Updated dependencies [a554163]
+  - @kafkats/client@0.11.2
+
 ## 0.11.1
 
 ### Patch Changes
