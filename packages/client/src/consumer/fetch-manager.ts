@@ -885,7 +885,11 @@ export class FetchManager {
 	/**
 	 * Fetch from a single broker and add results to buffer
 	 */
-	private async fetchFromBrokerToBuffer(broker: Broker, partitions: PartitionState[], maxBytes: number): Promise<void> {
+	private async fetchFromBrokerToBuffer(
+		broker: Broker,
+		partitions: PartitionState[],
+		maxBytes: number
+	): Promise<void> {
 		if (!this.fetchBuffer) return
 
 		// Map response entries back to the in-flight state we issued the fetch
