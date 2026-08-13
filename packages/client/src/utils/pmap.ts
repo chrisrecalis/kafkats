@@ -9,7 +9,7 @@
  * items claimed from the start of `items`; callers can resume with the remaining suffix
  * after handling the condition that requested the pause.
  */
-export async function pmapVoid<T>(
+export async function pmapVoidUntilPaused<T>(
 	items: readonly T[],
 	fn: (item: T) => Promise<void>,
 	concurrency: number,
@@ -32,7 +32,8 @@ export async function pmapVoid<T>(
 		}
 	}
 
-	const workerCount = Math.min(Math.max(1, Math.floor(concurrency) || 1), items.length)
+	const requestedWorkers = Number.isFinite(concurrency) ? Math.floor(concurrency) : 1
+	const workerCount = Math.min(Math.max(1, requestedWorkers), items.length)
 	await Promise.all(Array.from({ length: workerCount }, worker))
 	if (error) throw error
 	return nextIndex

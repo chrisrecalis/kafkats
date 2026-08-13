@@ -184,7 +184,7 @@ import {
 	type ShareAcknowledgeResponse,
 } from '@/protocol/messages/responses/share-acknowledge.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
-import { DEFAULT_REQUEST_TIMEOUT_MS } from '@/network/request-queue.js'
+import { DEFAULT_REQUEST_TIMEOUT_MS } from '@/network/types.js'
 import { UnsupportedVersionError, KafkaProtocolError } from './errors.js'
 import type { BrokerConfig, VersionRange } from './types.js'
 

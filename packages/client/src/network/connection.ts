@@ -5,10 +5,15 @@
 import type * as net from 'node:net'
 import type * as tls from 'node:tls'
 import { EventEmitter } from 'node:events'
-import type { ConnectionConfig, ConnectionState, SaslConfig } from '@/network/types.js'
+import {
+	DEFAULT_REQUEST_TIMEOUT_MS,
+	type ConnectionConfig,
+	type ConnectionState,
+	type SaslConfig,
+} from '@/network/types.js'
 import { ApiKey } from '@/protocol/messages/api-keys.js'
 import { SocketFactory, type SocketFactoryOptions } from '@/network/socket-factory.js'
-import { DEFAULT_REQUEST_TIMEOUT_MS, RequestQueue, type RequestQueueOptions } from '@/network/request-queue.js'
+import { RequestQueue, type RequestQueueOptions } from '@/network/request-queue.js'
 import { ConnectionClosedError, NetworkError } from '@/network/errors.js'
 import { KafkaFrameDecoder, DEFAULT_MAX_FRAME_SIZE } from '@/network/kafka-frame-decoder.js'
 import { Decoder, Encoder } from '@/protocol/primitives/index.js'

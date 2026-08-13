@@ -9,7 +9,7 @@ import { EventEmitter } from 'node:events'
 import type { Cluster } from '@/client/cluster.js'
 import { KafkaProtocolError } from '@/client/errors.js'
 import { ErrorCode, isGenerationLostErrorCode } from '@/protocol/messages/error-codes.js'
-import { pmapVoid } from '@/utils/pmap.js'
+import { pmapVoidUntilPaused } from '@/utils/pmap.js'
 import type { DecodedRecord } from '@/protocol/records/index.js'
 import { buildDecoderMaps, decodeRecord } from './message-decoder.js'
 import {
@@ -99,8 +99,9 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			defaultApiTimeoutMs: config.defaultApiTimeoutMs ?? DEFAULT_CONSUMER_CONFIG.defaultApiTimeoutMs,
 			onBeforeRebalance: config.onBeforeRebalance,
 		}
-		if (!Number.isInteger(this.config.maxRecords) || this.config.maxRecords <= 0)
+		if (!Number.isInteger(this.config.maxRecords) || this.config.maxRecords <= 0) {
 			throw new Error('maxRecords must be a positive integer')
+		}
 	}
 
 	private startRun(commitOffsets: boolean, externalSignal?: AbortSignal): void {
@@ -440,7 +441,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			let nextPartitionGroup = 0
 
 			while (nextPartitionGroup < partitionGroups.length && this.state === 'running' && !signal.aborted) {
-				const claimed = await pmapVoid(
+				const claimed = await pmapVoidUntilPaused(
 					partitionGroups.slice(nextPartitionGroup),
 					async partitionBatches => {
 						for (const batch of partitionBatches) {

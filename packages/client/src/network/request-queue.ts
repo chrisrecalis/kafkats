@@ -3,10 +3,8 @@
  */
 
 import type { ApiKey } from '@/protocol/messages/api-keys.js'
-import type { PendingRequest, QueuedRequest } from '@/network/types.js'
+import { DEFAULT_REQUEST_TIMEOUT_MS, type PendingRequest, type QueuedRequest } from '@/network/types.js'
 import { RequestTimeoutError, ConnectionClosedError } from '@/network/errors.js'
-
-export const DEFAULT_REQUEST_TIMEOUT_MS = 30000
 
 export interface RequestQueueOptions {
 	/** Maximum in-flight requests (default: 5) */

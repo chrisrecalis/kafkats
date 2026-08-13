@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { pmap, pmapVoid } from '@/utils/pmap.js'
+import { pmap, pmapVoidUntilPaused } from '@/utils/pmap.js'
 
 describe('pmap', () => {
 	it('maps all items with the given function', async () => {
@@ -220,14 +220,14 @@ describe('pmap', () => {
 	})
 })
 
-describe('pmapVoid', () => {
+describe('pmapVoidUntilPaused', () => {
 	it('stops admitting work and waits for already-active functions', async () => {
 		let paused = false
 		let active = 0
 		let maxActive = 0
 		const started: number[] = []
 
-		const claimed = await pmapVoid(
+		const claimed = await pmapVoidUntilPaused(
 			[1, 2, 3, 4, 5],
 			async item => {
 				started.push(item)
@@ -250,7 +250,7 @@ describe('pmapVoid', () => {
 
 	it('uses one worker when concurrency is NaN', async () => {
 		const started: number[] = []
-		const claimed = await pmapVoid(
+		const claimed = await pmapVoidUntilPaused(
 			[1, 2],
 			async item => {
 				started.push(item)
