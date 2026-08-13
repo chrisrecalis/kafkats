@@ -111,7 +111,7 @@ describe('FetchManager OffsetOutOfRange handling', () => {
 		fm.addPartitions([{ topic: 't', partition: 0, offset: 100n }])
 		const state = fmAny.partitionStates.get('t:0')
 
-		await fmAny.fetchFromBrokerToBuffer(broker, [state])
+		await fmAny.fetchFromBrokerToBuffer(broker, [state], 1048576)
 
 		// Offset is reset to the new earliest...
 		expect(state.offset).toBe(200n)
@@ -183,7 +183,7 @@ describe('FetchManager OffsetOutOfRange handling', () => {
 		fm.addPartitions([{ topic: 't', partition: 0, offset: 100n }])
 		const state = fmAny.partitionStates.get('t:0')
 
-		const inflight: Promise<void> = fmAny.fetchFromBrokerToBuffer(broker, [state])
+		const inflight: Promise<void> = fmAny.fetchFromBrokerToBuffer(broker, [state], 1048576)
 
 		// Give the microtask queue a chance to reach the await on the offset lookup.
 		await new Promise(resolve => setTimeout(resolve, 0))

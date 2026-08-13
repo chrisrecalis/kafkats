@@ -74,7 +74,7 @@ describe('FetchManager position advancement past record-less batches', () => {
 		fm.addPartitions([{ topic: 't', partition: 0, offset: 10n }])
 		const state = fmAny.partitionStates.get('t:0')
 
-		await fmAny.fetchFromBrokerToBuffer(broker, [state])
+		await fmAny.fetchFromBrokerToBuffer(broker, [state], 1048576)
 
 		// Without advancing here the consumer re-fetches offset 10 forever.
 		expect(state.offset).toBe(11n)
@@ -95,7 +95,7 @@ describe('FetchManager position advancement past record-less batches', () => {
 		fm.addPartitions([{ topic: 't', partition: 0, offset: 20n }])
 		const state = fmAny.partitionStates.get('t:0')
 
-		await fmAny.fetchFromBrokerToBuffer(broker, [state])
+		await fmAny.fetchFromBrokerToBuffer(broker, [state], 1048576)
 
 		expect(state.offset).toBe(25n)
 		expect(onFetchPosition).toHaveBeenCalledWith({ topic: 't', partition: 0, offset: 25n }, 0)
@@ -117,7 +117,7 @@ describe('FetchManager position advancement past record-less batches', () => {
 		fm.addPartitions([{ topic: 't', partition: 0, offset: 5n }])
 		const state = fmAny.partitionStates.get('t:0')
 
-		await fmAny.fetchFromBrokerToBuffer(broker, [state])
+		await fmAny.fetchFromBrokerToBuffer(broker, [state], 1048576)
 
 		// The live record at offset 10 must be buffered (decoded with its real offset), not skipped.
 		expect(fmAny.fetchBuffer.add).toHaveBeenCalledTimes(1)

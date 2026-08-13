@@ -79,8 +79,10 @@ interface CompletedFetch {
 class FetchBuffer {
 	private queue: CompletedFetch[] = []
 	private bufferedBytes = 0
+	private reservedBytes = 0
 	private readonly maxBytes: number
 	private waiters: Array<() => void> = []
+	private capacityWaiter: (() => void) | null = null
 
 	constructor(maxBytes: number) {
 		this.maxBytes = maxBytes
@@ -96,13 +98,34 @@ class FetchBuffer {
 	}
 
 	/**
-	 * Drain all buffered fetches
+	 * Drain all buffered fetches, coalescing responses for the same partition and
+	 * assignment epoch. Background prefetch may complete several requests while a
+	 * handler is running; exposing each response as a separate runBatch invocation
+	 * would turn those implementation-level fetch boundaries into separate EOS
+	 * transactions.
 	 */
 	drain(): CompletedFetch[] {
-		const result = this.queue
+		const queue = this.queue
 		this.queue = []
 		this.bufferedBytes = 0
-		return result
+		this.signalCapacityWaiter()
+
+		if (queue.length < 2) {
+			return queue
+		}
+
+		const byPartitionAndEpoch = new Map<string, CompletedFetch>()
+		for (const fetch of queue) {
+			const key = `${tpKey(fetch.topic, fetch.partition)}\0${fetch.assignmentEpoch}`
+			const existing = byPartitionAndEpoch.get(key)
+			if (existing) {
+				existing.records = existing.records.concat(fetch.records)
+				existing.byteSize += fetch.byteSize
+			} else {
+				byPartitionAndEpoch.set(key, fetch)
+			}
+		}
+		return Array.from(byPartitionAndEpoch.values())
 	}
 
 	isEmpty(): boolean {
@@ -110,7 +133,41 @@ class FetchBuffer {
 	}
 
 	isFull(): boolean {
-		return this.bufferedBytes >= this.maxBytes
+		return this.remainingCapacity() === 0
+	}
+
+	remainingCapacity(): number {
+		return Math.max(0, this.maxBytes - this.bufferedBytes - this.reservedBytes)
+	}
+
+	/** Reserve part of the memory budget for a Fetch response before dispatching it. */
+	reserveCapacity(maxBytes: number): number {
+		const reserved = Math.min(maxBytes, this.remainingCapacity())
+		this.reservedBytes += reserved
+		return reserved
+	}
+
+	releaseCapacity(bytes: number): void {
+		this.reservedBytes = Math.max(0, this.reservedBytes - bytes)
+		this.signalCapacityWaiter()
+	}
+
+	/** Wait until poll() or partition removal frees buffer capacity. */
+	async waitForCapacity(signal?: AbortSignal): Promise<void> {
+		if (!this.isFull() || signal?.aborted) {
+			return
+		}
+
+		await new Promise<void>(resolve => {
+			const resume = () => {
+				this.capacityWaiter = null
+				signal?.removeEventListener('abort', resume)
+				resolve()
+			}
+
+			this.capacityWaiter = resume
+			signal?.addEventListener('abort', resume, { once: true })
+		})
 	}
 
 	/**
@@ -181,12 +238,17 @@ class FetchBuffer {
 		}
 	}
 
+	private signalCapacityWaiter(): void {
+		if (!this.isFull()) this.capacityWaiter?.()
+	}
+
 	/**
 	 * Clear all buffered data
 	 */
 	clear(): void {
 		this.queue = []
 		this.bufferedBytes = 0
+		this.signalCapacityWaiter()
 	}
 
 	/**
@@ -203,6 +265,7 @@ class FetchBuffer {
 		}
 		this.queue = filtered
 		this.bufferedBytes = newBytes
+		this.signalCapacityWaiter()
 	}
 
 	/**
@@ -221,6 +284,7 @@ class FetchBuffer {
 		}
 		this.queue = filtered
 		this.bufferedBytes = newBytes
+		this.signalCapacityWaiter()
 	}
 
 	/**
@@ -251,6 +315,7 @@ class FetchBuffer {
 		}
 		this.queue = filtered
 		this.bufferedBytes = newBytes
+		this.signalCapacityWaiter()
 		return earliest
 	}
 }
@@ -682,6 +747,16 @@ export class FetchManager {
 
 		while (this.running && !signal?.aborted) {
 			try {
+				const fetchBuffer = this.fetchBuffer
+				if (!fetchBuffer) break
+
+				// Do not issue another Fetch once buffered data plus in-flight response
+				// reservations have reached the memory budget.
+				if (fetchBuffer.isFull()) {
+					await fetchBuffer.waitForCapacity(signal)
+					continue
+				}
+
 				// Get ready (non-paused) partitions - reuse array
 				readyPartitions.length = 0
 				for (const state of this.partitionStates.values()) {
@@ -698,23 +773,34 @@ export class FetchManager {
 				// Group partitions by leader broker
 				const partitionsByBroker = await this.groupPartitionsByBroker(readyPartitions)
 
+				// stop() may have run during the await above; don't issue a final fetch
+				// against the stale buffer captured before it.
+				if (!this.running || signal?.aborted) break
+
 				if (partitionsByBroker.size === 0) {
 					await sleep(100, { signal }).catch(() => {})
 					continue
 				}
-
-				// Issue fetch to each broker that doesn't have in-flight request
+				// Issue fetch to each broker that doesn't have an in-flight request. Split
+				// remaining capacity across those brokers so concurrent responses cannot each
+				// independently claim the entire buffer budget.
 				let fetchesIssued = 0
-				for (const [brokerId, { broker, partitions }] of partitionsByBroker) {
-					if (this.brokerInFlight.get(brokerId)) {
-						continue // Skip if already fetching from this broker
-					}
+				const availableBrokers = Array.from(partitionsByBroker.entries()).filter(
+					([brokerId]) => !this.brokerInFlight.get(brokerId)
+				)
+				for (let index = 0; index < availableBrokers.length; index++) {
+					const [brokerId, { broker, partitions }] = availableBrokers[index]!
+					const remainingBrokers = availableBrokers.length - index
+					const fairShare = Math.max(1, Math.floor(fetchBuffer.remainingCapacity() / remainingBrokers))
+					const naturalMaxBytes = this.config.maxBytesPerPartition * partitions.length
+					const reservedBytes = fetchBuffer.reserveCapacity(Math.min(naturalMaxBytes, fairShare))
+					if (reservedBytes === 0) break
 
 					this.brokerInFlight.set(brokerId, true)
 					fetchesIssued++
 
 					// Fire and forget - don't await, let it run in background
-					this.fetchFromBrokerToBuffer(broker, partitions)
+					this.fetchFromBrokerToBuffer(broker, partitions, reservedBytes)
 						.catch(error => {
 							this.logger.error('background fetch failed', {
 								brokerId,
@@ -722,15 +808,14 @@ export class FetchManager {
 							})
 						})
 						.finally(() => {
+							fetchBuffer.releaseCapacity(reservedBytes)
 							this.brokerInFlight.set(brokerId, false)
 						})
 				}
 
-				// Only sleep when necessary to prevent busy-loop
-				if (this.fetchBuffer?.isFull()) {
-					// Buffer is full, wait for consumer to drain it
-					await sleep(10, { signal }).catch(() => {})
-				} else if (fetchesIssued === 0) {
+				// Only sleep when necessary to prevent busy-loop. Capacity backpressure
+				// is handled at the top of the loop before any request is issued.
+				if (fetchesIssued === 0) {
 					// All brokers have in-flight requests, wait briefly
 					await sleep(1, { signal }).catch(() => {})
 				}
@@ -800,7 +885,7 @@ export class FetchManager {
 	/**
 	 * Fetch from a single broker and add results to buffer
 	 */
-	private async fetchFromBrokerToBuffer(broker: Broker, partitions: PartitionState[]): Promise<void> {
+	private async fetchFromBrokerToBuffer(broker: Broker, partitions: PartitionState[], maxBytes: number): Promise<void> {
 		if (!this.fetchBuffer) return
 
 		// Map response entries back to the in-flight state we issued the fetch
@@ -837,7 +922,7 @@ export class FetchManager {
 			replicaId: -1,
 			maxWaitMs: this.config.maxWaitMs,
 			minBytes: this.config.minBytes,
-			maxBytes: this.config.maxBytesPerPartition * partitions.length,
+			maxBytes,
 			isolationLevel: this.config.isolationLevel === 'read_committed' ? 1 : 0,
 			topics,
 		})
