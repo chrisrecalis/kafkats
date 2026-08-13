@@ -84,7 +84,7 @@ describe('FetchManager response fencing', () => {
 		fm.addPartitions([{ topic: 't', partition: 0, offset: 10n }])
 		const oldState = fmAny.partitionStates.get('t:0')
 
-		const inflight: Promise<void> = fmAny.fetchFromBrokerToBuffer(broker, [oldState])
+		const inflight: Promise<void> = fmAny.fetchFromBrokerToBuffer(broker, [oldState], 1048576)
 
 		fm.removePartitions([{ topic: 't', partition: 0 }])
 		fm.addPartitions([{ topic: 't', partition: 0, offset: 100n }])
@@ -154,7 +154,7 @@ describe('FetchManager response fencing', () => {
 		fm.addPartitions([{ topic: 't', partition: 0, offset: 10n }])
 		const state = fmAny.partitionStates.get('t:0')
 
-		const inflight: Promise<void> = fmAny.fetchFromBrokerToBuffer(broker, [state])
+		const inflight: Promise<void> = fmAny.fetchFromBrokerToBuffer(broker, [state], 1048576)
 
 		// Pause the partition while its fetch is still in flight.
 		fm.pausePartitions([{ topic: 't', partition: 0 }])
@@ -223,7 +223,7 @@ describe('FetchManager response fencing', () => {
 		fm.addPartitions([{ topic: 't', partition: 0, offset: 10n }])
 		const state = fmAny.partitionStates.get('t:0')
 
-		const inflight: Promise<void> = fmAny.fetchFromBrokerToBuffer(broker, [state])
+		const inflight: Promise<void> = fmAny.fetchFromBrokerToBuffer(broker, [state], 1048576)
 
 		// Seek (backward) while the fetch issued at offset 10 is in flight.
 		fm.seekPartition('t', 0, 5n)

@@ -92,7 +92,7 @@ describe('FetchManager pause with already-buffered records', () => {
 		fm.addPartitions([{ topic: 't', partition: 0, offset: 10n }])
 		const state = fmAny.partitionStates.get('t:0')
 
-		await fmAny.fetchFromBrokerToBuffer(broker, [state])
+		await fmAny.fetchFromBrokerToBuffer(broker, [state], 1048576)
 		expect(state.offset).toBe(12n) // advanced past the buffered records
 		expect(added).toEqual([{ topic: 't', partition: 0 }])
 
@@ -156,7 +156,7 @@ describe('FetchManager pause with already-buffered records', () => {
 		const state = fmAny.partitionStates.get('t:0')
 
 		// Fetch issued while state.offset === 12 (mirrors a fetch in flight when pause lands).
-		const inflight: Promise<void> = fmAny.fetchFromBrokerToBuffer(broker, [state])
+		const inflight: Promise<void> = fmAny.fetchFromBrokerToBuffer(broker, [state], 1048576)
 
 		// Pause rewinds to 10 (records 10,11 were buffered-but-undelivered), then resume reopens.
 		fm.pausePartitions([{ topic: 't', partition: 0 }])

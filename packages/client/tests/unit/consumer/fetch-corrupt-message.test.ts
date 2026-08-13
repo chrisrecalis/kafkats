@@ -73,7 +73,7 @@ describe('FetchManager CORRUPT_MESSAGE handling', () => {
 		fm.addPartitions([{ topic: 't', partition: 0, offset: 0n }])
 		const state = fmAny.partitionStates.get('t:0')
 
-		await fmAny.fetchFromBrokerToBuffer(broker, [state])
+		await fmAny.fetchFromBrokerToBuffer(broker, [state], 1048576)
 		expect(fmAny.pendingError).toBeInstanceOf(Error)
 		expect((fmAny.pendingError as Error).message).toMatch(/corrupt/i)
 	})
