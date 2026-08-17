@@ -3,8 +3,8 @@
  *
  * This is a separate consumer from the classic Consumer group implementation and uses:
  * - ShareGroupHeartbeat for membership
- * - ShareFetch for record acquisition (v1 = Kafka 4.1, v2 = Kafka 4.2 adds acquireMode and renew)
- * - ShareAcknowledge for per-record acknowledgements (v1 = Kafka 4.1, v2 = Kafka 4.2 adds renew)
+ * - ShareFetch v2 for record acquisition and acquire modes
+ * - ShareAcknowledge v2 for per-record acknowledgements and lock renewal
  */
 
 import { EventEmitter } from 'node:events'
@@ -482,7 +482,10 @@ export class ShareConsumer extends EventEmitter<ShareConsumerEvents> {
 				response = await broker.shareFetch(request)
 			} catch (e) {
 				if (e instanceof UnsupportedVersionError) {
-					throw new KafkaFeatureUnsupportedError('share-groups', 'broker does not support ShareFetch')
+					throw new KafkaFeatureUnsupportedError(
+						'share-groups',
+						'ShareConsumer requires ShareFetch and ShareAcknowledge v2 (Kafka 4.2+)'
+					)
 				}
 				throw e
 			}

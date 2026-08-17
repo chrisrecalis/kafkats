@@ -91,10 +91,11 @@ await consumer.runEach('my-topic', async (message, ctx) => {
 
 See [Consumer API](/client/consumer) for full documentation.
 
-## Creating a ShareConsumer (experimental)
+## Creating a ShareConsumer
 
-Kafka Share Groups (KIP-932) provide queue-like consumption with per-record acknowledgements.
-They require Kafka 4.1+ with Share Groups enabled (see [ShareConsumer API](/client/share-consumer)).
+Kafka Share Groups (KIP-932) provide queue-like consumption with per-record acknowledgements. `ShareConsumer`
+requires the production-ready Share Consumer APIs in Kafka 4.2+. Kafka 4.2.1+ is recommended because it fixes a
+critical Share Group broker deadlock.
 
 ```typescript
 const shareConsumer = client.shareConsumer({
@@ -103,7 +104,9 @@ const shareConsumer = client.shareConsumer({
 
 await shareConsumer.runEach('my-topic', async message => {
 	// For string topic subscriptions, key/value are raw Buffers (same as Consumer).
-	await process(message.value.toString('utf-8'))
+	if (message.value !== null) {
+		await process(message.value.toString('utf-8'))
+	}
 
 	// If you don't call ack/release/reject, the message is implicitly ack'd (ACCEPT) on success.
 	// await message.release()

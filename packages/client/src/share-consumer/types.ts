@@ -1,8 +1,7 @@
 /**
  * Share consumer types and interfaces.
  *
- * Implements Kafka Share Groups (KIP-932), generally available since Kafka 4.2.
- * Supports ShareFetch/ShareAcknowledge v1 (Kafka 4.1+) and v2 (Kafka 4.2+).
+ * Implements production-ready Kafka Share Groups (KIP-932) using ShareFetch/ShareAcknowledge v2 (Kafka 4.2+).
  */
 
 import type { TopicDefinition, DecoderLike } from '@/topic.js'
@@ -109,17 +108,17 @@ export interface ShareConsumerConfig {
 	 */
 	maxBytes?: number
 	/**
-	 * Maximum records to return (ShareFetch v1+)
+	 * Maximum records to return.
 	 */
 	maxRecords?: number
 	/**
-	 * Suggested batch size for acquired records / acknowledgements (ShareFetch v1+)
+	 * Suggested batch size for acquired records / acknowledgements.
 	 */
 	batchSize?: number
 	/**
-	 * Acquire mode (KIP-1206, ShareFetch v2+, Kafka 4.2+).
+	 * Acquire mode (KIP-1206).
 	 * - `batch_optimized` (default): broker may return more than `maxRecords` to align batch boundaries.
-	 * - `record_limit`: broker strictly caps the response at `maxRecords`. Requires v2; throws on older brokers.
+	 * - `record_limit`: broker strictly caps the response at `maxRecords`.
 	 */
 	acquireMode?: ShareConsumerAcquireMode
 }
@@ -156,13 +155,12 @@ export interface ShareMessage<V = Buffer, K = Buffer> {
 	 */
 	reject(): Promise<void>
 	/**
-	 * Renew the acquisition lock (KIP-1222, Kafka 4.2+).
+	 * Renew the acquisition lock (KIP-1222).
 	 *
 	 * Use for long-running handlers that need more time than the broker's lock timeout.
 	 * The message remains in-flight after `renew()`; the handler must still call `ack`/`release`/`reject`
 	 * (or `runEach()` will auto-ack on success). Multiple renews per message are allowed.
 	 *
-	 * Throws if the broker does not support ShareAcknowledge v2.
 	 */
 	renew(): Promise<void>
 }

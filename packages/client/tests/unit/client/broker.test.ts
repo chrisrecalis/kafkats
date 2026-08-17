@@ -193,18 +193,24 @@ describe('Broker', () => {
 			;(broker as unknown as { connection: typeof controlConnection }).connection = controlConnection
 			;(broker as unknown as { fetchConnection: typeof fetchConnection }).fetchConnection = fetchConnection
 
-			// Only report ApiVersions, not Metadata
+			// Report the preview Share APIs but not Metadata.
 			controlConnection.setSendHandler(async apiKey => {
 				if (apiKey === ApiKey.ApiVersions) {
-					return buildApiVersionsResponse([{ apiKey: ApiKey.ApiVersions, minVersion: 0, maxVersion: 3 }])
+					return buildApiVersionsResponse([
+						{ apiKey: ApiKey.ApiVersions, minVersion: 0, maxVersion: 3 },
+						{ apiKey: ApiKey.ShareFetch, minVersion: 1, maxVersion: 1 },
+						{ apiKey: ApiKey.ShareAcknowledge, minVersion: 1, maxVersion: 1 },
+					])
 				}
 				throw new Error(`Unexpected API key: ${apiKey}`)
 			})
 
 			await broker.connect()
 
-			// Trying to get version for unsupported API should throw
+			// Missing APIs and the Kafka 4.1 preview Share APIs are unsupported.
 			expect(() => broker.getApiVersion(ApiKey.Metadata)).toThrow(UnsupportedVersionError)
+			expect(() => broker.getApiVersion(ApiKey.ShareFetch)).toThrow(UnsupportedVersionError)
+			expect(() => broker.getApiVersion(ApiKey.ShareAcknowledge)).toThrow(UnsupportedVersionError)
 		})
 
 		it('does not stay cached as connected when ApiVersions negotiation fails', async () => {
@@ -540,7 +546,8 @@ describe('Broker', () => {
 					return buildApiVersionsResponse([
 						{ apiKey: ApiKey.ApiVersions, minVersion: 0, maxVersion: 3 },
 						{ apiKey: ApiKey.Fetch, minVersion: 11, maxVersion: 11 },
-						{ apiKey: ApiKey.ShareFetch, minVersion: 1, maxVersion: 1 },
+						{ apiKey: ApiKey.ShareFetch, minVersion: 1, maxVersion: 2 },
+						{ apiKey: ApiKey.ShareAcknowledge, minVersion: 1, maxVersion: 2 },
 					])
 				}
 				throw new Error(`Unexpected API key: ${apiKey}`)
@@ -581,7 +588,7 @@ describe('Broker', () => {
 				})
 			).rejects.toThrow('Unexpected request')
 
-			expect(fetchConnection.send).toHaveBeenLastCalledWith(ApiKey.ShareFetch, 1, expect.any(Function), 75000)
+			expect(fetchConnection.send).toHaveBeenLastCalledWith(ApiKey.ShareFetch, 2, expect.any(Function), 75000)
 		})
 	})
 

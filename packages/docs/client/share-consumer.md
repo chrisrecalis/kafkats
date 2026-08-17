@@ -2,18 +2,15 @@
 
 The share consumer reads records from Kafka topics using Kafka **Share Groups** (KIP-932) for queue-like consumption with per-record acknowledgements.
 
-Share Groups are **GA in Kafka 4.2** (February 2026). `ShareConsumer` works against Kafka 4.1 (KIP-932 stable v1) and adds opt-in support for Kafka 4.2 features (KIP-1206 acquire mode, KIP-1222 lock renewal) when the broker negotiates ShareFetch/ShareAcknowledge v2.
+`ShareConsumer` requires the **production-ready Kafka 4.2** Share Group APIs: ShareFetch and ShareAcknowledge v2.
+These APIs include the KIP-1206 acquire modes and KIP-1222 acquisition-lock renewal. Kafka 4.2.1+ is recommended
+because it fixes a critical Share Group broker deadlock. The preview APIs from Kafka 4.0 and 4.1 are not supported.
 
 ## Requirements
 
-- Kafka brokers must support Share APIs (Kafka 4.1+; Kafka 4.2+ for `record_limit` acquire mode and `renew()`)
-- Share Groups must be enabled on the cluster (feature flag `share.version=1`)
-
-Enable Share Groups:
-
-```bash
-kafka-features.sh --bootstrap-server localhost:9092 upgrade --feature share.version=1
-```
+- Kafka 4.2+ with ShareFetch and ShareAcknowledge v2 is required
+- Kafka 4.2.1+ is recommended
+- Clusters running the latest production metadata version enable `share.version=1` by default
 
 If the broker does not support Share APIs, `ShareConsumer` throws `KafkaFeatureUnsupportedError('share-groups')`.
 If Share Groups are supported but disabled, it throws `KafkaFeatureDisabledError('share-groups')`.
@@ -54,7 +51,7 @@ await shareConsumer.runEach('events', async (message, ctx) => {
 		topic: ctx.topic,
 		partition: ctx.partition,
 		offset: ctx.offset,
-		value: message.value.toString('utf-8'),
+		value: message.value?.toString('utf-8'),
 	})
 })
 ```
@@ -66,7 +63,7 @@ await shareConsumer.runEach('events', async (message, ctx) => {
 - `message.ack()` (ACCEPT) — finalize successful processing
 - `message.release()` (RELEASE) — return to the queue for redelivery
 - `message.reject()` (REJECT) — drop without redelivery
-- `message.renew()` (RENEW, Kafka 4.2+) — extend the acquisition lock without finalizing
+- `message.renew()` (RENEW) — extend the acquisition lock without finalizing
 
 `ack`, `release`, and `reject` each finalize the record; calling more than one for the same message throws. `renew` does **not** finalize — call it any number of times to keep the lock alive while a slow handler runs, then call one of the finalizing methods (or rely on `runEach()`'s implicit ACCEPT on success).
 
@@ -77,7 +74,9 @@ In `stream()` mode, the record is **implicitly acknowledged** (ACCEPT) when you 
 ```typescript
 await shareConsumer.runEach('events', async message => {
 	try {
-		await process(message.value.toString('utf-8'))
+		if (message.value !== null) {
+			await process(message.value.toString('utf-8'))
+		}
 		await message.ack()
 	} catch {
 		await message.release()
@@ -85,7 +84,7 @@ await shareConsumer.runEach('events', async message => {
 })
 ```
 
-#### Renewing the acquisition lock (KIP-1222, Kafka 4.2+)
+#### Renewing the acquisition lock (KIP-1222)
 
 For long-running handlers that need more time than the broker's `group.share.record.lock.duration.ms`, call `message.renew()` to extend the lock:
 
@@ -95,14 +94,14 @@ await shareConsumer.runEach('events', async (message, ctx) => {
 		message.renew().catch(err => ctx.signal.aborted || console.error(err))
 	}, 20_000)
 	try {
-		await longRunningProcessing(message.value)
+		if (message.value !== null) {
+			await longRunningProcessing(message.value)
+		}
 	} finally {
 		clearInterval(heartbeat)
 	}
 })
 ```
-
-`renew()` requires ShareAcknowledge v2 — it throws against Kafka 4.1 brokers.
 
 ### Async Iterator Mode (stream)
 
@@ -110,7 +109,7 @@ Consume messages via `for await ... of`:
 
 ```typescript
 for await (const { message, ctx } of shareConsumer.stream('events')) {
-	console.log(ctx.topic, ctx.partition, ctx.offset, message.value.toString('utf-8'))
+	console.log(ctx.topic, ctx.partition, ctx.offset, message.value?.toString('utf-8'))
 	// Optionally:
 	// await message.release()
 	// await message.reject()
@@ -126,19 +125,15 @@ interface ShareMessage<V = Buffer, K = Buffer> {
 	offset: bigint
 	timestamp: bigint
 	key: K | null
-	value: V
+	value: V | null
 	headers: Record<string, Buffer>
 	deliveryCount?: number
 	ack(): Promise<void>
 	release(): Promise<void>
 	reject(): Promise<void>
-	renew(): Promise<void> // Kafka 4.2+
+	renew(): Promise<void>
 }
 ```
-
-::: tip Tombstones
-Kafka tombstones (`value = null`) are supported, but the current types do not model nullable values.
-:::
 
 ## Consume Context
 
@@ -180,24 +175,27 @@ const userEvents = topic('user-events', {
 await shareConsumer.runEach(userEvents, async message => {
 	// message.key: string
 	// message.value: UserEvent
-	console.log(`User ${message.value.userId}: ${message.value.action}`)
+	if (message.value !== null) {
+		console.log(`User ${message.value.userId}: ${message.value.action}`)
+	}
 })
 ```
 
 ## Consumer Config
 
-| Option        | Type                                  | Default             | Description                                                                                                                        |
-| ------------- | ------------------------------------- | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `groupId`     | `string`                              | required            | Share group identifier                                                                                                             |
-| `rackId`      | `string`                              | -                   | Rack ID hint for rack-aware assignment                                                                                             |
-| `maxWaitMs`   | `number`                              | `5000`              | `ShareFetch.max_wait_ms`                                                                                                           |
-| `minBytes`    | `number`                              | `1`                 | `ShareFetch.min_bytes`                                                                                                             |
-| `maxBytes`    | `number`                              | `1048576`           | `ShareFetch.max_bytes`                                                                                                             |
-| `maxRecords`  | `number`                              | `500`               | Max records the broker should return per fetch                                                                                     |
-| `batchSize`   | `number`                              | `100`               | Suggested batch size for acquired records and acknowledgements                                                                     |
-| `acquireMode` | `'batch_optimized' \| 'record_limit'` | `'batch_optimized'` | KIP-1206, Kafka 4.2+. `record_limit` strictly caps each fetch at `maxRecords`; `batch_optimized` may exceed it for batch alignment |
+| Option        | Type                                  | Default             | Description                                                                                                            |
+| ------------- | ------------------------------------- | ------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `groupId`     | `string`                              | required            | Share group identifier                                                                                                 |
+| `rackId`      | `string`                              | -                   | Rack ID hint for rack-aware assignment                                                                                 |
+| `maxWaitMs`   | `number`                              | `5000`              | `ShareFetch.max_wait_ms`                                                                                               |
+| `minBytes`    | `number`                              | `1`                 | `ShareFetch.min_bytes`                                                                                                 |
+| `maxBytes`    | `number`                              | `1048576`           | `ShareFetch.max_bytes`                                                                                                 |
+| `maxRecords`  | `number`                              | `500`               | Max records the broker should return per fetch                                                                         |
+| `batchSize`   | `number`                              | `100`               | Suggested batch size for acquired records and acknowledgements                                                         |
+| `acquireMode` | `'batch_optimized' \| 'record_limit'` | `'batch_optimized'` | KIP-1206. `record_limit` strictly caps each fetch at `maxRecords`; `batch_optimized` may exceed it for batch alignment |
 
-`acquireMode: 'record_limit'` requires ShareFetch v2 (Kafka 4.2+); against older brokers the consumer throws on the first fetch.
+Against brokers without ShareFetch or ShareAcknowledge v2, the consumer throws `KafkaFeatureUnsupportedError`
+before acquiring records.
 
 ## Run Options
 
@@ -317,5 +315,4 @@ For trivial handlers (0ms processing), regular consumers may be faster due to lo
 
 - No dead-letter queue / retry policy helpers (KIP-1191 lands in Kafka 4.4 and is not yet implemented)
 - Share Groups do not support static membership
-- `record_limit` acquire mode and `renew()` require Kafka 4.2+
-- Requires Kafka 4.1+ with Share Groups enabled (`share.version=1`)
+- Requires Kafka 4.2+ ShareFetch and ShareAcknowledge v2

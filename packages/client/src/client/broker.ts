@@ -972,6 +972,8 @@ export class Broker {
 
 	async shareFetch(request: ShareFetchRequest): Promise<ShareFetchResponse> {
 		const version = this.getApiVersion(ApiKey.ShareFetch)
+		// A ShareConsumer must be able to settle records before it acquires them.
+		this.getApiVersion(ApiKey.ShareAcknowledge)
 		const startTime = Date.now()
 		this.logger.debug('sending request', { api: 'ShareFetch', version })
 
