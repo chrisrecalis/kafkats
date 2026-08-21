@@ -49,6 +49,12 @@ describe('OffsetManager.fetchCommittedOffsets partition-level errors', () => {
 		const result = await manager.fetchCommittedOffsets([{ topic: 't', partition: 0 }])
 
 		expect(offsetFetch).toHaveBeenCalledTimes(2)
+		expect(offsetFetch).toHaveBeenCalledWith(
+			expect.objectContaining({
+				groupId: 'g1',
+				requireStable: true,
+			})
+		)
 		expect(result.get('t:0')).toBe(42n)
 	})
 
