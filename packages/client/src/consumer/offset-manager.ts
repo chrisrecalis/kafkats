@@ -339,7 +339,11 @@ export class OffsetManager {
 				if (!this.coordinator) {
 					throw new KafkaProtocolError(ErrorCode.CoordinatorNotAvailable, 'OffsetFetch: no coordinator')
 				}
-				const res = await this.coordinator.offsetFetch({ groupId: this.groupId, topics })
+				const res = await this.coordinator.offsetFetch({
+					groupId: this.groupId,
+					topics,
+					requireStable: true,
+				})
 				if (res.errorCode !== ErrorCode.None) {
 					throw new KafkaProtocolError(res.errorCode, 'OffsetFetch failed')
 				}

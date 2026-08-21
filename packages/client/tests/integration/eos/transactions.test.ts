@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest'
 
+import type { Cluster } from '@/client/cluster.js'
 import { topic } from '@/topic.js'
 import { codec } from '@/codec.js'
+import type { ConsumerGroup } from '@/consumer/consumer-group.js'
 
 import { createClient } from '../helpers/kafka.js'
 import { sleep, uniqueName } from '../helpers/testkit.js'
@@ -403,5 +405,133 @@ describe.concurrent('EOS (integration) - transactions', () => {
 
 		await producer.disconnect()
 		await client.disconnect()
+	})
+
+	it('does not reprocess an assigned partition while its transactional offset commit is pending', async () => {
+		const client = createClient('it-kip-447-stable-offset')
+		const replacementClient = createClient('it-kip-447-stable-offset-replacement')
+		await Promise.all([client.connect(), replacementClient.connect()])
+
+		const topicName = uniqueName('kip-447-input')
+		const input = topic<string>(topicName, { value: codec.string() })
+		const groupId = uniqueName('kip-447-group')
+		const transactionalId = uniqueName('kip-447-tx')
+
+		await client.createTopics([{ name: topicName, numPartitions: 1, replicationFactor: 1 }])
+
+		const seedProducer = client.producer({ lingerMs: 0 })
+		await seedProducer.send(input, { value: 'once' })
+
+		const transactionProducer = client.producer({
+			transactionalId,
+			retries: 10,
+			retryBackoffMs: 100,
+			maxRetryBackoffMs: 1_000,
+		})
+
+		// Initialize the producer, then hold its specific transaction coordinator at
+		// EndTxn. By this point TxnOffsetCommit has already written a pending offset
+		// to __consumer_offsets. This widens the same unstable-offset window that is
+		// normally present while the coordinator propagates transaction markers.
+		await transactionProducer.transaction(async () => {})
+		const producerCluster = (transactionProducer as unknown as { cluster: Cluster }).cluster
+		const transactionCoordinator = await producerCluster.getCoordinator('TRANSACTION', transactionalId)
+		const originalEndTxn = transactionCoordinator.endTxn.bind(transactionCoordinator)
+
+		let endTxnReachedResolve!: () => void
+		const endTxnReached = new Promise<void>(resolve => {
+			endTxnReachedResolve = resolve
+		})
+		let releaseEndTxnResolve!: () => void
+		const releaseEndTxn = new Promise<void>(resolve => {
+			releaseEndTxnResolve = resolve
+		})
+		transactionCoordinator.endTxn = async request => {
+			endTxnReachedResolve()
+			await releaseEndTxn
+			return originalEndTxn(request)
+		}
+
+		const firstConsumer = client.consumer({ groupId, autoOffsetReset: 'earliest' })
+		const secondConsumer = replacementClient.consumer({ groupId, autoOffsetReset: 'earliest' })
+		const secondAbort = new AbortController()
+		const duplicateOffsets: bigint[] = []
+		let pendingCommittedOffset: bigint | undefined
+
+		let firstRun: Promise<void> | undefined
+		let secondRun: Promise<void> | undefined
+		try {
+			firstRun = firstConsumer.runEach(
+				input,
+				async (_message, context) => {
+					await transactionProducer.transaction(async tx => {
+						await tx.sendOffsets(context)
+					})
+					firstConsumer.stop()
+				},
+				{ autoCommit: false, commitOffsets: false }
+			)
+
+			await endTxnReached
+			const groupCoordinator = await producerCluster.getCoordinator('GROUP', groupId)
+			const pendingResponse = await groupCoordinator.offsetFetch({
+				groupId,
+				topics: [{ name: topicName, partitions: [{ partitionIndex: 0 }] }],
+				requireStable: false,
+			})
+			pendingCommittedOffset = pendingResponse.topics[0]?.partitions[0]?.committedOffset
+
+			// Force the old member out after TxnOffsetCommit has already been accepted.
+			// This models a pod disappearing without letting the high-level consumer wait
+			// for its in-flight handler. The replacement then follows the normal group join
+			// and post-rebalance OffsetManager.fetchCommittedOffsets path.
+			const oldGroup = (firstConsumer as unknown as { consumerGroup: ConsumerGroup }).consumerGroup
+			await oldGroup.stop()
+
+			let secondRunningResolve!: () => void
+			const secondRunning = new Promise<void>(resolve => {
+				secondRunningResolve = resolve
+			})
+			secondConsumer.once('running', secondRunningResolve)
+			secondRun = secondConsumer.runEach(
+				input,
+				async message => {
+					duplicateOffsets.push(message.offset)
+					secondConsumer.stop()
+				},
+				{
+					autoCommit: false,
+					commitOffsets: false,
+					signal: secondAbort.signal,
+				}
+			)
+
+			// Before the fix, OffsetFetch v5 initializes immediately from the previous
+			// committed position and redelivers offset 0. With requireStable, the replacement
+			// remains in initialization until EndTxn makes the pending offset stable.
+			await Promise.race([secondRunning, sleep(3_000)])
+			await sleep(500)
+			releaseEndTxnResolve()
+			await firstRun
+			await sleep(500)
+			secondAbort.abort()
+			await secondRun
+		} finally {
+			releaseEndTxnResolve()
+			secondAbort.abort()
+			firstConsumer.stop()
+			secondConsumer.stop()
+			await Promise.allSettled([firstRun, secondRun].filter((run): run is Promise<void> => run !== undefined))
+			transactionCoordinator.endTxn = originalEndTxn
+			await Promise.allSettled([
+				seedProducer.disconnect(),
+				transactionProducer.disconnect(),
+				client.disconnect(),
+				replacementClient.disconnect(),
+			])
+		}
+
+		expect(pendingCommittedOffset).toBe(-1n)
+		expect(duplicateOffsets).toEqual([])
 	})
 })
