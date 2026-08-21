@@ -1,5 +1,18 @@
 # @kafkats/codec-zod
 
+## 0.11.3
+
+### Patch Changes
+
+- 20f47fe: Graduate `ShareConsumer` from experimental status now that Share Groups are production-ready in Kafka 4.2.
+  Require the production-ready ShareFetch and ShareAcknowledge v2 APIs, recommend Kafka 4.2.1 or newer, and cover
+  the acquire-mode and lock-renewal paths against Kafka 4.2.
+- 4af22ac: Require stable OffsetFetch v7 reads when initializing assigned consumer partitions so pending transactional offset
+  commits cannot cause cross-owner duplicate processing during rebalances.
+- Updated dependencies [20f47fe]
+- Updated dependencies [4af22ac]
+  - @kafkats/client@0.11.3
+
 ## 0.11.2
 
 ### Patch Changes

@@ -1,7 +1,7 @@
 {
 	"name": "@kafkats/flow-state-lmdb",
 	"private": false,
-	"version": "0.11.2",
+	"version": "0.11.3",
 	"description": "LMDB state store provider for @kafkats/flow",
 	"type": "module",
 	"main": "dist/index.cjs",
@@ -55,7 +55,7 @@
 		"lmdb": "^3.2.6"
 	},
 	"peerDependencies": {
-		"@kafkats/flow": "workspace:>=0.11.2"
+		"@kafkats/flow": "workspace:>=0.11.3"
 	},
 	"devDependencies": {
 		"@kafkats/flow": "workspace:^",
