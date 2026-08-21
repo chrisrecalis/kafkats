@@ -59,7 +59,7 @@ await consumer.runEach('events', async message => {
 - [Getting Started](/client/getting-started) - Basic setup and usage
 - [Producer API](/client/producer) - Sending messages
 - [Consumer API](/client/consumer) - Receiving messages
-- [ShareConsumer (experimental)](/client/share-consumer) - Share Groups (KIP-932)
+- [ShareConsumer](/client/share-consumer) - Production-ready Share Groups (KIP-932)
 - [Codecs](/client/codecs) - Type-safe serialization
 - [Authentication](/client/authentication) - SASL configuration
 - [Benchmarks](/client/benchmarks) - Performance comparisons

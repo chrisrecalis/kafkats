@@ -9,14 +9,14 @@ import { topic } from '@/topic.js'
 import { string } from '@/codec.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
 
-const APACHE_KAFKA_IMAGE = 'apache/kafka:4.1.1'
+const APACHE_KAFKA_IMAGE = 'apache/kafka:4.2.1'
 
 type KafkaRuntime = {
 	container: StartedTestContainer
 	brokers: string
 }
 
-async function startApacheKafka41WithShareGroups(): Promise<KafkaRuntime> {
+async function startApacheKafkaWithShareGroups(): Promise<KafkaRuntime> {
 	const advertisedHost = process.env.TESTCONTAINERS_HOST_OVERRIDE ?? 'localhost'
 	const hostPort = await getFreePort()
 
@@ -45,32 +45,7 @@ async function startApacheKafka41WithShareGroups(): Promise<KafkaRuntime> {
 		.withStartupTimeout(120_000)
 		.start()
 
-	await enableKafkaFeature(container, 'share.version=1', 'localhost:19092')
-
 	return { container, brokers: `${advertisedHost}:${hostPort}` }
-}
-
-async function enableKafkaFeature(
-	container: StartedTestContainer,
-	feature: string,
-	bootstrapServer: string
-): Promise<void> {
-	const command = [
-		'bash',
-		'-lc',
-		[
-			// Prefer PATH, fall back to the standard install location.
-			'FEATURES_BIN="$(command -v kafka-features.sh || true)"',
-			'if [ -z "$FEATURES_BIN" ] && [ -x /opt/kafka/bin/kafka-features.sh ]; then FEATURES_BIN="/opt/kafka/bin/kafka-features.sh"; fi',
-			'if [ -z "$FEATURES_BIN" ]; then echo "kafka-features.sh not found" >&2; exit 1; fi',
-			`"$FEATURES_BIN" --bootstrap-server "${bootstrapServer}" upgrade --feature "${feature}"`,
-		].join('\n'),
-	]
-
-	const result = await container.exec(command)
-	if (result.exitCode !== 0) {
-		throw new Error(`Failed to enable feature ${feature}: ${result.output}`)
-	}
 }
 
 async function getFreePort(): Promise<number> {
@@ -101,17 +76,17 @@ async function createTopicWithAdmin(client: KafkaClient, name: string): Promise<
 	}
 }
 
-describe('ShareConsumer (integration) - Apache Kafka 4.1 share groups', () => {
-	let runtime: KafkaRuntime
+let runtime: KafkaRuntime
 
-	beforeAll(async () => {
-		runtime = await startApacheKafka41WithShareGroups()
-	}, 180_000)
+beforeAll(async () => {
+	runtime = await startApacheKafkaWithShareGroups()
+}, 300_000)
 
-	afterAll(async () => {
-		await runtime.container.stop()
-	}, 60_000)
+afterAll(async () => {
+	await runtime?.container.stop()
+}, 60_000)
 
+describe('ShareConsumer (integration) - Apache Kafka 4.2 GA API', () => {
 	it('consumes records produced after joining (latest offset)', async () => {
 		const client = new KafkaClient({
 			clientId: `it-share-${randomUUID()}`,
@@ -348,6 +323,57 @@ describe('ShareConsumer (integration) - Apache Kafka 4.1 share groups', () => {
 			},
 			{ timeout: 15_000, interval: 25 }
 		)
+
+		await client.disconnect()
+	})
+})
+
+describe('ShareConsumer (integration) - Apache Kafka 4.2 GA v2 API', () => {
+	it('uses the record-limit acquire mode and renew acknowledgement', async () => {
+		const client = new KafkaClient({
+			clientId: `it-share-v2-${randomUUID()}`,
+			brokers: [runtime.brokers],
+			logLevel: 'error',
+		})
+		await client.connect()
+
+		const topicName = `it-share-v2-topic-${randomUUID()}`
+		await createTopicWithAdmin(client, topicName)
+
+		const testTopic = topic<string, string>(topicName, { value: string() })
+		const share = client.shareConsumer({
+			groupId: `it-share-v2-group-${randomUUID()}`,
+			acquireMode: 'record_limit',
+			maxRecords: 1,
+			batchSize: 1,
+		})
+		const assigned = once(share, 'partitionsAssigned')
+
+		let received: string | null = null
+		let renewed = false
+		const run = share.runEach(
+			testTopic,
+			async message => {
+				received = message.value
+				await message.renew()
+				renewed = true
+				await message.ack()
+				share.stop()
+			},
+			{ concurrency: 1 }
+		)
+
+		await assigned
+
+		const producer = client.producer({ lingerMs: 0 })
+		await producer.send(testTopic, { value: 'v2' })
+		await producer.flush()
+		await producer.disconnect()
+
+		await run
+		expect(received).toBe('v2')
+		expect(renewed).toBe(true)
+		expect(share.acquisitionLockTimeoutMs).toBeGreaterThan(0)
 
 		await client.disconnect()
 	})

@@ -3,7 +3,6 @@
  */
 
 import type { IDecoder } from '@/protocol/primitives/index.js'
-import { ApiKey, isFlexibleVersion } from '@/protocol/messages/api-keys.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import { SHARE_ACKNOWLEDGE_VERSIONS } from '@/protocol/messages/requests/share-acknowledge.js'
 
@@ -31,8 +30,7 @@ export interface ShareAcknowledgeResponse {
 	errorCode: ErrorCode
 	errorMessage: string | null
 	/**
-	 * Acquisition lock timeout reported by the broker (KIP-1222, ShareAcknowledge v2+).
-	 * 0 when the field is not present (older brokers).
+	 * Acquisition lock timeout reported by the broker (KIP-1222).
 	 */
 	acquisitionLockTimeoutMs: number
 	topics: ShareAcknowledgeTopicResponse[]
@@ -44,16 +42,11 @@ export function decodeShareAcknowledgeResponse(decoder: IDecoder, version: numbe
 		throw new Error(`Unsupported ShareAcknowledge version: ${version}`)
 	}
 
-	const flexible = isFlexibleVersion(ApiKey.ShareAcknowledge, version)
-	if (!flexible) {
-		throw new Error(`ShareAcknowledge v${version} must be flexible`)
-	}
-
 	const throttleTimeMs = decoder.readInt32()
 	const errorCode = decoder.readInt16() as ErrorCode
 	const errorMessage = decoder.readCompactNullableString()
 
-	const acquisitionLockTimeoutMs = version >= 2 ? decoder.readInt32() : 0
+	const acquisitionLockTimeoutMs = decoder.readInt32()
 
 	const topics = decoder.readCompactArray(d => {
 		const topicId = d.readUUID()

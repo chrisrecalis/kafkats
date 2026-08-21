@@ -6,22 +6,21 @@
  *
  * Flexible (tagged fields) in all supported versions.
  *
- * v1: KIP-932 stable share groups (Kafka 4.1+).
- * v2: KIP-1206 ShareAcquireMode + KIP-1222 Renew acknowledgements (Kafka 4.2+).
+ * v2: Production-ready Share Groups in Kafka 4.2, including KIP-1206 ShareAcquireMode
+ * and KIP-1222 Renew acknowledgements.
  */
 
 import type { IEncoder } from '@/protocol/primitives/index.js'
-import { ApiKey, isFlexibleVersion } from '@/protocol/messages/api-keys.js'
 
 export const SHARE_FETCH_VERSIONS = {
-	min: 1,
+	min: 2,
 	max: 2,
 }
 
 /**
- * ShareAcquireMode controls how the broker honors `maxRecords` (KIP-1206, ShareFetch v2+).
+ * ShareAcquireMode controls how the broker honors `maxRecords` (KIP-1206).
  * - `batch_optimized` (0): may return more than `maxRecords` to align batch boundaries
- *   (the v1 behavior).
+ *   for throughput.
  * - `record_limit` (1): strictly caps the response at `maxRecords`.
  */
 export const SHARE_ACQUIRE_MODE_BATCH_OPTIMIZED = 0
@@ -71,24 +70,6 @@ export function encodeShareFetchRequest(encoder: IEncoder, version: number, requ
 		throw new Error(`Unsupported ShareFetch version: ${version}`)
 	}
 
-	const flexible = isFlexibleVersion(ApiKey.ShareFetch, version)
-	if (!flexible) {
-		throw new Error(`ShareFetch v${version} must be flexible`)
-	}
-
-	if (typeof request.maxRecords !== 'number' || typeof request.batchSize !== 'number') {
-		throw new Error('ShareFetch v1 requires maxRecords and batchSize')
-	}
-
-	if (version < 2) {
-		if (request.acquireMode === SHARE_ACQUIRE_MODE_RECORD_LIMIT) {
-			throw new Error('ShareFetch acquireMode=record_limit requires v2 (Kafka 4.2+)')
-		}
-		if (request.isRenewAck) {
-			throw new Error('ShareFetch isRenewAck requires v2 (Kafka 4.2+)')
-		}
-	}
-
 	encoder.writeCompactNullableString(request.groupId)
 	encoder.writeCompactNullableString(request.memberId)
 	encoder.writeInt32(request.shareSessionEpoch)
@@ -99,10 +80,8 @@ export function encodeShareFetchRequest(encoder: IEncoder, version: number, requ
 	encoder.writeInt32(request.maxRecords)
 	encoder.writeInt32(request.batchSize)
 
-	if (version >= 2) {
-		encoder.writeInt8(request.acquireMode ?? SHARE_ACQUIRE_MODE_BATCH_OPTIMIZED)
-		encoder.writeBoolean(request.isRenewAck ?? false)
-	}
+	encoder.writeInt8(request.acquireMode ?? SHARE_ACQUIRE_MODE_BATCH_OPTIMIZED)
+	encoder.writeBoolean(request.isRenewAck ?? false)
 
 	encoder.writeCompactArray(request.topics, (topic, te) => {
 		te.writeUUID(topic.topicId)

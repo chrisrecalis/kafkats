@@ -5,15 +5,13 @@
  *
  * Flexible (tagged fields) in all supported versions.
  *
- * v1: KIP-932 stable share groups (Kafka 4.1+).
- * v2: KIP-1222 Renew acknowledgements (Kafka 4.2+).
+ * v2: Production-ready Share Groups in Kafka 4.2, including KIP-1222 Renew acknowledgements.
  */
 
 import type { IEncoder } from '@/protocol/primitives/index.js'
-import { ApiKey, isFlexibleVersion } from '@/protocol/messages/api-keys.js'
 
 export const SHARE_ACKNOWLEDGE_VERSIONS = {
-	min: 1,
+	min: 2,
 	max: 2,
 }
 
@@ -51,22 +49,11 @@ export function encodeShareAcknowledgeRequest(
 		throw new Error(`Unsupported ShareAcknowledge version: ${version}`)
 	}
 
-	const flexible = isFlexibleVersion(ApiKey.ShareAcknowledge, version)
-	if (!flexible) {
-		throw new Error(`ShareAcknowledge v${version} must be flexible`)
-	}
-
-	if (version < 2 && request.isRenewAck) {
-		throw new Error('ShareAcknowledge isRenewAck requires v2 (Kafka 4.2+)')
-	}
-
 	encoder.writeCompactNullableString(request.groupId)
 	encoder.writeCompactNullableString(request.memberId)
 	encoder.writeInt32(request.shareSessionEpoch)
 
-	if (version >= 2) {
-		encoder.writeBoolean(request.isRenewAck ?? false)
-	}
+	encoder.writeBoolean(request.isRenewAck ?? false)
 
 	encoder.writeCompactArray(request.topics, (topic, te) => {
 		te.writeUUID(topic.topicId)
