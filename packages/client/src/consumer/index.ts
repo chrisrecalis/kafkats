@@ -16,6 +16,7 @@ export type {
 	SubscriptionInput,
 	MsgOf,
 	KeyOf,
+	TopicOf,
 	// Message
 	Message,
 	ConsumeContext,
@@ -26,6 +27,7 @@ export type {
 	// Options
 	RunEachOptions,
 	RunBatchOptions,
+	StreamOptions,
 	// Configuration
 	ConsumerConfig,
 	AutoOffsetReset,
@@ -38,6 +40,9 @@ export type {
 	ConsumerGroupEvents,
 	ConsumerEvents,
 } from './types.js'
+
+export { strict, weighted } from './priority.js'
+export type { PriorityStrategy, SchedulerState, SchedulerPartition, ScheduleDecision } from './priority.js'
 
 export {
 	normalizeDecoder,
