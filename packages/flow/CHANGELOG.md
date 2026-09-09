@@ -1,5 +1,18 @@
 # @kafkats/flow
 
+## 0.12.0
+
+### Minor Changes
+
+- 09d499e: Add pluggable strict and weighted topic-priority scheduling for consumers.
+
+### Patch Changes
+
+- 53e18d2: Keep each consumer partition moving independently across buffered polls so a slow partition handler no longer blocks work already available for other partitions.
+- Updated dependencies [53e18d2]
+- Updated dependencies [09d499e]
+  - @kafkats/client@0.12.0
+
 ## 0.11.3
 
 ### Patch Changes
