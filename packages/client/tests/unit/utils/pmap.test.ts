@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { pmap, pmapVoidUntilPaused } from '@/utils/pmap.js'
+import { pmap } from '@/utils/pmap.js'
 
 describe('pmap', () => {
 	it('maps all items with the given function', async () => {
@@ -217,49 +217,5 @@ describe('pmap', () => {
 		// But it was already in-flight, so its result should be captured
 		expect(results).toContain('first')
 		expect(results).toContain('second')
-	})
-})
-
-describe('pmapVoidUntilPaused', () => {
-	it('stops admitting work and waits for already-active functions', async () => {
-		let paused = false
-		let active = 0
-		let maxActive = 0
-		const started: number[] = []
-
-		const claimed = await pmapVoidUntilPaused(
-			[1, 2, 3, 4, 5],
-			async item => {
-				started.push(item)
-				active++
-				maxActive = Math.max(maxActive, active)
-				await Promise.resolve()
-				if (item === 1) paused = true
-				await Promise.resolve()
-				active--
-			},
-			2,
-			() => paused
-		)
-
-		expect(claimed).toBe(2)
-		expect(started).toEqual([1, 2])
-		expect(active).toBe(0)
-		expect(maxActive).toBe(2)
-	})
-
-	it('uses one worker when concurrency is NaN', async () => {
-		const started: number[] = []
-		const claimed = await pmapVoidUntilPaused(
-			[1, 2],
-			async item => {
-				started.push(item)
-			},
-			Number.NaN,
-			() => false
-		)
-
-		expect(claimed).toBe(2)
-		expect(started).toEqual([1, 2])
 	})
 })

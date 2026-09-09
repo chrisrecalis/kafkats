@@ -81,11 +81,11 @@ describe('failed rebalance stops the consumer', () => {
 		consumerAny.state = 'running'
 		consumerAny.abortController = new AbortController()
 		consumerAny.commitOffsets = false
-		consumerAny.fetchManager = { poll: vi.fn().mockResolvedValue([]) }
+		consumerAny.fetchManager = { poll: vi.fn().mockResolvedValue([]), wakePoll: vi.fn() }
 		consumerAny.offsetManager = { startAutoCommit: vi.fn() }
 		consumerAny.partitionTracker = {}
 		consumerAny.partitionProvider = {
-			hasPendingRebalance: () => false,
+			hasPendingRebalance: () => true,
 			checkAndHandleRebalance: vi.fn().mockRejectedValue(failure),
 		}
 

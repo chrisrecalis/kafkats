@@ -9,7 +9,6 @@ import { EventEmitter } from 'node:events'
 import type { Cluster } from '@/client/cluster.js'
 import { KafkaProtocolError } from '@/client/errors.js'
 import { ErrorCode, isGenerationLostErrorCode } from '@/protocol/messages/error-codes.js'
-import { pmapVoidUntilPaused } from '@/utils/pmap.js'
 import type { DecodedRecord } from '@/protocol/records/index.js'
 import { buildDecoderMaps, decodeRecord } from './message-decoder.js'
 import {
@@ -35,6 +34,7 @@ import type {
 	StreamOptions,
 	TopicPartition,
 	ManualAssignment,
+	PartitionBatch,
 } from './types.js'
 import {
 	DEFAULT_CONSUMER_CONFIG,
@@ -413,76 +413,67 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		}
 
 		const handlerCtx = { signal, offsetManager, commitOffsets: this.commitOffsets }
+		const maxConcurrency = Math.max(1, Math.floor(concurrency)) || 1
+		// One handler per partition, keyed by topic:partition. FetchBuffer keeps records for
+		// these partitions buffered so a slow partition cannot occupy a free slot.
+		const active = new Map<string, Promise<void>>()
+		let pending: PartitionBatch[] = []
+		let handlerError: Error | null = null
 
-		while (this.state === 'running' && !signal.aborted) {
-			const batches = await fetchManager.poll()
-
-			// Handle any pending rebalance after poll returns but before processing
-			// This ensures revoked partitions are removed before we check assignments
-			await partitionProvider.checkAndHandleRebalance()
-			if (this.state !== 'running' || signal.aborted) break
-
-			if (batches.length === 0) {
-				continue
-			}
-
-			const batchesByPartition = new Map<string, typeof batches>()
-			for (const batch of batches) {
-				const key = `${batch.topic}:${batch.partition}`
-				const partitionBatches = batchesByPartition.get(key)
-				if (partitionBatches) {
-					partitionBatches.push(batch)
-				} else {
-					batchesByPartition.set(key, [batch])
-				}
-			}
-
-			const partitionGroups = Array.from(batchesByPartition.values())
-			let nextPartitionGroup = 0
-
-			while (nextPartitionGroup < partitionGroups.length && this.state === 'running' && !signal.aborted) {
-				const claimed = await pmapVoidUntilPaused(
-					partitionGroups.slice(nextPartitionGroup),
-					async partitionBatches => {
-						for (const batch of partitionBatches) {
-							if (signal.aborted) {
-								return
-							}
-
-							// Skip batches from partitions that were revoked during rebalance.
-							// The assignment-epoch check also drops batches drained before an
-							// eager rebalance removed and re-added a retained partition — those
-							// records are re-fetched from the committed offset and would
-							// otherwise be delivered twice.
-							if (!fetchManager.isBatchAssigned(batch)) {
-								continue
-							}
-
-							// Mark partition as processing - returns false if partition is not assigned or being revoked
-							if (!partitionTracker.startProcessing(batch.topic, batch.partition)) {
-								continue
-							}
-
-							try {
-								await batchHandler(batch.topic, batch.partition, batch.records, decoders, handlerCtx)
-							} finally {
-								// Mark processing complete - this unblocks any pending revoke() wait
-								partitionTracker.endProcessing(batch.topic, batch.partition)
-							}
-						}
-					},
-					concurrency,
-					() => partitionProvider.hasPendingRebalance(),
-					signal
-				)
-				nextPartitionGroup += claimed
-
-				// A heartbeat can request a rebalance while handlers are running. Stop
-				// admitting new partition work, let the active handlers finish, then
-				// rejoin before resuming any still-valid batches from this poll.
-				await partitionProvider.checkAndHandleRebalance()
+		const runHandler = async (batch: PartitionBatch, key: string): Promise<void> => {
+			try {
+				await batchHandler(batch.topic, batch.partition, batch.records, decoders, handlerCtx)
+			} catch (cause) {
+				handlerError ??= cause instanceof Error ? cause : new Error(String(cause))
+			} finally {
+				partitionTracker.endProcessing(batch.topic, batch.partition)
+				active.delete(key)
+				fetchManager.wakePoll()
 			}
 		}
+
+		// Start handlers for pending batches whose partition is idle, up to maxConcurrency.
+		// Batches from revoked partitions or a stale assignment epoch are dropped.
+		const admitPending = (): void => {
+			pending = pending.filter(batch => {
+				if (active.size >= maxConcurrency || partitionProvider.hasPendingRebalance()) return true
+				const key = `${batch.topic}:${batch.partition}`
+				if (active.has(key)) return true
+				if (!fetchManager.isBatchAssigned(batch)) return false
+				if (!partitionTracker.startProcessing(batch.topic, batch.partition)) return false
+				active.set(key, runHandler(batch, key))
+				return false
+			})
+		}
+
+		const waitForAllHandlers = () => Promise.all(active.values())
+
+		try {
+			while (this.state === 'running' && !signal.aborted && !handlerError) {
+				if (partitionProvider.hasPendingRebalance()) {
+					// Stop admission and let active handlers finish before changing the assignment.
+					await waitForAllHandlers()
+					if (handlerError) break
+					await partitionProvider.checkAndHandleRebalance()
+					continue
+				}
+
+				admitPending()
+				if (handlerError || partitionProvider.hasPendingRebalance()) continue
+
+				if (pending.length > 0 || active.size >= maxConcurrency) {
+					// Leftover pending batches belong to active partitions, so a handler is running.
+					await Promise.race(active.values())
+					continue
+				}
+
+				pending.push(...(await fetchManager.poll(active)))
+			}
+		} finally {
+			await waitForAllHandlers()
+		}
+
+		if (handlerError) throw handlerError
 	}
 
 	/**
