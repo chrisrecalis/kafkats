@@ -3,43 +3,6 @@
  */
 
 /**
- * Execute async functions with a concurrency limit, pausing admission when requested.
- *
- * Already-started functions are allowed to finish. The return value is the number of
- * items claimed from the start of `items`; callers can resume with the remaining suffix
- * after handling the condition that requested the pause.
- */
-export async function pmapVoidUntilPaused<T>(
-	items: readonly T[],
-	fn: (item: T) => Promise<void>,
-	concurrency: number,
-	shouldPause: () => boolean,
-	signal?: AbortSignal
-): Promise<number> {
-	let nextIndex = 0
-	let error: Error | null = null
-
-	async function worker(): Promise<void> {
-		while (error === null && !signal?.aborted && !shouldPause()) {
-			if (nextIndex >= items.length) return
-			const item = items[nextIndex++]!
-
-			try {
-				await fn(item)
-			} catch (cause) {
-				error ??= cause instanceof Error ? cause : new Error(String(cause))
-			}
-		}
-	}
-
-	const requestedWorkers = Number.isFinite(concurrency) ? Math.floor(concurrency) : 1
-	const workerCount = Math.min(Math.max(1, requestedWorkers), items.length)
-	await Promise.all(Array.from({ length: workerCount }, worker))
-	if (error) throw error
-	return nextIndex
-}
-
-/**
  * Parallel map with concurrency limit, preserving result order.
  *
  * @param items - Array of items to process

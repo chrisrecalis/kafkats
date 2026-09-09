@@ -11,6 +11,7 @@ describe('consumer rebalance admission', () => {
 			fetchManager: {
 				poll: ReturnType<typeof vi.fn>
 				isBatchAssigned: ReturnType<typeof vi.fn>
+				wakePoll: ReturnType<typeof vi.fn>
 			}
 			offsetManager: { startAutoCommit: ReturnType<typeof vi.fn> }
 			partitionTracker: {
@@ -45,6 +46,7 @@ describe('consumer rebalance admission', () => {
 		consumerInternal.fetchManager = {
 			poll: vi.fn().mockResolvedValueOnce(batches),
 			isBatchAssigned: vi.fn().mockReturnValue(true),
+			wakePoll: vi.fn(),
 		}
 		consumerInternal.offsetManager = { startAutoCommit: vi.fn() }
 		consumerInternal.partitionTracker = {

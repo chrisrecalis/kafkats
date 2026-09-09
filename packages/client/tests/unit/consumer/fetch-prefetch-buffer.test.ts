@@ -60,6 +60,28 @@ describe('FetchManager bounded prefetch', () => {
 		manager.stop()
 	})
 
+	it('leaves active partitions buffered while draining records for idle partitions', async () => {
+		const manager = makeFetchManager(100, 3)
+		await manager.poll()
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const buffer = (manager as any).fetchBuffer
+
+		buffer.add(completedFetch('topic-a', 0, [0n, 1n, 2n], 60))
+		buffer.add(completedFetch('topic-a', 1, [3n, 4n], 40))
+
+		const idlePartition = await manager.poll(new Set(['topic-a:0']))
+		expect(idlePartition).toHaveLength(1)
+		expect(idlePartition[0]).toMatchObject({ topic: 'topic-a', partition: 1 })
+		expect(idlePartition[0]!.records.map(record => record.offset)).toEqual([3n, 4n])
+
+		const previouslyActivePartition = await manager.poll()
+		expect(previouslyActivePartition).toHaveLength(1)
+		expect(previouslyActivePartition[0]).toMatchObject({ topic: 'topic-a', partition: 0 })
+		expect(previouslyActivePartition[0]!.records.map(record => record.offset)).toEqual([0n, 1n, 2n])
+
+		manager.stop()
+	})
+
 	it('coalesces prefetched responses for the same partition and assignment epoch', async () => {
 		const manager = makeFetchManager()
 		// Lazily create the real FetchBuffer without assigning partitions (so the

@@ -82,6 +82,9 @@ interface BufferedFetch {
 	nextRecord: number
 }
 
+/** Anything with set-like `has(topic:partition)`; a Set or a Map keyed by partition works. */
+type PartitionKeys = Pick<ReadonlySet<string>, 'has'>
+
 /**
  * Buffer for completed fetches with memory bounding and wait/signal
  */
@@ -90,7 +93,7 @@ class FetchBuffer {
 	private bufferedBytes = 0
 	private reservedBytes = 0
 	private readonly maxBytes: number
-	private waiters: Array<() => void> = []
+	private waiters: Array<(force?: boolean) => void> = []
 	private capacityWaiter: (() => void) | null = null
 
 	constructor(maxBytes: number) {
@@ -111,7 +114,7 @@ class FetchBuffer {
 	 * assignment epoch so prefetch boundaries do not create extra batch handlers.
 	 * Excess records remain buffered for the next poll.
 	 */
-	drain(maxRecords: number): CompletedFetch[] {
+	drain(maxRecords: number, excludedPartitions?: PartitionKeys): CompletedFetch[] {
 		const drained = new Map<string, CompletedFetch>()
 		const retained: BufferedFetch[] = []
 		let partial: BufferedFetch | null = null
@@ -119,6 +122,10 @@ class FetchBuffer {
 		let drainedBytes = 0
 
 		for (const fetch of this.queue) {
+			if (excludedPartitions?.has(tpKey(fetch.topic, fetch.partition))) {
+				retained.push(fetch)
+				continue
+			}
 			const availableRecords = fetch.records.length - fetch.nextRecord
 			const recordCount = Math.min(remainingRecords, availableRecords)
 			if (recordCount === 0) {
@@ -163,8 +170,8 @@ class FetchBuffer {
 		return Array.from(drained.values())
 	}
 
-	isEmpty(): boolean {
-		return this.queue.length === 0
+	hasDataFor(excludedPartitions?: PartitionKeys): boolean {
+		return this.queue.some(fetch => !excludedPartitions?.has(tpKey(fetch.topic, fetch.partition)))
 	}
 
 	isFull(): boolean {
@@ -209,8 +216,8 @@ class FetchBuffer {
 	 * Wait for data to be available in the buffer
 	 * @returns true if data is available, false if timeout/aborted
 	 */
-	async waitForData(timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
-		if (!this.isEmpty()) {
+	async waitForData(timeoutMs: number, signal?: AbortSignal, excludedPartitions?: PartitionKeys): Promise<boolean> {
+		if (this.hasDataFor(excludedPartitions)) {
 			return true
 		}
 
@@ -233,9 +240,10 @@ class FetchBuffer {
 				}
 			}
 
-			const waiterCallback = () => {
+			const waiterCallback = (force = false) => {
+				if (!force && !this.hasDataFor(excludedPartitions)) return
 				cleanup()
-				resolve(true)
+				resolve(this.hasDataFor(excludedPartitions))
 			}
 
 			this.waiters.push(waiterCallback)
@@ -265,11 +273,14 @@ class FetchBuffer {
 	/**
 	 * Signal all waiters that data is available
 	 */
-	private signalWaiters(): void {
-		const waiters = this.waiters
-		this.waiters = []
+	wakeWaiters(): void {
+		this.signalWaiters(true)
+	}
+
+	private signalWaiters(force = false): void {
+		const waiters = [...this.waiters]
 		for (const waiter of waiters) {
-			waiter()
+			waiter(force)
 		}
 	}
 
@@ -1059,7 +1070,7 @@ export class FetchManager {
 	 * Returns records grouped by topic/partition. Internal offsets are advanced
 	 * so subsequent polls return new records.
 	 */
-	async poll(): Promise<PartitionBatch[]> {
+	async poll(excludedPartitions?: PartitionKeys): Promise<PartitionBatch[]> {
 		// Surface a fatal fetch error (e.g. CORRUPT_MESSAGE) recorded by the background loop.
 		// Cleared once thrown; if the condition persists the next fetch re-records it.
 		this.throwPendingError()
@@ -1075,18 +1086,27 @@ export class FetchManager {
 		}
 
 		// Return immediately if buffer has data
-		if (!this.fetchBuffer.isEmpty()) {
-			return this.drainBuffer()
+		if (this.fetchBuffer.hasDataFor(excludedPartitions)) {
+			return this.drainBuffer(excludedPartitions)
 		}
 
 		// Wait for data to arrive (up to maxWaitMs)
-		const hasData = await this.fetchBuffer.waitForData(this.config.maxWaitMs, this.abortController?.signal)
+		const hasData = await this.fetchBuffer.waitForData(
+			this.config.maxWaitMs,
+			this.abortController?.signal,
+			excludedPartitions
+		)
 
 		// A fatal error may have been recorded by the background loop while we waited (it adds no
 		// data, so the waiter isn't signalled). Surface it now rather than returning an empty poll.
 		this.throwPendingError()
 
-		return hasData ? this.drainBuffer() : []
+		return hasData ? this.drainBuffer(excludedPartitions) : []
+	}
+
+	/** Wake a poll waiting for an idle partition after handler state changes. */
+	wakePoll(): void {
+		this.fetchBuffer?.wakeWaiters()
 	}
 
 	/** Throw and clear any fatal fetch error recorded by the background loop. No-op otherwise. */
@@ -1100,9 +1120,9 @@ export class FetchManager {
 	/**
 	 * Drain buffer and return completed fetches directly
 	 */
-	private drainBuffer(): PartitionBatch[] {
+	private drainBuffer(excludedPartitions?: PartitionKeys): PartitionBatch[] {
 		if (!this.fetchBuffer) return []
-		return this.fetchBuffer.drain(this.config.maxRecords)
+		return this.fetchBuffer.drain(this.config.maxRecords, excludedPartitions)
 	}
 
 	/**
