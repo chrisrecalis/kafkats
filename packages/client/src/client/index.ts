@@ -33,7 +33,7 @@ export type {
 } from '@/producer/index.js'
 
 // Consumer
-export { Consumer, ShareConsumer } from '@/consumer/index.js'
+export { Consumer, ShareConsumer, strict, weighted } from '@/consumer/index.js'
 export type {
 	ConsumerConfig,
 	TopicSubscription,
@@ -44,6 +44,12 @@ export type {
 	BatchHandler,
 	RunEachOptions,
 	RunBatchOptions,
+	StreamOptions,
+	TopicOf,
+	PriorityStrategy,
+	SchedulerState,
+	SchedulerPartition,
+	ScheduleDecision,
 	ShareConsumerConfig,
 	ShareSubscriptionInput,
 	ShareMessage,

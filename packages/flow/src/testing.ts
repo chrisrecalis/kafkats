@@ -24,7 +24,7 @@
 
 import { EventEmitter } from 'node:events'
 import { vi } from 'vitest'
-import { KafkaClient, type ConsumeContext, type Message } from '@kafkats/client'
+import { KafkaClient, type ConsumeContext, type Message, type RunEachOptions } from '@kafkats/client'
 import type { Codec } from '@/codec.js'
 import { flow, type FlowApp, type FlowConfig, type Consumed } from '@/flow.js'
 
@@ -69,7 +69,7 @@ export class MockConsumer extends EventEmitter {
 	private stopResolve: (() => void) | null = null
 	private offsetCounter = 0n
 
-	async runEach(_subscription: string[], handler: TestHandler): Promise<void> {
+	async runEach(_subscription: string[], handler: TestHandler, _options?: RunEachOptions): Promise<void> {
 		this.handler = handler
 		super.emit('running')
 		return new Promise(resolve => {

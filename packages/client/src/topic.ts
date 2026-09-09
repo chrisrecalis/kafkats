@@ -46,8 +46,8 @@ export function normalizeDecoder<T>(decoder: DecoderLike<T>): (buffer: Buffer) =
  * Topic definition with optional key/value codecs.
  * If none are provided, key/value default to Buffer.
  */
-export interface TopicDefinition<V = Buffer, K = Buffer> {
-	readonly topic: string
+export interface TopicDefinition<V = Buffer, K = Buffer, N extends string = string> {
+	readonly topic: N
 	readonly key?: Codec<K>
 	readonly value?: Codec<V>
 }
@@ -93,7 +93,10 @@ export type TopicOptions<V = Buffer, K = Buffer> = {
  * @param options - Key/value codecs
  * @returns A TopicDefinition for use with Producer.send() or Consumer.run()
  */
-export function topic<V = Buffer, K = Buffer>(name: string, options: TopicOptions<V, K> = {}): TopicDefinition<V, K> {
+export function topic<V = Buffer, K = Buffer, const N extends string = string>(
+	name: N,
+	options: TopicOptions<V, K> = {}
+): TopicDefinition<V, K, N> {
 	return {
 		topic: name,
 		key: options.key,

@@ -156,6 +156,20 @@ const consumer = client.consumer({
 | `'read_committed'`   | Only see committed transactional messages |
 | `'read_uncommitted'` | See all messages including uncommitted    |
 
+### Consumer Run Options
+
+These options are passed to `runEach()`, `runBatch()`, or `stream()` rather than `consumer()`.
+
+| Option                 | Type                 | Default | Description                                          |
+| ---------------------- | -------------------- | ------- | ---------------------------------------------------- |
+| `partitionConcurrency` | `number`             | `1`     | Concurrent partition handlers (`runEach`/`runBatch`) |
+| `autoCommit`           | `boolean`            | `true`  | Enable periodic commits (`runEach`/`runBatch`)       |
+| `commitOffsets`        | `boolean`            | `true`  | Track consumed offsets                               |
+| `autoCommitIntervalMs` | `number`             | `5000`  | Periodic commit interval                             |
+| `signal`               | `AbortSignal`        | -       | Abort to stop consumption                            |
+| `assignment`           | `ManualAssignment[]` | -       | Use manual partition assignment                      |
+| `priority`             | `PriorityStrategy`   | -       | Prioritize topics for fetching and delivery          |
+
 ## Environment-Based Configuration
 
 ```typescript

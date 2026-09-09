@@ -5,6 +5,7 @@
 import type { Cluster } from '@/client/cluster.js'
 import type { TopicDefinition, DecoderLike } from '@/topic.js'
 import type { DecodedRecord } from '@/protocol/records/index.js'
+import type { PriorityStrategy } from './priority.js'
 export { normalizeDecoder } from '@/topic.js'
 export type { Decoder, DecoderLike } from '@/topic.js'
 
@@ -13,8 +14,8 @@ export type { Decoder, DecoderLike } from '@/topic.js'
 /**
  * Topic subscription configuration
  */
-export interface TopicSubscription<V = Buffer, K = Buffer> {
-	topic: string
+export interface TopicSubscription<V = Buffer, K = Buffer, N extends string = string> {
+	topic: N
 	decoder: DecoderLike<V>
 	keyDecoder?: DecoderLike<K>
 }
@@ -22,7 +23,7 @@ export interface TopicSubscription<V = Buffer, K = Buffer> {
 /**
  * A subscription-like type that can be either TopicSubscription or TopicDefinition
  */
-export type SubscriptionLike<V, K> = TopicSubscription<V, K> | TopicDefinition<V, K>
+export type SubscriptionLike<V, K, N extends string = string> = TopicSubscription<V, K, N> | TopicDefinition<V, K, N>
 
 /**
  * Single subscription or tuple of subscriptions
@@ -58,13 +59,26 @@ export type KeyOf<S> = S extends string
 			: S extends readonly unknown[]
 				? KeyOf<S[number]>
 				: never
+
+/** Extract the topic-name type from a subscription. */
+export type TopicOf<S> = S extends string
+	? S
+	: S extends TopicSubscription<any, any, infer N>
+		? N
+		: S extends TopicDefinition<any, any, infer N>
+			? N
+			: S extends readonly unknown[]
+				? TopicOf<S[number]>
+				: never
 /* eslint-enable @typescript-eslint/no-explicit-any */
 
 /**
  * Check if a subscription is a TopicDefinition (not a TopicSubscription)
  * TopicDefinition has key/value codecs, TopicSubscription has decoder
  */
-export function isTopicDefinition<V, K>(sub: SubscriptionLike<V, K>): sub is TopicDefinition<V, K> {
+export function isTopicDefinition<V, K, N extends string>(
+	sub: SubscriptionLike<V, K, N>
+): sub is TopicDefinition<V, K, N> {
 	// TopicSubscription has 'decoder', TopicDefinition has key/value codecs
 	return !('decoder' in sub)
 }
@@ -74,10 +88,10 @@ export function isTopicDefinition<V, K>(sub: SubscriptionLike<V, K>): sub is Top
  * TopicDefinition uses its value codec as the decoder (defaults to Buffer)
  */
 export function toTopicSubscription(sub: string): TopicSubscription<Buffer, Buffer>
-export function toTopicSubscription<V, K>(sub: SubscriptionLike<V, K>): TopicSubscription<V, K>
-export function toTopicSubscription<V, K>(
-	sub: SubscriptionLike<V, K> | string
-): TopicSubscription<V | Buffer, K | Buffer> {
+export function toTopicSubscription<V, K, N extends string>(sub: SubscriptionLike<V, K, N>): TopicSubscription<V, K, N>
+export function toTopicSubscription<V, K, N extends string>(
+	sub: SubscriptionLike<V, K, N> | string
+): TopicSubscription<V | Buffer, K | Buffer, N | string> {
 	if (typeof sub === 'string') {
 		return {
 			topic: sub,
@@ -162,7 +176,7 @@ export type BatchHandler<V = Buffer, K = Buffer> = (batch: Message<V, K>[], ctx:
 /**
  * Options for runEach() - single message processing
  */
-export interface RunEachOptions {
+export interface RunEachOptions<T extends string = string> {
 	partitionConcurrency?: number
 	autoCommit?: boolean
 	commitOffsets?: boolean
@@ -176,12 +190,14 @@ export interface RunEachOptions {
 	 *   but without group generation/member metadata.
 	 */
 	assignment?: ManualAssignment[]
+	/** Controls topic ordering for both buffered delivery and background fetches. */
+	priority?: PriorityStrategy<T>
 }
 
 /**
  * Options for runBatch() - batch message processing
  */
-export interface RunBatchOptions {
+export interface RunBatchOptions<T extends string = string> {
 	partitionConcurrency?: number
 	autoCommit?: boolean
 	commitOffsets?: boolean
@@ -195,12 +211,14 @@ export interface RunBatchOptions {
 	 *   but without group generation/member metadata.
 	 */
 	assignment?: ManualAssignment[]
+	/** Controls topic ordering for both buffered delivery and background fetches. */
+	priority?: PriorityStrategy<T>
 }
 
 /**
  * Options for stream() - async iterator mode
  */
-export interface StreamOptions {
+export interface StreamOptions<T extends string = string> {
 	commitOffsets?: boolean
 	autoCommitIntervalMs?: number
 	signal?: AbortSignal
@@ -212,6 +230,8 @@ export interface StreamOptions {
 	 *   but without group generation/member metadata.
 	 */
 	assignment?: ManualAssignment[]
+	/** Controls topic ordering for both buffered delivery and background fetches. */
+	priority?: PriorityStrategy<T>
 }
 
 // ==================== Consumer Configuration ====================

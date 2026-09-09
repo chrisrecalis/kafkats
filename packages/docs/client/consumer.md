@@ -161,6 +161,7 @@ await consumer.runEach(userEvents, async message => {
 | `autoCommitIntervalMs` | `number`             | `5000`  | Commit interval when `autoCommit` is enabled        |
 | `signal`               | `AbortSignal`        | -       | Abort to stop the consumer                          |
 | `assignment`           | `ManualAssignment[]` | -       | Manually assign partitions instead of joining group |
+| `priority`             | `PriorityStrategy`   | -       | Prioritize topics when fetching and delivering      |
 
 ### runBatch Options
 
@@ -171,9 +172,8 @@ await consumer.runEach(userEvents, async message => {
 | `commitOffsets`        | `boolean`            | `true`  | Track consumed offsets for committing               |
 | `autoCommitIntervalMs` | `number`             | `5000`  | Commit interval when `autoCommit` is enabled        |
 | `signal`               | `AbortSignal`        | -       | Abort to stop the consumer                          |
-| `maxBatchSize`         | `number`             | `100`   | Maximum messages per partition-batch                |
-| `maxBatchWaitMs`       | `number`             | `50`    | Max time to wait before flushing a batch            |
 | `assignment`           | `ManualAssignment[]` | -       | Manually assign partitions instead of joining group |
+| `priority`             | `PriorityStrategy`   | -       | Prioritize topics when fetching and delivering      |
 
 ## Partition Concurrency
 
@@ -189,6 +189,43 @@ await consumer.runEach('events', handler, {
 ::: warning
 Higher concurrency increases throughput but may cause out-of-order processing across partitions. Within a partition, order is always preserved.
 :::
+
+## Topic Priority
+
+When one consumer handles latency-sensitive and backlog topics, use a priority strategy to control both which
+buffered records are delivered and which partitions the background fetcher requests.
+
+```typescript
+import { strict, weighted } from '@kafkats/client'
+
+const live = topic('live')
+const bulk = topic('bulk')
+
+await consumer.runEach([live, bulk], handler, {
+	partitionConcurrency: 4,
+	priority: strict({ order: ['live', 'bulk'] }),
+})
+
+// Reserve an approximate 80/20 share while allowing either topic to use spare capacity.
+await consumer.runEach([live, bulk], handler, {
+	priority: weighted({ shares: { live: 8, bulk: 2 } }),
+})
+```
+
+`strict` can starve lower-priority topics while higher-priority traffic remains available. Use `weighted` when every
+topic must continue making progress. Topics omitted from a strict order share the final tier; topics omitted from
+weighted shares receive a share of `1`.
+
+Custom strategies implement `PriorityStrategy` and return ordered `drain` entries plus the partitions currently
+allowed to `fetch`. Buffered partitions omitted from `drain` are still delivered FIFO after the planned entries within
+the remaining poll budget, so hold a topic back through `fetch`, not `drain`. Derive fairness from the supplied
+scheduler state: the fetch loop may call `schedule()` without a drain, and a drain decision may be only partially
+applied.
+
+Priority applies at poll granularity. A handler batch already admitted is never preempted; lower `maxRecords` for
+finer-grained scheduling when `partitionConcurrency` is small. Literal topic names are checked against the
+subscription. One TypeScript limitation is that `topic<Order>('orders')` leaves the name typed as `string` because
+generic arguments cannot be partially inferred; codec-driven inference preserves the literal name.
 
 ## Offset Management
 

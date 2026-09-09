@@ -32,6 +32,7 @@ import type {
 	RunEachOptions,
 	RunBatchOptions,
 	StreamOptions,
+	TopicOf,
 	TopicPartition,
 	ManualAssignment,
 	PartitionBatch,
@@ -48,6 +49,7 @@ import { OffsetManager } from './offset-manager.js'
 import { FetchManager } from './fetch-manager.js'
 import { PartitionTracker } from './partition-tracker.js'
 import { noopLogger, type Logger } from '@/logger.js'
+import { validatePriorityStrategy, type PriorityStrategy } from './priority.js'
 
 type ConsumerState = 'idle' | 'running' | 'stopping'
 
@@ -188,7 +190,12 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		}
 	}
 
-	private initComponents(partitionConcurrency: number, useConsumerGroup: boolean, logger?: Logger): void {
+	private initComponents(
+		partitionConcurrency: number,
+		useConsumerGroup: boolean,
+		logger?: Logger,
+		priority?: PriorityStrategy
+	): void {
 		this.partitionTracker = new PartitionTracker({ logger })
 
 		if (useConsumerGroup) {
@@ -217,6 +224,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 				partitionConcurrency,
 				isolationLevel: this.config.isolationLevel,
 				checkCrcs: this.config.checkCrcs,
+				priority,
 				onFetchPosition: (position, recordCount) => {
 					this.emit('fetchPosition', position, recordCount)
 				},
@@ -492,9 +500,10 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		try {
 			const manualAssignment = opts.assignment
 			const { subscriptions, topics } = this.getSubscriptionsAndTopics(subscription)
+			if (opts.priority) validatePriorityStrategy(opts.priority, topics)
 
 			const useConsumerGroup = !manualAssignment
-			this.initComponents(concurrency, useConsumerGroup, this.logger)
+			this.initComponents(concurrency, useConsumerGroup, this.logger, opts.priority)
 
 			if (manualAssignment) {
 				const normalized = this.normalizeAndValidateManualAssignment(manualAssignment, topics)
@@ -559,10 +568,10 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	 * })
 	 * ```
 	 */
-	async runEach<S extends SubscriptionInput>(
+	async runEach<const S extends SubscriptionInput>(
 		subscription: S,
 		handler: MessageHandler<MsgOf<S>, KeyOf<S>>,
-		options?: RunEachOptions
+		options?: RunEachOptions<NoInfer<TopicOf<S>>>
 	): Promise<void> {
 		const opts = { ...DEFAULT_RUN_EACH_OPTIONS, ...options }
 		const concurrency = opts.partitionConcurrency ?? DEFAULT_RUN_EACH_OPTIONS.partitionConcurrency
@@ -612,10 +621,10 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	 * })
 	 * ```
 	 */
-	async runBatch<S extends SubscriptionInput>(
+	async runBatch<const S extends SubscriptionInput>(
 		subscription: S,
 		handler: BatchHandler<MsgOf<S>, KeyOf<S>>,
-		options?: RunBatchOptions
+		options?: RunBatchOptions<NoInfer<TopicOf<S>>>
 	): Promise<void> {
 		const opts = { ...DEFAULT_RUN_BATCH_OPTIONS, ...options }
 		const concurrency = opts.partitionConcurrency ?? DEFAULT_RUN_BATCH_OPTIONS.partitionConcurrency
@@ -663,9 +672,9 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	 * }
 	 * ```
 	 */
-	async *stream<S extends SubscriptionInput>(
+	async *stream<const S extends SubscriptionInput>(
 		subscription: S,
-		options?: StreamOptions
+		options?: StreamOptions<NoInfer<TopicOf<S>>>
 	): AsyncIterable<{ message: Message<MsgOf<S>, KeyOf<S>>; ctx: ConsumeContext }> {
 		const commitOffsets = options?.commitOffsets !== false
 		const autoCommitIntervalMs: number = options?.autoCommitIntervalMs ?? 5000
@@ -674,10 +683,11 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		try {
 			const manualAssignment = options?.assignment
 			const { subscriptions, topics } = this.getSubscriptionsAndTopics(subscription)
+			if (options?.priority) validatePriorityStrategy(options.priority, topics)
 			const decoders = buildDecoderMaps(subscriptions)
 
 			const useConsumerGroup = !manualAssignment
-			this.initComponents(1, useConsumerGroup, this.logger)
+			this.initComponents(1, useConsumerGroup, this.logger, options?.priority)
 
 			const offsetManager = this.offsetManager!
 			const fetchManager = this.fetchManager!
