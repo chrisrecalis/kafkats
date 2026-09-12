@@ -14,6 +14,7 @@ This is a pnpm monorepo containing a pure-protocol TypeScript Kafka client and s
 | `@kafkats/flow` | Kafka Streams-like DSL for stream processing |
 | `@kafkats/flow-state-lmdb` | Persistent LMDB state stores for flow |
 | `@kafkats/codec-zod` | Zod-based serialization codecs |
+| `@kafkats/lag` | Consumer-group time-lag Prometheus exporter, complements kafka_exporter |
 | `@kafkats/benchmark` | Performance benchmarks vs kafkajs |
 | `docs` | VitePress documentation site |
 
@@ -21,7 +22,7 @@ Each package has its own `AGENTS.md` with package-specific guidance. **Read the 
 
 ## Versioning
 
-All publishable packages (`@kafkats/client`, `@kafkats/flow`, `@kafkats/codec-zod`, `@kafkats/flow-state-lmdb`) are released in lockstep and share the same version number for minor and major releases. When creating changesets, include all four packages with the same bump type.
+All publishable packages (`@kafkats/client`, `@kafkats/flow`, `@kafkats/codec-zod`, `@kafkats/flow-state-lmdb`, `@kafkats/lag`) are released in lockstep and share the same version number for minor and major releases. When creating changesets, include all five packages with the same bump type. The `@kafkats/lag` Docker image is tagged with this version.
 
 ## Development Commands
 

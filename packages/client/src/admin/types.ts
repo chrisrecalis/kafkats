@@ -108,6 +108,25 @@ export interface ConsumerGroupDescription {
 }
 
 /**
+ * Committed offset for a single topic-partition of a consumer group
+ */
+export interface ConsumerGroupOffset {
+	/** Topic name */
+	topic: string
+	/** Partition index */
+	partition: number
+	/**
+	 * Committed offset, or `null` when the group has no committed offset for this partition
+	 * (Kafka reports -1).
+	 */
+	offset: bigint | null
+	/** Leader epoch recorded with the commit, or -1 when unknown */
+	leaderEpoch: number
+	/** Free-form metadata string stored with the commit (empty by default) */
+	metadata: string | null
+}
+
+/**
  * Broker description
  */
 export interface BrokerDescription {

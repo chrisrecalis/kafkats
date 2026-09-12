@@ -20,13 +20,13 @@ No registration call is needed. When a codec is first looked up, kafkats checks 
 
 ## Compression Types
 
-| Type       | Speed     | Ratio | Built-in | Notes                                       |
-| ---------- | --------- | ----- | -------- | ------------------------------------------- |
-| `'none'`   | Fastest   | 1:1   | Yes      | No compression                              |
-| `'gzip'`   | Slow      | Best  | Yes      | Uses Node.js zlib                           |
-| `'snappy'` | Fast      | Good  | No       | Balanced choice, auto-detected library      |
-| `'lz4'`    | Very fast | Good  | No       | Best for throughput, auto-detected library  |
-| `'zstd'`   | Medium    | Best  | No       | Modern and efficient, auto-detected library |
+| Type       | Speed     | Ratio | Built-in    | Notes                                      |
+| ---------- | --------- | ----- | ----------- | ------------------------------------------ |
+| `'none'`   | Fastest   | 1:1   | Yes         | No compression                             |
+| `'gzip'`   | Slow      | Best  | Yes         | Uses Node.js zlib                          |
+| `'snappy'` | Fast      | Good  | No          | Balanced choice, auto-detected library     |
+| `'lz4'`    | Very fast | Good  | No          | Best for throughput, auto-detected library |
+| `'zstd'`   | Medium    | Best  | Node 22.15+ | Auto-detected library, else Node.js zlib   |
 
 ## Built-in Codecs
 
@@ -71,19 +71,17 @@ npm install lz4-napi
 
 ### Zstd
 
-| Library            | Type   | Performance | Auto-detected |
-| ------------------ | ------ | ----------- | ------------- |
-| `@mongodb-js/zstd` | Native | Fastest     | Yes (1st)     |
-| `zstd-napi`        | Native | Fastest     | Yes (2nd)     |
-| `zstd-codec`       | WASM   | Good        | No (manual)   |
+| Library        | Type     | Performance | Auto-detected               |
+| -------------- | -------- | ----------- | --------------------------- |
+| `zstd-napi`    | Native   | Fastest     | Yes (1st)                   |
+| Node.js `zlib` | Built-in | Fast        | Yes (fallback, Node 22.15+) |
+| `zstd-codec`   | WASM     | Good        | No (manual)                 |
+
+On Node 22.15+ / 23.8+ nothing needs to be installed: when no library is found, kafkats uses the Zstd support built into Node's `zlib`. Install `zstd-napi` for the fastest path or for older Node versions:
 
 ```bash
-npm install @mongodb-js/zstd
+npm install zstd-napi
 ```
-
-::: warning
-`@mongodb-js/zstd` v7+ requires Node 20.19 or later. On Node 18, install `@mongodb-js/zstd@2` (or `zstd-napi`) instead.
-:::
 
 ### Disabling auto-registration
 
@@ -120,7 +118,7 @@ compressionCodecs.register(CompressionType.Lz4, createLz4Codec(lz4))
 ### Zstd
 
 ```typescript
-import { compress, decompress } from '@mongodb-js/zstd' // or: 'zstd-napi'
+import { compress, decompress } from 'zstd-napi'
 import { CompressionType, compressionCodecs, createZstdCodec } from '@kafkats/client'
 
 compressionCodecs.register(CompressionType.Zstd, createZstdCodec({ compress, decompress }))
@@ -152,9 +150,17 @@ ZstdCodec.run(zstd => {
 Zstd supports compression levels from 1-22 (default: 3). Lower levels are faster, higher levels achieve better compression:
 
 ```typescript
-import { compress, decompress } from '@mongodb-js/zstd'
+import { compress, decompress } from 'zstd-napi'
 
 compressionCodecs.register(CompressionType.Zstd, createZstdCodec({ compress, decompress }, { level: 6 }))
+```
+
+Or with the built-in codec (Node 22.15+):
+
+```typescript
+import { CompressionType, compressionCodecs, createNodeZstdCodec } from '@kafkats/client'
+
+compressionCodecs.register(CompressionType.Zstd, createNodeZstdCodec({ level: 6 })!)
 ```
 
 ## Transparent Decompression
@@ -203,8 +209,8 @@ Choose your compression strategy based on your use case:
 
 ### Zstd
 
-- **Native**: [`@mongodb-js/zstd`](https://www.npmjs.com/package/@mongodb-js/zstd) - MongoDB's binding
 - **Native**: [`zstd-napi`](https://www.npmjs.com/package/zstd-napi) - Node-API binding
+- **Built-in**: Node.js `zlib` on Node 22.15+ / 23.8+ (fallback)
 - **WASM**: [`zstd-codec`](https://www.npmjs.com/package/zstd-codec) - Emscripten based
 
 ## Custom Codecs
