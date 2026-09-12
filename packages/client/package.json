@@ -67,7 +67,6 @@
 		"vitest-mock-extended": "^4.0.0"
 	},
 	"peerDependencies": {
-		"@mongodb-js/zstd": ">=1.0.0",
 		"@node-rs/crc32": "^1.10.6",
 		"lz4": "^0.6.0",
 		"lz4-napi": ">=2.0.0",
@@ -77,9 +76,6 @@
 		"zstd-napi": ">=0.0.7 <0.1.0"
 	},
 	"peerDependenciesMeta": {
-		"@mongodb-js/zstd": {
-			"optional": true
-		},
 		"@node-rs/crc32": {
 			"optional": true
 		},

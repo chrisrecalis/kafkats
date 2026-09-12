@@ -3,6 +3,7 @@
  */
 
 import type { Cluster } from '@/client/cluster.js'
+import type { Broker } from '@/client/broker.js'
 import type {
 	AdminConfig,
 	ResolvedAdminConfig,
@@ -10,6 +11,7 @@ import type {
 	PartitionInfo,
 	ConsumerGroupListing,
 	ConsumerGroupDescription,
+	ConsumerGroupOffset,
 	MemberDescription,
 	TopicPartition,
 	ClusterDescription,
@@ -29,11 +31,13 @@ import { createListGroupsRequest } from '@/protocol/messages/requests/list-group
 import { createDescribeGroupsRequest } from '@/protocol/messages/requests/describe-groups.js'
 import { createDeleteGroupsRequest } from '@/protocol/messages/requests/delete-groups.js'
 import { OFFSET_TIMESTAMP } from '@/protocol/messages/requests/list-offsets.js'
+import type { OffsetFetchTopic } from '@/protocol/messages/requests/offset-fetch.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import { KafkaProtocolError, isKafkaError, shouldRefreshMetadata } from '@/client/errors.js'
 import type { Logger } from '@/logger.js'
 import { noopLogger } from '@/logger.js'
 import { sleep } from '@/utils/sleep.js'
+import { retry } from '@/utils/retry.js'
 import { DEFAULT_REQUEST_TIMEOUT_MS } from '@/network/types.js'
 
 /**
@@ -158,9 +162,14 @@ export class Admin {
 	/**
 	 * Fetch the earliest or latest offsets for a topic's partitions.
 	 *
-	 * Uses the ListOffsets API against each partition leader. When `isolationLevel` is `read_committed`,
-	 * the returned "latest" offsets represent the last stable offset (LSO) rather than the log end offset (LEO),
-	 * matching what a `read_committed` consumer can actually read.
+	 * Partitions are grouped by leader and queried with one ListOffsets request per leader, so the
+	 * cost is bounded by broker count rather than partition count. Partitions that fail with a
+	 * retriable error (leader moved, not available) are retried with refreshed metadata; any other
+	 * error fails the call.
+	 *
+	 * When `isolationLevel` is `read_committed`, the returned "latest" offsets represent the last
+	 * stable offset (LSO) rather than the log end offset (LEO), matching what a `read_committed`
+	 * consumer can actually read.
 	 */
 	async fetchTopicOffsets(
 		topic: string,
@@ -168,23 +177,105 @@ export class Admin {
 		which: 'earliest' | 'latest',
 		options?: { isolationLevel?: 'read_uncommitted' | 'read_committed' }
 	): Promise<Map<number, bigint>> {
-		if (partitions.length === 0) {
-			return new Map()
-		}
-
-		const uniquePartitions = [...new Set(partitions)]
+		const result = new Map<number, bigint>()
+		let pending = [...new Set(partitions)]
+		if (pending.length === 0) return result
 
 		const timestamp = which === 'earliest' ? OFFSET_TIMESTAMP.EARLIEST : OFFSET_TIMESTAMP.LATEST
 		const isolationLevel = options?.isolationLevel === 'read_committed' ? 1 : 0
+		const maxAttempts = 5
+		let lastError: unknown
 
-		const offsets = await Promise.all(
-			uniquePartitions.map(async partition => {
-				const offset = await this.listOffset(topic, partition, timestamp, isolationLevel)
-				return [partition, offset] as const
+		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+			const byLeader = new Map<number, { leader: Broker; partitions: number[] }>()
+			const retry: number[] = []
+			for (const partition of pending) {
+				try {
+					const leader = await this.cluster.getLeaderForPartition(topic, partition)
+					const group = byLeader.get(leader.nodeId) ?? { leader, partitions: [] }
+					group.partitions.push(partition)
+					byLeader.set(leader.nodeId, group)
+				} catch (error) {
+					if (!(isKafkaError(error) && error.retriable)) throw error
+					lastError = error
+					retry.push(partition)
+				}
+			}
+
+			await Promise.all(
+				Array.from(byLeader.values(), async ({ leader, partitions: batch }) => {
+					let response
+					try {
+						response = await leader.listOffsets({
+							isolationLevel,
+							topics: [
+								{
+									name: topic,
+									partitions: batch.map(partitionIndex => ({ partitionIndex, timestamp })),
+								},
+							],
+						})
+					} catch (error) {
+						if (!(isKafkaError(error) && error.retriable)) throw error
+						lastError = error
+						retry.push(...batch)
+						return
+					}
+					const answered = new Map(
+						response.topics
+							.find(t => t.name === topic)
+							?.partitions.map(p => [p.partitionIndex, p] as const) ?? []
+					)
+					for (const partition of batch) {
+						const p = answered.get(partition)
+						if (!p) {
+							lastError = new Error(`No offset response for ${topic}-${partition}`)
+							retry.push(partition)
+							continue
+						}
+						if (p.errorCode === ErrorCode.None) {
+							result.set(partition, p.offset)
+							continue
+						}
+						const error = new KafkaProtocolError(
+							p.errorCode,
+							`ListOffsets failed for ${topic}-${partition}`
+						)
+						if (!error.retriable) throw error
+						lastError = error
+						retry.push(partition)
+					}
+				})
+			)
+
+			if (retry.length === 0) return result
+			pending = retry
+			if (attempt >= maxAttempts) break
+
+			const errorCode = isKafkaError(lastError) ? lastError.errorCode : undefined
+			if (errorCode === undefined || shouldRefreshMetadata(errorCode)) {
+				this.logger.debug('refreshing metadata due to listOffsets error', {
+					topic,
+					partitions: pending.length,
+					errorCode,
+					attempt,
+				})
+				await this.cluster.refreshMetadata([topic]).catch(() => {})
+			}
+			const delayMs = Math.min(100 * 2 ** (attempt - 1), 2000)
+			this.logger.debug('retrying listOffsets after error', {
+				topic,
+				partitions: pending.length,
+				attempt,
+				delayMs,
+				error: lastError instanceof Error ? lastError.message : String(lastError),
 			})
-		)
+			await sleep(delayMs)
+		}
 
-		return new Map(offsets)
+		throw lastError instanceof Error
+			? lastError
+			: new Error(`ListOffsets failed for ${topic} partitions ${pending.join(', ')}`)
 	}
 
 	/**
@@ -396,32 +487,31 @@ export class Admin {
 	/**
 	 * List all consumer groups
 	 *
-	 * Queries all brokers and aggregates results.
+	 * Queries all brokers and aggregates results. By default a broker that cannot be queried is
+	 * logged and skipped, so the result may be missing the groups it coordinates.
 	 *
-	 * @param options - Filter options
+	 * @param options.statesFilter - Only return groups in these states
+	 * @param options.strict - Throw instead of returning a partial result when any broker fails
 	 * @returns Array of consumer group listings
 	 */
-	async listGroups(options?: { statesFilter?: string[] }): Promise<ConsumerGroupListing[]> {
+	async listGroups(options?: { statesFilter?: string[]; strict?: boolean }): Promise<ConsumerGroupListing[]> {
 		this.logger.debug('listing groups', { statesFilter: options?.statesFilter })
 
 		// Get metadata to find all brokers
 		const metadata = await this.cluster.refreshMetadata()
 
 		const allGroups = new Map<string, ConsumerGroupListing>()
+		const failures: Array<{ nodeId: number; error: Error }> = []
 
 		// Query each broker for groups
 		for (const [nodeId] of metadata.brokers) {
 			try {
 				const broker = await this.cluster.getBroker(nodeId)
-				const request = createListGroupsRequest(options)
+				const request = createListGroupsRequest({ statesFilter: options?.statesFilter })
 				const response = await broker.listGroups(request)
 
 				if (response.errorCode !== ErrorCode.None) {
-					this.logger.warn('list groups failed on broker', {
-						nodeId,
-						errorCode: response.errorCode,
-					})
-					continue
+					throw new KafkaProtocolError(response.errorCode, `ListGroups failed on broker ${nodeId}`)
 				}
 
 				for (const group of response.groups) {
@@ -435,11 +525,19 @@ export class Admin {
 					}
 				}
 			} catch (error) {
+				failures.push({ nodeId, error: error as Error })
 				this.logger.warn('failed to query broker for groups', {
 					nodeId,
 					error: (error as Error).message,
 				})
 			}
+		}
+
+		if (options?.strict && failures.length > 0) {
+			const detail = failures.map(f => `broker ${f.nodeId}: ${f.error.message}`).join('; ')
+			throw new Error(`ListGroups failed on ${failures.length} of ${metadata.brokers.size} brokers (${detail})`, {
+				cause: failures[0]!.error,
+			})
 		}
 
 		const groups = Array.from(allGroups.values())
@@ -526,6 +624,106 @@ export class Admin {
 
 		this.logger.debug('described groups', { count: descriptions.length })
 		return descriptions
+	}
+
+	/**
+	 * List the committed offsets of a consumer group
+	 *
+	 * Uses the OffsetFetch API against the group's coordinator. The group does not need
+	 * active members; offsets committed by a group that has since gone empty are returned
+	 * until the broker expires them (`offsets.retention.minutes`).
+	 *
+	 * Partitions without a committed offset are reported with `offset: null`.
+	 *
+	 * @param groupId - Consumer group ID
+	 * @param partitions - Partitions to look up; omit to return every partition the group has committed
+	 * @param options.requireStable - Wait for pending transactional commits (KIP-447) instead of returning
+	 *   the previous position. Defaults to `false`; monitoring callers rarely need it.
+	 * @throws KafkaProtocolError if the coordinator rejects the request (e.g. GroupAuthorizationFailed)
+	 */
+	async listConsumerGroupOffsets(
+		groupId: string,
+		partitions?: TopicPartition[],
+		options?: { requireStable?: boolean }
+	): Promise<ConsumerGroupOffset[]> {
+		this.logger.debug('listing consumer group offsets', { groupId, partitions: partitions?.length ?? 'all' })
+
+		let topics: OffsetFetchTopic[] | null = null
+		if (partitions) {
+			if (partitions.length === 0) {
+				return []
+			}
+			const byTopic = new Map<string, Set<number>>()
+			for (const tp of partitions) {
+				const set = byTopic.get(tp.topic) ?? new Set<number>()
+				set.add(tp.partition)
+				byTopic.set(tp.topic, set)
+			}
+			topics = Array.from(byTopic, ([name, parts]) => ({
+				name,
+				partitions: Array.from(parts, partitionIndex => ({ partitionIndex })),
+			}))
+		}
+
+		// Coordinator lookups and OffsetFetch both return transient codes while the coordinator is
+		// loading or moving (CoordinatorNotAvailable, CoordinatorLoadInProgress, NotCoordinator), and
+		// requireStable adds UnstableOffsetCommit while a transactional commit is pending. Retry those
+		// within the request timeout, re-discovering the coordinator when it has moved.
+		const response = await retry(
+			async () => {
+				const coordinator = await this.cluster.getCoordinator('GROUP', groupId)
+				const res = await coordinator.offsetFetch({
+					groupId,
+					topics,
+					requireStable: options?.requireStable ?? false,
+				})
+				if (res.errorCode !== ErrorCode.None) {
+					throw new KafkaProtocolError(res.errorCode, `OffsetFetch failed for group ${groupId}`)
+				}
+				for (const topic of res.topics) {
+					for (const partition of topic.partitions) {
+						if (partition.errorCode !== ErrorCode.None) {
+							throw new KafkaProtocolError(
+								partition.errorCode,
+								`OffsetFetch failed for group ${groupId} on ${topic.name}-${partition.partitionIndex}`
+							)
+						}
+					}
+				}
+				return res
+			},
+			{
+				maxAttempts: 1_000,
+				maxElapsedMs: this.config.requestTimeoutMs,
+				initialDelayMs: 100,
+				maxDelayMs: 1_000,
+				multiplier: 2,
+				jitter: 0,
+				shouldRetry: error => isKafkaError(error) && error.retriable,
+				onRetry: ({ error }) => {
+					const code = isKafkaError(error) ? error.errorCode : undefined
+					if (code === ErrorCode.NotCoordinator || code === ErrorCode.CoordinatorNotAvailable) {
+						this.cluster.invalidateCoordinator('GROUP', groupId)
+					}
+				},
+			}
+		)
+
+		const offsets: ConsumerGroupOffset[] = []
+		for (const topic of response.topics) {
+			for (const partition of topic.partitions) {
+				offsets.push({
+					topic: topic.name,
+					partition: partition.partitionIndex,
+					offset: partition.committedOffset < 0n ? null : partition.committedOffset,
+					leaderEpoch: partition.committedLeaderEpoch,
+					metadata: partition.metadata,
+				})
+			}
+		}
+
+		this.logger.debug('listed consumer group offsets', { groupId, count: offsets.length })
+		return offsets
 	}
 
 	/**
@@ -823,85 +1021,5 @@ export class Admin {
 
 		this.logger.debug('deleted ACLs', { filterCount: results.length })
 		return results
-	}
-
-	/**
-	 * List a single offset for a topic partition with retries and metadata refresh.
-	 */
-	private async listOffset(
-		topic: string,
-		partition: number,
-		timestamp: bigint,
-		isolationLevel: number
-	): Promise<bigint> {
-		const maxAttempts = 5
-		let lastError: unknown
-
-		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-			try {
-				const leader = await this.cluster.getLeaderForPartition(topic, partition)
-
-				const response = await leader.listOffsets({
-					isolationLevel,
-					topics: [
-						{
-							name: topic,
-							partitions: [
-								{
-									partitionIndex: partition,
-									timestamp,
-								},
-							],
-						},
-					],
-				})
-
-				const topicResponse = response.topics.find(t => t.name === topic)
-				const partitionResponse = topicResponse?.partitions.find(p => p.partitionIndex === partition)
-
-				if (!partitionResponse) {
-					throw new Error(`No offset response for ${topic}-${partition}`)
-				}
-
-				if (partitionResponse.errorCode !== ErrorCode.None) {
-					throw new KafkaProtocolError(
-						partitionResponse.errorCode,
-						`ListOffsets failed for ${topic}-${partition}`
-					)
-				}
-
-				return partitionResponse.offset
-			} catch (error) {
-				lastError = error
-
-				const retriable = isKafkaError(error) && error.retriable
-				if (!retriable || attempt >= maxAttempts) {
-					throw error
-				}
-
-				const errorCode = isKafkaError(error) ? error.errorCode : undefined
-				if (errorCode !== undefined && shouldRefreshMetadata(errorCode)) {
-					this.logger.debug('refreshing metadata due to listOffsets error', {
-						topic,
-						partition,
-						errorCode,
-						attempt,
-					})
-					await this.cluster.refreshMetadata([topic]).catch(() => {})
-				}
-
-				const delayMs = Math.min(100 * 2 ** (attempt - 1), 2000)
-				this.logger.debug('retrying listOffsets after error', {
-					topic,
-					partition,
-					attempt,
-					delayMs,
-					error: error instanceof Error ? error.message : String(error),
-				})
-				await sleep(delayMs)
-			}
-		}
-
-		throw lastError instanceof Error ? lastError : new Error(`ListOffsets failed for ${topic}-${partition}`)
 	}
 }

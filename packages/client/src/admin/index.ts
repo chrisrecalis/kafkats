@@ -9,6 +9,7 @@ export type {
 	PartitionInfo,
 	ConsumerGroupListing,
 	ConsumerGroupDescription,
+	ConsumerGroupOffset,
 	MemberDescription,
 	TopicPartition,
 	ClusterDescription,
