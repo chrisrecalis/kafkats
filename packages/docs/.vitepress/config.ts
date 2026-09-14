@@ -80,7 +80,7 @@ export default defineConfig({
 					text: 'Consumer',
 					items: [
 						{ text: 'Consumer API', link: '/client/consumer' },
-						{ text: 'ShareConsumer (experimental)', link: '/client/share-consumer' },
+						{ text: 'ShareConsumer (Kafka 4.2+)', link: '/client/share-consumer' },
 					],
 				},
 				{
