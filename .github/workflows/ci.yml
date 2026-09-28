@@ -67,6 +67,7 @@ jobs:
                 package:
                     - client
                     - flow
+                    - lag
         steps:
             - name: Checkout
               uses: actions/checkout@v4
@@ -95,6 +96,7 @@ jobs:
                 package:
                     - client
                     - flow
+                    - lag
         services:
             docker:
                 image: docker:dind
@@ -120,3 +122,48 @@ jobs:
               env:
                   KAFKA_TS_LOG_LEVEL: warn
                   VITEST_MAX_WORKERS: 1
+
+    docker-image:
+        name: Lag Exporter Image
+        runs-on: ubuntu-latest
+        # Only when the build itself changes; code changes are covered by the test jobs
+        if: github.event_name == 'pull_request'
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Detect image-relevant changes
+              id: changes
+              uses: dorny/paths-filter@v3
+              with:
+                  filters: |
+                      image:
+                          - 'packages/lag/Dockerfile'
+                          - 'packages/lag/package.json'
+                          - 'packages/client/package.json'
+                          - '.dockerignore'
+                          - '.npmrc'
+                          - 'package.json'
+                          - 'pnpm-lock.yaml'
+                          - 'pnpm-workspace.yaml'
+                          - 'turbo.json'
+
+            - name: Set up Docker Buildx
+              if: steps.changes.outputs.image == 'true'
+              uses: docker/setup-buildx-action@v3
+
+            - name: Build image
+              if: steps.changes.outputs.image == 'true'
+              uses: docker/build-push-action@v6
+              with:
+                  context: .
+                  file: packages/lag/Dockerfile
+                  push: false
+                  load: true
+                  tags: kafkats-lag:ci
+                  cache-from: type=gha
+                  cache-to: type=gha,mode=max
+
+            - name: Smoke test image
+              if: steps.changes.outputs.image == 'true'
+              run: docker run --rm kafkats-lag:ci --help

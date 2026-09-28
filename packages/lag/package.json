@@ -1,0 +1,59 @@
+{
+	"name": "@kafkats/lag",
+	"private": false,
+	"version": "0.12.0",
+	"description": "Kafka consumer group time lag (seconds behind) Prometheus exporter. Complements kafka_exporter.",
+	"type": "module",
+	"bin": {
+		"kafkats-lag": "./dist/cli.js"
+	},
+	"files": [
+		"dist"
+	],
+	"license": "MIT",
+	"keywords": [
+		"kafka",
+		"consumer-lag",
+		"time-lag",
+		"kafka-exporter",
+		"lag-exporter",
+		"prometheus",
+		"monitoring",
+		"typescript"
+	],
+	"homepage": "https://chrisrecalis.github.io/kafkats",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/chrisrecalis/kafkats.git",
+		"directory": "packages/lag"
+	},
+	"bugs": {
+		"url": "https://github.com/chrisrecalis/kafkats/issues"
+	},
+	"engines": {
+		"node": ">=22.15"
+	},
+	"scripts": {
+		"build": "pnpm clean && tsdown --config-loader native",
+		"typecheck": "tsc -p tsconfig.json --noEmit",
+		"clean": "rm -rf dist",
+		"prepack": "pnpm -w turbo run build --filter=$npm_package_name",
+		"test": "vitest run --config vitest.unit.config.ts tests/unit",
+		"test:unit": "vitest run --config vitest.unit.config.ts tests/unit",
+		"test:integration": "vitest run --config vitest.integration.config.ts tests/integration"
+	},
+	"dependencies": {
+		"@kafkats/client": "workspace:^",
+		"lz4-napi": "^2.9.0",
+		"prom-client": "^15.1.3",
+		"snappy": "^7.3.3"
+	},
+	"devDependencies": {
+		"@testcontainers/kafka": "^11.8.1",
+		"@types/node": "^24.10.1",
+		"testcontainers": "^11.8.1",
+		"tsdown": "^0.22.14",
+		"typescript": "^7.0.2",
+		"vitest": "^4.0.12"
+	}
+}

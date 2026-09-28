@@ -10,6 +10,7 @@ import {
 	type CompressionCodecRegistry,
 	CompressionType,
 	createLz4Codec,
+	createNodeZstdCodec,
 	createSnappyCodec,
 	createZstdCodec,
 	getCompressionTypeName,
@@ -20,6 +21,10 @@ import {
 } from '@/protocol/records/compression.js'
 
 export type ModuleLoader = (id: string) => unknown
+export type BuiltinCodecSource = (type: CompressionType) => CompressionCodec | undefined
+
+const defaultBuiltinCodec: BuiltinCodecSource = type =>
+	type === CompressionType.Zstd ? createNodeZstdCodec() : undefined
 
 let nodeRequire: NodeJS.Require | undefined
 const defaultModuleLoader: ModuleLoader = id => {
@@ -43,7 +48,8 @@ function pickExports<T>(mod: unknown, fns: string[]): T {
 }
 
 /**
- * Known libraries per compression type, in preference order (fastest first).
+ * Known libraries per compression type, in preference order (fastest first). Zstd additionally
+ * falls back to Node's built-in zlib implementation (22.15+ / 23.8+) when none is installed.
  *
  * `zstd-codec` (WASM) is intentionally absent: it requires asynchronous
  * initialization via ZstdCodec.run() and must be registered manually.
@@ -62,10 +68,6 @@ const autoCodecSources: Partial<Record<CompressionType, readonly AutoCodecSource
 		{ module: 'lz4js', create: mod => createLz4Codec(pickExports<Lz4Lib>(mod, ['compress', 'decompress'])) },
 	],
 	[CompressionType.Zstd]: [
-		{
-			module: '@mongodb-js/zstd',
-			create: mod => createZstdCodec(pickExports<ZstdLib>(mod, ['compress', 'decompress'])),
-		},
 		{ module: 'zstd-napi', create: mod => createZstdCodec(pickExports<ZstdLib>(mod, ['compress', 'decompress'])) },
 	],
 }
@@ -80,7 +82,11 @@ export class CodecRegistry implements CompressionCodecRegistry {
 	private codecs = new Map<CompressionType, CompressionCodec>()
 	private autoLoadAttempted = new Set<CompressionType>()
 
-	constructor(private moduleLoader: ModuleLoader = defaultModuleLoader) {
+	constructor(
+		private moduleLoader: ModuleLoader = defaultModuleLoader,
+		/** Codecs the runtime itself provides; the fallback when no supported library is installed */
+		private builtinCodec: BuiltinCodecSource = defaultBuiltinCodec
+	) {
 		this.codecs.set(CompressionType.Gzip, gzipCodec)
 	}
 
@@ -132,7 +138,12 @@ export class CodecRegistry implements CompressionCodecRegistry {
 				warnUnusable(source.module, type, error)
 			}
 		}
-		return undefined
+
+		// An installed native library is preferred (faster, and the user chose it); the runtime's own
+		// implementation covers the common case of nothing installed.
+		const builtin = this.builtinCodec(type)
+		if (builtin) this.codecs.set(type, builtin)
+		return builtin
 	}
 }
 
@@ -163,8 +174,11 @@ export const compressionCodecs: CompressionCodecRegistry = new CodecRegistry()
  */
 export function missingCodecError(type: CompressionType): Error {
 	const sources = autoCodecSources[type]
+	const libraries = `one of: ${sources?.map(s => s.module).join(', ')} (used automatically when installed)`
 	const hint = sources?.length
-		? ` Install one of: ${sources.map(s => s.module).join(', ')} (used automatically when installed), ` +
+		? (type === CompressionType.Zstd
+				? ` Install ${libraries}, or upgrade to Node 22.15+ / 23.8+ (built-in Zstd), `
+				: ` Install ${libraries}, `) +
 			`or register a codec via compressionCodecs.register(). ` +
 			`See https://chrisrecalis.github.io/kafkats/client/compression`
 		: ''

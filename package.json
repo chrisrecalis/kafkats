@@ -30,7 +30,6 @@
 	},
 	"pnpm": {
 		"neverBuiltDependencies": [
-			"@mongodb-js/zstd",
 			"lz4",
 			"zstd-napi"
 		]

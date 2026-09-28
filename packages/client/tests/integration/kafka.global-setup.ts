@@ -26,6 +26,8 @@ async function startMainContainer(image: string): Promise<StartedKafkaContainer>
 	return new KafkaContainer(image)
 		.withKraft()
 		.withEnvironment({
+			KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: '1',
+			KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: '0',
 			KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: '1',
 			KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: '1',
 			// Enable ACL authorization with StandardAuthorizer (KRaft mode)

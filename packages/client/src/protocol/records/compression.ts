@@ -5,8 +5,10 @@
  * - GZIP: Built-in using Node.js zlib
  * - Snappy, LZ4, Zstd: Auto-registered when a supported library is installed,
  *   or pluggable via manual registration
+ * - Zstd additionally falls back to Node.js zlib (Node 22.15+ / 23.8+) when no library is installed
  */
 
+import * as zlib from 'node:zlib'
 import { gzipSync, gunzipSync } from 'node:zlib'
 
 /**
@@ -330,7 +332,7 @@ export function createLz4Codec(lz4: Lz4Lib): CompressionCodec {
 }
 
 /**
- * Zstd library interface for async native libraries (e.g., '@mongodb-js/zstd', 'zstd-napi')
+ * Zstd library interface for async native libraries (e.g., 'zstd-napi')
  */
 export interface ZstdNativeAsyncLib {
 	compress: (data: Buffer, level?: number) => Promise<Buffer>
@@ -365,19 +367,15 @@ export interface ZstdCodecOptions {
  * Factory function to create a Zstd codec from an external library
  *
  * Supports the following libraries:
- * - **Native**: `@mongodb-js/zstd` - MongoDB's native Zstd binding
  * - **Native**: `zstd-napi` - Native Zstd using Node-API
  * - **WASM**: `zstd-codec` - Zstd codec powered by Emscripten
+ * - Any library exposing async or sync `compress(data, level)` / `decompress(data)`
+ *
+ * For Node's built-in implementation, see `createNodeZstdCodec`.
  *
  * @param zstd - The Zstd library instance
  * @param options - Optional configuration
  * @returns A compression codec
- *
- * @example @mongodb-js/zstd (native async)
- * ```typescript
- * import { compress, decompress } from '@mongodb-js/zstd'
- * compressionCodecs.register(CompressionType.Zstd, createZstdCodec({ compress, decompress }))
- * ```
  *
  * @example zstd-napi (native async)
  * ```typescript
@@ -406,7 +404,7 @@ export function createZstdCodec(zstd: ZstdLib, options?: ZstdCodecOptions): Comp
 		// unhandled promise rejection (which crashes the process under the default handler).
 		testResult.catch(() => {})
 
-		// Native async library (@mongodb-js/zstd, zstd-napi)
+		// Native async library (zstd-napi)
 		const asyncLib = zstd as ZstdNativeAsyncLib
 		return {
 			compress: (data: Buffer) => asyncLib.compress(data, level),
@@ -425,6 +423,23 @@ export function createZstdCodec(zstd: ZstdLib, options?: ZstdCodecOptions): Comp
 				return Promise.resolve(Buffer.from(result))
 			},
 		}
+	}
+}
+
+/**
+ * Zstd codec backed by Node's own zlib binding (Node 22.15+ / 23.8+), or `undefined` when this
+ * runtime lacks it. Used automatically when no Zstd library is installed; call it directly to pass a
+ * compression level.
+ */
+export function createNodeZstdCodec(options?: ZstdCodecOptions): SyncCompressionCodec | undefined {
+	const { zstdCompressSync, zstdDecompressSync, constants } = zlib as Partial<typeof zlib>
+	if (typeof zstdCompressSync !== 'function' || typeof zstdDecompressSync !== 'function') return undefined
+	const params = { [constants!.ZSTD_c_compressionLevel]: options?.level ?? 3 }
+	return {
+		compress: data => Promise.resolve(zstdCompressSync(data, { params })),
+		decompress: data => Promise.resolve(zstdDecompressSync(data)),
+		compressSync: data => zstdCompressSync(data, { params }),
+		decompressSync: data => zstdDecompressSync(data),
 	}
 }
 

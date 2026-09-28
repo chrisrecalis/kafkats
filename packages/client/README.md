@@ -64,11 +64,12 @@ await admin.createTopics([{ name: 'events', partitions: 3 }])
 
 ## Compression
 
-GZIP works out of the box. For Snappy, LZ4, or Zstd, install a supported library — it is detected
-and registered automatically, no registration code needed:
+GZIP works out of the box, and so does Zstd on Node 22.15+. For Snappy or LZ4 (or Zstd on older
+Node), install a supported library — it is detected and registered automatically, no registration
+code needed:
 
 ```bash
-npm install snappy   # or: lz4-napi, @mongodb-js/zstd
+npm install snappy   # or: lz4-napi, zstd-napi
 ```
 
 ```typescript
