@@ -264,12 +264,13 @@ export interface ConsumerConfig {
 	sessionTimeoutMs?: number
 	rebalanceTimeoutMs?: number
 	heartbeatIntervalMs?: number
-	maxBytesPerPartition?: number
 	/**
-	 * Maximum number of records returned by one poll across all assigned partitions.
-	 * Additional fetched records remain buffered for the next poll (default: 500).
+	 * Maximum bytes fetched per partition in one Fetch request, and the maximum (estimated) bytes
+	 * delivered in one partition batch. Prefetched responses for a partition are coalesced up to this
+	 * size; the rest stays buffered for the next batch. A batch always holds at least one record, so
+	 * a record larger than this is still delivered (default: 1MB).
 	 */
-	maxRecords?: number
+	maxBytesPerPartition?: number
 	minBytes?: number
 	maxWaitMs?: number
 	/**
@@ -335,7 +336,6 @@ export interface ResolvedConsumerConfig {
 	rebalanceTimeoutMs: number
 	heartbeatIntervalMs: number
 	maxBytesPerPartition: number
-	maxRecords: number
 	minBytes: number
 	maxWaitMs: number
 	autoOffsetReset: AutoOffsetReset
@@ -368,7 +368,6 @@ export const DEFAULT_CONSUMER_CONFIG = {
 	rebalanceTimeoutMs: 60000,
 	heartbeatIntervalMs: 3000,
 	maxBytesPerPartition: 1048576, // 1MB
-	maxRecords: 500,
 	minBytes: 1,
 	maxWaitMs: 5000,
 	autoOffsetReset: 'latest' as AutoOffsetReset,

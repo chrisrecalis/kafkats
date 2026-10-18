@@ -214,7 +214,6 @@ async function main(): Promise<void> {
 
 	const messageCount = getNumberArg(args, 'messageCount', 10_000)
 	const messageSize = getNumberArg(args, 'messageSize', 1024)
-	const maxRecords = getNumberArg(args, 'maxRecords', 500)
 	const batchSize = getNumberArg(args, 'batchSize', 100)
 	const shareConsumers = getNumberArg(args, 'shareConsumers', 2)
 
@@ -235,9 +234,6 @@ async function main(): Promise<void> {
 		console.log(`  Operation:    ${operation}`)
 		console.log(`  Messages:     ${formatNumber(messageCount)}`)
 		console.log(`  Message Size: ${formatBytes(messageSize)}`)
-		if (operation === 'consumer' || operation === 'all') {
-			console.log(`  Max Records:  ${formatNumber(maxRecords)}`)
-		}
 		if (operation === 'producer' || operation === 'all') {
 			console.log(`  Batch Size:   ${formatNumber(batchSize)}`)
 		}
@@ -268,7 +264,6 @@ async function main(): Promise<void> {
 				operation,
 				messageCount,
 				messageSize,
-				maxRecords,
 				batchSize,
 				shareConsumers,
 				diagnostics,
@@ -306,7 +301,7 @@ async function main(): Promise<void> {
 				verbose,
 				diagnostics,
 				trace,
-				run: opts => runConsumerBenchmark(cluster, { messageCount, messageSize, maxRecords }, opts),
+				run: opts => runConsumerBenchmark(cluster, { messageCount, messageSize }, opts),
 			})
 		}
 

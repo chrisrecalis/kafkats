@@ -25,11 +25,13 @@ describe.concurrent('Consumer (integration) - topic priority', () => {
 		)
 		await producer.flush()
 
-		const maxRecords = 50
+		const maxBytesPerPartition = 16 * 1024
+		// Records are estimated at value + key + 64 bytes, so a batch holds at most this many.
+		const maxBatchRecords = Math.floor(maxBytesPerPartition / 64)
 		const consumer = client.consumer({
 			groupId: uniqueName('it-priority-group'),
 			autoOffsetReset: 'earliest',
-			maxRecords,
+			maxBytesPerPartition,
 		})
 		let bulkCount = 0
 		let bulkAtLiveStart = 0
@@ -65,7 +67,7 @@ describe.concurrent('Consumer (integration) - topic priority', () => {
 		clearTimeout(safetyTimer)
 
 		expect(liveCount).toBe(5)
-		expect(bulkAtLiveEnd - bulkAtLiveStart).toBeLessThanOrEqual(2 * maxRecords)
+		expect(bulkAtLiveEnd - bulkAtLiveStart).toBeLessThanOrEqual(2 * maxBatchRecords)
 		await producer.disconnect()
 		await client.disconnect()
 	})
@@ -82,21 +84,27 @@ describe.concurrent('Consumer (integration) - topic priority', () => {
 			{ name: bulkName, numPartitions: 1, replicationFactor: 1 },
 		])
 
+		// One send is one record batch. Small batches let one Fetch response carry complete batches for
+		// both topics despite the small maxBytesPerPartition.
 		const producer = client.producer({ lingerMs: 0 })
-		await producer.send(
-			live,
-			Array.from({ length: 200 }, (_, index) => ({ value: `live-${index}` }))
-		)
-		await producer.send(
-			bulk,
-			Array.from({ length: 200 }, (_, index) => ({ value: `bulk-${index}` }))
-		)
+		for (let start = 0; start < 200; start += 20) {
+			const indexes = Array.from({ length: 20 }, (_, index) => start + index)
+			await producer.send(
+				live,
+				indexes.map(index => ({ value: `live-${index}` }))
+			)
+			await producer.send(
+				bulk,
+				indexes.map(index => ({ value: `bulk-${index}` }))
+			)
+		}
 		await producer.flush()
 
 		const consumer = client.consumer({
 			groupId: uniqueName('it-weighted-group'),
 			autoOffsetReset: 'earliest',
-			maxRecords: 40,
+			// About 40 records per poll: each record here is estimated at roughly 70-72 bytes.
+			maxBytesPerPartition: 40 * 72,
 		})
 		const firstWindow: string[] = []
 		let liveCount = 0
@@ -122,6 +130,7 @@ describe.concurrent('Consumer (integration) - topic priority', () => {
 		const firstBulk = firstWindow.filter(name => name === bulkName).length
 		expect(firstLive).toBeGreaterThanOrEqual(28)
 		expect(firstBulk).toBeGreaterThanOrEqual(8)
+		expect(liveCount).toBe(200)
 		expect(bulkWhenLiveFinished).toBeLessThan(200)
 		await producer.disconnect()
 		await client.disconnect()

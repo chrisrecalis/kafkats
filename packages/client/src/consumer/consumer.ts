@@ -90,7 +90,6 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			rebalanceTimeoutMs: config.rebalanceTimeoutMs ?? DEFAULT_CONSUMER_CONFIG.rebalanceTimeoutMs,
 			heartbeatIntervalMs: config.heartbeatIntervalMs ?? DEFAULT_CONSUMER_CONFIG.heartbeatIntervalMs,
 			maxBytesPerPartition: config.maxBytesPerPartition ?? DEFAULT_CONSUMER_CONFIG.maxBytesPerPartition,
-			maxRecords: config.maxRecords ?? DEFAULT_CONSUMER_CONFIG.maxRecords,
 			minBytes: config.minBytes ?? DEFAULT_CONSUMER_CONFIG.minBytes,
 			maxWaitMs: config.maxWaitMs ?? DEFAULT_CONSUMER_CONFIG.maxWaitMs,
 			autoOffsetReset: config.autoOffsetReset ?? DEFAULT_CONSUMER_CONFIG.autoOffsetReset,
@@ -101,8 +100,8 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			defaultApiTimeoutMs: config.defaultApiTimeoutMs ?? DEFAULT_CONSUMER_CONFIG.defaultApiTimeoutMs,
 			onBeforeRebalance: config.onBeforeRebalance,
 		}
-		if (!Number.isInteger(this.config.maxRecords) || this.config.maxRecords <= 0) {
-			throw new Error('maxRecords must be a positive integer')
+		if (!Number.isInteger(this.config.maxBytesPerPartition) || this.config.maxBytesPerPartition <= 0) {
+			throw new Error('maxBytesPerPartition must be a positive integer')
 		}
 	}
 
@@ -218,7 +217,6 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			this.config.autoOffsetReset,
 			{
 				maxBytesPerPartition: this.config.maxBytesPerPartition,
-				maxRecords: this.config.maxRecords,
 				minBytes: this.config.minBytes,
 				maxWaitMs: this.config.maxWaitMs,
 				partitionConcurrency,

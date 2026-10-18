@@ -87,7 +87,6 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 			rebalanceTimeoutMs: config.rebalanceTimeoutMs ?? DEFAULT_CONSUMER_CONFIG.rebalanceTimeoutMs,
 			heartbeatIntervalMs: config.heartbeatIntervalMs ?? DEFAULT_CONSUMER_CONFIG.heartbeatIntervalMs,
 			maxBytesPerPartition: config.maxBytesPerPartition ?? DEFAULT_CONSUMER_CONFIG.maxBytesPerPartition,
-			maxRecords: config.maxRecords ?? DEFAULT_CONSUMER_CONFIG.maxRecords,
 			minBytes: config.minBytes ?? DEFAULT_CONSUMER_CONFIG.minBytes,
 			maxWaitMs: config.maxWaitMs ?? DEFAULT_CONSUMER_CONFIG.maxWaitMs,
 			autoOffsetReset: config.autoOffsetReset ?? DEFAULT_CONSUMER_CONFIG.autoOffsetReset,

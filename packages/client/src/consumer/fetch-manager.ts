@@ -59,6 +59,11 @@ function filterRecordsFromOffset(records: DecodedRecord[], minOffset: bigint): D
 	return start === 0 ? records : records.slice(start)
 }
 
+/** Estimated in-memory size of a decoded record; drives buffer accounting and the per-partition batch cap. */
+function recordBytes(record: DecodedRecord): number {
+	return (record.key?.length ?? 0) + (record.value?.length ?? 0) + 64
+}
+
 /**
  * Completed fetch from a single partition
  * Similar to Java client's CompletedFetch
@@ -67,7 +72,6 @@ interface CompletedFetch {
 	topic: string
 	partition: number
 	records: DecodedRecord[]
-	byteSize: number
 	// Assignment epoch of the partition when the fetch was buffered (see
 	// FetchManager.assignmentEpochs). Stale batches are fenced by comparing this
 	// against the current epoch at delivery time.
@@ -83,11 +87,10 @@ interface BufferedFetch {
 	nextRecord: number
 }
 
-/** Per-partition aggregate of buffered-but-undelivered records, for priority scheduling. */
+/** Per-partition aggregate of buffered-but-undelivered bytes, for priority scheduling. */
 interface BufferedPartitionStats {
 	topic: string
 	partition: number
-	records: number
 	bytes: number
 }
 
@@ -114,183 +117,104 @@ class FetchBuffer {
 	 * Add a completed fetch to the buffer and signal any waiters
 	 */
 	add(fetch: CompletedFetch): void {
-		this.queue.push({ ...fetch, nextRecord: 0 })
-		this.bufferedBytes += fetch.byteSize
+		let byteSize = 0
+		for (const record of fetch.records) byteSize += recordBytes(record)
+		this.queue.push({ ...fetch, byteSize, nextRecord: 0 })
+		this.bufferedBytes += byteSize
 		this.signalWaiters()
 	}
 
 	/**
-	 * Drain up to maxRecords, coalescing responses for the same partition and
-	 * assignment epoch so prefetch boundaries do not create extra batch handlers.
-	 * Excess records remain buffered for the next poll.
+	 * Drain one batch per partition and assignment epoch, coalescing that partition's buffered
+	 * fetches up to `maxBytesPerPartition` estimated bytes. Each batch takes at least one record so
+	 * an oversized record still makes progress. Planned partitions go first, in plan order and capped
+	 * per entry, then the remaining partitions FIFO. A poll stops starting partitions once it has used
+	 * `maxBytesPerPartition` of budget; served partitions rotate behind the others for the next poll.
 	 */
-	drain(maxRecords: number, excludedPartitions?: PartitionKeys): CompletedFetch[] {
-		const drained = new Map<string, CompletedFetch>()
-		const retained: BufferedFetch[] = []
-		let partial: BufferedFetch | null = null
-		let remainingRecords = maxRecords
-		let drainedBytes = 0
-
-		for (const fetch of this.queue) {
-			if (excludedPartitions?.has(tpKey(fetch.topic, fetch.partition))) {
-				retained.push(fetch)
-				continue
-			}
-			const availableRecords = fetch.records.length - fetch.nextRecord
-			const recordCount = Math.min(remainingRecords, availableRecords)
-			if (recordCount === 0) {
-				retained.push(fetch)
-				continue
-			}
-
-			const byteSize = Math.floor((fetch.byteSize * recordCount) / availableRecords)
-			const records: DecodedRecord[] = []
-			for (let index = fetch.nextRecord; index < fetch.nextRecord + recordCount; index++) {
-				records.push(fetch.records[index]!)
-				fetch.records[index] = null
-			}
-			const key = `${tpKey(fetch.topic, fetch.partition)}\0${fetch.assignmentEpoch}`
-			const existing = drained.get(key)
-			if (existing) {
-				for (const record of records) existing.records.push(record)
-				existing.byteSize += byteSize
-			} else {
-				drained.set(key, {
-					topic: fetch.topic,
-					partition: fetch.partition,
-					records,
-					byteSize,
-					assignmentEpoch: fetch.assignmentEpoch,
-				})
-			}
-
-			fetch.nextRecord += recordCount
-			fetch.byteSize -= byteSize
-			drainedBytes += byteSize
-			remainingRecords -= recordCount
-			if (fetch.nextRecord < fetch.records.length) partial = fetch
-		}
-
-		// A partially served partition moves behind the other buffered partitions so a
-		// hot partition cannot monopolize every maxRecords-limited poll.
-		if (partial) retained.push(partial)
-		this.queue = retained
-		this.bufferedBytes -= drainedBytes
-		this.signalCapacityWaiter()
-		return Array.from(drained.values())
-	}
-
-	/**
-	 * Drain following a scheduler plan: planned partitions first, in plan order and capped per entry,
-	 * then any remaining buffered partitions FIFO until maxRecords is reached. Fetches of served
-	 * partitions rotate to the back of the queue so equal-priority partitions take turns.
-	 */
-	drainPlanned(
-		plan: ScheduleDecision['drain'],
-		maxRecords: number,
-		excludedPartitions?: PartitionKeys
+	drain(
+		maxBytesPerPartition: number,
+		excludedPartitions?: PartitionKeys,
+		plan: ScheduleDecision['drain'] = []
 	): CompletedFetch[] {
 		const byPartition = new Map<string, BufferedFetch[]>()
 		for (const fetch of this.queue) {
 			const key = tpKey(fetch.topic, fetch.partition)
+			if (excludedPartitions?.has(key)) continue
 			const entries = byPartition.get(key)
 			if (entries) entries.push(fetch)
 			else byPartition.set(key, [fetch])
 		}
 
 		const drained = new Map<string, CompletedFetch>()
-		const plannedPartitions = new Set<string>()
-		const servedPartitions = new Set<string>()
-		let remainingBudget = maxRecords
-		let drainedBytes = 0
+		const served = new Set<string>()
+		// Bytes charged against the poll budget. A partition is charged at most its own allowance, so
+		// an oversized first record cannot crowd out the partitions planned after it.
+		let budgetUsed = 0
 
-		const take = (fetch: BufferedFetch, limit: number): number => {
-			const recordCount = Math.min(limit, fetch.records.length - fetch.nextRecord)
-			if (recordCount <= 0) return 0
-			const result = this.takeRecords(fetch, recordCount)
-			const key = `${tpKey(fetch.topic, fetch.partition)}\0${fetch.assignmentEpoch}`
-			const existing = drained.get(key)
-			if (existing) {
-				existing.records.push(...result.records)
-				existing.byteSize += result.byteSize
-			} else drained.set(key, result)
-			servedPartitions.add(tpKey(fetch.topic, fetch.partition))
-			remainingBudget -= recordCount
-			drainedBytes += result.byteSize
-			return recordCount
-		}
-
-		const takeFromPartition = (partitionKey: string, limit: number): void => {
-			for (const fetch of byPartition.get(partitionKey) ?? []) {
-				if (limit === 0) break
-				limit -= take(fetch, limit)
+		const take = (partitionKey: string, maxBytes: number): void => {
+			let takenBytes = 0
+			for (const fetch of byPartition.get(partitionKey)!) {
+				const key = `${partitionKey}\0${fetch.assignmentEpoch}`
+				let batch = drained.get(key)
+				while (fetch.nextRecord < fetch.records.length) {
+					const record = fetch.records[fetch.nextRecord]!
+					const size = recordBytes(record)
+					if (takenBytes > 0 && takenBytes + size > maxBytes) break
+					if (!batch) {
+						batch = {
+							topic: fetch.topic,
+							partition: fetch.partition,
+							records: [],
+							assignmentEpoch: fetch.assignmentEpoch,
+						}
+						drained.set(key, batch)
+					}
+					batch.records.push(record)
+					fetch.records[fetch.nextRecord++] = null
+					fetch.byteSize -= size
+					this.bufferedBytes -= size
+					takenBytes += size
+				}
+				if (fetch.nextRecord < fetch.records.length) break
 			}
+			served.add(partitionKey)
+			budgetUsed += Math.min(takenBytes, maxBytes)
 		}
 
 		for (const entry of plan) {
-			if (remainingBudget === 0) break
+			if (budgetUsed >= maxBytesPerPartition) break
 			const partitionKey = tpKey(entry.topic, entry.partition)
-			if (excludedPartitions?.has(partitionKey)) continue
-			plannedPartitions.add(partitionKey)
-			const allowed = Math.floor(Math.min(entry.maxRecords, remainingBudget))
-			if (allowed > 0) takeFromPartition(partitionKey, allowed)
+			if (served.has(partitionKey) || !byPartition.has(partitionKey)) continue
+			const maxBytes = Math.min(entry.maxBytes, maxBytesPerPartition)
+			take(partitionKey, maxBytes > 0 ? maxBytes : 0)
 		}
-
-		// Buffered partitions the plan omitted still make progress with whatever budget is left.
 		for (const partitionKey of byPartition.keys()) {
-			if (remainingBudget === 0) break
-			if (excludedPartitions?.has(partitionKey) || plannedPartitions.has(partitionKey)) continue
-			takeFromPartition(partitionKey, remainingBudget)
+			if (budgetUsed >= maxBytesPerPartition) break
+			if (!served.has(partitionKey)) take(partitionKey, maxBytesPerPartition)
 		}
 
 		const untouched: BufferedFetch[] = []
 		const rotated: BufferedFetch[] = []
 		for (const fetch of this.queue) {
 			if (fetch.nextRecord >= fetch.records.length) continue
-			const target = servedPartitions.has(tpKey(fetch.topic, fetch.partition)) ? rotated : untouched
+			const target = served.has(tpKey(fetch.topic, fetch.partition)) ? rotated : untouched
 			target.push(fetch)
 		}
 		this.queue = [...untouched, ...rotated]
-		this.bufferedBytes -= drainedBytes
 		this.signalCapacityWaiter()
 		return Array.from(drained.values())
 	}
 
-	/** Aggregate buffered records per partition, in queue (first-seen) order. */
+	/** Aggregate buffered bytes per partition, in queue (first-seen) order. */
 	snapshot(): BufferedPartitionStats[] {
 		const stats = new Map<string, BufferedPartitionStats>()
 		for (const fetch of this.queue) {
-			const records = fetch.records.length - fetch.nextRecord
-			if (records === 0) continue
 			const key = tpKey(fetch.topic, fetch.partition)
 			const existing = stats.get(key)
-			if (existing) {
-				existing.records += records
-				existing.bytes += fetch.byteSize
-			} else {
-				stats.set(key, { topic: fetch.topic, partition: fetch.partition, records, bytes: fetch.byteSize })
-			}
+			if (existing) existing.bytes += fetch.byteSize
+			else stats.set(key, { topic: fetch.topic, partition: fetch.partition, bytes: fetch.byteSize })
 		}
 		return Array.from(stats.values())
-	}
-
-	private takeRecords(fetch: BufferedFetch, recordCount: number): CompletedFetch {
-		const availableRecords = fetch.records.length - fetch.nextRecord
-		const byteSize = Math.floor((fetch.byteSize * recordCount) / availableRecords)
-		const records: DecodedRecord[] = []
-		for (let index = fetch.nextRecord; index < fetch.nextRecord + recordCount; index++) {
-			records.push(fetch.records[index]!)
-			fetch.records[index] = null
-		}
-		fetch.nextRecord += recordCount
-		fetch.byteSize -= byteSize
-		return {
-			topic: fetch.topic,
-			partition: fetch.partition,
-			records,
-			byteSize,
-			assignmentEpoch: fetch.assignmentEpoch,
-		}
 	}
 
 	hasDataFor(excludedPartitions?: PartitionKeys): boolean {
@@ -510,9 +434,8 @@ interface PartitionState {
  * Fetch manager configuration
  */
 export interface FetchManagerConfig {
+	/** Max bytes per partition in one Fetch request, and per delivered partition batch (estimated). */
 	maxBytesPerPartition: number
-	/** Maximum records returned by one poll across all partitions (default: 500). */
-	maxRecords: number
 	minBytes: number
 	maxWaitMs: number
 	partitionConcurrency: number
@@ -534,7 +457,6 @@ export interface FetchManagerConfig {
  */
 export const DEFAULT_FETCH_CONFIG: FetchManagerConfig = {
 	maxBytesPerPartition: 1048576, // 1MB
-	maxRecords: 500,
 	minBytes: 1,
 	maxWaitMs: 5000,
 	partitionConcurrency: 1,
@@ -1170,18 +1092,10 @@ export class FetchManager {
 					const records = filterRecordsFromOffset(decoded, fetchOffset)
 
 					if (records.length > 0) {
-						// Estimate byte size for memory tracking
-						let byteSize = 0
-						for (const record of records) {
-							byteSize += (record.key?.length ?? 0) + (record.value?.length ?? 0) + 64
-						}
-
-						// Add to buffer
 						this.fetchBuffer.add({
 							topic: state.topic,
 							partition: state.partition,
 							records,
-							byteSize,
 							assignmentEpoch: this.getAssignmentEpoch(state.topic, state.partition),
 						})
 					}
@@ -1267,10 +1181,11 @@ export class FetchManager {
 	private drainBuffer(excludedPartitions?: PartitionKeys): PartitionBatch[] {
 		const fetchBuffer = this.fetchBuffer
 		if (!fetchBuffer) return []
-		if (!this.config.priority) return fetchBuffer.drain(this.config.maxRecords, excludedPartitions)
+		const { maxBytesPerPartition, priority } = this.config
+		if (!priority) return fetchBuffer.drain(maxBytesPerPartition, excludedPartitions)
 		this.lastExcluded = excludedPartitions
-		const decision = this.config.priority.schedule(this.buildSchedulerState(fetchBuffer, excludedPartitions))
-		return fetchBuffer.drainPlanned(decision.drain, this.config.maxRecords, excludedPartitions)
+		const decision = priority.schedule(this.buildSchedulerState(fetchBuffer, excludedPartitions))
+		return fetchBuffer.drain(maxBytesPerPartition, excludedPartitions, decision.drain)
 	}
 
 	/** Buffered partitions first (in buffer order), then idle assigned partitions with zero buffered. */
@@ -1282,7 +1197,6 @@ export class FetchManager {
 			return {
 				topic: state.topic,
 				partition: state.partition,
-				bufferedRecords: stat?.records ?? 0,
 				bufferedBytes: stat?.bytes ?? 0,
 				busy: excludedPartitions?.has(key) ?? false,
 			}
@@ -1296,7 +1210,7 @@ export class FetchManager {
 		}
 		return {
 			partitions,
-			recordBudget: this.config.maxRecords,
+			byteBudget: this.config.maxBytesPerPartition,
 			bufferCapacityBytes: fetchBuffer.maxBytes,
 			bufferedBytes: fetchBuffer.sizeBytes,
 		}

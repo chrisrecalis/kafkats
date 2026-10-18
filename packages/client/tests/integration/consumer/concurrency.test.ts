@@ -73,7 +73,8 @@ describe.concurrent('Consumer (integration) - concurrency', () => {
 		const consumer = client.consumer({
 			groupId: uniqueName('it-group'),
 			autoOffsetReset: 'earliest',
-			maxRecords: 1,
+			// Smaller than one record, so fast-1 and fast-2 are delivered by separate polls.
+			maxBytesPerPartition: 64,
 		})
 		let releaseSlowHandler!: () => void
 		const slowHandler = new Promise<void>(resolve => {

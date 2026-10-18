@@ -52,21 +52,20 @@ await consumer.runEach('events', async (message, ctx) => {
 Process messages in batches for higher throughput:
 
 ```typescript
-await consumer.runBatch(
-	'events',
-	async (messages, ctx) => {
-		console.log(`Received ${messages.length} messages from ${ctx.topic}[${ctx.partition}]`)
+await consumer.runBatch('events', async (messages, ctx) => {
+	console.log(`Received ${messages.length} messages from ${ctx.topic}[${ctx.partition}]`)
 
-		for (const message of messages) {
-			await processMessage(message)
-		}
-	},
-	{
-		maxBatchSize: 100, // Max messages per batch
-		maxBatchWaitMs: 50, // Max wait time to fill batch
+	for (const message of messages) {
+		await processMessage(message)
 	}
-)
+})
 ```
+
+Each batch holds records from one partition, up to the consumer's `maxBytesPerPartition` (estimated from key and
+value sizes). Records fetched ahead while a handler is busy stay buffered for the next batch, so a slow handler never
+receives more than one partition's byte budget at once. A record larger than the limit is delivered on its own.
+Lower `maxBytesPerPartition` when per-record work is slow: a rebalance waits for in-flight batches, so smaller batches
+keep rebalances and topic priority responsive (smaller fetches are the trade-off).
 
 ### Async Iterator Mode (stream)
 
@@ -216,13 +215,13 @@ await consumer.runEach([live, bulk], handler, {
 topic must continue making progress. Topics omitted from a strict order share the final tier; topics omitted from
 weighted shares receive a share of `1`.
 
-Custom strategies implement `PriorityStrategy` and return ordered `drain` entries plus the partitions currently
-allowed to `fetch`. Buffered partitions omitted from `drain` are still delivered FIFO after the planned entries within
+Custom strategies implement `PriorityStrategy` and return ordered `drain` entries, each capped at `maxBytes` out of
+the poll's `byteBudget` (the consumer's `maxBytesPerPartition`), plus the partitions currently allowed to `fetch`. Buffered partitions omitted from `drain` are still delivered FIFO after the planned entries within
 the remaining poll budget, so hold a topic back through `fetch`, not `drain`. Derive fairness from the supplied
 scheduler state: the fetch loop may call `schedule()` without a drain, and a drain decision may be only partially
 applied.
 
-Priority applies at poll granularity. A handler batch already admitted is never preempted; lower `maxRecords` for
+Priority applies at poll granularity. A handler batch already admitted is never preempted; lower `maxBytesPerPartition` for
 finer-grained scheduling when `partitionConcurrency` is small. Literal topic names are checked against the
 subscription. One TypeScript limitation is that `topic<Order>('orders')` leaves the name typed as `string` because
 generic arguments cannot be partially inferred; codec-driven inference preserves the literal name.

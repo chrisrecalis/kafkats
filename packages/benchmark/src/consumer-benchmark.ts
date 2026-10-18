@@ -17,7 +17,6 @@ import {
 interface ConsumerBenchmarkConfig {
 	messageCount: number
 	messageSize: number
-	maxRecords: number
 }
 
 export interface BenchmarkRunOptions {
@@ -29,7 +28,6 @@ export interface BenchmarkRunOptions {
 const DEFAULT_CONFIG: ConsumerBenchmarkConfig = {
 	messageCount: 10000,
 	messageSize: 1024,
-	maxRecords: 500,
 }
 
 const ALIGNED_CONSUMER_CONFIG = {
@@ -82,7 +80,7 @@ async function benchmarkKafkaTsConsumer(
 	config: ConsumerBenchmarkConfig,
 	options: BenchmarkRunOptions
 ): Promise<BenchmarkResult> {
-	const { messageCount, messageSize, maxRecords } = config
+	const { messageCount, messageSize } = config
 	const topicName = uniqueName('bench-consumer-kafkats')
 	const trace = options.trace ? createTraceCollector() : null
 	const shouldPrint = options.print !== false
@@ -108,7 +106,6 @@ async function benchmarkKafkaTsConsumer(
 		maxWaitMs: ALIGNED_CONSUMER_CONFIG.maxWaitMs,
 		minBytes: ALIGNED_CONSUMER_CONFIG.minBytes,
 		maxBytesPerPartition: ALIGNED_CONSUMER_CONFIG.maxBytesPerPartition,
-		maxRecords,
 		trace: trace?.trace,
 	})
 
@@ -422,7 +419,6 @@ export async function runConsumerBenchmark(
 		console.log('='.repeat(60))
 		console.log(`  Message Count: ${fullConfig.messageCount}`)
 		console.log(`  Message Size:  ${fullConfig.messageSize} bytes`)
-		console.log(`  Max Records:   ${fullConfig.maxRecords}`)
 	}
 
 	const kafkaTs = await benchmarkKafkaTsConsumer(cluster, fullConfig, opts)

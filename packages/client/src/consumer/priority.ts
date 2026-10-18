@@ -1,25 +1,30 @@
 export interface SchedulerPartition {
 	topic: string
 	partition: number
-	bufferedRecords: number
+	/** Estimated bytes buffered but not yet delivered. */
 	bufferedBytes: number
 	busy: boolean
 }
 
 export interface SchedulerState {
 	partitions: SchedulerPartition[]
-	recordBudget: number
+	/**
+	 * A poll stops starting partitions once it has used this many (estimated) bytes. Equal to the
+	 * consumer's `maxBytesPerPartition`, which also caps each partition's batch.
+	 */
+	byteBudget: number
 	bufferCapacityBytes: number
 	bufferedBytes: number
 }
 
 export interface ScheduleDecision {
 	/**
-	 * Partitions to deliver from, in order, each capped at `maxRecords`. Buffered partitions omitted
-	 * here are still delivered FIFO after the planned entries within the remaining poll budget, so
-	 * use `fetch` (not `drain`) to hold a topic back.
+	 * Partitions to deliver from, in order, each capped at `maxBytes` (and at `byteBudget`). Every batch
+	 * holds at least one record, so a zero cap does not withhold a partition. Buffered partitions omitted
+	 * here are still delivered FIFO after the planned entries while poll budget remains, so use `fetch`
+	 * (not `drain`) to hold a topic back.
 	 */
-	drain: Array<{ topic: string; partition: number; maxRecords: number }>
+	drain: Array<{ topic: string; partition: number; maxBytes: number }>
 	/** Partitions the background fetcher may request from next. Omitted partitions are not fetched. */
 	fetch: Array<{ topic: string; partition: number }>
 }
@@ -61,21 +66,21 @@ export function strict<const T extends string>(options: { order: readonly T[] })
 				.sort((a, b) => a.rank - b.rank || a.index - b.index)
 
 			const drain = ranked
-				.filter(({ partition }) => !partition.busy && partition.bufferedRecords > 0)
+				.filter(({ partition }) => !partition.busy && partition.bufferedBytes > 0)
 				.map(({ partition }) => ({
 					topic: partition.topic,
 					partition: partition.partition,
-					maxRecords: state.recordBudget,
+					maxBytes: state.byteBudget,
 				}))
 
 			const bufferedByRank = Array<number>(fallbackRank + 1).fill(0)
 			for (const { partition, rank } of ranked) {
-				if (!partition.busy) bufferedByRank[rank]! += partition.bufferedRecords
+				if (!partition.busy) bufferedByRank[rank]! += partition.bufferedBytes
 			}
 
 			let allowedRank = 0
 			let higherBuffered = bufferedByRank[0]!
-			while (allowedRank < fallbackRank && higherBuffered < state.recordBudget) {
+			while (allowedRank < fallbackRank && higherBuffered < state.byteBudget) {
 				allowedRank++
 				higherBuffered += bufferedByRank[allowedRank]!
 			}
@@ -112,12 +117,12 @@ export function weighted<const T extends string>(options: {
 				partitions,
 				share: shareOf(topic),
 				demand: partitions.reduce(
-					(total, partition) => total + (partition.busy ? 0 : partition.bufferedRecords),
+					(total, partition) => total + (partition.busy ? 0 : partition.bufferedBytes),
 					0
 				),
 				allocation: 0,
 			}))
-			let remaining = state.recordBudget
+			let remaining = state.byteBudget
 			let unsatisfied = topicStates.filter(topic => topic.demand > 0)
 
 			while (remaining > 0 && unsatisfied.length > 0) {
@@ -133,19 +138,9 @@ export function weighted<const T extends string>(options: {
 				unsatisfied = unsatisfied.filter(topic => !satisfied.includes(topic))
 			}
 
-			if (remaining > 0 && unsatisfied.length > 0) {
-				unsatisfied.sort((a, b) => b.share - a.share)
-				const totalShare = unsatisfied.reduce((sum, topic) => sum + topic.share, 0)
-				let assigned = 0
-				for (const topic of unsatisfied) {
-					topic.allocation = Math.floor((remaining * topic.share) / totalShare)
-					assigned += topic.allocation
-				}
-				let leftovers = remaining - assigned
-				for (const topic of unsatisfied) {
-					if (leftovers-- <= 0) break
-					topic.allocation++
-				}
+			const totalShare = unsatisfied.reduce((sum, topic) => sum + topic.share, 0)
+			for (const topic of unsatisfied) {
+				topic.allocation = Math.floor((remaining * topic.share) / totalShare)
 			}
 
 			const drain: ScheduleDecision['drain'] = []
@@ -153,9 +148,9 @@ export function weighted<const T extends string>(options: {
 				let allocation = topic.allocation
 				for (const partition of topic.partitions) {
 					if (partition.busy || allocation === 0) continue
-					const maxRecords = Math.min(allocation, partition.bufferedRecords)
-					if (maxRecords > 0) drain.push({ topic: topic.topic, partition: partition.partition, maxRecords })
-					allocation -= maxRecords
+					const maxBytes = Math.min(allocation, partition.bufferedBytes)
+					if (maxBytes > 0) drain.push({ topic: topic.topic, partition: partition.partition, maxBytes })
+					allocation -= maxBytes
 				}
 			}
 
