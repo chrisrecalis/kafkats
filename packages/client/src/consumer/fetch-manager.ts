@@ -26,6 +26,9 @@ import { tpKey, formatPartitions } from '@/utils/topic-partition.js'
 import { sleep } from '@/utils/sleep.js'
 import type { PriorityStrategy, ScheduleDecision, SchedulerPartition, SchedulerState } from './priority.js'
 
+// Matches the Java client's retry.backoff.ms default.
+const LEADER_RETRY_BACKOFF_MS = 100
+
 /**
  * True when the bytes at the decoder's position cannot hold the batch they declare: either the
  * 12-byte preamble (baseOffset + batchLength) is cut off, or fewer than `12 + batchLength` bytes
@@ -423,7 +426,8 @@ interface PartitionState {
 	offset: bigint
 	paused: boolean
 	abortController: AbortController // Per-partition abort signal for incremental control
-	cachedLeader: Broker | null // Cached leader broker - invalidated on NotLeaderOrFollower
+	cachedLeader: Broker | null // Cached leader broker - invalidated on NotLeaderOrFollower or a failed fetch
+	leaderRetryAt: number // Epoch ms before which the leader is not looked up again
 	// Bumped by seek(). A fetch captures the epoch at issue time; a response whose
 	// partition epoch changed is dropped, so a seek that lands mid-flight is not
 	// clobbered by the stale response advancing the offset.
@@ -555,6 +559,7 @@ export class FetchManager {
 				paused: false,
 				abortController: new AbortController(),
 				cachedLeader: null,
+				leaderRetryAt: 0,
 				fetchEpoch: 0,
 			}
 			this.partitionStates.set(key, state)
@@ -587,6 +592,7 @@ export class FetchManager {
 				paused: false,
 				abortController: new AbortController(),
 				cachedLeader: null,
+				leaderRetryAt: 0,
 				fetchEpoch: 0,
 			}
 			this.partitionStates.set(key, state)
@@ -925,6 +931,7 @@ export class FetchManager {
 								brokerId,
 								error: (error as Error).message,
 							})
+							return this.invalidateLeader(broker, partitions)
 						})
 						.finally(() => {
 							fetchBuffer.releaseCapacity(reservedBytes)
@@ -957,6 +964,7 @@ export class FetchManager {
 
 		// Collect partitions needing leader lookup
 		const needsLookup: PartitionState[] = []
+		const now = Date.now()
 		for (const state of partitions) {
 			if (state.cachedLeader) {
 				const brokerId = state.cachedLeader.nodeId
@@ -964,7 +972,7 @@ export class FetchManager {
 					partitionsByBroker.set(brokerId, { broker: state.cachedLeader, partitions: [] })
 				}
 				partitionsByBroker.get(brokerId)!.partitions.push(state)
-			} else {
+			} else if (state.leaderRetryAt <= now) {
 				needsLookup.push(state)
 			}
 		}
@@ -978,6 +986,7 @@ export class FetchManager {
 						state.cachedLeader = leader
 						return { state, leader }
 					} catch (error) {
+						state.leaderRetryAt = Date.now() + LEADER_RETRY_BACKOFF_MS
 						this.logger.error('failed to get leader', {
 							topic: state.topic,
 							partition: state.partition,
@@ -999,6 +1008,32 @@ export class FetchManager {
 		}
 
 		return partitionsByBroker
+	}
+
+	/**
+	 * Drop a broker from the partitions that cached it after a request to it failed. A closed
+	 * connection never yields a per-partition error code, so without this the partitions keep
+	 * the dead Broker forever and Cluster.getBroker, which reconnects, is never called again.
+	 */
+	private async invalidateLeader(broker: Broker, partitions: PartitionState[]): Promise<void> {
+		const topics = new Set<string>()
+		const retryAt = Date.now() + LEADER_RETRY_BACKOFF_MS
+		for (const state of partitions) {
+			if (state.cachedLeader !== broker) continue
+			state.cachedLeader = null
+			state.leaderRetryAt = retryAt
+			topics.add(state.topic)
+		}
+		if (topics.size === 0) return
+
+		try {
+			await this.cluster.refreshMetadata([...topics])
+		} catch (error) {
+			this.logger.error('failed to refresh metadata after fetch failure', {
+				brokerId: broker.nodeId,
+				error: (error as Error).message,
+			})
+		}
 	}
 
 	/**
