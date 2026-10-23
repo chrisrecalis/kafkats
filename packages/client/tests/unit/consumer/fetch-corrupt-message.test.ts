@@ -8,6 +8,7 @@ function makeFetchManager() {
 	const broker = { nodeId: 1, fetch: vi.fn() }
 	const cluster = {
 		getLeaderForPartition: vi.fn().mockResolvedValue(broker),
+		refreshMetadata: vi.fn().mockResolvedValue(undefined),
 		getLogger: () => null,
 	}
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
