@@ -5,6 +5,7 @@ import { createRequire } from 'node:module'
 import {
 	CompressionType,
 	createLz4Codec,
+	createNodeZstdCodec,
 	createSnappyCodec,
 	createZstdCodec,
 	getCompressionTypeName,
@@ -248,14 +249,33 @@ describe('automatic codec registration', () => {
 		expect(await codec.decompress(await codec.compress(payload))).toEqual(payload)
 	})
 
-	it('auto-registers zstd via an async compress/decompress API', async () => {
+	it('falls back to the built-in zlib zstd codec when no library is installed', async () => {
+		const { loader, requested } = fakeLoader({})
+		const registry = new CodecRegistry(loader)
+		const codec = registry.get(CompressionType.Zstd)
+		expect(requested).toEqual(['zstd-napi'])
+		if (!createNodeZstdCodec()) {
+			expect(codec).toBeUndefined()
+			return
+		}
+		expect(codec).toBeDefined()
+		const payload = Buffer.from('built-in zstd '.repeat(100))
+		const compressed = await codec!.compress(payload)
+		expect(compressed.length).toBeLessThan(payload.length)
+		expect(await codec!.decompress(compressed)).toEqual(payload)
+	})
+
+	it('prefers an installed zstd library over the built-in codec', async () => {
+		const builtin = vi.fn(() => undefined)
 		const { loader } = fakeLoader({
-			'@mongodb-js/zstd': {
+			'zstd-napi': {
 				compress: async (data: Buffer) => data,
 				decompress: async (data: Buffer) => data,
 			},
 		})
-		const registry = new CodecRegistry(loader)
+		const registry = new CodecRegistry(loader, builtin)
+		expect(registry.get(CompressionType.Zstd)).toBeDefined()
+		expect(builtin).not.toHaveBeenCalled()
 
 		const codec = registry.get(CompressionType.Zstd)!
 		const payload = Buffer.from('auto-zstd')
@@ -351,7 +371,7 @@ describe('automatic codec registration', () => {
 	it('includes an install hint in the missing codec error', () => {
 		expect(missingCodecError(CompressionType.Snappy).message).toMatch(/Install one of: snappy, snappyjs/)
 		expect(missingCodecError(CompressionType.Lz4).message).toMatch(/lz4-napi, lz4, lz4js/)
-		expect(missingCodecError(CompressionType.Zstd).message).toMatch(/@mongodb-js\/zstd, zstd-napi/)
+		expect(missingCodecError(CompressionType.Zstd).message).toMatch(/zstd-napi.*Node 22\.15\+/)
 	})
 })
 

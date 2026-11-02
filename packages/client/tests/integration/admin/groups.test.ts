@@ -117,6 +117,63 @@ describe.concurrent('Admin - Consumer Groups (integration)', () => {
 		await client.disconnect()
 	})
 
+	it('lists committed offsets for a group, including after it goes empty', async () => {
+		const client = createClient('admin-group-offsets')
+		await client.connect()
+
+		const topicName = uniqueName('admin-offsets-topic')
+		const groupId = uniqueName('admin-offsets-group')
+		const testTopic = topic<string>(topicName, { value: string() })
+
+		await client.createTopics([{ name: topicName, numPartitions: 2, replicationFactor: 1 }])
+
+		const producer = client.producer()
+		await producer.send(testTopic, [
+			{ value: 'a', partition: 0 },
+			{ value: 'b', partition: 0 },
+			{ value: 'c', partition: 0 },
+		])
+		await producer.disconnect()
+
+		const admin = client.admin()
+
+		// No commits yet: an unknown group has no offsets at all
+		expect(await admin.listConsumerGroupOffsets(groupId)).toEqual([])
+		// ...and an explicit partition lookup reports null
+		const before = await admin.listConsumerGroupOffsets(groupId, [{ topic: topicName, partition: 0 }])
+		expect(before).toEqual([
+			{ topic: topicName, partition: 0, offset: null, leaderEpoch: -1, metadata: expect.anything() },
+		])
+
+		let seen = 0
+		const consumer = client.consumer({ groupId, autoOffsetReset: 'earliest' })
+		const consumePromise = consumer.runEach(
+			testTopic,
+			async () => {
+				seen++
+				if (seen === 3) consumer.stop()
+			},
+			{ autoCommit: true }
+		)
+		await consumePromise
+
+		const after = await admin.listConsumerGroupOffsets(groupId)
+		const p0 = after.find(o => o.topic === topicName && o.partition === 0)
+		expect(p0?.offset).toBe(3n)
+		// Partition 1 never received records; the consumer may or may not have committed a position for it
+		for (const o of after) {
+			expect(o.topic).toBe(topicName)
+		}
+
+		// Empty group (no members) still returns offsets
+		const descriptions = await admin.describeGroups([groupId])
+		expect(descriptions[0]!.members).toHaveLength(0)
+		const stillThere = await admin.listConsumerGroupOffsets(groupId, [{ topic: topicName, partition: 0 }])
+		expect(stillThere[0]!.offset).toBe(3n)
+
+		await client.disconnect()
+	})
+
 	it('deletes empty consumer groups', async () => {
 		const client = createClient('admin-delete-groups')
 		await client.connect()

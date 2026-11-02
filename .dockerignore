@@ -1,0 +1,6 @@
+.git
+.turbo
+**/node_modules
+**/dist
+**/coverage
+**/*.tsbuildinfo
