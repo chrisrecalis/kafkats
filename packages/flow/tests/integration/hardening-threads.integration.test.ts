@@ -163,7 +163,13 @@ describe('hardening: multi-thread EOS topologies with commit failures', () => {
 						counts.size === KEYS &&
 						groups.size === 3
 					) {
-						const fin = [...counts.values()].every(v => v.length >= N)
+						// The grouped counts arrive last (they pass through the repartition topic), so
+						// wait for them too rather than asserting on a result that is still in flight.
+						const groupSize = (g: string) =>
+							Array.from({ length: KEYS }, (_, k) => k).filter(k => `grp${k % 3}` === g).length * N
+						const fin =
+							[...counts.values()].every(v => v.length >= N) &&
+							[...groups].every(([g, seq]) => seq.length >= groupSize(g))
 						if (fin) break
 					}
 					if (Date.now() > deadline) break
