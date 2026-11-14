@@ -3,6 +3,7 @@ import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import { Producer } from '@/producer/producer.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import type { ProduceRequest } from '@/protocol/messages/requests/produce.js'
+import { decodeRecordBatch } from '@/protocol/records/record-batch.js'
 import { createMockBroker, createMockCluster, buildProduceResponse } from './_helpers.js'
 
 /** Record count of an encoded record batch (int32 at byte 57 of the v2 batch header). */
@@ -97,6 +98,98 @@ describe('Producer: batches queued behind an in-flight request are merged', () =
 		// The oversized send keeps its own request; the sends around it are not folded into it.
 		expect(requests.map(r => r.records)).toEqual([1, 30, 1])
 
+		await producer.disconnect()
+	})
+
+	it('keeps every partition in order when partitions back up independently', async () => {
+		const maxBatchBytes = 1000
+		const partitionCount = 3
+		mockCluster = createMockCluster({ partitionCount })
+		mockCluster.getLeaderForPartition.mockResolvedValue(mockBroker)
+		// Values (and encoded bytes) seen per partition, in the order the broker received them.
+		const received = new Map<number, string[]>()
+		const nextOffsets = new Map<number, bigint>()
+		mockBroker.produce.mockImplementation(async (request: ProduceRequest) => {
+			const partitions = []
+			for (const { partitionIndex, records } of request.topics[0]!.partitions) {
+				const batch = await decodeRecordBatch(records)
+				// Only a single over-limit send may exceed the limit, and nothing is merged into it.
+				if (records.length > maxBatchBytes) {
+					const sendIds = new Set(batch.records.map(r => r.value!.toString().split('.')[0]))
+					expect(sendIds.size).toBe(1)
+				}
+				const values = received.get(partitionIndex) ?? []
+				for (const record of batch.records) values.push(record.value!.toString())
+				received.set(partitionIndex, values)
+				const baseOffset = nextOffsets.get(partitionIndex) ?? 0n
+				nextOffsets.set(partitionIndex, baseOffset + BigInt(batch.records.length))
+				partitions.push({ partitionIndex, errorCode: ErrorCode.None, baseOffset })
+			}
+			// Partition 0 is slow, so its sends back up while the others keep going.
+			const slow = request.topics[0]!.partitions.some(p => p.partitionIndex === 0)
+			await new Promise(resolve => setTimeout(resolve, slow ? 10 : 1))
+			return buildProduceResponse([{ name: 'test-topic', partitions }])
+		})
+		const producer = new Producer(mockCluster, { maxBatchBytes, retries: 0 })
+		const pad = 'x'.repeat(40)
+
+		// Interleaved single sends, some multi-record sends (one batch each, one over the limit).
+		const expected = new Map<number, string[]>()
+		const sends: Array<Promise<unknown>> = []
+		for (let i = 0; i < 300; i++) {
+			const partition = i % partitionCount
+			const count = i % 37 === 0 ? 20 : i % 11 === 0 ? 3 : 1
+			const messages = Array.from({ length: count }, (_, j) => ({
+				value: Buffer.from(`${i}.${j}:${pad}`),
+				partition,
+			}))
+			const values = expected.get(partition) ?? []
+			for (const message of messages) values.push(message.value.toString())
+			expected.set(partition, values)
+			sends.push(producer.send('test-topic', messages))
+			// Let some sends go out on their own between bursts.
+			if (i % 50 === 0) await new Promise(resolve => setTimeout(resolve, 2))
+		}
+		await Promise.all(sends)
+
+		for (let partition = 0; partition < partitionCount; partition++) {
+			expect(received.get(partition)).toEqual(expected.get(partition))
+		}
+		await producer.disconnect()
+	})
+
+	it('sends the remainder of a sequence-wrap split before the batches queued after it', async () => {
+		mockCluster.getAnyBroker.mockResolvedValue(mockBroker)
+		mockBroker.initProducerId.mockResolvedValue({
+			throttleTimeMs: 0,
+			errorCode: ErrorCode.None,
+			producerId: 9n,
+			producerEpoch: 0,
+		})
+		const batches: Array<{ baseSequence: number; values: string[] }> = []
+		mockBroker.produce.mockImplementation(async (request: ProduceRequest) => {
+			const batch = await decodeRecordBatch(request.topics[0]!.partitions[0]!.records)
+			batches.push({ baseSequence: batch.baseSequence, values: batch.records.map(r => r.value!.toString()) })
+			await new Promise(resolve => setTimeout(resolve, 5))
+			return buildProduceResponse([
+				{ name: 'test-topic', partitions: [{ partitionIndex: 0, errorCode: ErrorCode.None, baseOffset: 0n }] },
+			])
+		})
+		// Room for four one-byte records per batch (the accumulator counts 51 bytes for each).
+		const producer = new Producer(mockCluster, { idempotent: true, retries: 1, maxBatchBytes: 220 })
+		await producer.send('test-topic', { value: Buffer.from('init'), partition: 0 })
+		batches.length = 0
+		;(producer as unknown as { sequences: Map<string, number> }).sequences.set('test-topic:0', 0x7fffffff - 1)
+
+		const send = (value: string) => producer.send('test-topic', { value: Buffer.from(value), partition: 0 })
+		// p, a, b, c are merged into one batch and d, e stay queued (no room). Only p and a fit below
+		// the sequence wrap (MAX-1, MAX): b and c are split off and must still go before d and e.
+		await Promise.all(['p', 'a', 'b', 'c', 'd', 'e'].map(send))
+
+		expect(batches).toEqual([
+			{ baseSequence: 0x7fffffff - 1, values: ['p', 'a'] },
+			{ baseSequence: 0, values: ['b', 'c', 'd', 'e'] },
+		])
 		await producer.disconnect()
 	})
 })

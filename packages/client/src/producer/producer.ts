@@ -188,8 +188,9 @@ export class Producer extends EventEmitter<ProducerEvents> {
 
 	private inflightCount = 0
 
-	// Broker-level batching: collect ready batches and group by broker
-	private pendingBatches: PartitionBatch[] = []
+	// Sealed batches waiting to be sent, by `topic:partition`, each queue in append order.
+	// A drain takes from the partitions without an in-flight send and groups them by broker.
+	private pendingBatches = new Map<string, PartitionBatch[]>()
 	private drainScheduled = false
 	// Every outstanding send() promise. A send's promise settles only once all its
 	// messages are acked (including retries), so flush() can wait for in-progress sends
@@ -233,12 +234,16 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		this.config = this.resolveConfig(config)
 		this.accumulator = new RecordAccumulator(this.config, this.logger)
 		this.accumulator.on('batchReady', batch => {
-			// Collect batches and schedule drain to group by broker
-			this.pendingBatches.push(batch)
-			// A batch for a partition with an in-flight send cannot go out yet, and the drain that
-			// runs when that send settles will pick it up. Draining now would only re-scan the
-			// queue once per send() call, which is quadratic while a busy partition backs up.
-			if (!this.mutedPartitions.has(`${batch.topic}:${batch.partition}`)) {
+			const key = `${batch.topic}:${batch.partition}`
+			const queue = this.pendingBatches.get(key)
+			if (queue) {
+				queue.push(batch)
+			} else {
+				this.pendingBatches.set(key, [batch])
+			}
+			// A batch for a partition with an in-flight send cannot go out yet: the drain that
+			// runs when that send settles picks it up.
+			if (!this.mutedPartitions.has(key)) {
 				this.scheduleDrain()
 			}
 		})
@@ -286,55 +291,49 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	 * per broker containing all ready partition batches for that broker.
 	 */
 	private drainPendingBatches(): void {
-		const batches = this.pendingBatches
-		this.pendingBatches = []
-
-		if (batches.length === 0) return
-
-		// Take at most one batch per partition, and never a partition that already has
-		// an in-flight send (muted). This preserves per-partition ordering for the
-		// idempotent producer: sending a second batch while an earlier one is in flight
-		// would let a retriable failure on the earlier batch reorder sequences, so the
-		// later (higher-sequence) batch reaches the broker first and trips
-		// OutOfOrderSequenceNumber. Deferred batches stay queued and are drained when
-		// their partition's in-flight send settles (see the finally below) — every
-		// deferred batch's partition is muted, so a re-drain is always pending.
+		// Take one batch per partition, and never from a partition that already has an
+		// in-flight send (muted). This preserves per-partition ordering for the idempotent
+		// producer: sending a second batch while an earlier one is in flight would let a
+		// retriable failure on the earlier batch reorder sequences, so the later
+		// (higher-sequence) batch reaches the broker first and trips
+		// OutOfOrderSequenceNumber. Batches of a muted partition stay queued and are drained
+		// when its in-flight send settles (see the finally below).
 		//
-		// Batches of one partition that queued up behind an in-flight send are merged into a
-		// single batch (in order, up to maxBatchBytes). Every send() call seals its own batch
-		// right away, so without this, concurrent sends to a busy partition would each cost a
-		// round trip; with it, a busy partition batches whatever arrived while it was sending.
-		const picked = new Map<string, PartitionBatch>()
-		// Partitions whose picked batch is complete: a later batch did not fit, so everything
-		// after it must wait as well (merging past it would reorder the partition).
-		const full = new Set<string>()
+		// The batches at the head of a partition's queue are merged into a single batch (in
+		// order, up to maxBatchBytes). Every send() call seals its own batch right away, so
+		// without this, concurrent sends to a busy partition would each cost a round trip;
+		// with it, a busy partition batches whatever arrived while it was sending. Merging
+		// stops at the first batch that does not fit: it and everything after it wait.
+		const picked: string[] = []
+		const toSend: PartitionBatch[] = []
 
-		for (const batch of batches) {
-			const key = `${batch.topic}:${batch.partition}`
-			if (this.mutedPartitions.has(key) || full.has(key)) {
-				this.pendingBatches.push(batch)
-				continue
-			}
-			const first = picked.get(key)
-			if (!first) {
-				picked.set(key, batch)
-			} else if (first.sizeBytes + batch.sizeBytes <= this.config.maxBatchBytes) {
+		for (const [key, queue] of this.pendingBatches) {
+			if (this.mutedPartitions.has(key)) continue
+
+			const first = queue[0]!
+			let taken = 1
+			while (taken < queue.length && first.sizeBytes + queue[taken]!.sizeBytes <= this.config.maxBatchBytes) {
+				const batch = queue[taken]!
 				for (const message of batch.messages) first.messages.push(message)
 				first.sizeBytes += batch.sizeBytes
 				// The merged batch is sent (and accounted for) as part of `first`.
 				this.accumulator.batchCompleted()
-			} else {
-				full.add(key)
-				this.pendingBatches.push(batch)
+				taken++
 			}
+			if (taken === queue.length) {
+				this.pendingBatches.delete(key)
+			} else {
+				queue.splice(0, taken)
+			}
+
+			picked.push(key)
+			toSend.push(first)
 		}
 
-		if (picked.size === 0) return
-
-		const toSend = [...picked.values()]
+		if (toSend.length === 0) return
 
 		// Mute the partitions we are about to send so subsequent drains skip them.
-		for (const key of picked.keys()) {
+		for (const key of picked) {
 			this.mutedPartitions.add(key)
 		}
 
@@ -342,11 +341,11 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		this.inflight.add(promise)
 		promise.finally(() => {
 			this.inflight.delete(promise)
-			for (const key of picked.keys()) {
+			for (const key of picked) {
 				this.mutedPartitions.delete(key)
 			}
-			// Now-unmuted partitions may have deferred batches waiting.
-			if (this.pendingBatches.length > 0) {
+			// Now-unmuted partitions may have batches waiting.
+			if (this.pendingBatches.size > 0) {
 				this.scheduleDrain()
 			}
 		})
@@ -394,7 +393,13 @@ export class Producer extends EventEmitter<ProducerEvents> {
 					// follow the ones being sent now. It must drain before any later batch
 					// already queued for this partition, or per-partition order would break
 					// (the later batch would get a lower sequence than the remainder).
-					this.pendingBatches.unshift(remainingBatch)
+					const key = `${topic}:${partition}`
+					const queue = this.pendingBatches.get(key)
+					if (queue) {
+						queue.unshift(remainingBatch)
+					} else {
+						this.pendingBatches.set(key, [remainingBatch])
+					}
 					// The remainder never went through flushBatch(), but its send will call
 					// batchCompleted() — account for it or the pending counter goes negative.
 					this.accumulator.batchEnqueued()
@@ -725,15 +730,17 @@ export class Producer extends EventEmitter<ProducerEvents> {
 
 	/** Reject every message still queued in pendingBatches (split remainders) and clear the queue. */
 	private rejectAndClearPendingBatches(error: Error): void {
-		for (const batch of this.pendingBatches) {
-			for (const msg of batch.messages) {
-				msg.reject(error)
+		for (const queue of this.pendingBatches.values()) {
+			for (const batch of queue) {
+				for (const msg of batch.messages) {
+					msg.reject(error)
+				}
+				// Every queued batch holds a pendingBatches count (flushBatch or batchEnqueued)
+				// and will never reach batchCompleted() — settle the accounting here.
+				this.accumulator.batchCompleted()
 			}
-			// Every queued batch holds a pendingBatches count (flushBatch or batchEnqueued)
-			// and will never reach batchCompleted() — settle the accounting here.
-			this.accumulator.batchCompleted()
 		}
-		this.pendingBatches = []
+		this.pendingBatches.clear()
 	}
 
 	/**
