@@ -49,6 +49,10 @@ Keep only matching entries:
 usersTable.filter((key, user) => user.isActive)
 ```
 
+When a row stops matching (for example the user becomes inactive), `filter()` emits a **tombstone** for that key, so downstream tables and aggregations drop the row. The function is never called for tombstones. Likewise, `mapValues()` never calls your function for a tombstone: a deletion stays a deletion.
+
+The results of `filter()` and `mapValues()` are not materialized, so they cannot be used as the lookup side of a join. See [Known Limitations](/flow/fault-tolerance#known-limitations).
+
 ### filterNot
 
 Remove matching entries:
@@ -77,11 +81,17 @@ stream.mapValues(user => ({ event: 'user_updated', user })).to(userEventsTopic)
 Group table by a new key:
 
 ```typescript
-const byCountry = usersTable.groupBy((key, user) => user.country)
+const byCountry = usersTable.groupBy((key, user) => [user.country, user], { key: string() })
 // Returns KGroupedTable
 ```
 
+::: warning
+`KTable.groupBy()` aggregations keep app-wide (not partitioned) state. They are only correct with a single application instance and `numStreamThreads: 1`. See [Known Limitations](/flow/fault-tolerance#known-limitations).
+:::
+
 ## Joins
+
+Both tables of a table-table join must be [co-partitioned](/flow/state-stores#co-partitioning): same partition count and same partitioning of keys. Otherwise `start()` throws `CoPartitioningError`. Tables created with `app.table()`, and tables from `count()`, `reduce()` and `aggregate()`, can be joined.
 
 ### join (inner join)
 
@@ -120,7 +130,12 @@ const merged = table1.outerJoin(table2, (left, right) => ({
 
 ## Global Tables
 
-Global tables are fully replicated to all application instances, useful for small lookup tables:
+A global table is fully replicated to every application instance. Unlike `app.table()`, it is not read through the consumer group:
+
+- every instance reads **all partitions** of the topic itself
+- the table is **fully loaded before processing starts**, then kept up to date by following the topic
+- no changelog is written, because the topic is the source of truth
+- there is no co-partitioning requirement, so the stream and the topic can have different partition counts
 
 ```typescript
 // Define a config topic
@@ -132,7 +147,7 @@ const configTopic = topic('app-config', {
 // Create global table
 const configTable = app.globalTable(configTopic)
 
-// Use in joins - available on all partitions
+// Use as the lookup side of a stream join
 app.stream(eventsTopic)
 	.join(configTable, (event, config) => ({
 		...event,
@@ -141,11 +156,16 @@ app.stream(eventsTopic)
 	.to(enrichedEventsTopic)
 ```
 
+A global table can **only** be used as the lookup side of a stream join (`join()` or `leftJoin()`). Any other operation (`toStream()`, `mapValues()`, `filter()`, `groupBy()`, table-table joins) throws.
+
+The topic must exist when the app starts. If loading the table makes no progress for `changelog.restoration.idleTimeoutMs` (default 30 seconds), `start()` fails.
+
 ::: tip When to Use Global Tables
 
 - Small, slowly-changing data (config, reference data)
 - Data needed for every partition
 - Lookup tables for enrichment
+- Joining topics that are not co-partitioned
   :::
 
 ## Example: User Enrichment
@@ -182,7 +202,7 @@ const usersTable = app.table<string, User>(usersTopic)
 app.stream<string, Order>(ordersTopic)
 	// Rekey by userId for join
 	.selectKey((_, order) => order.userId)
-	// Join with users
+	// Join with users. The re-keyed stream is repartitioned first, which needs the key codec
 	.join(
 		usersTable,
 		(order, user) =>
@@ -194,7 +214,8 @@ app.stream<string, Order>(ordersTopic)
 				items: order.items,
 				total: order.total,
 				discount: user.tier === 'premium' ? order.total * 0.1 : 0,
-			}) as EnrichedOrder
+			}) as EnrichedOrder,
+		{ key: string() }
 	)
 	.to(enrichedOrdersTopic)
 ```

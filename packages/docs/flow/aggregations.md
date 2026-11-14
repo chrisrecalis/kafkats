@@ -10,9 +10,13 @@ Before aggregating, group records by key:
 // Group by existing key
 const grouped = stream.groupByKey()
 
-// Group by computed key
-const grouped = stream.groupBy((key, value) => value.category)
+// Group by computed key (needs a key codec, and repartitions through an internal topic)
+const grouped = stream.groupBy((key, value) => value.category, { key: string(), name: 'by-category' })
 ```
+
+State is kept per partition, so all records of a key must be processed in one partition. `groupBy()` always writes the records through an internal topic named `<applicationId>-<name>-repartition`, and `groupByKey()` does the same after `selectKey()` or `map()`. Use `name` to give the topic a stable name. See [Repartitioning](/flow/streams#repartitioning).
+
+Aggregation results are `KTable`s that can be joined with streams and with other tables.
 
 ## Count
 
@@ -46,6 +50,8 @@ The reducer receives:
 - Current value
 - Returns new aggregated value
 
+For session windows, existing sessions are merged in time order, and the reducer is always called as `(aggregate, value)`, so it also works for reducers that are not commutative.
+
 ## Aggregate
 
 Custom aggregation with initializer:
@@ -74,7 +80,11 @@ const stats = stream.groupByKey().aggregate<Stats>(
 
 ## Table Aggregations
 
-KGroupedTable has different aggregation semantics:
+KGroupedTable has different aggregation semantics.
+
+::: warning
+`KTable.groupBy()` aggregations keep app-wide (not partitioned) state. They are only correct with a single application instance and `numStreamThreads: 1`. See [Known Limitations](/flow/fault-tolerance#known-limitations).
+:::
 
 ```typescript
 const grouped = table.groupBy((key, value) => value.category)
@@ -103,6 +113,10 @@ const store = app.getStore<string, number>('my-counts-store')
 const count = await store.get('some-key')
 ```
 
+## Delivery Guarantees
+
+With the default `at_least_once`, a record can be processed again after a crash, so counts and sums can over-count. Use `processingGuarantee: 'exactly_once'` when that is not acceptable. See [Fault Tolerance](/flow/fault-tolerance).
+
 ## Converting Results
 
 Aggregations return KTable. Convert to stream for output:
@@ -130,8 +144,7 @@ interface PageStats {
 }
 
 app.stream<string, PageView>(pageViewsTopic)
-	.selectKey((_, v) => v.page)
-	.groupByKey()
+	.groupBy((_, v) => v.page, { key: string(), name: 'page-views-by-page' })
 	.windowedBy(TimeWindows.of('15m'))
 	.aggregate<{ views: number; users: string[]; totalDuration: number }>(
 		() => ({ views: 0, users: [], totalDuration: 0 }),

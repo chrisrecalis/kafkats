@@ -39,9 +39,13 @@ await app.start()
 lmdb({
 	stateDir: './state', // Directory for state files
 	mapSize: 1024 ** 3, // Max database size (default: 1GB)
-	maxDbs: 100, // Max number of stores (default: 100)
+	maxDbs: 4096, // Max number of named databases (default: 4096)
 })
 ```
+
+State is partitioned, so each partition of a store is its own LMDB database named `<storeName>.p<partition>`. Size `maxDbs` for the number of stores times the number of partitions.
+
+An app that uses an LMDB provider cannot be `start()`ed again after `close()`: create a new provider and a new app.
 
 ## Documentation
 

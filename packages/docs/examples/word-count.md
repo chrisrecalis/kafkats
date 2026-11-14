@@ -45,8 +45,8 @@ async function main() {
 		// Rekey by word
 		.selectKey((_, word) => word)
 
-		// Group by word
-		.groupByKey()
+		// Group by word (re-keyed streams are repartitioned, which needs codecs)
+		.groupByKey({ key: string(), value: string(), name: 'words' })
 
 		// Count in 1-minute windows
 		.windowedBy(TimeWindows.of('1m'))
@@ -172,7 +172,7 @@ Count all time:
 app.stream(lines)
 	.flatMapValues(line => line.toLowerCase().split(/\s+/))
 	.selectKey((_, word) => word)
-	.groupByKey()
+	.groupByKey({ key: string(), value: string(), name: 'words' })
 	.count() // No windowing
 	.toStream()
 	.to(wordCounts)

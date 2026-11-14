@@ -22,12 +22,15 @@ Many operations accept an `options` object. These are the common ones:
 | `value` | `Codec<V>` | Encode values |
 | `partitioner` | `(key: K   | null, value: V, partitionCount: number) => number` | Choose a partition for produced records |
 
+Records written with `to()` or `through()` keep the timestamp of the input record.
+
 ### Grouped (for `groupBy(...)`, `groupByKey(...)`)
 
-| Option  | Type       | Description                               |
-| ------- | ---------- | ----------------------------------------- |
-| `key`   | `Codec<K>` | Key codec for grouping / repartitioning   |
-| `value` | `Codec<V>` | Value codec for grouping / repartitioning |
+| Option  | Type       | Description                                                                               |
+| ------- | ---------- | ----------------------------------------------------------------------------------------- |
+| `key`   | `Codec<K>` | Key codec for grouping / repartitioning (required for `groupBy()`)                        |
+| `value` | `Codec<V>` | Value codec for grouping / repartitioning                                                 |
+| `name`  | `string`   | Name of the internal repartition topic, `<applicationId>-<name>-repartition`. Recommended |
 
 ### Materialized (for `toTable(...)` and stateful ops)
 
@@ -79,6 +82,8 @@ Change the key:
 ```typescript
 stream.selectKey((key, value) => value.userId)
 ```
+
+`selectKey()` and `map()` mark the stream as re-keyed. If it is followed by `groupByKey()`, a join or `toTable()`, it is [repartitioned](/flow/streams#repartitioning) through an internal topic, which needs key and value codecs.
 
 ### filter
 
@@ -140,10 +145,11 @@ const grouped = stream.groupByKey()
 Group by computed key:
 
 ```typescript
-const grouped = stream.groupBy((key, value) => value.category)
-
-// With options
-const grouped = stream.groupBy((key, value) => value.category, { key: string() })
+// The new key needs a codec. Records are repartitioned through an internal topic
+const grouped = stream.groupBy((key, value) => value.category, {
+	key: string(),
+	name: 'by-category', // stable topic name: <applicationId>-by-category-repartition
+})
 ```
 
 ## Aggregation Operations
@@ -206,6 +212,8 @@ grouped.sessionWindowedBy(SessionWindows.withInactivityGap('30m'))
 ```
 
 ## Join Operations
+
+The inputs of a join must be [co-partitioned](/flow/state-stores#co-partitioning), otherwise `start()` throws `CoPartitioningError`. A [global table](/flow/tables#global-tables) can be joined from a stream without that requirement.
 
 ### join (inner)
 
@@ -293,7 +301,7 @@ stream.to(outputTopic, { partitioner: customPartitioner })
 
 ### through
 
-Write and continue processing:
+Write to a topic and continue from what is read back from it. It is a real repartition point, and the topic must already exist:
 
 ```typescript
 stream
@@ -329,7 +337,7 @@ app.stream(inputTopic)
 	.filter((_, v) => v.valid)
 	.mapValues(v => transform(v))
 	.selectKey((_, v) => v.userId)
-	.groupByKey()
+	.groupByKey({ key: string(), value: json<Valid>(), name: 'valid-by-user' })
 	.windowedBy(TimeWindows.of('1h'))
 	.count()
 	.toStream()
@@ -342,15 +350,15 @@ app.stream(inputTopic)
 
 ## Operation Categories
 
-| Category    | Operations                         | State Required |
-| ----------- | ---------------------------------- | -------------- |
-| Transform   | map, mapValues, selectKey, flatMap | No             |
-| Filter      | filter, filterNot                  | No             |
-| Side Effect | peek                               | No             |
-| Group       | groupByKey, groupBy                | No             |
-| Aggregate   | count, reduce, aggregate           | Yes            |
-| Window      | windowedBy, sessionWindowedBy      | Yes            |
-| Join        | join, leftJoin, outerJoin          | Yes            |
-| Branch      | branch, merge                      | No             |
-| Output      | to, through                        | No             |
-| Convert     | toTable, toStream                  | Maybe          |
+| Category    | Operations                         | State Required                               |
+| ----------- | ---------------------------------- | -------------------------------------------- |
+| Transform   | map, mapValues, selectKey, flatMap | No                                           |
+| Filter      | filter, filterNot                  | No                                           |
+| Side Effect | peek                               | No                                           |
+| Group       | groupByKey, groupBy                | Repartition topic after a re-key / `groupBy` |
+| Aggregate   | count, reduce, aggregate           | Yes                                          |
+| Window      | windowedBy, sessionWindowedBy      | Yes                                          |
+| Join        | join, leftJoin, outerJoin          | Yes                                          |
+| Branch      | branch, merge                      | No                                           |
+| Output      | to, through                        | No                                           |
+| Convert     | toTable, toStream                  | Maybe                                        |

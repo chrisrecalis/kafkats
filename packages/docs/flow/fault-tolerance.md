@@ -1,0 +1,142 @@
+# Fault Tolerance
+
+This page covers what Flow guarantees when things fail: processing guarantees, how failures are handled, how state is restored, and the known limitations.
+
+## Processing Guarantees
+
+Set `processingGuarantee` in the app config:
+
+```typescript
+const app = flow({
+	applicationId: 'my-app',
+	client: { brokers: ['localhost:9092'] },
+	processingGuarantee: 'exactly_once', // or 'at_least_once' (default)
+	commitIntervalMs: 100, // exactly_once only
+})
+```
+
+### At-Least-Once (default)
+
+No record is lost. After a crash or a redelivery, records since the last committed offset are processed again, so their **outputs and state updates may be applied again**. A `count()` can over-count, and a record can be written to the output topic twice.
+
+### Exactly-Once
+
+Input offsets, output records and changelog records are committed atomically in a single Kafka transaction. Transactions are committed every `commitIntervalMs` (default `100`), when the app closes, and before a rebalance.
+
+State store writes are **buffered while the transaction is open** and applied to the local store only after the commit succeeds. An aborted transaction, or a crash at any point, never leaves uncommitted updates in a store. This includes persistent LMDB stores.
+
+Read the output topics with `isolationLevel: 'read_committed'`, otherwise consumers see records from transactions that are later aborted:
+
+```typescript
+const consumer = client.consumer({
+	groupId: 'downstream',
+	isolationLevel: 'read_committed',
+})
+```
+
+Flow's own consumers use `read_committed` automatically when `processingGuarantee` is `exactly_once`.
+
+## Failure Handling
+
+A worker (one per `numStreamThreads`) that hits a failure **never continues past it**. It stops consuming, so nothing after the last committed offset is acknowledged. What happens next depends on the kind of failure.
+
+| Failure                                                                                        | What happens                                                                                                           |
+| ---------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| **Recoverable**: broker or network errors, failed commits, lost sessions, restore failures     | The worker aborts its transaction, drops buffered state, rejoins the group and resumes from the last committed offsets |
+| **Not retried**: errors thrown by your code (mappers, aggregators, codecs), fatal Kafka errors | `state()` becomes `'ERROR'` and the worker stays stopped                                                               |
+
+Fatal Kafka errors are: fenced producer or instance, authorization failures, unsupported version, invalid session timeout or config, inconsistent group protocol, and message too large.
+
+Recoverable failures are retried with exponential backoff, starting at 0.5 seconds and capped at 30 seconds. The backoff resets once the worker has processed records again. Set `restartOnError: false` to disable restarts, so every failure puts the app in `'ERROR'`:
+
+```typescript
+const app = flow({
+	applicationId: 'my-app',
+	client: { brokers: ['localhost:9092'] },
+	restartOnError: false,
+})
+```
+
+When the app is in `'ERROR'`, `app.getError()` returns the error. The records that were not committed are processed again after you restart the app:
+
+```typescript
+await app.start()
+
+setInterval(() => {
+	if (app.state() === 'ERROR') {
+		console.error('Flow failed', app.getError())
+		process.exit(1) // let your supervisor restart the process
+	}
+}, 1000)
+```
+
+If a failure happens during `start()`, `start()` rejects, the state is `'ERROR'`, and `start()` can be called again.
+
+::: tip
+`getError()` returns the most recent error the app observed. It can also be set by transient errors the app recovered from, so check `state()` to find out whether the app has failed.
+:::
+
+### Application States
+
+| State         | Meaning                                                                                                                                      |
+| ------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CREATED`     | Created, `start()` not called yet                                                                                                            |
+| `RUNNING`     | Started and processing                                                                                                                       |
+| `REBALANCING` | A rebalance is in progress, or a worker is waiting to restart after a recoverable failure. Returns to `RUNNING` once partitions are assigned |
+| `ERROR`       | A worker stopped on an error that is not retried (or `restartOnError` is `false`), or `start()` failed. Check `getError()`                   |
+| `STOPPED`     | `close()` completed                                                                                                                          |
+
+## State Restoration
+
+On every assignment, the newly assigned partitions are **paused**, their state is restored from the changelog, and then they resume. No record is processed against state that has not been restored.
+
+- State partition `N` is restored from changelog partition `N` (see [Partitioned State](/flow/state-stores#partitioned-state)).
+- A restore that makes no progress for `changelog.restoration.idleTimeoutMs` (default `30000`) **fails**. It never completes with partial state. During `start()` the failure rejects `start()`; afterwards it is a recoverable failure and the worker restarts.
+- `start()` resolves once the partitions assigned at startup are restored.
+
+```typescript
+const app = flow({
+	applicationId: 'my-app',
+	client: { brokers: ['localhost:9092'] },
+	changelog: {
+		restoration: {
+			idleTimeoutMs: 60_000, // give slow brokers more time
+		},
+	},
+})
+```
+
+### Checkpoints
+
+Providers with durable state (LMDB) keep a checkpoint per changelog partition, so a restart restores only what is missing instead of replaying the whole changelog. A checkpoint is ignored, and the store is wiped and rebuilt from the start of the changelog, when:
+
+- it is outside the changelog's offset range (for example the topic was recreated or truncated by retention), or
+- the local store is empty although the checkpoint claims progress (for example the state directory was replaced).
+
+In-memory state is caught up from in-process checkpoints after a rebalance, so a partition that comes straight back is not rebuilt from scratch. A partition that moved to another instance is dropped about 30 seconds later, because the other instance now advances it.
+
+### Global Tables
+
+A [global table](/flow/tables#global-tables) is fully loaded before any record is processed, and is rebuilt from its topic on every start (it has no changelog). If it makes no progress for `idleTimeoutMs` while loading, `start()` fails.
+
+## Upgrading From Earlier Versions
+
+- **Stop all instances before upgrading.** Consumers now always use the `range` partition assignor (required for [co-partitioning](/flow/state-stores#co-partitioning)), which changes the group protocol, so old and new instances cannot be in the same group at the same time. A rolling upgrade does not work.
+- **Windowed stores, session stores and join buffers restart from empty.** Earlier versions did not write them partition-aligned, so their state cannot be reused. In-flight windows and joins start again after the upgrade.
+- **Key-value state is restored normally.** State from inputs that used the default partitioner is rebuilt from the changelog into the new per-partition stores.
+- **LMDB:** stores are now named `<storeName>.p<partition>`. The old unpartitioned databases stay in the file until you delete the state directory, and count towards `maxDbs`. Deleting it is safe, as state is rebuilt from the changelog.
+- Topologies that re-key a stream (`selectKey()`, `map()`, `groupBy()`) before a stateful operation now write through [internal repartition topics](/flow/streams#repartitioning), and inputs to a stateful operation must be co-partitioned. See [Co-partitioning](/flow/state-stores#co-partitioning).
+- `through()` now reads the topic back. The topic must exist.
+
+## Known Limitations
+
+- **`KTable.groupBy()` aggregations** keep app-wide (not partitioned) state. They are only correct with a single application instance and `numStreamThreads: 1`.
+- **Stream-stream `leftJoin()` and `outerJoin()` emit the unmatched result eagerly.** When a later record matches, a second record is emitted for the same input.
+- **Derived tables are not materialized.** The result of `filter()` or `mapValues()` on a table, a table-table join, or a windowed aggregation has no state store of its own and cannot be the lookup side of a join. Join the table it was derived from instead, or write it to a topic and read it back with `app.table()`. Tables from `count()`, `reduce()` and `aggregate()` can be joined.
+- **LMDB:** an app cannot be `start()`ed again after `close()`, because `close()` closes the provider. Create a new provider and a new app instead.
+
+## Next Steps
+
+- [State Stores](/flow/state-stores) - Partitioned state, changelogs and LMDB
+- [Joins](/flow/joins) - Co-partitioning requirements
+- [Testing](/flow/testing) - Test topologies without a broker

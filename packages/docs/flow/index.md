@@ -6,6 +6,7 @@ Kafka Streams-like flow APIs for building stream processing applications in Type
 
 - **Kafka Streams DSL** - Familiar APIs: KStream, KTable, windowing, joins
 - **Exactly-Once Semantics** - Transactional processing with batch commits
+- **Fault Tolerant** - Partitioned, changelog-backed state; workers restart after recoverable failures
 - **Type-Safe** - Full TypeScript support with strong typing
 - **Pluggable State** - In-memory and LMDB state stores
 - **Windowing** - Time, session, and sliding windows
@@ -121,3 +122,4 @@ app.stream(clicks).groupByKey().windowedBy(TimeWindows.of('5m')).count()
 - [KTable](/flow/tables) - Table operations
 - [Windowing](/flow/windowing) - Time-based processing
 - [State Stores](/flow/state-stores) - Stateful processing
+- [Fault Tolerance](/flow/fault-tolerance) - Processing guarantees and failure handling

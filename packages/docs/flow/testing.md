@@ -38,6 +38,42 @@ await driver.run(async ({ send, output }) => {
 })
 ```
 
+### Topics the topology also reads
+
+When a topology writes to a topic that it also reads, `TestDriver` feeds the record back into the topology automatically, like a real consumer would. This covers `through()` and the internal repartition topics created by `groupBy()` or by `selectKey()` followed by `groupByKey()`, a join or `toTable()`. The record is delivered once the current record has been processed, with its key, partition, timestamp and headers.
+
+```typescript
+driver
+	.input('orders', { key: string(), value: json<Order>() })
+	.groupBy((_, order) => order.userId, { key: string(), name: 'orders-by-user' })
+	.count()
+	.toStream()
+	.peek(results.collector())
+
+await driver.run(async ({ send }) => {
+	await send('orders', { userId: 'u1', total: 10 }, { key: Buffer.from('o1') })
+
+	// The record went through the repartition topic and was counted
+	expect(results.last?.value).toBe(1)
+})
+```
+
+### Timestamps and headers
+
+`MockProducer` records the `timestamp` and `headers` of every message it receives, next to `topic`, `key`, `value` and `partition`, so you can assert on them. Records written with `to()` or `through()` keep the input record's timestamp:
+
+```typescript
+driver.input('in').to('out')
+
+await driver.run(async ({ send, producer }) => {
+	await send('in', Buffer.from('v'), { timestamp: 1000n, headers: { 'trace-id': Buffer.from('abc') } })
+
+	const [message] = producer.messagesFor('out')
+	expect(message.timestamp).toBe(1000n)
+	expect(message.headers).toEqual({ 'trace-id': Buffer.from('abc') })
+})
+```
+
 ## ResultCollector
 
 Capture stream output without writing to a topic:

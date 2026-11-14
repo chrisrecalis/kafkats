@@ -14,12 +14,21 @@ pnpm typecheck  # Type checking
 
 ```
 src/
-├── flow.ts     # Core streaming DSL (KStream, KTable, windowing)
-├── codec.ts    # Serialization codecs (string, json, buffer)
-├── state.ts    # State store interfaces
+├── flow.ts        # FlowApp runtime: workers, topology validation, restoration, transactions, global tables
+├── types.ts       # Public types (FlowApp, KStream, KTable, FlowConfig, ...)
+├── changelog.ts   # Changelog config, writer/restorer, error classes (incl. CoPartitioningError)
+├── codec.ts       # Serialization codecs (string, json, buffer)
+├── state.ts       # State store interfaces
 ├── state/
-│   └── memory.ts  # In-memory state store implementation
-└── index.ts    # Public exports
+│   ├── memory.ts       # In-memory state store implementation
+│   ├── partitioned.ts  # Per-partition slices of a store (<storeName>.p<partition>)
+│   ├── buffered.ts     # Transactional write buffer (exactly_once)
+│   └── changelog.ts    # Changelog-backed store wrappers
+├── streams/       # KStream / KTable / grouped stream implementations
+├── processors/    # Processor nodes (aggregations, joins, table nodes)
+├── runtime/       # Record context (worker + source partition) via AsyncLocalStorage
+├── testing.ts     # TestDriver, MockProducer/MockConsumer
+└── index.ts       # Public exports
 ```
 
 ### Key Abstractions
@@ -28,7 +37,21 @@ src/
 - **KStream**: Unbounded stream of key-value records
 - **KTable**: Changelog stream representing a table
 - **KGroupedStream**: Stream grouped by key for aggregations
-- **Windowing**: TimeWindows, SessionWindows, SlidingWindows
+- **Windowing**: TimeWindows, SessionWindows (SlidingWindows is not implemented and throws)
+
+### Runtime Model
+
+- **Partitioned state**: every source partition has its own slice of every state store. State partition N is logged to changelog partition N and restored from it. Provider-level store names are `<storeName>.p<partition>` (default LMDB `maxDbs` is 4096 for that reason).
+- **Co-partitioning**: all topics feeding one stateful operation must have the same partition count, otherwise `start()` throws `CoPartitioningError`. Consumers always use the `range` assignor so partition N of every co-partitioned topic lands on the same worker.
+- **Repartitioning**: `groupBy()`, and `selectKey()`/`map()` followed by `groupByKey()`, a join or `toTable()`, write through an internal topic `<applicationId>-<name | repartition-N>-repartition` and read it back. `through(topic)` does the same with a user topic. Both are read from the beginning when the group has no committed offset. Needs key and value codecs.
+- **Global tables**: `globalTable()` is read in full by every instance outside the consumer group, loaded before processing starts, has no changelog and is only usable as the lookup side of a stream join.
+- **Exactly-once**: offsets, outputs and changelog records commit in one transaction. Store writes are buffered (`state/buffered.ts`) and applied only after the commit; an abort or crash never leaves uncommitted updates in a store.
+- **Fail-stop workers**: a worker that fails never continues past the failure. Recoverable failures (Kafka/infrastructure errors) abort the transaction, drop buffered state, rejoin and resume from committed offsets with backoff (0.5s to 30s), unless `restartOnError: false`. User-code errors and fatal Kafka errors set `state()` to `'ERROR'`; see `app.getError()`.
+- **Restoration**: newly assigned partitions are paused, restored from the changelog, then resumed. A restore with no progress for `changelog.restoration.idleTimeoutMs` (default 30000) fails. Checkpoints are ignored (wipe + rebuild) when outside the changelog offset range or when the local store is empty.
+- **Stream time** is tracked per source partition (late-record dropping, window expiry).
+- **Known limitations**: `KTable.groupBy()` state is app-wide (single instance, `numStreamThreads: 1` only); stream-stream left/outer joins emit the unmatched result eagerly; derived tables (`filter`/`mapValues`/joins/windowed results) are not materialized and cannot be a join lookup side; an LMDB-backed app cannot be restarted after `close()`.
+
+User-facing documentation: `packages/docs/flow/fault-tolerance.md`.
 
 ### Codecs
 
@@ -109,7 +132,7 @@ Changelog topics are automatically created with the same partition count as sour
 app.stream('orders', { key: codec.string(), value: codec.json<Order>() }).groupByKey().count()
 ```
 
-For merged streams, uses the maximum partition count from all sources.
+Topics that feed the same stateful operation (merged streams, join sides) must have the same partition count; a mismatch throws `CoPartitioningError` from `start()`. Repartition topics are created with the largest partition count of the topics feeding them.
 
 ### Configuration
 
@@ -146,7 +169,8 @@ stream.groupByKey().count({
 ### Key Files
 
 - `src/changelog.ts` - ChangelogConfig, error classes, ChangelogWriter/Restorer
-- `src/flow.ts` - validateAndCreateChangelogTopics(), source topic tracking
+- `src/flow.ts` - validateAndCreateInternalTopics(), restoration, worker lifecycle, source topic tracking
+- `src/state/partitioned.ts`, `src/state/buffered.ts` - per-partition stores and the transactional write buffer
 
 ## Testing Infrastructure
 
@@ -201,6 +225,8 @@ await driver.run(async ({ send }) => {
 
 ### Utilities
 
+- **Loopback**: records written to a topic the topology also reads (`through()`, repartition topics) are fed back into the topology automatically
+- **MockProducer** records `timestamp` and `headers` of produced messages
 - **testRecord(topic, key, value, options?)**: Create a test record for processor testing
 - **testRecordSequence(topic, items, options?)**: Create a sequence of records with incrementing timestamps
 - **createFactory(generator)**: Create test data factories

@@ -58,7 +58,13 @@ Sessions:
 - Extend with each new event
 - Close after inactivity gap elapses
 
+When a record bridges several sessions, they are merged in time order. `reduce()` always calls the reducer as `(aggregate, value)`. `aggregate()` on session windows needs a `merger` option that combines the aggregates of two sessions when they merge: `aggregate(init, agg, { value, merger: (a, b) => ... })`.
+
 ## Sliding Windows
+
+::: warning
+`SlidingWindows` is not implemented yet. `windowedBy(SlidingWindows.of(...))` throws. Use hopping `TimeWindows` (`TimeWindows.of(size).advanceBy(advance)`) instead.
+:::
 
 Continuous, overlapping windows:
 
@@ -91,6 +97,17 @@ windowed.aggregate(
 	})
 )
 ```
+
+## Stream Time and Late Records
+
+Windows are driven by event time, not wall-clock time. **Stream time is tracked per source partition**: it is the highest record timestamp seen on that partition. Partitions progress independently, so a partition that is far ahead does not make in-order records on another partition late.
+
+Stream time is used to:
+
+- **Drop late records**: a record is dropped when its window (or session) is already past retention, which is 24 times the window size (or session gap) behind stream time. A record for a window that is still retained is applied normally, and a late session record that can merge into a live session is kept.
+- **Expire old windows**: windows and sessions past retention are removed from the store.
+
+Windowed state is partitioned like all other state, see [Partitioned State](/flow/state-stores#partitioned-state).
 
 ## Windowed Keys
 

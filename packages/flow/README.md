@@ -9,7 +9,8 @@ Kafka Streams-like DSL for stream processing in TypeScript.
 - **Aggregations** — groupByKey, count, aggregate, reduce
 - **Windowing** — Tumbling, hopping, sliding, and session windows
 - **Joins** — Stream-stream and stream-table joins
-- **State Stores** — Pluggable state with in-memory default
+- **State Stores** — Pluggable state with in-memory default, partitioned per source partition
+- **Fault tolerance** — At-least-once or exactly-once processing, changelog restoration, workers that restart after recoverable failures
 - **Testing** — Built-in TestDriver for unit testing topologies
 
 ## Installation
@@ -35,6 +36,12 @@ app.stream('input-topic')
 
 await app.start()
 ```
+
+### Partitioning and failures
+
+State is kept per source partition, so topics that feed one stateful operation must have the same partition count (otherwise `start()` throws `CoPartitioningError`). Re-keyed streams are repartitioned through an internal topic before aggregations and joins; pass key and value codecs and a stable `name` in `groupBy(fn, { key, value, name })`.
+
+A worker that hits a failure never continues past it. Recoverable failures restart the worker from the last committed offsets (disable with `restartOnError: false`); errors thrown by your code and fatal Kafka errors set `app.state()` to `'ERROR'`, and `app.getError()` returns the error. See the [fault tolerance guide](https://chrisrecalis.github.io/kafkats/flow/fault-tolerance).
 
 ### Testing
 
