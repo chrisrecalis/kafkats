@@ -271,6 +271,61 @@ describe('changelog restorer', () => {
 		expect(await store.get('a')).toBe(1)
 		expect(await store.get('ghost')).toBeUndefined()
 	}, 30_000)
+
+	it('applies the last change of every key when a key changes several times within one fetched batch', async () => {
+		const topic = uniqueTopicName('restore-batch-order')
+		await createTopics(client, [{ name: topic }])
+		const put = (key: string, value: number) => ({ key, value: numberCodec.encode(value) })
+		const del = (key: string) => ({ key, value: null })
+		// One send: the restore consumer receives all of it in one batch.
+		await producer.send(topic, [
+			put('a', 1),
+			put('b', 1),
+			del('a'),
+			put('b', 2),
+			put('a', 3),
+			put('c', 1),
+			del('c'),
+			put('d', 1),
+			put('b', 4),
+		])
+
+		const store = await newKvStore('batch-order')
+		await store.put('d', 99) // stale local state: wiped, then rebuilt from the changelog
+		const restorer = new ChangelogRestorer(topic, stringCodec, numberCodec, store)
+		const restored = await restorer.restore(client, RESTORE_FAST, [0], new MemoryCheckpointStore())
+
+		expect(restored).toBe(7) // every non-deleting record counts, also the overwritten ones
+		expect(await store.get('a')).toBe(3)
+		expect(await store.get('b')).toBe(4)
+		expect(await store.get('c')).toBeUndefined()
+		expect(await store.get('d')).toBe(1)
+	}, 30_000)
+
+	it('does not apply records written after the restore started', async () => {
+		const topic = uniqueTopicName('restore-past-end')
+		await createTopics(client, [{ name: topic }])
+		await producer.send(topic, [
+			{ key: 'a', value: numberCodec.encode(1) },
+			{ key: 'b', value: numberCodec.encode(1) },
+		])
+
+		const inner = await newKvStore('past-end')
+		const hooks = { armed: true, delayMs: 1_500 }
+		const restorer = new ChangelogRestorer(topic, stringCodec, numberCodec, delayPuts(inner, blockNextPut(hooks)))
+		const restoring = restorer.restore(client, RESTORE_FAST, [0], new MemoryCheckpointStore())
+		// While the first write is held, a concurrent writer appends past the captured end offset.
+		await waitUntil('first restore write held', () => !hooks.armed)
+		await producer.send(topic, [
+			{ key: 'a', value: numberCodec.encode(2) },
+			{ key: 'c', value: numberCodec.encode(2) },
+		])
+		await restoring
+
+		expect(await inner.get('a')).toBe(1)
+		expect(await inner.get('b')).toBe(1)
+		expect(await inner.get('c')).toBeUndefined()
+	}, 30_000)
 })
 
 describe('restart cycles with a persistent store and checkpoint store', () => {

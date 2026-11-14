@@ -70,7 +70,7 @@ export class ChangelogRestorer<K, V> {
 		const toReplay = starts.filter(s => s.from < s.end)
 		const restored =
 			toReplay.length > 0
-				? await new Replay(client, admin, this.topicName, options, toReplay, this.applyRecord).run()
+				? await new Replay(client, admin, this.topicName, options, toReplay, this.applyChanges).run()
 				: 0
 
 		if (checkpointStore) {
@@ -141,15 +141,23 @@ export class ChangelogRestorer<K, V> {
 		}
 	}
 
-	/** Phase 3 (per record): write one changelog record into the raw store. */
-	private readonly applyRecord = async (partition: number, key: Buffer, value: Buffer | null): Promise<void> => {
+	/**
+	 * Phase 3 (per consumed batch): write the changes of one batch into the raw store. They are for
+	 * distinct keys, so the writes are issued together (in order) and awaited together; a store that
+	 * commits asynchronously (LMDB) then commits them as one write transaction instead of one per
+	 * record. The next batch is not applied before these writes have completed.
+	 */
+	private readonly applyChanges = async (partition: number, changes: Iterable<Change>): Promise<void> => {
 		const store = await this.storeFor(partition)
-		const decodedKey = this.keyCodec.decode(key)
-		if (value === null) {
-			await store.delete(decodedKey)
-		} else {
-			await store.put(decodedKey, this.valueCodec.decode(value))
+		const write = async ({ key, value }: Change): Promise<void> => {
+			const decodedKey = this.keyCodec.decode(key)
+			if (value === null) {
+				await store.delete(decodedKey)
+			} else {
+				await store.put(decodedKey, this.valueCodec.decode(value))
+			}
 		}
+		await Promise.all(Array.from(changes, write))
 	}
 
 	/** Phase 4: record the end offset as the checkpoint of every partition now caught up. */
@@ -190,6 +198,9 @@ async function isCheckpointTrusted<K, V>(
 	// contain, e.g. the state directory was replaced. Rebuild from the start.
 	return checkpoint === earliest || (await store.approximateNumEntries()) !== 0
 }
+
+/** One changelog record: a key and its new value, or null for a deletion. */
+type Change = { key: Buffer; value: Buffer | null }
 
 type ReplayProgress = {
 	end: bigint
@@ -232,7 +243,7 @@ class Replay {
 		private readonly topicName: string,
 		options: ChangelogRestorationOptions | undefined,
 		partitions: Array<{ partition: number; from: bigint; end: bigint }>,
-		private readonly apply: (partition: number, key: Buffer, value: Buffer | null) => Promise<void>
+		private readonly apply: (partition: number, changes: Iterable<Change>) => Promise<void>
 	) {
 		for (const { partition, from, end } of partitions) {
 			this.progress.set(partition, { end, position: from, fetched: 0, handled: 0 })
@@ -268,7 +279,7 @@ class Replay {
 		this.startedAt = Date.now()
 		const stallCheck = setInterval(() => this.checkForStall(), this.checkIntervalMs)
 		try {
-			await this.consumer.runEach([this.topicName], message => this.handle(message), {
+			await this.consumer.runBatch([this.topicName], messages => this.handle(messages), {
 				commitOffsets: false,
 				assignment: [...this.progress].map(([partition, { position }]) => ({
 					topic: this.topicName,
@@ -285,26 +296,40 @@ class Replay {
 		return this.restored
 	}
 
-	private async handle(message: Message): Promise<void> {
-		const state = this.progress.get(message.partition)
-		if (!state) return
-		this.inFlight += 1
-		try {
+	/** Applies one consumed batch (records of one partition, in offset order). */
+	private async handle(messages: Message[]): Promise<void> {
+		const partition = messages[0]?.partition
+		const state = partition === undefined ? undefined : this.progress.get(partition)
+		if (partition === undefined || !state) return
+
+		// Only the last change of each key decides what the store holds after the batch, so earlier
+		// changes of the same key are skipped. Re-inserting moves the key to the end, so the changes
+		// keep the order of their last occurrence.
+		const latest = new Map<string, Change>()
+		let puts = 0
+		for (const message of messages) {
 			// Records past the captured end offset belong to a concurrent writer; the partition's
 			// owner will have them in its own state.
-			if (message.offset < state.end && message.key !== null) {
-				await this.apply(message.partition, message.key, message.value)
-				if (message.value !== null) this.restored++
-			}
+			if (message.offset >= state.end || message.key === null) continue
+			const id = message.key.toString('latin1')
+			latest.delete(id)
+			latest.set(id, { key: message.key, value: message.value })
+			if (message.value !== null) puts++
+		}
+
+		this.inFlight += 1
+		try {
+			if (latest.size > 0) await this.apply(partition, latest.values())
+			this.restored += puts
 		} catch (err) {
 			this.handlerError = err
 			throw err
 		} finally {
 			this.inFlight -= 1
-			state.handled += 1
+			state.handled += messages.length
 			this.recordProgress()
 		}
-		this.completeIfCaughtUp(message.partition)
+		this.completeIfCaughtUp(partition)
 	}
 
 	private recordProgress(): void {
