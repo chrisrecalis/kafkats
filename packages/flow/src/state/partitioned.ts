@@ -25,7 +25,7 @@ export function partitionStoreName(storeName: string, partition: number): string
  * when the partition is revoked instead of lingering as stale data.
  */
 export class StorePartitions<S, R extends { init(): Promise<void> }> {
-	private readonly stacks = new Map<number, { stack: StoreStack<S, R>; ready: Promise<void> }>()
+	private readonly stacks = new Map<number, { stack: StoreStack<S, R>; ready: Promise<void>; initialized: boolean }>()
 
 	constructor(
 		readonly name: string,
@@ -40,11 +40,27 @@ export class StorePartitions<S, R extends { init(): Promise<void> }> {
 		let entry = this.stacks.get(partition)
 		if (!entry) {
 			const stack = this.factory(partition)
-			entry = { stack, ready: stack.raw.init() }
+			const created = { stack, ready: stack.raw.init(), initialized: false }
+			created.ready.then(
+				() => (created.initialized = true),
+				() => {}
+			)
+			entry = created
 			this.stacks.set(partition, entry)
 		}
 		await entry.ready
 		return entry.stack
+	}
+
+	/**
+	 * The current record's store if its partition is already initialized, else undefined (also
+	 * outside of record processing). Lets the per-record path skip the asynchronous lookup.
+	 */
+	initializedCurrent(): S | undefined {
+		const partition = this.shared ? 0 : recordContextStorage.getStore()?.partition
+		if (partition === undefined) return undefined
+		const entry = this.stacks.get(partition)
+		return entry?.initialized ? entry.stack.store : undefined
 	}
 
 	/** The store for the partition of the record currently being processed. */
@@ -109,7 +125,7 @@ abstract class PartitionedStore<K, V, S extends KeyValueStore<K, V>> implements 
 	}
 
 	async get(key: K): Promise<V | undefined> {
-		const current = await this.partitions.currentOrNull()
+		const current = this.partitions.initializedCurrent() ?? (await this.partitions.currentOrNull())
 		if (current) return current.get(key)
 		for (const store of await this.partitions.allStores()) {
 			const value = await store.get(key)
@@ -119,11 +135,13 @@ abstract class PartitionedStore<K, V, S extends KeyValueStore<K, V>> implements 
 	}
 
 	async put(key: K, value: V): Promise<void> {
-		await (await this.partitions.current()).put(key, value)
+		const current = this.partitions.initializedCurrent() ?? (await this.partitions.current())
+		await current.put(key, value)
 	}
 
 	async delete(key: K): Promise<void> {
-		await (await this.partitions.current()).delete(key)
+		const current = this.partitions.initializedCurrent() ?? (await this.partitions.current())
+		await current.delete(key)
 	}
 
 	all(): AsyncIterable<[K, V]> {
@@ -158,7 +176,7 @@ abstract class PartitionedStore<K, V, S extends KeyValueStore<K, V>> implements 
 
 	/** Scan the current record's partition, or every local partition outside of record processing. */
 	protected async *scan<T>(fn: (store: S) => AsyncIterable<T>): AsyncIterable<T> {
-		const current = await this.partitions.currentOrNull()
+		const current = this.partitions.initializedCurrent() ?? (await this.partitions.currentOrNull())
 		if (current) {
 			yield* fn(current)
 			return
@@ -189,7 +207,8 @@ export class PartitionedWindowStore<K, V>
 
 	async expireOldWindows(currentTime: number): Promise<number> {
 		// Stream time is per partition, so expiry only ever applies to the current partition.
-		return (await this.partitions.current()).expireOldWindows(currentTime)
+		const current = this.partitions.initializedCurrent() ?? (await this.partitions.current())
+		return current.expireOldWindows(currentTime)
 	}
 }
 
@@ -202,11 +221,13 @@ export class PartitionedSessionStore<K, V>
 	}
 
 	async remove(key: K): Promise<void> {
-		await (await this.partitions.current()).remove(key)
+		const current = this.partitions.initializedCurrent() ?? (await this.partitions.current())
+		await current.remove(key)
 	}
 
 	async expireOldSessions(currentTime: number): Promise<WindowedKey<K>[]> {
 		// Stream time is per partition, so expiry only ever applies to the current partition.
-		return (await this.partitions.current()).expireOldSessions(currentTime)
+		const current = this.partitions.initializedCurrent() ?? (await this.partitions.current())
+		return current.expireOldSessions(currentTime)
 	}
 }

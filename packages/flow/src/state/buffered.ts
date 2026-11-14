@@ -9,6 +9,8 @@ import {
 
 type Buffered<SK> = { key: SK; keyBytes: Buffer; value: Buffer | null }
 
+const BUFFERED = Promise.resolve()
+
 /**
  * Write buffer that makes local state transactional under exactly-once processing.
  *
@@ -57,36 +59,34 @@ abstract class BufferedStoreBase<SK, V, S extends KeyValueStore<SK, V>> implemen
 		return this.inner.name
 	}
 
-	async get(key: SK): Promise<V | undefined> {
+	// get/put/delete are not async: they run for every record, and only pass the call through or
+	// touch the in-memory buffer. They are only called through the (async) partitioned facade.
+	get(key: SK): Promise<V | undefined> {
 		const buffer = this.buffer
 		if (buffer && buffer.size > 0) {
 			const hit = buffer.get(this.storeKeyCodec.encode(key).toString('hex'))
 			if (hit) {
-				return hit.value === null ? undefined : this.valueCodec.decode(hit.value)
+				return Promise.resolve(hit.value === null ? undefined : this.valueCodec.decode(hit.value))
 			}
 		}
 		return this.inner.get(key)
 	}
 
-	async put(key: SK, value: V): Promise<void> {
+	put(key: SK, value: V): Promise<void> {
 		const scope = currentTransactionScope()
-		if (!scope) {
-			await this.inner.put(key, value)
-			return
-		}
+		if (!scope) return this.inner.put(key, value)
 		const keyBytes = this.storeKeyCodec.encode(key)
 		// Buffer the serialized value so later in-place mutation of the object can't leak in.
 		this.bufferFor(scope).set(keyBytes.toString('hex'), { key, keyBytes, value: this.valueCodec.encode(value) })
+		return BUFFERED
 	}
 
-	async delete(key: SK): Promise<void> {
+	delete(key: SK): Promise<void> {
 		const scope = currentTransactionScope()
-		if (!scope) {
-			await this.inner.delete(key)
-			return
-		}
+		if (!scope) return this.inner.delete(key)
 		const keyBytes = this.storeKeyCodec.encode(key)
 		this.bufferFor(scope).set(keyBytes.toString('hex'), { key, keyBytes, value: null })
+		return BUFFERED
 	}
 
 	all(): AsyncIterable<[SK, V]> {

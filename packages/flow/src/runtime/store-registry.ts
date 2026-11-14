@@ -305,7 +305,7 @@ export class StoreRegistry implements StoreFactory {
 				return ctx.worker.producer
 			},
 			() => recordContextStorage.getStore()?.worker.activeTransaction ?? null,
-			async result => {
+			result => {
 				// Mocked producers (tests) don't report offsets; nothing to checkpoint then.
 				if (!result || typeof result.offset !== 'bigint') return
 				const worker = recordContextStorage.getStore()?.worker
@@ -314,7 +314,7 @@ export class StoreRegistry implements StoreFactory {
 					worker.pendingCheckpoints.track(result.topic, result.partition, result.offset)
 					return
 				}
-				await this.checkpoints.recordWrite(result.topic, result.partition, result.offset)
+				return this.checkpoints.recordWrite(result.topic, result.partition, result.offset)
 			},
 			// State partition N is logged to changelog partition N (see ChangelogWriter).
 			scope === 'partition' ? () => recordContextStorage.getStore()?.partition : undefined,
