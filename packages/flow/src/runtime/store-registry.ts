@@ -23,10 +23,10 @@ import {
 	partitionStoreName,
 	type StoreStack,
 } from '@/state/partitioned.js'
+import type { SessionStoreOptions, StoreFactory, StoreOptions, WindowStoreOptions } from '@/streams/topology-builder.js'
 import type { FlowConfig } from '@/types.js'
 import { recordContextStorage } from '@/runtime/context.js'
 import type { Checkpoints } from '@/runtime/checkpoints.js'
-import { trackChangelogOffset } from '@/runtime/transactions.js'
 import type { GlobalTableDef, Topology } from '@/runtime/topology.js'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -34,14 +34,16 @@ type AnyStore = KeyValueStore<any, any>
 
 type StoreScope = 'partition' | 'app'
 
+type StoreKind = 'key-value' | 'window' | 'session'
+
 /** A logical state store and how its state is laid out. */
 export type StoreDef = {
 	name: string
+	kind: StoreKind
 	/**
 	 * 'partition': one slice of state per source partition, restored from the changelog partition
-	 * of the same index (the default; safe across instances).
-	 * 'app': a single app-wide store (legacy layout, only for stores whose keys are not
-	 * co-partitioned with their input).
+	 * of the same index (safe across instances).
+	 * 'app': a single app-wide store, for stores without source topics to be co-partitioned with.
 	 */
 	scope: StoreScope
 	partitions: StorePartitions<AnyStore, AnyStore>
@@ -51,12 +53,10 @@ export type StoreDef = {
 
 /** What getOrCreate() needs to know about one kind of store (key-value, window, session). */
 type StoreLayout<S extends AnyStore, KK, V> = {
-	changelog: boolean | ChangelogConfig | undefined
-	sourceTopics: Set<string> | undefined
-	restrictRestorationToSourcePartitions: boolean
+	kind: StoreKind
+	options: StoreOptions<unknown, V>
 	/** Codec of changelog record keys (the windowed key for window and session stores). */
 	changelogKeyCodec: Codec<KK>
-	valueCodec: Codec<V>
 	/** Retention of window and session stores; their changelogs expire records after it. */
 	retentionMs?: number
 	/** Build one partition's stack on top of the provider store called `providerName`. */
@@ -70,8 +70,8 @@ type StoreLayout<S extends AnyStore, KK, V> = {
  * Every logical store is a facade over per-partition stacks: the provider's store, a transactional
  * write buffer on top of it, and changelog logging on top of that.
  */
-export class StoreRegistry {
-	/** Every store by name, as handed to processors. */
+export class StoreRegistry implements StoreFactory {
+	/** Every store by name, as handed to processors (global tables' stores included). */
 	readonly stateStores = new Map<string, KeyValueStore<unknown, unknown>>()
 	private readonly defs = new Map<string, StoreDef>()
 	private readonly specs = new Map<string, ChangelogTopicSpec>()
@@ -80,25 +80,17 @@ export class StoreRegistry {
 
 	constructor(
 		private readonly config: FlowConfig,
-		readonly provider: StateStoreProvider,
+		private readonly provider: StateStoreProvider,
 		private readonly topology: Topology,
 		private readonly checkpoints: Checkpoints
 	) {}
 
-	getOrCreateStore<K, V>(
-		name: string | undefined,
-		keyCodec: Codec<K>,
-		valueCodec: Codec<V>,
-		changelog?: boolean | ChangelogConfig,
-		sourceTopics?: Set<string>,
-		restrictRestorationToSourcePartitions = true
-	): KeyValueStore<K, V> {
-		return this.getOrCreate(name ?? `store-${this.topology.nextStoreId()}`, {
-			changelog,
-			sourceTopics,
-			restrictRestorationToSourcePartitions,
+	getOrCreateKeyValueStore<K, V>(name: string, options: StoreOptions<K, V>): KeyValueStore<K, V> {
+		const { keyCodec, valueCodec } = options
+		return this.getOrCreate(name, {
+			kind: 'key-value',
+			options,
 			changelogKeyCodec: keyCodec,
-			valueCodec,
 			createStack: (providerName, writer) => {
 				const raw = this.provider.createKeyValueStore<K, V>(providerName, { keyCodec, valueCodec })
 				const buffered = new BufferedKeyValueStore<K, V>(raw, keyCodec, valueCodec)
@@ -109,37 +101,22 @@ export class StoreRegistry {
 		})
 	}
 
-	getOrCreateWindowStore<K, V>(
-		name: string | undefined,
-		keyCodec: Codec<K>,
-		valueCodec: Codec<V>,
-		windowOptions: { retentionMs: number; windowSizeMs: number },
-		changelog?: boolean | ChangelogConfig,
-		sourceTopics?: Set<string>,
-		restrictRestorationToSourcePartitions = true
-	): WindowStore<K, V> {
+	getOrCreateWindowStore<K, V>(name: string, options: WindowStoreOptions<K, V>): WindowStore<K, V> {
+		const { keyCodec, valueCodec, retentionMs, windowSizeMs } = options
 		const storeKeyCodec = windowedKeyCodec(keyCodec)
-		return this.getOrCreate(name ?? `window-store-${this.topology.nextStoreId()}`, {
-			changelog,
-			sourceTopics,
-			restrictRestorationToSourcePartitions,
+		return this.getOrCreate(name, {
+			kind: 'window',
+			options,
 			changelogKeyCodec: storeKeyCodec,
-			valueCodec,
-			retentionMs: windowOptions.retentionMs,
+			retentionMs,
 			createStack: (providerName, writer) => {
 				const raw = this.provider.createWindowStore<K, V>(providerName, {
 					keyCodec,
 					valueCodec,
-					retentionMs: windowOptions.retentionMs,
-					windowSizeMs: windowOptions.windowSizeMs,
+					retentionMs,
+					windowSizeMs,
 				})
-				const buffered = new BufferedWindowStore<K, V>(
-					raw,
-					storeKeyCodec,
-					valueCodec,
-					keyCodec,
-					windowOptions.retentionMs
-				)
+				const buffered = new BufferedWindowStore<K, V>(raw, storeKeyCodec, valueCodec, keyCodec, retentionMs)
 				const store = writer ? new ChangelogBackedWindowStore<K, V>(buffered, writer) : buffered
 				return { store, raw, buffer: buffered }
 			},
@@ -147,36 +124,17 @@ export class StoreRegistry {
 		})
 	}
 
-	getOrCreateSessionStore<K, V>(
-		name: string | undefined,
-		keyCodec: Codec<K>,
-		valueCodec: Codec<V>,
-		sessionOptions: { retentionMs: number },
-		changelog?: boolean | ChangelogConfig,
-		sourceTopics?: Set<string>,
-		restrictRestorationToSourcePartitions = true
-	): SessionStore<K, V> {
+	getOrCreateSessionStore<K, V>(name: string, options: SessionStoreOptions<K, V>): SessionStore<K, V> {
+		const { keyCodec, valueCodec, retentionMs } = options
 		const storeKeyCodec = windowedKeyCodec(keyCodec)
-		return this.getOrCreate(name ?? `session-store-${this.topology.nextStoreId()}`, {
-			changelog,
-			sourceTopics,
-			restrictRestorationToSourcePartitions,
+		return this.getOrCreate(name, {
+			kind: 'session',
+			options,
 			changelogKeyCodec: storeKeyCodec,
-			valueCodec,
-			retentionMs: sessionOptions.retentionMs,
+			retentionMs,
 			createStack: (providerName, writer) => {
-				const raw = this.provider.createSessionStore<K, V>(providerName, {
-					keyCodec,
-					valueCodec,
-					retentionMs: sessionOptions.retentionMs,
-				})
-				const buffered = new BufferedSessionStore<K, V>(
-					raw,
-					storeKeyCodec,
-					valueCodec,
-					keyCodec,
-					sessionOptions.retentionMs
-				)
+				const raw = this.provider.createSessionStore<K, V>(providerName, { keyCodec, valueCodec, retentionMs })
+				const buffered = new BufferedSessionStore<K, V>(raw, storeKeyCodec, valueCodec, keyCodec, retentionMs)
 				const store = writer ? new ChangelogBackedSessionStore<K, V>(buffered, writer) : buffered
 				return { store, raw, buffer: buffered }
 			},
@@ -249,25 +207,23 @@ export class StoreRegistry {
 	private getOrCreate<S extends AnyStore, KK, V>(storeName: string, layout: StoreLayout<S, KK, V>): S {
 		const existing = this.stateStores.get(storeName)
 		if (existing) {
+			// A global table's store has no definition; it is a key-value store.
+			const existingKind = this.defs.get(storeName)?.kind ?? 'key-value'
+			if (existingKind !== layout.kind) {
+				throw new Error(
+					`State store '${storeName}' already exists as a ${existingKind} store and cannot be used as a ` +
+						`${layout.kind} store; give one of them a different storeName`
+				)
+			}
 			return existing as unknown as S
 		}
 
 		// A store is partition-scoped when its keys are co-partitioned with known source topics.
-		const sourceTopics = layout.sourceTopics ?? new Set<string>()
-		const scope: StoreScope =
-			layout.restrictRestorationToSourcePartitions && sourceTopics.size > 0 ? 'partition' : 'app'
-		const changelogConfig = resolveChangelogConfig(layout.changelog)
-		const writer = changelogConfig.enabled
-			? this.setupChangelog(
-					storeName,
-					layout.changelogKeyCodec,
-					layout.valueCodec,
-					changelogConfig,
-					sourceTopics,
-					scope,
-					layout.retentionMs
-				)
-			: null
+		const { sourceTopics } = layout.options
+		const scope: StoreScope = sourceTopics.size > 0 ? 'partition' : 'app'
+		const changelogConfig = resolveChangelogConfig(layout.options.changelog)
+		const changelog = changelogConfig.enabled ? this.changelogSpec(storeName, layout, changelogConfig, scope) : null
+		const writer = changelog ? this.changelogWriter(changelog, layout, scope) : null
 
 		const partitions = new StorePartitions<S, S>(
 			storeName,
@@ -282,11 +238,15 @@ export class StoreRegistry {
 
 		this.defs.set(storeName, {
 			name: storeName,
+			kind: layout.kind,
 			scope,
 			partitions: partitions as unknown as StorePartitions<AnyStore, AnyStore>,
-			changelog: writer ? this.specs.get(storeName)! : null,
+			changelog,
 			sourceTopics,
 		})
+		if (changelog) {
+			this.specs.set(storeName, changelog)
+		}
 		this.stateStores.set(storeName, facade as unknown as KeyValueStore<unknown, unknown>)
 		if (scope === 'partition') {
 			this.topology.addStoreCopartitionGroup(sourceTopics)
@@ -295,49 +255,50 @@ export class StoreRegistry {
 	}
 
 	/**
-	 * Register a changelog topic spec and writer for a store.
+	 * The changelog topic of a store.
 	 *
-	 * `changelogKeyCodec` is the codec used to (de)serialize changelog record keys during
-	 * restoration. For windowed/session stores it is `windowedKeyCodec(userKeyCodec)` so the
-	 * WindowedKey round-trips through the changelog.
+	 * Its key codec (de)serializes changelog record keys during restoration. For window and session
+	 * stores it is `windowedKeyCodec(userKeyCodec)`, so the WindowedKey round-trips through the changelog.
 	 */
-	private setupChangelog<KK, VV>(
+	private changelogSpec<S extends AnyStore, KK, V>(
 		storeName: string,
-		changelogKeyCodec: Codec<KK>,
-		valueCodec: Codec<VV>,
+		layout: StoreLayout<S, KK, V>,
 		changelogConfig: ChangelogConfig,
-		sourceTopics: Set<string>,
-		scope: StoreScope,
-		windowRetentionMs?: number
-	): ChangelogWriter<KK, VV> {
-		const topicName = changelogConfig.topicName ?? buildChangelogTopicName(this.config.applicationId, storeName)
-
+		scope: StoreScope
+	): ChangelogTopicSpec {
 		// Window/session changelogs use delete+compact with a finite retention tied to the store's
 		// retention, so the broker prunes records for expired windows. Without this the (KV) default
 		// of compact + infinite retention would keep every window forever and resurrect expired
 		// windows on restore. User-supplied topicConfigs still take precedence.
 		const windowConfigOverrides: Record<string, string> =
-			windowRetentionMs !== undefined
-				? { 'cleanup.policy': 'delete,compact', 'retention.ms': String(windowRetentionMs) }
+			layout.retentionMs !== undefined
+				? { 'cleanup.policy': 'delete,compact', 'retention.ms': String(layout.retentionMs) }
 				: {}
 
-		this.specs.set(storeName, {
+		return {
 			storeName,
-			topicName,
+			topicName: changelogConfig.topicName ?? buildChangelogTopicName(this.config.applicationId, storeName),
 			replicationFactor: changelogConfig.replicationFactor,
 			configs: getDefaultTopicConfigs({ ...windowConfigOverrides, ...changelogConfig.topicConfigs }),
-			keyCodec: changelogKeyCodec as Codec<unknown>,
-			valueCodec: valueCodec as Codec<unknown>,
+			keyCodec: layout.changelogKeyCodec as Codec<unknown>,
+			valueCodec: layout.options.valueCodec as Codec<unknown>,
 			skipRestoration: changelogConfig.skipRestoration ?? false,
-			sourceTopics,
+			sourceTopics: layout.options.sourceTopics,
 			restrictRestorationToSourcePartitions: scope === 'partition',
 			validateOnly: this.config.changelog?.autoCreate === false,
-		})
+		}
+	}
 
-		return new ChangelogWriter<KK, VV>(
-			topicName,
-			changelogKeyCodec,
-			valueCodec,
+	/** Logs the writes made while processing a record to the store's changelog. */
+	private changelogWriter<S extends AnyStore, KK, V>(
+		spec: ChangelogTopicSpec,
+		layout: StoreLayout<S, KK, V>,
+		scope: StoreScope
+	): ChangelogWriter<KK, V> {
+		return new ChangelogWriter<KK, V>(
+			spec.topicName,
+			layout.changelogKeyCodec,
+			layout.options.valueCodec,
 			() => {
 				const ctx = recordContextStorage.getStore()
 				if (!ctx) {
@@ -351,8 +312,8 @@ export class StoreRegistry {
 				if (!result || typeof result.offset !== 'bigint') return
 				const worker = recordContextStorage.getStore()?.worker
 				if (worker?.activeTransaction) {
-					// Checkpoint only once the transaction has committed (see WorkerTransactions.commit).
-					trackChangelogOffset(worker, result.topic, result.partition, result.offset)
+					// Checkpointed only once the transaction has committed (see WorkerTransactions.commit).
+					worker.pendingCheckpoints.track(result.topic, result.partition, result.offset)
 					return
 				}
 				await this.checkpoints.recordWrite(result.topic, result.partition, result.offset)

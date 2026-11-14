@@ -1,7 +1,7 @@
-import type { ConsumeContext, KafkaClient, Logger, Message, ProducerConfig, RunEachOptions } from '@kafkats/client'
+import type { ConsumeContext, KafkaClient, Logger, Message } from '@kafkats/client'
 import type { AnyProcessor, SourceNode, WorkerContext } from '@/processors/index.js'
 import type { FlowConfig } from '@/types.js'
-import type { Checkpoints } from '@/runtime/checkpoints.js'
+import { PendingCheckpoints, type Checkpoints } from '@/runtime/checkpoints.js'
 import { recordContextStorage, type RecordContext } from '@/runtime/context.js'
 import {
 	RESTART_INITIAL_BACKOFF_MS,
@@ -16,15 +16,13 @@ import type { AppStatus } from '@/runtime/status.js'
 import type { StoreRegistry } from '@/runtime/store-registry.js'
 import type { Topology } from '@/runtime/topology.js'
 import { DEFAULT_COMMIT_INTERVAL_MS, WorkerTransactions } from '@/runtime/transactions.js'
-
-/** Default transaction timeout for exactly_once producers (same as Kafka Streams). */
-const DEFAULT_TRANSACTION_TIMEOUT_MS = 10_000
-
-/**
- * Default time to wait for a worker to join the group. Joining can legitimately take as long as
- * the session timeout of a member that crashed (the group waits for it before rebalancing).
- */
-const DEFAULT_START_TIMEOUT_MS = 120_000
+import {
+	type WorkerSlot,
+	workerConsumerConfig,
+	workerProducerConfig,
+	workerRunEachOptions,
+	workerStartTimeoutMs,
+} from '@/runtime/worker-config.js'
 
 export type WorkerDeps = {
 	client: KafkaClient
@@ -41,131 +39,34 @@ export type WorkerDeps = {
 	logger: Logger
 }
 
-/** The stream workers of the app (`numStreamThreads`), each one consumer + one producer. */
-export class WorkerPool {
-	private active: StreamWorker[] = []
-	private runPromises: Promise<void>[] = []
-
-	constructor(private readonly deps: WorkerDeps) {}
-
-	/**
-	 * Start the workers on the given topics. Resolves once every worker has joined the group and the
-	 * state of the partitions assigned so far has been restored.
-	 */
-	async start(topics: string[]): Promise<void> {
-		const threadCount = Math.max(1, this.deps.config.numStreamThreads ?? 1)
-		this.active = []
-		this.runPromises = []
-
-		const workerReady: Promise<void>[] = []
-		for (let id = 0; id < threadCount; id += 1) {
-			const worker = new StreamWorker(id, threadCount, this.deps)
-			this.active.push(worker)
-			workerReady.push(worker.whenRunning())
-			this.runPromises.push(worker.run(topics))
-		}
-
-		await Promise.all(workerReady)
-
-		// Partitions assigned so far are paused until their state is restored (see
-		// StreamWorker.onPartitionsAssigned). Wait for those restorations before reporting the app as started.
-		await this.deps.restoration.drain()
-	}
-
-	/** Whether any worker owns state partition `partition` of a store fed by `sourceTopics`. */
-	ownsStatePartition(sourceTopics: Set<string>, partition: number): boolean {
-		return this.active.some(worker => worker.ownsStatePartition(sourceTopics, partition))
-	}
-
-	/**
-	 * Commit every worker's open transaction (on close). A failure here loses nothing: the
-	 * transaction aborts and the records are reprocessed after restart.
-	 */
-	async commitAll(): Promise<void> {
-		for (const worker of this.active) {
-			await worker.transactions
-				.enqueue(() => worker.transactions.commit())
-				.catch(err => {
-					const error = toError(err)
-					this.deps.status.recordError(error)
-					this.deps.logger.warn('final transaction commit failed during close', {
-						worker: worker.context.id,
-						error: error.message,
-					})
-				})
-		}
-	}
-
-	/** Stop every worker's consumer; their run loops then wind down. */
-	stop(): void {
-		for (const worker of this.active) worker.stop()
-	}
-
-	/** Settles once every worker's run loop has returned. */
-	async settled(): Promise<void> {
-		await Promise.allSettled(this.runPromises)
-	}
-
-	/** Disconnect the producers and forget the workers. */
-	async disconnect(): Promise<void> {
-		for (const worker of this.active) {
-			await worker.context.producer.disconnect().catch(() => {})
-		}
-		this.active = []
-		this.runPromises = []
-	}
-}
-
 /**
  * One stream worker: a consumer feeding the topology and a producer for its output.
  *
  * A worker that fails never continues past the failure (fail-stop): it stops, drops everything it
  * has not committed, and either restarts from the committed offsets or puts the app in ERROR.
  */
-class StreamWorker {
+export class StreamWorker {
 	readonly context: WorkerContext
-	readonly transactions: WorkerTransactions
+	private readonly transactions: WorkerTransactions
 	private readonly eosEnabled: boolean
 
 	constructor(
-		id: number,
-		private readonly threadCount: number,
+		private readonly slot: WorkerSlot,
 		private readonly deps: WorkerDeps
 	) {
 		const { client, config } = deps
 		this.eosEnabled = deps.eosEnabled
-		const producer = client.producer(this.buildProducerConfig(id))
-
-		const userHook = config.consumer?.onBeforeRebalance
-		const consumer = client.consumer({
-			groupId: config.applicationId,
-			...config.consumer,
-			autoOffsetReset: deps.topology.resolveOffsetReset(),
-			groupInstanceId: this.buildGroupInstanceId(id),
-			isolationLevel: this.eosEnabled ? 'read_committed' : config.consumer?.isolationLevel,
-			// State is partitioned by source partition, so partition N of every co-partitioned
-			// topic must be owned by the same worker. The range assignor guarantees that;
-			// the sticky assignors balance topic-partitions individually and do not.
-			partitionAssignmentStrategy: 'range',
-			// EOS: commit the in-flight transaction inside the awaited rebalance window
-			// so offsets land before the group rejoins. Compose with any user-supplied
-			// hook (user runs first; their hook can prep state before the EOS commit).
-			// A commit failure rejects this promise → the consumer halts before processing
-			// on stale state and the worker restarts from the last committed offsets.
-			onBeforeRebalance:
-				this.eosEnabled || userHook
-					? async () => {
-							if (userHook) await userHook()
-							if (!this.eosEnabled) return
-							if (this.transactions.active) {
-								await this.transactions.enqueue(() => this.transactions.commit())
-							}
-						}
-					: undefined,
-		})
+		const producer = client.producer(this.producerConfig())
+		const consumer = client.consumer(
+			workerConsumerConfig(config, this.eosEnabled, deps.topology.resolveOffsetReset(), slot, async () => {
+				if (this.transactions.active) {
+					await this.commit()
+				}
+			})
+		)
 
 		this.context = {
-			id,
+			id: slot.id,
 			producer,
 			consumer,
 			activeTransaction: null,
@@ -174,7 +75,7 @@ class StreamWorker {
 			sourcesByTopic: new Map(),
 			assignedPartitions: new Map(),
 			pendingOffsets: new Map(),
-			pendingChangelogOffsets: new Map(),
+			pendingCheckpoints: new PendingCheckpoints(),
 			dirtyStores: new Set(),
 			streamClocks: new Map(),
 			failure: null,
@@ -193,11 +94,15 @@ class StreamWorker {
 		this.attachConsumerEvents()
 	}
 
+	get id(): number {
+		return this.context.id
+	}
+
 	/** Resolves once the consumer has joined the group and runs; rejects if it fails or stops first. */
 	whenRunning(): Promise<void> {
 		const consumer = this.context.consumer
 		return new Promise<void>((resolve, reject) => {
-			const startTimeoutMs = this.deps.config.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS
+			const startTimeoutMs = workerStartTimeoutMs(this.deps.config)
 			const timer = setTimeout(() => {
 				cleanup()
 				reject(new Error(`Consumer did not start within ${startTimeoutMs}ms`))
@@ -247,7 +152,7 @@ class StreamWorker {
 				await worker.consumer.runEach(
 					topics,
 					(message, ctx) => this.handleMessage(message, ctx),
-					this.buildRunEachOptions()
+					workerRunEachOptions(config, this.eosEnabled)
 				)
 			} catch (err) {
 				runError = err
@@ -295,9 +200,14 @@ class StreamWorker {
 			if (this.eosEnabled) {
 				// A producer whose transaction failed may be in an undefined state; start clean.
 				await worker.producer.disconnect().catch(() => {})
-				worker.producer = client.producer(this.buildProducerConfig(worker.id))
+				worker.producer = client.producer(this.producerConfig())
 			}
 		}
+	}
+
+	/** Commit the open transaction, after any transactional work queued before. */
+	commit(): Promise<void> {
+		return this.transactions.enqueue(() => this.transactions.commit())
 	}
 
 	/** Stop the consumer (on shutdown). */
@@ -308,6 +218,11 @@ class StreamWorker {
 		} catch {
 			// not running
 		}
+	}
+
+	/** Disconnect the producer (after the run loop has returned). Never rejects. */
+	async disconnect(): Promise<void> {
+		await this.context.producer.disconnect().catch(() => {})
 	}
 
 	ownsStatePartition(sourceTopics: Set<string>, partition: number): boolean {
@@ -495,68 +410,17 @@ class StreamWorker {
 		const { topology, status } = this.deps
 		const clonedByTopic = new Map<string, SourceNode<unknown, unknown>[]>()
 		const cloneMap = new Map<AnyProcessor, AnyProcessor>()
-
-		const add = (topic: string, source: SourceNode<unknown, unknown>) => {
-			const cloned = source.cloneGraph(this.context, cloneMap)
-			const list = clonedByTopic.get(topic) ?? []
-			list.push(cloned as SourceNode<unknown, unknown>)
-			clonedByTopic.set(topic, list)
+		for (const [topic, sources] of topology.groupSources(status.clusterAvailable)) {
+			clonedByTopic.set(
+				topic,
+				sources.map(source => source.cloneGraph(this.context, cloneMap) as SourceNode<unknown, unknown>)
+			)
 		}
-
-		for (const [topic, sources] of topology.sourcesByTopic) {
-			for (const source of sources) add(topic, source)
-		}
-		if (!status.clusterAvailable) {
-			// Without a cluster (mocked clients) global tables are fed like regular sources.
-			for (const table of topology.globalTables) add(table.topic, table.source)
-		}
-
 		return clonedByTopic
 	}
 
-	private buildRunEachOptions(): RunEachOptions | undefined {
-		const config = this.deps.config
-		if (!this.eosEnabled) {
-			return config.runEach
-		}
-
-		const base = config.runEach ?? {}
-		return {
-			...base,
-			autoCommit: false,
-			commitOffsets: false,
-			partitionConcurrency: 1,
-		}
-	}
-
-	private buildProducerConfig(workerId: number): ProducerConfig | undefined {
-		const config = this.deps.config
-		if (!this.eosEnabled) {
-			return config.producer
-		}
-
-		const base = config.producer ?? {}
-		const transactionalId = base.transactionalId
-			? this.threadCount > 1
-				? `${base.transactionalId}-w${workerId}`
-				: base.transactionalId
-			: `${config.applicationId}-${this.deps.processId}-w${workerId}`
-		return {
-			...base,
-			transactionalId,
-			idempotent: true,
-			retries: base.retries ?? 10,
-			// How long a crashed instance's open transaction can block restoration and
-			// read_committed readers of its output before the broker aborts it.
-			transactionTimeoutMs: base.transactionTimeoutMs ?? DEFAULT_TRANSACTION_TIMEOUT_MS,
-		}
-	}
-
-	private buildGroupInstanceId(workerId: number): string | undefined {
-		const base = this.deps.config.consumer?.groupInstanceId
-		if (!base) {
-			return undefined
-		}
-		return this.threadCount > 1 ? `${base}-w${workerId}` : base
+	private producerConfig() {
+		const { config, eosEnabled, processId } = this.deps
+		return workerProducerConfig(config, eosEnabled, processId, this.slot)
 	}
 }

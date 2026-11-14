@@ -1,10 +1,10 @@
 import type { KafkaClient } from '@kafkats/client'
 import type { Codec } from '@/codec.js'
-import type { StreamFormat, StreamRecord, WorkerContext } from '@/processors/index.js'
+import type { RecordSender, StreamFormat, StreamRecord, WorkerContext } from '@/processors/index.js'
 import type { Produced } from '@/types.js'
 
 /** Writes records produced by the topology (`to()`, repartition and through topics). */
-export class RecordOutput {
+export class RecordOutput implements RecordSender {
 	private readonly partitionCounts = new Map<string, number>()
 
 	constructor(

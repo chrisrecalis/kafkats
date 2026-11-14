@@ -1818,7 +1818,7 @@ describe('windowed/session store changelog wiring', () => {
 	function internals(app: unknown): { stateStores: Map<string, unknown>; changelogTopics: Map<string, any> } {
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const impl = app as any
-		return { stateStores: impl.stateStores, changelogTopics: impl.stores.changelogSpecs }
+		return { stateStores: impl.stores.stateStores, changelogTopics: impl.stores.changelogSpecs }
 	}
 
 	it('time-windowed aggregations create a changelog-backed window store with a registered spec', () => {

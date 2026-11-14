@@ -6,6 +6,33 @@ import type { AppStatus } from '@/runtime/status.js'
 export type ChangelogPosition = { topic: string; partition: number; offset: bigint }
 
 /**
+ * Changelog positions written by a worker's open transaction. They become checkpoints only once
+ * the transaction has committed (see Checkpoints.flush); an abort discards them.
+ */
+export class PendingCheckpoints {
+	private readonly positions = new Map<string, ChangelogPosition>()
+
+	/** A changelog record of the open transaction was acknowledged at `offset`. */
+	track(topic: string, partition: number, offset: bigint): void {
+		const key = `${topic}:${partition}`
+		const nextOffset = offset + 1n
+		const existing = this.positions.get(key)
+		if (!existing || nextOffset > existing.offset) {
+			this.positions.set(key, { topic, partition, offset: nextOffset })
+		}
+	}
+
+	/** The position after the last record of the transaction, per changelog partition. */
+	list(): ChangelogPosition[] {
+		return [...this.positions.values()]
+	}
+
+	clear(): void {
+		this.positions.clear()
+	}
+}
+
+/**
  * Changelog restore progress (the offset up to which a local state partition reflects its changelog).
  *
  * Providers with durable state supply a durable store; otherwise progress is tracked in-process,

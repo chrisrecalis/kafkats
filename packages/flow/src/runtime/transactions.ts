@@ -9,16 +9,6 @@ export const DEFAULT_COMMIT_INTERVAL_MS = 100
 /** A producer transaction held open until the batch commits or aborts. */
 type GatedTransaction = ActiveTransaction & { _resolve?: () => void; _reject?: (err: Error) => void }
 
-/** Remember the changelog position written by a worker's open transaction, to checkpoint it after the commit. */
-export function trackChangelogOffset(worker: WorkerContext, topic: string, partition: number, offset: bigint): void {
-	const key: TopicPartitionKey = `${topic}:${partition}`
-	const nextOffset = offset + 1n
-	const existing = worker.pendingChangelogOffsets.get(key)
-	if (!existing || nextOffset > existing.offset) {
-		worker.pendingChangelogOffsets.set(key, { topic, partition, offset: nextOffset })
-	}
-}
-
 /**
  * The exactly-once transaction batch of one worker.
  *
@@ -115,7 +105,7 @@ export class WorkerTransactions {
 		const tx = worker.activeTransaction as GatedTransaction
 		const txPromise = worker.activeTransactionPromise
 		const offsets = Array.from(worker.pendingOffsets.values())
-		const changelogOffsets = Array.from(worker.pendingChangelogOffsets.values())
+		const changelogPositions = worker.pendingCheckpoints.list()
 		const dirtyStores = [...worker.dirtyStores]
 
 		try {
@@ -154,7 +144,7 @@ export class WorkerTransactions {
 			this.fail(err, true)
 			throw err
 		}
-		await this.checkpoints.flush(changelogOffsets)
+		await this.checkpoints.flush(changelogPositions)
 	}
 
 	async abort(error: unknown): Promise<void> {
@@ -194,7 +184,7 @@ export class WorkerTransactions {
 	private clearState(): void {
 		const worker = this.worker
 		worker.pendingOffsets.clear()
-		worker.pendingChangelogOffsets.clear()
+		worker.pendingCheckpoints.clear()
 		worker.dirtyStores.clear()
 		worker.activeTransaction = null
 		worker.activeTransactionPromise = null

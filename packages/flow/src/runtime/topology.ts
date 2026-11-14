@@ -1,6 +1,7 @@
 import type { Codec } from '@/codec.js'
 import type { KeyValueStore } from '@/state.js'
 import type { SourceNode } from '@/processors/index.js'
+import type { TopologyRegistry } from '@/streams/topology-builder.js'
 import type { FlowConfig } from '@/types.js'
 
 export type OffsetReset = 'earliest' | 'latest' | 'none'
@@ -25,7 +26,7 @@ export type GlobalTableDef = {
 }
 
 /** What the DSL registered: sources, internal topics, co-partitioning constraints and global tables. */
-export class Topology {
+export class Topology implements TopologyRegistry {
 	private readonly sources = new Map<string, SourceNode<unknown, unknown>[]>()
 	private readonly offsetResetByTopic = new Map<string, OffsetReset>()
 	private readonly repartitions = new Map<string, RepartitionTopicSpec>()
@@ -58,6 +59,18 @@ export class Topology {
 	/** Source nodes by topic, as registered by the DSL (cloned per worker). */
 	get sourcesByTopic(): ReadonlyMap<string, readonly SourceNode<unknown, unknown>[]> {
 		return this.sources
+	}
+
+	/**
+	 * Source nodes fed by the consumer group, by topic. Without a cluster (mocked clients) global
+	 * tables are fed like regular sources; otherwise GlobalTables reads them outside the group.
+	 */
+	groupSources(clusterAvailable: boolean): ReadonlyMap<string, readonly SourceNode<unknown, unknown>[]> {
+		if (clusterAvailable || this.globals.length === 0) return this.sources
+		const sources = new Map<string, SourceNode<unknown, unknown>[]>()
+		for (const [topic, nodes] of this.sources) sources.set(topic, [...nodes])
+		for (const table of this.globals) sources.set(table.topic, [...(sources.get(table.topic) ?? []), table.source])
+		return sources
 	}
 
 	resolveOffsetReset(): OffsetReset | undefined {

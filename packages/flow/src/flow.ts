@@ -2,8 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { KafkaClient, type Logger } from '@kafkats/client'
 import type { Codec } from '@/codec.js'
 import { buffer as bufferCodec } from '@/codec.js'
-import type { ChangelogConfig } from '@/changelog.js'
-import type { StateStoreProvider, KeyValueStore, WindowStore, SessionStore } from '@/state.js'
+import type { KeyValueStore } from '@/state.js'
 import { InMemoryStateStoreProvider } from '@/state/memory.js'
 import { recordContextStorage } from '@/runtime/context.js'
 import { Checkpoints } from '@/runtime/checkpoints.js'
@@ -16,20 +15,10 @@ import { StartPositions } from '@/runtime/start-positions.js'
 import { AppStatus } from '@/runtime/status.js'
 import { StoreRegistry } from '@/runtime/store-registry.js'
 import { Topology } from '@/runtime/topology.js'
-import { WorkerPool } from '@/runtime/worker.js'
+import { WorkerPool } from '@/runtime/worker-pool.js'
 
 // Public types
-import type {
-	StreamState,
-	FlowConfig,
-	FlowApp,
-	KStream,
-	KTable,
-	Topic,
-	Consumed,
-	Produced,
-	Materialized,
-} from '@/types.js'
+import type { StreamState, FlowConfig, FlowApp, KStream, KTable, Topic, Consumed, Materialized } from '@/types.js'
 
 // Re-export public types for backward compatibility
 export * from '@/types.js'
@@ -37,12 +26,13 @@ export * from '@/windows.js'
 export { topic } from '@/topic.js'
 
 // Internal processor types
-import { SourceNode, type StreamFormat, type StreamRecord, type WorkerContext } from '@/processors/index.js'
+import { SourceNode, type StreamFormat } from '@/processors/index.js'
 import { TableStateNode } from '@/processors/table.js'
 
 // Stream implementations
 import { KStreamImpl } from '@/streams/kstream.js'
 import { KTableImpl } from '@/streams/ktable.js'
+import type { TopologyBuilder } from '@/streams/topology-builder.js'
 
 const DEFAULT_BUFFER_CODEC: Codec<Buffer> = bufferCodec()
 
@@ -72,6 +62,8 @@ class FlowAppImpl implements FlowApp {
 	private readonly globalTables: GlobalTables
 	private readonly workers: WorkerPool
 	private readonly output: RecordOutput
+	/** The view of the runtime that the streams and tables built from this app work with. */
+	private readonly builder: TopologyBuilder
 	private startPromise: Promise<void> | null = null
 	private closePromise: Promise<void> | null = null
 
@@ -127,106 +119,12 @@ class FlowAppImpl implements FlowApp {
 			logger,
 		})
 		this.output = new RecordOutput(client, this.eosEnabled)
-	}
-
-	// ------------------------------------------------------------------------------------------
-	// Topology building (FlowAppInterface, used by streams and tables)
-	// ------------------------------------------------------------------------------------------
-
-	get stateStoreProvider(): StateStoreProvider {
-		return this.stores.provider
-	}
-
-	get stateStores(): Map<string, KeyValueStore<unknown, unknown>> {
-		return this.stores.stateStores
-	}
-
-	nextStoreId(): number {
-		return this.topology.nextStoreId()
-	}
-
-	getOrCreateStore<K, V>(
-		name: string | undefined,
-		keyCodec: Codec<K>,
-		valueCodec: Codec<V>,
-		changelog?: boolean | ChangelogConfig,
-		sourceTopics?: Set<string>,
-		restrictRestorationToSourcePartitions = true
-	): KeyValueStore<K, V> {
-		return this.stores.getOrCreateStore(
-			name,
-			keyCodec,
-			valueCodec,
-			changelog,
-			sourceTopics,
-			restrictRestorationToSourcePartitions
-		)
-	}
-
-	getOrCreateWindowStore<K, V>(
-		name: string | undefined,
-		keyCodec: Codec<K>,
-		valueCodec: Codec<V>,
-		windowOptions: { retentionMs: number; windowSizeMs: number },
-		changelog?: boolean | ChangelogConfig,
-		sourceTopics?: Set<string>,
-		restrictRestorationToSourcePartitions = true
-	): WindowStore<K, V> {
-		return this.stores.getOrCreateWindowStore(
-			name,
-			keyCodec,
-			valueCodec,
-			windowOptions,
-			changelog,
-			sourceTopics,
-			restrictRestorationToSourcePartitions
-		)
-	}
-
-	getOrCreateSessionStore<K, V>(
-		name: string | undefined,
-		keyCodec: Codec<K>,
-		valueCodec: Codec<V>,
-		sessionOptions: { retentionMs: number },
-		changelog?: boolean | ChangelogConfig,
-		sourceTopics?: Set<string>,
-		restrictRestorationToSourcePartitions = true
-	): SessionStore<K, V> {
-		return this.stores.getOrCreateSessionStore(
-			name,
-			keyCodec,
-			valueCodec,
-			sessionOptions,
-			changelog,
-			sourceTopics,
-			restrictRestorationToSourcePartitions
-		)
-	}
-
-	requireCopartitioned(topics: Set<string>): void {
-		this.topology.requireCopartitioned(topics)
-	}
-
-	createRepartitionTopic(name: string | undefined, upstreamTopics: Set<string>): string {
-		return this.topology.createRepartitionTopic(name, upstreamTopics)
-	}
-
-	registerThroughTopic(topic: string): void {
-		this.topology.registerThroughTopic(topic)
-	}
-
-	isExactlyOnce(): boolean {
-		return this.eosEnabled
-	}
-
-	sendToTopic<K, V>(
-		worker: WorkerContext,
-		topic: string,
-		record: StreamRecord<K, V>,
-		options: Produced<K, V> | undefined,
-		format: StreamFormat<K, V>
-	): Promise<void> {
-		return this.output.send(worker, topic, record, options, format)
+		this.builder = {
+			stores: this.stores,
+			topology: this.topology,
+			output: this.output,
+			stream: (topic, options) => this.stream(topic, options),
+		}
 	}
 
 	// ------------------------------------------------------------------------------------------
@@ -237,7 +135,7 @@ class FlowAppImpl implements FlowApp {
 		const resolved = resolveSource(source, options)
 		const node = new SourceNode<K, V>(resolved.topic, resolved.format)
 		this.topology.registerSource(resolved.topic, node as SourceNode<unknown, unknown>, resolved.offsetReset)
-		return new KStreamImpl<K, V>(this, node, resolved.format, new Set([resolved.topic]))
+		return new KStreamImpl<K, V>(this.builder, node, resolved.format, new Set([resolved.topic]))
 	}
 
 	table<K = Buffer, V = Buffer>(
@@ -255,21 +153,20 @@ class FlowAppImpl implements FlowApp {
 			throw new Error('table() requires both key and value codecs for stateful operations')
 		}
 
-		const storeName = options?.materialized?.storeName ?? `table-${resolved.topic}-${this.nextStoreId()}`
+		const storeName = options?.materialized?.storeName ?? `table-${resolved.topic}-${this.topology.nextStoreId()}`
 		const sourceTopics = new Set([resolved.topic])
-		const store = this.stores.getOrCreateStore<K, V>(
-			storeName,
+		const store = this.stores.getOrCreateKeyValueStore<K, V>(storeName, {
 			keyCodec,
 			valueCodec,
-			options?.materialized?.changelog,
-			sourceTopics
-		)
+			changelog: options?.materialized?.changelog,
+			sourceTopics,
+		})
 		const storeRef = { store }
 
 		const tableStateNode = new TableStateNode<K, V>(storeName, storeRef)
 		sourceNode.connect(tableStateNode)
 
-		return new KTableImpl<K, V>(this, tableStateNode, resolved.format, storeRef, sourceTopics)
+		return new KTableImpl<K, V>(this.builder, tableStateNode, resolved.format, storeRef, sourceTopics)
 	}
 
 	/**
@@ -293,7 +190,8 @@ class FlowAppImpl implements FlowApp {
 			throw new Error('globalTable() requires both key and value codecs for stateful operations')
 		}
 
-		const storeName = options?.materialized?.storeName ?? `global-table-${resolved.topic}-${this.nextStoreId()}`
+		const storeName =
+			options?.materialized?.storeName ?? `global-table-${resolved.topic}-${this.topology.nextStoreId()}`
 		const store = this.stores.createGlobalStore<K, V>(storeName, keyCodec, valueCodec)
 		const storeRef = { store }
 
@@ -311,7 +209,7 @@ class FlowAppImpl implements FlowApp {
 			source: sourceNode as SourceNode<unknown, unknown>,
 		})
 
-		return new KTableImpl<K, V>(this, tableStateNode, resolved.format, storeRef, new Set(), true)
+		return new KTableImpl<K, V>(this.builder, tableStateNode, resolved.format, storeRef, new Set(), true)
 	}
 
 	// ------------------------------------------------------------------------------------------
@@ -361,7 +259,7 @@ class FlowAppImpl implements FlowApp {
 				status.assertNotClosing()
 			}
 
-			const topics = this.subscribedTopics()
+			const topics = [...this.topology.groupSources(status.clusterAvailable).keys()]
 			if (topics.length > 0) {
 				await this.workers.start(topics)
 			}
@@ -380,16 +278,6 @@ class FlowAppImpl implements FlowApp {
 			status.setState(wasClosing ? 'STOPPED' : 'ERROR')
 			throw error
 		}
-	}
-
-	/** Topics consumed through the consumer group. */
-	private subscribedTopics(): string[] {
-		const topics = new Set(this.topology.sourcesByTopic.keys())
-		if (!this.status.clusterAvailable) {
-			// Without a cluster (mocked clients) global tables are fed like regular sources.
-			for (const table of this.topology.globalTables) topics.add(table.topic)
-		}
-		return [...topics]
 	}
 
 	close(): Promise<void> {

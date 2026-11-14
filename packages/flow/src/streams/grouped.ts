@@ -14,7 +14,8 @@ import {
 import { TableDeltaCountNode, TableDeltaReduceNode, TableDeltaAggregateNode } from '@/processors/table.js'
 import { TimeWindows, SessionWindows, SlidingWindows } from '@/windows.js'
 import { parseWindowDuration, SLIDING_WINDOWS_NOT_IMPLEMENTED } from '@/helpers.js'
-import { KTableImpl, type FlowAppInterface } from '@/streams/ktable.js'
+import { KTableImpl } from '@/streams/ktable.js'
+import type { TopologyBuilder } from '@/streams/topology-builder.js'
 
 const numberCodec: Codec<number> = {
 	encode: (v: number) => {
@@ -58,7 +59,7 @@ function required<T>(value: T | undefined, message: string): T {
  * and return the resulting table.
  */
 function materializeKeyValue<K, V, A>(
-	app: FlowAppInterface,
+	builder: TopologyBuilder,
 	upstream: OutputProcessor<K, V>,
 	sourceTopics: Set<string>,
 	defaultStorePrefix: string,
@@ -67,17 +68,22 @@ function materializeKeyValue<K, V, A>(
 	options: Materialized<K, A> | undefined,
 	createNode: (storeName: string, storeRef: StoreRef<KeyValueStore<K, A>>) => Processor<K, V, K, A>
 ): KTable<K, A> {
-	const storeName = options?.storeName ?? `${defaultStorePrefix}-${app.nextStoreId()}`
-	const store = app.getOrCreateStore<K, A>(storeName, keyCodec, valueCodec, options?.changelog, sourceTopics)
+	const storeName = options?.storeName ?? `${defaultStorePrefix}-${builder.topology.nextStoreId()}`
+	const store = builder.stores.getOrCreateKeyValueStore<K, A>(storeName, {
+		keyCodec,
+		valueCodec,
+		changelog: options?.changelog,
+		sourceTopics,
+	})
 	const storeRef = { store }
 	const node = createNode(storeName, storeRef)
 	upstream.connect(node)
-	return new KTableImpl<K, A>(app, node, { keyCodec, valueCodec }, storeRef, sourceTopics)
+	return new KTableImpl<K, A>(builder, node, { keyCodec, valueCodec }, storeRef, sourceTopics)
 }
 
 export class KGroupedStreamImpl<K, V> implements KGroupedStream<K, V> {
 	constructor(
-		private readonly app: FlowAppInterface,
+		private readonly builder: TopologyBuilder,
 		private readonly node: OutputProcessor<K, V>,
 		private readonly format: StreamFormat<K, V>,
 		/** Source topics that feed into this grouped stream. Used for changelog partition inference. */
@@ -92,7 +98,7 @@ export class KGroupedStreamImpl<K, V> implements KGroupedStream<K, V> {
 		createNode: (storeName: string, storeRef: StoreRef<KeyValueStore<K, A>>) => Processor<K, V, K, A>
 	): KTable<K, A> {
 		return materializeKeyValue(
-			this.app,
+			this.builder,
 			this.node,
 			this.sourceTopics,
 			defaultStorePrefix,
@@ -161,7 +167,7 @@ export class KGroupedStreamImpl<K, V> implements KGroupedStream<K, V> {
 	}
 
 	windowedBy(windows: TimeWindows | SessionWindows | SlidingWindows): WindowedKGroupedStream<K, V> {
-		return new WindowedKGroupedStreamImpl<K, V>(this.app, this.node, this.format, windows, this.sourceTopics)
+		return new WindowedKGroupedStreamImpl<K, V>(this.builder, this.node, this.format, windows, this.sourceTopics)
 	}
 }
 
@@ -175,7 +181,7 @@ export class WindowedKGroupedStreamImpl<K, V> implements WindowedKGroupedStream<
 	private readonly advanceMs: number
 
 	constructor(
-		private readonly app: FlowAppInterface,
+		private readonly builder: TopologyBuilder,
 		private readonly node: OutputProcessor<K, V>,
 		private readonly format: StreamFormat<K, V>,
 		private readonly windows: TimeWindows | SessionWindows | SlidingWindows,
@@ -208,34 +214,30 @@ export class WindowedKGroupedStreamImpl<K, V> implements WindowedKGroupedStream<
 		options: Materialized<Windowed<K>, A> | undefined,
 		nodes: WindowedNodes<K, V, A>
 	): KTable<Windowed<K>, A> {
-		const storeName = options?.storeName ?? `${defaultStorePrefix}-${this.app.nextStoreId()}`
-		const retentionMs = this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER
+		const { stores, topology } = this.builder
+		const storeName = options?.storeName ?? `${defaultStorePrefix}-${topology.nextStoreId()}`
+		const storeOptions = {
+			keyCodec,
+			valueCodec,
+			changelog: options?.changelog,
+			sourceTopics: this.sourceTopics,
+			retentionMs: this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER,
+		}
 
 		let node: Processor<K, V, Windowed<K>, A>
 		if (this.windows instanceof SessionWindows) {
-			const store = this.app.getOrCreateSessionStore<K, A>(
-				storeName,
-				keyCodec,
-				valueCodec,
-				{ retentionMs },
-				options?.changelog,
-				this.sourceTopics
-			)
+			const store = stores.getOrCreateSessionStore<K, A>(storeName, storeOptions)
 			node = nodes.session(storeName, { store })
 		} else {
-			const store = this.app.getOrCreateWindowStore<K, A>(
-				storeName,
-				keyCodec,
-				valueCodec,
-				{ retentionMs, windowSizeMs: this.windowSizeMs },
-				options?.changelog,
-				this.sourceTopics
-			)
+			const store = stores.getOrCreateWindowStore<K, A>(storeName, {
+				...storeOptions,
+				windowSizeMs: this.windowSizeMs,
+			})
 			node = nodes.window(storeName, { store })
 		}
 		this.node.connect(node)
 
-		return new KTableImpl<Windowed<K>, A>(this.app, node, { keyCodec: windowedKeyCodec(keyCodec), valueCodec })
+		return new KTableImpl<Windowed<K>, A>(this.builder, node, { keyCodec: windowedKeyCodec(keyCodec), valueCodec })
 	}
 
 	count(options?: Materialized<Windowed<K>, number>): KTable<Windowed<K>, number> {
@@ -321,7 +323,7 @@ export class WindowedKGroupedStreamImpl<K, V> implements WindowedKGroupedStream<
 
 export class KGroupedTableImpl<K, V> implements KGroupedTable<K, V> {
 	constructor(
-		private readonly app: FlowAppInterface,
+		private readonly builder: TopologyBuilder,
 		private readonly node: OutputProcessor<K, V>,
 		private readonly format: StreamFormat<K, V>,
 		/** The repartition topic carrying the grouped rows; the aggregate state is co-partitioned with it. */
@@ -336,7 +338,7 @@ export class KGroupedTableImpl<K, V> implements KGroupedTable<K, V> {
 		createNode: (storeName: string, storeRef: StoreRef<KeyValueStore<K, A>>) => Processor<K, V, K, A>
 	): KTable<K, A> {
 		return materializeKeyValue(
-			this.app,
+			this.builder,
 			this.node,
 			this.sourceTopics,
 			defaultStorePrefix,
@@ -394,13 +396,12 @@ export class KGroupedTableImpl<K, V> implements KGroupedTable<K, V> {
 		return this.materialize('table-aggregate-store', keyCodec, valueCodec, options, (storeName, storeRef) => {
 			// Row count per group, so a group whose last row leaves is removed instead of lingering
 			// as whatever the subtractor returns for "nothing".
-			const members = this.app.getOrCreateStore<K, number>(
-				`${storeName}-members`,
+			const members = this.builder.stores.getOrCreateKeyValueStore<K, number>(`${storeName}-members`, {
 				keyCodec,
-				numberCodec,
-				options?.changelog === false ? false : undefined,
-				this.sourceTopics
-			)
+				valueCodec: numberCodec,
+				changelog: options?.changelog === false ? false : undefined,
+				sourceTopics: this.sourceTopics,
+			})
 			return new TableDeltaAggregateNode<K, V, A>(storeName, storeRef, initializer, adder, subtractor, {
 				store: members,
 			})

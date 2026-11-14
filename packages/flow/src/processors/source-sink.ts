@@ -3,9 +3,9 @@ import type { Codec } from '@/codec.js'
 import { Processor, type StreamRecord, type StreamFormat, type WorkerContext } from '@/processors/base.js'
 import type { Produced } from '@/types.js'
 
-/** The part of the app a ProduceNode writes through (an interface to avoid a circular import). */
+/** Where a ProduceNode writes records (the app's RecordOutput). */
 export interface RecordSender {
-	sendToTopic<K, V>(
+	send<K, V>(
 		worker: WorkerContext,
 		topic: string,
 		record: StreamRecord<K, V>,
@@ -51,7 +51,7 @@ export class SourceNode<K, V> extends Processor<K, V> {
 
 export class ProduceNode<K, V> extends Processor<K, V> {
 	constructor(
-		private readonly app: RecordSender,
+		private readonly output: RecordSender,
 		private readonly topic: string,
 		private readonly produced: Produced<K, V> | undefined,
 		private readonly format: StreamFormat<K, V>,
@@ -61,13 +61,13 @@ export class ProduceNode<K, V> extends Processor<K, V> {
 	}
 
 	clone(worker: WorkerContext): Processor<K, V, K, V> {
-		return new ProduceNode(this.app, this.topic, this.produced, this.format, worker)
+		return new ProduceNode(this.output, this.topic, this.produced, this.format, worker)
 	}
 
 	async process(record: StreamRecord<K, V>): Promise<void> {
 		if (!this.worker) {
 			throw new Error('ProduceNode is not bound to a worker')
 		}
-		await this.app.sendToTopic(this.worker, this.topic, record, this.produced, this.format)
+		await this.output.send(this.worker, this.topic, record, this.produced, this.format)
 	}
 }

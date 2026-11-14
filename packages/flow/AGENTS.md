@@ -24,7 +24,8 @@ src/
 │   ├── partitioned.ts  # Per-partition slices of a store (<applicationId>.<storeName>.p<partition>)
 │   ├── buffered.ts     # Transactional write buffer (exactly_once)
 │   └── changelog.ts    # Changelog-backed store wrappers
-├── streams/       # KStream / KTable / grouped stream implementations
+├── streams/       # KStream / KTable / grouped stream implementations (the DSL)
+│   └── topology-builder.ts # TopologyBuilder: the only part of the app the DSL may use (stores, topology, output)
 ├── processors/    # Processor nodes (aggregations, joins, table nodes)
 ├── runtime/
 │   ├── context.ts         # Record context (worker + source partition) via AsyncLocalStorage
@@ -32,14 +33,16 @@ src/
 │   ├── errors.ts          # Failure classification (fatal vs recoverable), restart backoff
 │   ├── topology.ts        # What the DSL registered (sources, internal topics, co-partition groups, global tables)
 │   ├── store-registry.ts  # State stores: per-partition stacks, provider names, changelog specs/writers
-│   ├── checkpoints.ts     # Changelog checkpoints (durable or in-process)
+│   ├── checkpoints.ts     # Changelog checkpoints (durable or in-process); pending checkpoints of an open transaction
 │   ├── internal-topics.ts # Co-partitioning checks, creation of changelog/repartition topics
 │   ├── restoration.ts     # Restore queue, app-/partition-scoped restore, release/prune of unowned state
 │   ├── start-positions.ts # Start position of partitions without a committed offset
 │   ├── transactions.ts    # Exactly-once batch of one worker (begin/commit/abort, commit timer)
-│   ├── worker.ts          # WorkerPool + StreamWorker: run/restart loop, message handling, rebalance events
+│   ├── worker-pool.ts     # WorkerPool: starts/stops the stream workers, commit on close
+│   ├── stream-worker.ts   # StreamWorker: run/restart loop, message handling, rebalance events
+│   ├── worker-config.ts   # Per-worker producer/consumer/runEach config (transactional id, group instance id, timeouts)
 │   ├── global-tables.ts   # Loading and following global tables
-│   └── output.ts          # sendToTopic: encoding, partitioner, transactional send
+│   └── output.ts          # RecordOutput: encoding, partitioner, transactional send
 ├── testing.ts     # TestDriver, MockProducer/MockConsumer
 └── index.ts       # Public exports
 ```
@@ -187,7 +190,7 @@ stream.groupByKey().count({
 ### Key Files
 
 - `src/changelog.ts` - ChangelogConfig, error classes, ChangelogWriter/Restorer
-- `src/runtime/internal-topics.ts` - validateAndCreateInternalTopics(); `src/runtime/restoration.ts` - restoration; `src/runtime/worker.ts` - worker lifecycle
+- `src/runtime/internal-topics.ts` - validateAndCreateInternalTopics(); `src/runtime/restoration.ts` - restoration; `src/runtime/stream-worker.ts` - worker lifecycle
 - `src/state/partitioned.ts`, `src/state/buffered.ts` - per-partition stores and the transactional write buffer
 
 ## Testing Infrastructure
