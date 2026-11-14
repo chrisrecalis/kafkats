@@ -70,17 +70,13 @@ export class StreamWorker {
 			producer,
 			consumer,
 			activeTransaction: null,
-			offsetCommitContext: null,
 			sourcesByTopic: new Map(),
 			assignedPartitions: new Map(),
-			pendingOffsets: new Map(),
 			pendingCheckpoints: new PendingCheckpoints(),
 			dirtyStores: new Set(),
 			streamClocks: new Map(),
 			failure: null,
-			eosQueue: Promise.resolve(),
-			commitTimer: null,
-			lastCommitTime: 0,
+			processedSinceRestart: false,
 		}
 		this.transactions = new WorkerTransactions(
 			this.context,
@@ -367,7 +363,12 @@ export class StreamWorker {
 
 			void restoration
 				.enqueue(partitions)
-				.then(() => startPositions.settle(worker, partitions, positions))
+				.then(() =>
+					startPositions.settle(partitions, positions, (topic, partition, offset) => {
+						if (worker.assignedPartitions.has(`${topic}:${partition}`))
+							consumer.seek(topic, partition, offset)
+					})
+				)
 				.then(() => {
 					const stillAssigned = partitions.filter(tp =>
 						worker.assignedPartitions.has(`${tp.topic}:${tp.partition}`)

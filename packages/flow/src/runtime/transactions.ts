@@ -20,11 +20,20 @@ type OpenTransaction = {
  *
  * Records are processed inside a producer transaction that stays open across records and commits
  * when the commit interval elapses. All transactional work of the worker (processing, commits,
- * aborts) runs through one serialized task queue. The batch state itself lives on the
- * WorkerContext, where processors and state stores read it.
+ * aborts) runs through one serialized task queue. The parts of the batch that
+ * processors and state stores read (the transaction, dirty stores, pending checkpoints) live on
+ * the WorkerContext; the rest is private to this class.
  */
 export class WorkerTransactions {
 	private open: OpenTransaction | null = null
+	/** Offsets (next to read) of the records processed in the open transaction. */
+	private readonly pendingOffsets = new Map<TopicPartitionKey, { topic: string; partition: number; offset: bigint }>()
+	/** Consume context of the batch's first record, needed to commit offsets in the transaction. */
+	private offsetCommitContext: ConsumeContext | null = null
+	/** Serializes all transactional work of the worker. */
+	private queue: Promise<void> = Promise.resolve()
+	private commitTimer: ReturnType<typeof setTimeout> | null = null
+	private lastCommitTime = 0
 
 	constructor(
 		private readonly worker: WorkerContext,
@@ -36,8 +45,8 @@ export class WorkerTransactions {
 
 	/** Run a task after every transactional task queued before it, whether that succeeded or not. */
 	enqueue<T>(fn: () => Promise<T>): Promise<T> {
-		const run = this.worker.eosQueue.then(fn, fn)
-		this.worker.eosQueue = run.then(
+		const run = this.queue.then(fn, fn)
+		this.queue = run.then(
 			() => {},
 			() => {}
 		)
@@ -46,7 +55,7 @@ export class WorkerTransactions {
 
 	/** Wait for all queued transactional work. */
 	idle(): Promise<void> {
-		return this.worker.eosQueue
+		return this.queue
 	}
 
 	get active(): boolean {
@@ -66,16 +75,16 @@ export class WorkerTransactions {
 		try {
 			if (!this.open) {
 				await this.begin()
-				worker.offsetCommitContext = ctx
+				this.offsetCommitContext = ctx
 			}
 
 			await handle()
 
 			// Track this offset for the batch commit
 			const key: TopicPartitionKey = `${message.topic}:${message.partition}`
-			const existingOffset = worker.pendingOffsets.get(key)
+			const existingOffset = this.pendingOffsets.get(key)
 			if (!existingOffset || message.offset + 1n > existingOffset.offset) {
-				worker.pendingOffsets.set(key, {
+				this.pendingOffsets.set(key, {
 					topic: message.topic,
 					partition: message.partition,
 					offset: message.offset + 1n, // Commit the next offset
@@ -88,9 +97,9 @@ export class WorkerTransactions {
 		}
 
 		// Commit if the interval has elapsed, otherwise make sure a commit is scheduled.
-		if (Date.now() - worker.lastCommitTime >= this.commitIntervalMs) {
+		if (Date.now() - this.lastCommitTime >= this.commitIntervalMs) {
 			await this.commit()
-		} else if (!worker.commitTimer) {
+		} else if (!this.commitTimer) {
 			this.scheduleCommit()
 		}
 	}
@@ -109,16 +118,16 @@ export class WorkerTransactions {
 		const open = this.open
 		if (!open) return
 
-		const offsets = Array.from(worker.pendingOffsets.values())
+		const offsets = Array.from(this.pendingOffsets.values())
 		const changelogPositions = worker.pendingCheckpoints.list()
 		const dirtyStores = [...worker.dirtyStores]
 
 		try {
 			if (offsets.length > 0) {
-				if (!worker.offsetCommitContext) {
+				if (!this.offsetCommitContext) {
 					throw new Error('exactly_once requires a consume context for transactional offset commits')
 				}
-				await open.tx.sendOffsets(worker.offsetCommitContext, offsets)
+				await open.tx.sendOffsets(this.offsetCommitContext, offsets)
 			}
 			await open.commit()
 		} catch (err) {
@@ -163,9 +172,9 @@ export class WorkerTransactions {
 	}
 
 	cancelCommitTimer(): void {
-		if (this.worker.commitTimer) {
-			clearTimeout(this.worker.commitTimer)
-			this.worker.commitTimer = null
+		if (this.commitTimer) {
+			clearTimeout(this.commitTimer)
+			this.commitTimer = null
 		}
 	}
 
@@ -173,29 +182,29 @@ export class WorkerTransactions {
 		const worker = this.worker
 		this.open = await openTransaction(worker.producer)
 		worker.activeTransaction = this.open.tx
-		worker.lastCommitTime = Date.now()
+		this.lastCommitTime = Date.now()
 	}
 
 	private clearState(): void {
 		const worker = this.worker
-		worker.pendingOffsets.clear()
+		this.pendingOffsets.clear()
 		worker.pendingCheckpoints.clear()
 		worker.dirtyStores.clear()
 		this.open = null
 		worker.activeTransaction = null
-		worker.offsetCommitContext = null
-		worker.lastCommitTime = Date.now()
+		this.offsetCommitContext = null
+		this.lastCommitTime = Date.now()
 	}
 
 	private scheduleCommit(): void {
 		const worker = this.worker
-		if (worker.commitTimer) {
+		if (this.commitTimer) {
 			return
 		}
 
-		const timeUntilCommit = Math.max(0, this.commitIntervalMs - (Date.now() - worker.lastCommitTime))
-		worker.commitTimer = setTimeout(() => {
-			worker.commitTimer = null
+		const timeUntilCommit = Math.max(0, this.commitIntervalMs - (Date.now() - this.lastCommitTime))
+		this.commitTimer = setTimeout(() => {
+			this.commitTimer = null
 			// A failed commit fails the worker inside commit() (fail-stop).
 			this.enqueue(() => this.commit()).catch(() => {})
 		}, timeUntilCommit)

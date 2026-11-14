@@ -1880,30 +1880,26 @@ describe('windowed/session store changelog wiring', () => {
 			// Changelog key round-trips a WindowedKey so restoration can decode it.
 			const encoded = spec.keyCodec.encode({ key: 'k', windowStart: 1000, windowEnd: 2000 })
 			expect(spec.keyCodec.decode(encoded)).toEqual({ key: 'k', windowStart: 1000, windowEnd: 2000 })
-			// Join windows are co-partitioned with their source, so restoration is restricted.
-			expect(spec.restrictRestorationToSourcePartitions).toBe(true)
 		}
 	})
 
-	it('threads restrictRestorationToSourcePartitions through windowedBy (re-keyed vs not)', () => {
+	it('co-partitions windowedBy state with its source or repartition topic', () => {
 		const { app } = createTestApp()
 
-		// groupByKey() keeps the source key -> restoration restricted to source partitions.
+		// groupByKey() keeps the source key, so state is co-partitioned with the source topic.
 		app.stream('events', { key: codec.string(), value: codec.json<{ region: string }>() })
 			.groupByKey()
 			.windowedBy(TimeWindows.of('10s'))
 			.count({ storeName: 'by-key' })
 
-		// groupBy() re-keys through a repartition topic, so its state is co-partitioned with that
-		// topic and restoration is restricted to the assigned partitions as well.
+		// groupBy() re-keys through a repartition topic, so its state is co-partitioned with that topic.
 		app.stream('events2', { key: codec.string(), value: codec.json<{ region: string }>() })
 			.groupBy((_key, value) => value!.region, { key: codec.string() })
 			.windowedBy(TimeWindows.of('10s'))
 			.count({ storeName: 'by-region' })
 
 		const { changelogTopics } = internals(app)
-		expect(changelogTopics.get('by-key').restrictRestorationToSourcePartitions).toBe(true)
-		expect(changelogTopics.get('by-region').restrictRestorationToSourcePartitions).toBe(true)
+		expect([...changelogTopics.get('by-key').sourceTopics]).toEqual(['events'])
 		expect([...changelogTopics.get('by-region').sourceTopics]).toEqual(['test-app-repartition-0-repartition'])
 	})
 })

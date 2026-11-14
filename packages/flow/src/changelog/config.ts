@@ -61,11 +61,6 @@ export interface ChangelogTopicSpec {
 	skipRestoration: boolean
 	/** Source topics that feed into this state store. Used to infer partition count. */
 	sourceTopics: Set<string>
-	/**
-	 * If true, restoration is restricted to partitions currently assigned from source topics.
-	 * Use false for stores that are re-keyed and no longer have source-partition affinity.
-	 */
-	restrictRestorationToSourcePartitions?: boolean
 	/** If true, only validate existing topics, don't create new ones. */
 	validateOnly: boolean
 }

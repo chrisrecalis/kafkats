@@ -56,11 +56,8 @@ export type WorkerContext = {
 	producer: Producer
 	consumer: Consumer
 	activeTransaction: ActiveTransaction | null
-	offsetCommitContext: ConsumeContext | null
 	sourcesByTopic: Map<string, SourceNode<unknown, unknown>[]>
 	assignedPartitions: Map<TopicPartitionKey, { topic: string; partition: number }>
-	// Transaction batching state for EOS
-	pendingOffsets: Map<TopicPartitionKey, { topic: string; partition: number; offset: bigint }>
 	/** Changelog positions of the open transaction, checkpointed once it commits. */
 	pendingCheckpoints: PendingCheckpoints
 	/**
@@ -73,10 +70,7 @@ export type WorkerContext = {
 	/** Set once the worker has failed; it processes nothing more until restarted. */
 	failure: { error: Error; recoverable: boolean } | null
 	/** Whether the worker made progress since it last (re)started; resets the restart backoff. */
-	processedSinceRestart?: boolean
-	eosQueue: Promise<void>
-	commitTimer: ReturnType<typeof setTimeout> | null
-	lastCommitTime: number
+	processedSinceRestart: boolean
 }
 
 /** Holder of a state store, shared by every worker clone of the node that uses it. */

@@ -222,7 +222,7 @@ export class StoreRegistry implements StoreFactory {
 		const { sourceTopics } = layout.options
 		const scope: StoreScope = sourceTopics.size > 0 ? 'partition' : 'app'
 		const changelogConfig = resolveChangelogConfig(layout.options.changelog)
-		const changelog = changelogConfig.enabled ? this.changelogSpec(storeName, layout, changelogConfig, scope) : null
+		const changelog = changelogConfig.enabled ? this.changelogSpec(storeName, layout, changelogConfig) : null
 		const writer = changelog ? this.changelogWriter(changelog, layout, scope) : null
 
 		const partitions = new StorePartitions<S, S>(
@@ -263,8 +263,7 @@ export class StoreRegistry implements StoreFactory {
 	private changelogSpec<S extends AnyStore, KK, V>(
 		storeName: string,
 		layout: StoreLayout<S, KK, V>,
-		changelogConfig: ChangelogConfig,
-		scope: StoreScope
+		changelogConfig: ChangelogConfig
 	): ChangelogTopicSpec {
 		// Window/session changelogs use delete+compact with a finite retention tied to the store's
 		// retention, so the broker prunes records for expired windows. Without this the (KV) default
@@ -284,7 +283,6 @@ export class StoreRegistry implements StoreFactory {
 			valueCodec: layout.options.valueCodec as Codec<unknown>,
 			skipRestoration: changelogConfig.skipRestoration ?? false,
 			sourceTopics: layout.options.sourceTopics,
-			restrictRestorationToSourcePartitions: scope === 'partition',
 			validateOnly: this.config.changelog?.autoCreate === false,
 		}
 	}

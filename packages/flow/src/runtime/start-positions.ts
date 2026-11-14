@@ -1,5 +1,4 @@
 import { ErrorCode, KafkaError, type KafkaClient } from '@kafkats/client'
-import type { WorkerContext } from '@/processors/index.js'
 import type { AppStatus } from '@/runtime/status.js'
 import type { TopicPartition } from '@/runtime/restoration.js'
 import type { Topology } from '@/runtime/topology.js'
@@ -30,10 +29,14 @@ export class StartPositions {
 		private readonly status: AppStatus
 	) {}
 
+	/**
+	 * Settle where newly assigned partitions without a committed offset start, calling `seek` for
+	 * each one whose position must move. `startPositions` holds where the consumer resolved them.
+	 */
 	async settle(
-		worker: WorkerContext,
 		partitions: TopicPartition[],
-		startPositions: Map<string, bigint>
+		startPositions: Map<string, bigint>,
+		seek: (topic: string, partition: number, offset: bigint) => void
 	): Promise<void> {
 		const topology = this.topology
 		const policy = topology.resolveOffsetReset() ?? 'latest'
@@ -41,66 +44,61 @@ export class StartPositions {
 		const relevant = partitions.filter(tp => topology.isInternalTopic(tp.topic) || policy === 'latest')
 		if (relevant.length === 0 || !this.status.clusterAvailable) return
 
-		const byTopic = new Map<string, number[]>()
-		for (const tp of relevant) {
-			byTopic.set(tp.topic, [...(byTopic.get(tp.topic) ?? []), tp.partition])
-		}
-
-		const groupId = this.groupId
-		const topics = [...byTopic].map(([name, parts]) => ({
-			name,
-			partitions: parts.map(partitionIndex => ({ partitionIndex })),
-		}))
-		// Offsets of an in-flight transaction (another instance committing) are reported as
-		// unstable; wait for them rather than guessing.
-		const deadline = Date.now() + 30_000
-		let response
-		for (;;) {
-			try {
-				const coordinator = await this.client.cluster.getCoordinator('GROUP', groupId)
-				response = await coordinator.offsetFetch({ groupId, topics, requireStable: true })
-				const code =
-					response.errorCode !== ErrorCode.None
-						? response.errorCode
-						: response.topics.flatMap(t => t.partitions).find(p => p.errorCode !== ErrorCode.None)
-								?.errorCode
-				if (code === undefined) break
-				throw new KafkaError(`OffsetFetch failed for group ${groupId}`, code)
-			} catch (err) {
-				const retriable = err instanceof KafkaError && err.retriable
-				if (!retriable || Date.now() > deadline || this.status.closing) throw err
-				this.client.cluster.invalidateCoordinator('GROUP', groupId)
-				await new Promise(resolve => setTimeout(resolve, 200))
-			}
-		}
-
 		const admin = this.client.admin()
-		for (const topic of response.topics) {
-			const uncommitted: number[] = []
-			for (const partition of topic.partitions) {
-				if (partition.committedOffset < 0n) uncommitted.push(partition.partitionIndex)
-			}
-			if (uncommitted.length === 0) continue
-			if (topology.isInternalTopic(topic.name)) {
-				const earliest = await admin.fetchTopicOffsets(topic.name, uncommitted, 'earliest')
-				for (const partition of uncommitted) {
-					if (!worker.assignedPartitions.has(`${topic.name}:${partition}`)) continue
-					worker.consumer.seek(topic.name, partition, earliest.get(partition) ?? 0n)
-				}
+		for (const [topic, uncommitted] of await this.uncommittedPartitions(relevant)) {
+			if (topology.isInternalTopic(topic)) {
+				const earliest = await admin.fetchTopicOffsets(topic, uncommitted, 'earliest')
+				for (const partition of uncommitted) seek(topic, partition, earliest.get(partition) ?? 0n)
 				continue
 			}
 			// Source topic read from 'latest': the first position this process started the partition
 			// at stays its start position until an offset is committed.
 			for (const partition of uncommitted) {
-				const key = `${topic.name}:${partition}`
-				if (!worker.assignedPartitions.has(`${topic.name}:${partition}`)) continue
+				const key = `${topic}:${partition}`
 				const pinned = this.initialPositions.get(key)
 				const resolved = startPositions.get(key)
 				if (pinned === undefined) {
 					if (resolved !== undefined) this.initialPositions.set(key, resolved)
 				} else if (pinned !== resolved) {
-					worker.consumer.seek(topic.name, partition, pinned)
+					seek(topic, partition, pinned)
 				}
+			}
+		}
+	}
+
+	/** The given partitions for which the group has no committed offset, by topic. */
+	private async uncommittedPartitions(partitions: TopicPartition[]): Promise<Map<string, number[]>> {
+		const groupId = this.groupId
+		const topics = [...new Set(partitions.map(tp => tp.topic))].map(name => ({
+			name,
+			partitions: partitions.filter(tp => tp.topic === name).map(tp => ({ partitionIndex: tp.partition })),
+		}))
+
+		// Offsets of an in-flight transaction (another instance committing) are reported as
+		// unstable; wait for them rather than guessing.
+		const deadline = Date.now() + 30_000
+		for (;;) {
+			try {
+				const coordinator = await this.client.cluster.getCoordinator('GROUP', groupId)
+				const response = await coordinator.offsetFetch({ groupId, topics, requireStable: true })
+				const all = response.topics.flatMap(t => t.partitions)
+				const code =
+					response.errorCode !== ErrorCode.None
+						? response.errorCode
+						: all.find(p => p.errorCode !== ErrorCode.None)?.errorCode
+				if (code !== undefined) throw new KafkaError(`OffsetFetch failed for group ${groupId}`, code)
+
+				const uncommitted = new Map<string, number[]>()
+				for (const topic of response.topics) {
+					const missing = topic.partitions.filter(p => p.committedOffset < 0n).map(p => p.partitionIndex)
+					if (missing.length > 0) uncommitted.set(topic.name, missing)
+				}
+				return uncommitted
+			} catch (err) {
+				const retriable = err instanceof KafkaError && err.retriable
+				if (!retriable || Date.now() > deadline || this.status.closing) throw err
+				this.client.cluster.invalidateCoordinator('GROUP', groupId)
+				await this.status.sleepUnlessClosing(200)
 			}
 		}
 	}
