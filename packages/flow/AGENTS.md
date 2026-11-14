@@ -16,7 +16,12 @@ pnpm typecheck  # Type checking
 src/
 ├── flow.ts        # flow() / FlowAppImpl: DSL entry points, start/close lifecycle, wiring of runtime/
 ├── types.ts       # Public types (FlowApp, KStream, KTable, FlowConfig, ...)
-├── changelog.ts   # Changelog config, writer/restorer, error classes (incl. CoPartitioningError)
+├── changelog.ts   # Stable import path re-exporting changelog/
+├── changelog/
+│   ├── config.ts    # Changelog config, restoration options, topic naming
+│   ├── errors.ts    # ChangelogPartitionMismatchError, SourceTopicNotFoundError, CoPartitioningError
+│   ├── writer.ts    # ChangelogWriter, changelog key format for windowed stores
+│   └── restorer.ts  # ChangelogRestorer: checkpoint trust, replay to the log end, stall detection
 ├── codec.ts       # Serialization codecs (string, json, buffer)
 ├── state.ts       # State store interfaces
 ├── state/
@@ -189,7 +194,7 @@ stream.groupByKey().count({
 
 ### Key Files
 
-- `src/changelog.ts` - ChangelogConfig, error classes, ChangelogWriter/Restorer
+- `src/changelog/` - ChangelogConfig, error classes, ChangelogWriter/Restorer
 - `src/runtime/internal-topics.ts` - validateAndCreateInternalTopics(); `src/runtime/restoration.ts` - restoration; `src/runtime/stream-worker.ts` - worker lifecycle
 - `src/state/partitioned.ts`, `src/state/buffered.ts` - per-partition stores and the transactional write buffer
 
