@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { KafkaClient, type Producer } from '@kafkats/client'
+import type { KafkaClient, Producer } from '@kafkats/client'
 import {
 	ChangelogPartitionMismatchError,
 	type ChangelogCheckpointStore,
@@ -12,30 +12,27 @@ import {
 	InMemoryKeyValueStore,
 	InMemoryStateStoreProvider,
 } from '../../src/index.js'
-import { MultiTopicCollector, createTopics, requireKafkaBrokers, uniqueTopicName } from './test-helpers.js'
+import {
+	createTopics,
+	float64Codec as numberCodec,
+	MultiTopicCollector,
+	newClient,
+	requireKafkaBrokers,
+	sleep,
+	uniqueTopicName,
+	withTimeout,
+} from './test-helpers.js'
 
 type InputEvent = { n: number; type: string }
 
 const stringCodec = codec.string()
 const jsonCodec = codec.json<InputEvent>()
 
-const numberCodec = {
-	encode: (v: number) => {
-		const buf = Buffer.alloc(8)
-		buf.writeDoubleLE(v, 0)
-		return buf
-	},
-	decode: (b: Buffer) => b.readDoubleLE(0),
-}
-
 let client: KafkaClient
 let producer: Producer
 
 beforeAll(async () => {
-	client = new KafkaClient({
-		clientId: `flow-integration-${Date.now()}`,
-		brokers: requireKafkaBrokers(),
-	})
+	client = newClient('flow-integration')
 	await client.connect()
 	producer = client.producer()
 })
@@ -45,20 +42,6 @@ afterAll(async () => {
 	await client.disconnect()
 })
 
-async function withTimeout<T>(label: string, promise: Promise<T>, timeoutMs: number): Promise<T> {
-	let timer: ReturnType<typeof setTimeout> | undefined
-	try {
-		return await Promise.race([
-			promise,
-			new Promise<T>((_resolve, reject) => {
-				timer = setTimeout(() => reject(new Error(`Timed out after ${timeoutMs}ms: ${label}`)), timeoutMs)
-			}),
-		])
-	} finally {
-		if (timer) clearTimeout(timer)
-	}
-}
-
 async function waitForTopicPartitionCount(topic: string, expected: number, timeoutMs: number = 5_000): Promise<void> {
 	const start = Date.now()
 	while (Date.now() - start < timeoutMs) {
@@ -67,7 +50,7 @@ async function waitForTopicPartitionCount(topic: string, expected: number, timeo
 		if (count === expected) {
 			return
 		}
-		await new Promise(resolve => setTimeout(resolve, 100))
+		await sleep(100)
 	}
 	throw new Error(`Timed out waiting for ${topic} to have ${expected} partitions`)
 }
@@ -1336,7 +1319,7 @@ describe('changelog topics and restoration', () => {
 				if (app.state() === 'ERROR') {
 					return
 				}
-				await new Promise(resolve => setTimeout(resolve, 50))
+				await sleep(50)
 			}
 			throw new Error('Timed out waiting for app to enter ERROR state')
 		}
@@ -1414,7 +1397,7 @@ describe('changelog topics and restoration', () => {
 			while (Date.now() - startedAt < timeoutMs) {
 				const [desc] = await admin.describeGroups([params.groupId])
 				if (desc?.state !== 'Stable') {
-					await new Promise(resolve => setTimeout(resolve, 200))
+					await sleep(200)
 					continue
 				}
 
@@ -1424,7 +1407,7 @@ describe('changelog topics and restoration', () => {
 					return partition
 				}
 
-				await new Promise(resolve => setTimeout(resolve, 200))
+				await sleep(200)
 			}
 
 			throw new Error(`Timed out waiting for group assignment for ${params.memberClientId} in ${params.groupId}`)

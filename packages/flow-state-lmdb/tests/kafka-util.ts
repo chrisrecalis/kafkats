@@ -1,6 +1,11 @@
+/**
+ * Helpers for the broker-backed LMDB tests: client/topic setup, a read_committed reader and the
+ * `hardening-worker.ts` child process. Requires a built @kafkats/client.
+ */
 import { spawn, type ChildProcess } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
+// @kafkats/client is not a dependency of this package; load the workspace build directly.
 import { KafkaClient } from '../../client/dist/index.js'
 
 export const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms))

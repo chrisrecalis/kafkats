@@ -1,7 +1,7 @@
 /**
  * Scenario D: graceful close() behaviour.
  *
- * Prereq: docker container `kafka-chaos` on 127.0.0.1:29092 (start-kafka.sh kafka-chaos 29092).
+ * Prereq: docker container `kafka-chaos` on 127.0.0.1:29092 (any single-broker Kafka; no start script is checked in).
  * Run (from packages/flow):
  *   pnpm exec tsx tests/chaos/close-chaos.ts --scenario drain --guarantee eos --mode count   # SIGTERM -> close() under load, restart, verify
  *   pnpm exec tsx tests/chaos/close-chaos.ts --scenario start --delay-ms 300                 # close() while start() in progress

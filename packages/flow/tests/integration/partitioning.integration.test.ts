@@ -3,7 +3,7 @@
  * their source partition across restarts, rebalances and instance changes.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { KafkaClient, type Producer } from '@kafkats/client'
+import type { KafkaClient, Producer } from '@kafkats/client'
 import {
 	TimeWindows,
 	codec,
@@ -14,23 +14,25 @@ import {
 	type KeyValueStore,
 	type StateStoreProvider,
 } from '../../src/index.js'
-import { MultiTopicCollector, createTopics, requireKafkaBrokers, uniqueTopicName } from './test-helpers.js'
+import {
+	createTopics,
+	float64Codec as numberCodec,
+	MultiTopicCollector,
+	newClient,
+	requireKafkaBrokers,
+	sleep,
+	uniqueTopicName,
+	waitUntil,
+	withTimeout,
+} from './test-helpers.js'
 
 const stringCodec = codec.string()
-const numberCodec = {
-	encode: (v: number) => {
-		const buf = Buffer.alloc(8)
-		buf.writeDoubleLE(v, 0)
-		return buf
-	},
-	decode: (b: Buffer) => b.readDoubleLE(0),
-}
 
 let client: KafkaClient
 let producer: Producer
 
 beforeAll(async () => {
-	client = new KafkaClient({ clientId: `part-part-${Date.now()}`, brokers: requireKafkaBrokers() })
+	client = newClient('part-part')
 	await client.connect()
 	producer = client.producer()
 })
@@ -39,27 +41,6 @@ afterAll(async () => {
 	await producer.disconnect()
 	await client.disconnect()
 })
-
-const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
-
-async function waitUntil(cond: () => boolean, timeoutMs: number): Promise<void> {
-	const deadline = Date.now() + timeoutMs
-	while (!cond() && Date.now() < deadline) await sleep(50)
-}
-
-async function withTimeout<T>(label: string, promise: Promise<T>, timeoutMs: number): Promise<T> {
-	let timer: ReturnType<typeof setTimeout> | undefined
-	try {
-		return await Promise.race([
-			promise,
-			new Promise<T>((_res, rej) => {
-				timer = setTimeout(() => rej(new Error(`Timed out after ${timeoutMs}ms: ${label}`)), timeoutMs)
-			}),
-		])
-	} finally {
-		if (timer) clearTimeout(timer)
-	}
-}
 
 /** Java-compatible murmur2 (copy of the client's default partitioner; it is not exported from the package index). */
 function murmur2(data: Buffer): number {
@@ -708,7 +689,11 @@ describe('state/changelog partitioning', () => {
 			for (const p of [0, 1])
 				for (const k of cfgKeys) await producer.send(events, { key: k, value: Buffer.from(k), partition: p })
 			const expected = [...cfgKeys, ...cfgKeys].map(k => `${k}:val-${k}`)
-			await waitUntil(() => collector.getTopicMessages<string, string>(out).length >= expected.length, 20_000)
+			await waitUntil(
+				'global table lookups',
+				() => collector.getTopicMessages<string, string>(out).length >= expected.length,
+				20_000
+			).catch(() => {}) // the assertion below reports what is missing
 			const results = collector.getTopicMessages<string, string>(out).map(m => String(m.value))
 			expect(results.sort(), 'lookups against a global table').toEqual(expected.sort())
 		} finally {

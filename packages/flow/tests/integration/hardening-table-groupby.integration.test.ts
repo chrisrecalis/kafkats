@@ -5,31 +5,20 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { KafkaClient, Producer } from '@kafkats/client'
 import { codec, flow, type FlowApp } from '../../src/index.js'
-import { createTopics, uniqueTopicName } from './test-helpers.js'
-import { injectCommitFailures, newClient, readAllCommitted, sleep } from './eos-test-util.js'
+import {
+	createTopics,
+	injectCommitFailures,
+	lcg,
+	newClient,
+	readCommittedTable,
+	sleep,
+	uniqueTopicName,
+} from './test-helpers.js'
 
 const str = codec.string()
 const num = codec.json<number>()
 const USERS = 20
 const GROUPS = 4
-
-async function latest(admin: KafkaClient, topic: string): Promise<Record<string, number>> {
-	const out: Record<string, number> = {}
-	for (const m of await readAllCommitted(admin, topic, 1_200)) {
-		const k = m.key!.toString()
-		if (m.value === null) delete out[k]
-		else out[k] = num.decode(m.value)
-	}
-	return out
-}
-
-function lcg(seed: number) {
-	let s = seed >>> 0
-	return () => {
-		s = (Math.imul(s, 1664525) + 1013904223) >>> 0
-		return s / 2 ** 32
-	}
-}
 
 describe('hardening: KTable.groupBy vs ground truth', () => {
 	let admin: KafkaClient
@@ -170,9 +159,9 @@ describe('hardening: KTable.groupBy vs ground truth', () => {
 			let got = { count: {}, sum: {}, agg: {} } as Record<'count' | 'sum' | 'agg', Record<string, number>>
 			while (Date.now() < deadline) {
 				got = {
-					count: await latest(admin, outs.count),
-					sum: await latest(admin, outs.sum),
-					agg: await latest(admin, outs.agg),
+					count: await readCommittedTable(admin, outs.count, num, 1_200),
+					sum: await readCommittedTable(admin, outs.sum, num, 1_200),
+					agg: await readCommittedTable(admin, outs.agg, num, 1_200),
 				}
 				if (
 					JSON.stringify(got) ===

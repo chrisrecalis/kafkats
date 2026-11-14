@@ -9,46 +9,17 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { codec, flow } from '@kafkats/flow'
-// @kafkats/client is not a dependency of this package; load the workspace build directly for topic admin + producing.
-import { KafkaClient } from '../../client/dist/index.js'
-
 import { lmdb } from '@/lmdb.js'
+import { numberCodec } from './codecs.js'
+import { createTopic, makeClient, sleep, uniq } from './kafka-util.js'
 
 const brokers = process.env.KAFKA_BROKERS?.split(',').map(b => b.trim())
 const stringCodec = codec.string()
-const numberCodec = {
-	encode: (v: number) => {
-		const buf = Buffer.alloc(8)
-		buf.writeDoubleLE(v, 0)
-		return buf
-	},
-	decode: (b: Buffer) => b.readDoubleLE(0),
-}
-
-const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
-const uniq = (p: string) => `${p}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let client: any
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let producer: any
-
-async function createTopic(name: string) {
-	await client.createTopics([{ name, numPartitions: 1, replicationFactor: 1 }])
-	const deadline = Date.now() + 15_000
-	while (Date.now() < deadline) {
-		const meta = await client.getMetadata([name])
-		const t = meta.topics.get(name)
-		if (
-			t &&
-			[...t.partitions.values()].every((p: { leaderId: number }) => p.leaderId >= 0) &&
-			t.partitions.size === 1
-		)
-			return
-		await sleep(100)
-	}
-	throw new Error(`topic ${name} not ready`)
-}
 
 /** Reads every message on a topic from the beginning (value decoded as number). */
 async function readAll(topic: string, quietMs = 1_500): Promise<Array<{ key: string; value: number }>> {
@@ -72,8 +43,7 @@ async function readAll(topic: string, quietMs = 1_500): Promise<Array<{ key: str
 
 describe.skipIf(!brokers)('lmdb-restart: flow restart cycles on LMDB', () => {
 	beforeAll(async () => {
-		client = new KafkaClient({ clientId: uniq('lmdb-restart'), brokers: brokers! })
-		await client.connect()
+		client = await makeClient(brokers!)
 		producer = client.producer()
 	})
 	afterAll(async () => {
@@ -128,8 +98,8 @@ describe.skipIf(!brokers)('lmdb-restart: flow restart cycles on LMDB', () => {
 				const input = uniq(`lmdb-restart-in-${guarantee}`)
 				const out = uniq(`lmdb-restart-out-${guarantee}`)
 				const appId = uniq(`lmdb-restart-${guarantee}`)
-				await createTopic(input)
-				await createTopic(out)
+				await createTopic(client, input, 1)
+				await createTopic(client, out, 1)
 				let stateDir = mkdtempSync(join(tmpdir(), 'lmdb-restart-'))
 				try {
 					for (let cycle = 1; cycle <= 3; cycle++) {
@@ -156,8 +126,8 @@ describe.skipIf(!brokers)('lmdb-restart: flow restart cycles on LMDB', () => {
 	it('the same app can be started again after close()', async () => {
 		const input = uniq('lmdb-reopen-in')
 		const out = uniq('lmdb-reopen-out')
-		await createTopic(input)
-		await createTopic(out)
+		await createTopic(client, input, 1)
+		await createTopic(client, out, 1)
 		const stateDir = mkdtempSync(join(tmpdir(), 'lmdb-reopen-'))
 		try {
 			const app = build(uniq('lmdb-reopen'), input, out, stateDir, 'exactly_once')

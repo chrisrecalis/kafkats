@@ -6,8 +6,14 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { KafkaClient, Producer } from '@kafkats/client'
 import { codec, flow, type FlowApp } from '../../src/index.js'
-import { createTopics, uniqueTopicName } from './test-helpers.js'
-import { newClient, readAllCommitted, sleep } from './eos-test-util.js'
+import {
+	collectUnhandledRejections,
+	createTopics,
+	newClient,
+	readAllCommitted,
+	sleep,
+	uniqueTopicName,
+} from './test-helpers.js'
 
 const str = codec.string()
 const num = codec.json<number>()
@@ -17,16 +23,13 @@ const PER_KEY = 50
 describe('hardening: session loss (blocked event loop) with a second instance', () => {
 	let admin: KafkaClient
 	let producer: Producer
-	const rejections: unknown[] = []
-	const onRej = (r: unknown) => rejections.push(r)
+	const rejections = collectUnhandledRejections()
 	beforeAll(async () => {
-		process.on('unhandledRejection', onRej)
 		admin = newClient('r3-pl-admin')
 		await admin.connect()
 		producer = admin.producer({ lingerMs: 0, idempotent: true })
 	})
 	afterAll(async () => {
-		process.off('unhandledRejection', onRej)
 		await producer.disconnect()
 		await admin.disconnect()
 	})

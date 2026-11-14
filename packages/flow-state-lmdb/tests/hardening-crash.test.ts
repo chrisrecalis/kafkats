@@ -7,7 +7,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { ChildWorker, createTopic, makeClient, readCommitted, sleep, uniq } from './hardening-util.js'
+import { ChildWorker, createTopic, makeClient, readCommitted, sleep, uniq } from './kafka-util.js'
 
 const brokers = process.env.KAFKA_BROKERS?.split(',').map(b => b.trim())
 const KEYS = 8

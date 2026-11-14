@@ -1,7 +1,7 @@
 /**
  * Scenarios A + B: SIGKILL chaos for stateless and count pipelines, ALO and EOS.
  *
- * Prereq:  start-kafka.sh kafka-chaos 29092   (broker at 127.0.0.1:29092; override with CHAOS_BROKERS)
+ * Prereq:  a broker at 127.0.0.1:29092 (override with CHAOS_BROKERS), e.g. a docker container `kafka-chaos`; no start script is checked in.
  * Run (from packages/flow):
  *   pnpm exec tsx tests/chaos/kill-chaos.ts --guarantee eos --mode count --instances 2 --threads 1 --kills 8
  * Flags: --guarantee alo|eos  --mode stateless|count|regroup  --instances 1|2  --threads N  --kills N

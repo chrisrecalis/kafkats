@@ -5,21 +5,19 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { KafkaClient, Producer } from '@kafkats/client'
 import { codec, flow, type FlowApp } from '../../src/index.js'
-import { createTopics, requireKafkaBrokers, uniqueTopicName } from './test-helpers.js'
-import { injectCommitFailures, newClient, sleep } from './eos-test-util.js'
+import {
+	collectUnhandledRejections,
+	createTopics,
+	injectCommitFailures,
+	newClient,
+	requireKafkaBrokers,
+	sleep,
+	uniqueTopicName,
+	withTimeout,
+} from './test-helpers.js'
 
 const str = codec.string()
 const num = codec.json<number>()
-
-function withTimeout<T>(label: string, p: Promise<T>, ms: number): Promise<T> {
-	let t: ReturnType<typeof setTimeout>
-	return Promise.race([
-		p,
-		new Promise<T>((_r, rej) => {
-			t = setTimeout(() => rej(new Error(`HANG > ${ms}ms: ${label}`)), ms)
-		}),
-	]).finally(() => clearTimeout(t))
-}
 
 // an app that creates its client from a config object owns (and must disconnect) it
 const ownedClient = () => ({
@@ -34,16 +32,13 @@ const sockets = () =>
 describe('hardening: lifecycle storms', () => {
 	let admin: KafkaClient
 	let producer: Producer
-	const rejections: unknown[] = []
-	const onRej = (r: unknown) => rejections.push(r)
+	const rejections = collectUnhandledRejections()
 	beforeAll(async () => {
-		process.on('unhandledRejection', onRej)
 		admin = newClient('r3-lc-admin')
 		await admin.connect()
 		producer = admin.producer({ lingerMs: 0 })
 	})
 	afterAll(async () => {
-		process.off('unhandledRejection', onRej)
 		await producer.disconnect()
 		await admin.disconnect()
 	})

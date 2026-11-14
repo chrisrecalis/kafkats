@@ -6,8 +6,16 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { KafkaClient, Producer } from '@kafkats/client'
 import { codec, flow, type FlowApp, type KeyValueStore, type KeyValueStoreOptions } from '../../src/index.js'
-import { createTopics, uniqueTopicName } from './test-helpers.js'
-import { DurableMemoryProvider, newClient, readAllCommitted, sleep } from './eos-test-util.js'
+import {
+	collectUnhandledRejections,
+	createTopics,
+	delayPuts,
+	DurableMemoryProvider,
+	newClient,
+	readAllCommitted,
+	sleep,
+	uniqueTopicName,
+} from './test-helpers.js'
 
 const str = codec.string()
 const num = codec.json<number>()
@@ -19,36 +27,20 @@ class SlowProvider extends DurableMemoryProvider {
 		super()
 	}
 	override createKeyValueStore<K, V>(name: string, o: KeyValueStoreOptions<K, V>): KeyValueStore<K, V> {
-		const inner = super.createKeyValueStore(name, o)
-		const delay = this.putDelayMs
-		return new Proxy(inner, {
-			get(target, prop) {
-				const v = Reflect.get(target, prop, target) as unknown
-				if (prop === 'put') {
-					return async (...args: unknown[]) => {
-						await sleep(delay)
-						return (v as (...a: unknown[]) => Promise<void>).apply(target, args)
-					}
-				}
-				return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(target) : v
-			},
-		})
+		return delayPuts(super.createKeyValueStore(name, o), () => sleep(this.putDelayMs))
 	}
 }
 
 describe('hardening: churn during slow restoration', () => {
 	let admin: KafkaClient
 	let producer: Producer
-	const rejections: unknown[] = []
-	const onRej = (r: unknown) => rejections.push(r)
+	const rejections = collectUnhandledRejections()
 	beforeAll(async () => {
-		process.on('unhandledRejection', onRej)
 		admin = newClient('r3-ch-admin')
 		await admin.connect()
 		producer = admin.producer({ lingerMs: 0, idempotent: true })
 	})
 	afterAll(async () => {
-		process.off('unhandledRejection', onRej)
 		await producer.disconnect()
 		await admin.disconnect()
 	})

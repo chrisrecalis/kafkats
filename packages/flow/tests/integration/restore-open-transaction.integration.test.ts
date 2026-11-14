@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { KafkaClient } from '@kafkats/client'
+import type { KafkaClient } from '@kafkats/client'
 import { ChangelogRestorer, InMemoryKeyValueStore, codec } from '../../src/index.js'
-import { createTopics, requireKafkaBrokers, uniqueTopicName } from './test-helpers.js'
+import { createTopics, newClient, uniqueTopicName } from './test-helpers.js'
 
 const stringCodec = codec.string()
 
@@ -9,7 +9,7 @@ describe('changelog restore with a dangling transaction', () => {
 	let client: KafkaClient
 
 	beforeAll(async () => {
-		client = new KafkaClient({ clientId: `flow-restore-open-tx-${Date.now()}`, brokers: requireKafkaBrokers() })
+		client = newClient('flow-restore-open-tx')
 		await client.connect()
 	})
 

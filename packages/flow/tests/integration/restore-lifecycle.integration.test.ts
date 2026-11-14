@@ -3,7 +3,7 @@
  * (start/close/restart) against a real broker.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { KafkaClient, type Producer } from '@kafkats/client'
+import type { KafkaClient, Producer } from '@kafkats/client'
 import {
 	ChangelogRestorer,
 	InMemoryKeyValueStore,
@@ -15,23 +15,27 @@ import {
 	type KeyValueStore,
 	type KeyValueStoreOptions,
 } from '../../src/index.js'
-import { MultiTopicCollector, createTopics, requireKafkaBrokers, uniqueTopicName } from './test-helpers.js'
+import {
+	createTopics,
+	delayPuts,
+	DurableMemoryProvider,
+	float64Codec as numberCodec,
+	MultiTopicCollector,
+	newClient,
+	requireKafkaBrokers,
+	sleep,
+	uniqueTopicName,
+	waitUntil,
+	withTimeout,
+} from './test-helpers.js'
 
 const stringCodec = codec.string()
-const numberCodec = {
-	encode: (v: number) => {
-		const buf = Buffer.alloc(8)
-		buf.writeDoubleLE(v, 0)
-		return buf
-	},
-	decode: (b: Buffer) => b.readDoubleLE(0),
-}
 
 let client: KafkaClient
 let producer: Producer
 
 beforeAll(async () => {
-	client = new KafkaClient({ clientId: `restore-${Date.now()}`, brokers: requireKafkaBrokers() })
+	client = newClient('restore')
 	await client.connect()
 	producer = client.producer()
 })
@@ -40,31 +44,6 @@ afterAll(async () => {
 	await producer.disconnect()
 	await client.disconnect()
 })
-
-const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
-
-async function withTimeout<T>(label: string, promise: Promise<T>, timeoutMs: number): Promise<T> {
-	let timer: ReturnType<typeof setTimeout> | undefined
-	try {
-		return await Promise.race([
-			promise,
-			new Promise<T>((_r, reject) => {
-				timer = setTimeout(() => reject(new Error(`Timed out after ${timeoutMs}ms: ${label}`)), timeoutMs)
-			}),
-		])
-	} finally {
-		if (timer) clearTimeout(timer)
-	}
-}
-
-async function waitUntil(label: string, cond: () => boolean, timeoutMs = 10_000): Promise<void> {
-	const start = Date.now()
-	while (Date.now() - start < timeoutMs) {
-		if (cond()) return
-		await sleep(50)
-	}
-	throw new Error(`Timed out waiting for: ${label}`)
-}
 
 class MemoryCheckpointStore implements ChangelogCheckpointStore {
 	readonly offsets = new Map<string, bigint>()
@@ -76,23 +55,11 @@ class MemoryCheckpointStore implements ChangelogCheckpointStore {
 	}
 }
 
-/** Wraps a KV store so that put() can be made to block once (simulates a slow/blocked store). */
-function slowStore<K, V>(inner: KeyValueStore<K, V>, hooks: { armed: boolean; delayMs: number }): KeyValueStore<K, V> {
-	return new Proxy(inner, {
-		get(target, prop) {
-			if (prop === 'put') {
-				return async (k: K, v: V) => {
-					if (hooks.armed) {
-						hooks.armed = false
-						await sleep(hooks.delayMs)
-					}
-					return target.put(k, v)
-				}
-			}
-			const value = Reflect.get(target, prop) as unknown
-			return typeof value === 'function' ? (value as (...a: unknown[]) => unknown).bind(target) : value
-		},
-	})
+/** A `delayPuts` hook: while `hooks.armed`, the next put disarms it and blocks for `hooks.delayMs`. */
+const blockNextPut = (hooks: { armed: boolean; delayMs: number }) => async () => {
+	if (!hooks.armed) return
+	hooks.armed = false
+	await sleep(hooks.delayMs)
 }
 
 /** In-memory provider whose first store put blocks once when armed; exposes the per-partition inner stores. */
@@ -108,27 +75,7 @@ class SlowProvider extends InMemoryStateStoreProvider {
 	override createKeyValueStore<K, V>(name: string, options: KeyValueStoreOptions<K, V>): KeyValueStore<K, V> {
 		const inner = super.createKeyValueStore(name, options)
 		this.inners.set(name, inner as KeyValueStore<unknown, unknown>)
-		return slowStore(inner, this.hooks)
-	}
-}
-
-/** Provider that behaves like a persistent one: stores (`<name>.p<N>`) + checkpoints survive close() and re-creation. */
-class PersistentProvider extends InMemoryStateStoreProvider {
-	readonly checkpoints = new MemoryCheckpointStore()
-	readonly kvStores = new Map<string, KeyValueStore<unknown, unknown>>()
-	getChangelogCheckpointStore() {
-		return this.checkpoints
-	}
-	override createKeyValueStore<K, V>(name: string, options: KeyValueStoreOptions<K, V>): KeyValueStore<K, V> {
-		let s = this.kvStores.get(name)
-		if (!s) {
-			s = new InMemoryKeyValueStore<unknown, unknown>(name, options as KeyValueStoreOptions<unknown, unknown>)
-			this.kvStores.set(name, s)
-		}
-		return s as KeyValueStore<K, V>
-	}
-	override close(): Promise<void> {
-		return Promise.resolve()
+		return delayPuts(inner, blockNextPut(this.hooks))
 	}
 }
 
@@ -154,7 +101,7 @@ describe('changelog restorer', () => {
 		}
 
 		const inner = await newKvStore('slow-put')
-		const slow = slowStore(inner, { armed: true, delayMs: 3_000 })
+		const slow = delayPuts(inner, blockNextPut({ armed: true, delayMs: 3_000 }))
 		const checkpoints = new MemoryCheckpointStore()
 
 		const restorer = new ChangelogRestorer(topic, stringCodec, numberCodec, slow)
@@ -334,7 +281,7 @@ describe('restart cycles with a persistent store and checkpoint store', () => {
 			const out = uniqueTopicName(`restore-cycles-${guarantee}-out`)
 			const appId = `restore-cycles-${guarantee}-${Date.now()}`
 			await createTopics(client, [{ name: input }, { name: out }])
-			const provider = new PersistentProvider()
+			const provider = new DurableMemoryProvider()
 
 			const collector = new MultiTopicCollector({
 				client,
@@ -484,7 +431,7 @@ describe('processing failures', () => {
 			topics: [{ topic: out, keyCodec: stringCodec, valueCodec: numberCodec }],
 		})
 		await collector.start()
-		const provider = new PersistentProvider()
+		const provider = new DurableMemoryProvider()
 		const app = flow({
 			applicationId: appId,
 			client,

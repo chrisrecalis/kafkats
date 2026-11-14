@@ -1,12 +1,20 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { KafkaClient, type Producer } from '@kafkats/client'
+import type { KafkaClient, Producer } from '@kafkats/client'
 import { InMemoryStateStoreProvider, buildChangelogTopicName, codec, flow, type FlowApp } from '../../src/index.js'
-import { createTopics, requireKafkaBrokers, uniqueTopicName } from './test-helpers.js'
+import {
+	createTopics,
+	injectCommitFailures,
+	newClient,
+	requireKafkaBrokers,
+	sleep,
+	uniqueTopicName,
+	waitUntil,
+} from './test-helpers.js'
 
 const stringCodec = codec.string()
 const numberCodec = codec.json<number>()
-
-const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
+/** A plain (non-Kafka) error thrown from a transaction's sendOffsets. */
+const sendOffsetsFailure = () => new Error('injected sendOffsets failure')
 
 /** Read every committed record of a topic (read_committed) until `idleMs` passes without a new one. */
 async function readCommitted(
@@ -56,21 +64,12 @@ async function readCommitted(
 	return out
 }
 
-async function waitFor(cond: () => boolean, timeoutMs: number, label = 'condition'): Promise<void> {
-	const deadline = Date.now() + timeoutMs
-	while (Date.now() < deadline) {
-		if (cond()) return
-		await sleep(25)
-	}
-	throw new Error(`timed out waiting for ${label}`)
-}
-
 describe('EOS failure paths', () => {
 	let client: KafkaClient
 	let producer: Producer
 
 	beforeAll(async () => {
-		client = new KafkaClient({ clientId: `eos-eos-${Date.now()}`, brokers: requireKafkaBrokers() })
+		client = newClient('eos-eos')
 		await client.connect()
 		producer = client.producer({ lingerMs: 0 })
 	})
@@ -106,28 +105,19 @@ describe('EOS failure paths', () => {
 			await createTopics(client, [{ name: input }, { name: output }])
 
 			// Private client so patching producer.transaction() does not affect other tests.
-			const c2 = new KafkaClient({ clientId: `eos-t1-${Date.now()}`, brokers: requireKafkaBrokers() })
+			const c2 = newClient('eos-t1')
 			let failNextSendOffsets = false
 			let failures = 0
-			const origProducer = c2.producer.bind(c2)
-			;(c2 as any).producer = (cfg: any) => {
-				const p = origProducer(cfg)
-				const origTx = p.transaction.bind(p)
-				;(p as any).transaction = (fn: any, o: any) =>
-					origTx(async (tx: any) => {
-						const orig = tx.sendOffsets.bind(tx)
-						tx.sendOffsets = async (...args: any[]) => {
-							if (failNextSendOffsets) {
-								failNextSendOffsets = false
-								failures++
-								throw new Error('injected sendOffsets failure')
-							}
-							return orig(...args)
-						}
-						return fn(tx)
-					}, o)
-				return p
-			}
+			injectCommitFailures(
+				c2,
+				() => {
+					if (!failNextSendOffsets) return false
+					failNextSendOffsets = false
+					failures++
+					return true
+				},
+				sendOffsetsFailure
+			)
 
 			const app = flow(eosCfg(uniqueTopicName('eos-t1-app'), { client: c2 }))
 			app.stream(input, { key: stringCodec, value: numberCodec })
@@ -149,7 +139,7 @@ describe('EOS failure paths', () => {
 					input,
 					[3, 4, 5].map(i => ({ key: 'k', value: numberCodec.encode(i) }))
 				)
-				await waitFor(() => failures > 0, 10_000, 'injected failure')
+				await waitUntil('injected failure', () => failures > 0, 10_000)
 				await sleep(300)
 				// batch C after the failure; app is (probably) still consuming
 				await producer.send(
@@ -175,28 +165,19 @@ describe('EOS failure paths', () => {
 			const input = uniqueTopicName('eos-t1b-in')
 			const output = uniqueTopicName('eos-t1b-out')
 			await createTopics(client, [{ name: input }, { name: output }])
-			const c2 = new KafkaClient({ clientId: `eos-t1b-${Date.now()}`, brokers: requireKafkaBrokers() })
+			const c2 = newClient('eos-t1b')
 			let arm = false
 			let failures = 0
-			const origProducer = c2.producer.bind(c2)
-			;(c2 as any).producer = (cfg: any) => {
-				const p = origProducer(cfg)
-				const origTx = p.transaction.bind(p)
-				;(p as any).transaction = (fn: any, o: any) =>
-					origTx(async (tx: any) => {
-						const orig = tx.sendOffsets.bind(tx)
-						tx.sendOffsets = async (...args: any[]) => {
-							if (arm) {
-								arm = false
-								failures++
-								throw new Error('injected sendOffsets failure')
-							}
-							return orig(...args)
-						}
-						return fn(tx)
-					}, o)
-				return p
-			}
+			injectCommitFailures(
+				c2,
+				() => {
+					if (!arm) return false
+					arm = false
+					failures++
+					return true
+				},
+				sendOffsetsFailure
+			)
 			const app = flow(eosCfg(uniqueTopicName('eos-t1b-app'), { client: c2 }))
 			app.stream(input, { key: stringCodec, value: numberCodec })
 				.groupByKey()
@@ -214,7 +195,7 @@ describe('EOS failure paths', () => {
 				await readCommitted(client, output, { minCount: 3, timeoutMs: 10_000, idleMs: 500 })
 				arm = true
 				await send3(3)
-				await waitFor(() => failures > 0, 10_000, 'injected failure')
+				await waitUntil('injected failure', () => failures > 0, 10_000)
 				await sleep(300)
 				await send3(6)
 				await sleep(2_000)
@@ -261,7 +242,7 @@ describe('EOS failure paths', () => {
 			)
 			const app = build()
 			await app.start()
-			await waitFor(() => app.state() === 'ERROR', 10_000, 'ERROR')
+			await waitUntil('ERROR', () => app.state() === 'ERROR', 10_000)
 			await sleep(2_500)
 			expect(seen).toEqual([0, 1, 2, 3, 4, 5])
 			await app.close().catch(() => {})
@@ -325,7 +306,7 @@ describe('EOS failure paths', () => {
 			])
 			const app1 = build()
 			await app1.start()
-			await waitFor(() => app1.state() === 'ERROR', 15_000, 'app1 ERROR')
+			await waitUntil('app1 ERROR', () => app1.state() === 'ERROR', 15_000)
 			await app1.close().catch(() => {})
 
 			const app2 = build()
@@ -526,29 +507,20 @@ describe('EOS failure paths', () => {
 			{ name: output, partitions: 2 },
 		])
 		const appId = uniqueTopicName('eos-t7-app')
-		const c1 = new KafkaClient({ clientId: 'eos-t7-1', brokers: requireKafkaBrokers() })
-		const c2 = new KafkaClient({ clientId: 'eos-t7-2', brokers: requireKafkaBrokers() })
+		const c1 = newClient('eos-t7-1')
+		const c2 = newClient('eos-t7-2')
 		let arm = false
 		let failures = 0
-		const origProducer = c1.producer.bind(c1)
-		;(c1 as any).producer = (cfg: any) => {
-			const p = origProducer(cfg)
-			const origTx = p.transaction.bind(p)
-			;(p as any).transaction = (fn: any, o: any) =>
-				origTx(async (tx: any) => {
-					const orig = tx.sendOffsets.bind(tx)
-					tx.sendOffsets = async (...args: any[]) => {
-						if (arm) {
-							arm = false
-							failures++
-							throw new Error('injected sendOffsets failure')
-						}
-						return orig(...args)
-					}
-					return fn(tx)
-				}, o)
-			return p
-		}
+		injectCommitFailures(
+			c1,
+			() => {
+				if (!arm) return false
+				arm = false
+				failures++
+				return true
+			},
+			sendOffsetsFailure
+		)
 		const build = (c: KafkaClient) => {
 			const app = flow(eosCfg(appId, { client: c, commitIntervalMs: 20_000 }))
 			app.stream(input, { key: stringCodec, value: numberCodec })

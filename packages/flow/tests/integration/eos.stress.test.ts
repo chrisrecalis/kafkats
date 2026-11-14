@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { KafkaClient, type Producer } from '@kafkats/client'
+import type { KafkaClient, Producer } from '@kafkats/client'
 import { codec, flow, type FlowApp } from '../../src/index.js'
-import { MultiTopicCollector, createTopics, requireKafkaBrokers, uniqueTopicName } from './test-helpers.js'
+import { createTopics, MultiTopicCollector, newClient, sleep, uniqueTopicName } from './test-helpers.js'
 
 const PARTITION_COUNT = 4
 const KEY_COUNT = 12
@@ -27,7 +27,7 @@ async function waitForOutcome(
 		if (collector.getTopicMessages<string, number>(outputTopic).length >= RECORD_COUNT) {
 			return 'complete'
 		}
-		await new Promise(resolve => setTimeout(resolve, 20))
+		await sleep(20)
 	}
 
 	throw new Error(
@@ -41,10 +41,7 @@ describe('exactly-once stress', () => {
 	let producer: Producer
 
 	beforeAll(async () => {
-		client = new KafkaClient({
-			clientId: `flow-eos-stress-${Date.now()}`,
-			brokers: requireKafkaBrokers(),
-		})
+		client = newClient('flow-eos-stress')
 		await client.connect()
 		producer = client.producer({ lingerMs: 0 })
 	})

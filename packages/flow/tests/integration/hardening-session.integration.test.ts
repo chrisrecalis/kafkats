@@ -6,21 +6,20 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { KafkaClient, Producer } from '@kafkats/client'
 import { codec, flow, SessionWindows, type FlowApp } from '../../src/index.js'
-import { createTopics, uniqueTopicName } from './test-helpers.js'
-import { injectCommitFailures, newClient, readAllCommitted, sleep } from './eos-test-util.js'
+import {
+	createTopics,
+	injectCommitFailures,
+	lcg,
+	newClient,
+	readAllCommitted,
+	sleep,
+	uniqueTopicName,
+} from './test-helpers.js'
 
 const str = codec.string()
 const num = codec.json<number>()
 const GAP = 1_000
 const KEYS = 6
-
-function lcg(seed: number) {
-	let s = seed >>> 0
-	return () => {
-		s = (Math.imul(s, 1664525) + 1013904223) >>> 0
-		return s / 2 ** 32
-	}
-}
 
 type Ev = { key: string; ts: number; v: number }
 

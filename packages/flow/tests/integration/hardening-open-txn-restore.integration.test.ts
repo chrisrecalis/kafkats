@@ -10,8 +10,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { KafkaClient, Producer } from '@kafkats/client'
 import { codec, flow, type FlowApp } from '../../src/index.js'
-import { createTopics, uniqueTopicName } from './test-helpers.js'
-import { newClient, readAllCommitted, sleep } from './eos-test-util.js'
+import { createTopics, newClient, readAllCommitted, sleep, uniqueTopicName } from './test-helpers.js'
 
 const str = codec.string()
 const num = codec.json<number>()

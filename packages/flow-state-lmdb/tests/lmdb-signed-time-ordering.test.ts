@@ -4,19 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { lmdb, writeSignedTime, readSignedTime } from '@/lmdb.js'
-
-const stringCodec = {
-	encode: (s: string) => Buffer.from(s, 'utf-8'),
-	decode: (b: Buffer) => b.toString('utf-8'),
-}
-const numberCodec = {
-	encode: (n: number) => {
-		const b = Buffer.alloc(8)
-		b.writeDoubleLE(n, 0)
-		return b
-	},
-	decode: (b: Buffer) => b.readDoubleLE(0),
-}
+import { numberCodec, stringCodec } from './codecs.js'
 
 // F5b: LMDB time-key encoding must preserve signed-integer order. Pre-fix `writeBigInt64BE`
 // stored negatives as 0xFF…FF which sort AFTER positives in unsigned-byte order, so range

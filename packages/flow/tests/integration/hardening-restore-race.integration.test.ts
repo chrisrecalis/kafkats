@@ -8,8 +8,15 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { KafkaClient, Producer } from '@kafkats/client'
 import { codec, flow, type FlowApp, type KeyValueStore, type KeyValueStoreOptions } from '../../src/index.js'
-import { createTopics, uniqueTopicName } from './test-helpers.js'
-import { DurableMemoryProvider, newClient, readAllCommitted, sleep } from './eos-test-util.js'
+import {
+	createTopics,
+	delayPuts,
+	DurableMemoryProvider,
+	newClient,
+	readAllCommitted,
+	sleep,
+	uniqueTopicName,
+} from './test-helpers.js'
 
 const str = codec.string()
 const num = codec.json<number>()
@@ -18,19 +25,8 @@ const USERS = 2_500
 class SlowProvider extends DurableMemoryProvider {
 	slow = false
 	override createKeyValueStore<K, V>(name: string, o: KeyValueStoreOptions<K, V>): KeyValueStore<K, V> {
-		const inner = super.createKeyValueStore(name, o)
-		const isSlow = () => this.slow
-		return new Proxy(inner, {
-			get(target, prop) {
-				const v = Reflect.get(target, prop, target) as unknown
-				if (prop === 'put') {
-					return async (...args: unknown[]) => {
-						if (isSlow()) await sleep(5)
-						return (v as (...a: unknown[]) => Promise<void>).apply(target, args)
-					}
-				}
-				return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(target) : v
-			},
+		return delayPuts(super.createKeyValueStore(name, o), async () => {
+			if (this.slow) await sleep(5)
 		})
 	}
 }

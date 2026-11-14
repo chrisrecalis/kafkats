@@ -9,7 +9,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { codec, flow } from '@kafkats/flow'
-import { createTopic, makeClient, readCommitted, sleep, uniq } from './hardening-util.js'
+import { createTopic, makeClient, readCommitted, sleep, uniq } from './kafka-util.js'
 import { lmdb } from '@/lmdb.js'
 
 const brokers = process.env.KAFKA_BROKERS?.split(',').map(b => b.trim())

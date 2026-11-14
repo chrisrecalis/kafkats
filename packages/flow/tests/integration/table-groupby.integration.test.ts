@@ -1,27 +1,25 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { KafkaClient, Producer } from '@kafkats/client'
 import { codec, flow, type FlowApp } from '../../src/index.js'
-import { createTopics, uniqueTopicName } from './test-helpers.js'
-import { injectCommitFailures, newClient, readAllCommitted, sleep } from './eos-test-util.js'
+import {
+	createTopics,
+	injectCommitFailures,
+	newClient,
+	readCommittedTable,
+	sleep,
+	uniqueTopicName,
+} from './test-helpers.js'
 
 const stringCodec = codec.string()
 const numberCodec = codec.json<number>()
 const USERS = 24
 const GROUPS = 4
 
-async function latestPerKey(admin: KafkaClient, topic: string): Promise<Record<string, number>> {
-	const out: Record<string, number> = {}
-	for (const m of await readAllCommitted(admin, topic, 1_200)) {
-		out[m.key!.toString()] = numberCodec.decode(m.value!)
-	}
-	return out
-}
-
 async function eventually(admin: KafkaClient, topic: string, expected: Record<string, number>, timeoutMs: number) {
 	const deadline = Date.now() + timeoutMs
 	let last: Record<string, number> = {}
 	while (Date.now() < deadline) {
-		last = await latestPerKey(admin, topic)
+		last = await readCommittedTable(admin, topic, numberCodec, 1_200)
 		if (JSON.stringify(Object.entries(last).sort()) === JSON.stringify(Object.entries(expected).sort())) return last
 		await sleep(500)
 	}

@@ -1,7 +1,7 @@
 /**
  * Scenario C: broker restart / pause chaos (and E: unhandled rejections are logged by worker).
  *
- * Prereq: docker container `kafka-chaos` on 127.0.0.1:29092 (start-kafka.sh kafka-chaos 29092). Uses docker restart/pause on it ONLY.
+ * Prereq: docker container `kafka-chaos` on 127.0.0.1:29092 (any single-broker Kafka; no start script is checked in). Uses docker restart/pause on it ONLY.
  * Run (from packages/flow):
  *   pnpm exec tsx tests/chaos/broker-chaos.ts --guarantee eos --mode stateless --fault restart
  *   pnpm exec tsx tests/chaos/broker-chaos.ts --guarantee alo --mode count --fault pause --pause-s 25

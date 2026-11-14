@@ -14,7 +14,7 @@ export const REPLICATION_FACTOR = Number(process.env.CHAOS_RF ?? '1')
 /** All broker containers of the cluster, for rolling restarts (CHAOS_CONTAINERS=a,b,c). */
 export const CONTAINERS = (process.env.CHAOS_CONTAINERS ?? CONTAINER).split(',')
 const here = path.dirname(fileURLToPath(import.meta.url))
-export const WORKER = path.join(here, 'worker.ts')
+const WORKER = path.join(here, 'worker.ts')
 export const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms))
 export const rnd = (a: number, b: number) => a + Math.random() * (b - a)
 
@@ -227,7 +227,7 @@ export function summarizeStateless(inputs: Rec[], outs: Out[]) {
 	return { inputs: inputs.length, outputs: outs.length, missing, missingSample, dupes, dupSample, unexpected }
 }
 
-/** counts per key in output order. returns {gaps, repeats, maxByKey, finalByKey} relative to expected perKey. */
+/** Per-key count sequences in output order, checked against the expected 1..perKey (per-key override: expectedByKey). */
 export function summarizeCount(
 	keys: number,
 	perKeyDefault: number,

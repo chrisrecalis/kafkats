@@ -9,8 +9,7 @@ import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import type { KafkaClient, Producer } from '@kafkats/client'
 import { codec, flow } from '../../src/index.js'
-import { createTopics, uniqueTopicName } from './test-helpers.js'
-import { newClient, readAllCommitted, sleep } from './eos-test-util.js'
+import { createTopics, newClient, readAllCommitted, sleep, uniqueTopicName } from './test-helpers.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const str = codec.string()
