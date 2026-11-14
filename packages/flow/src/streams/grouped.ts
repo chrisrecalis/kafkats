@@ -71,10 +71,7 @@ export class KGroupedStreamImpl<K, V> implements KGroupedStream<K, V> {
 
 		this.node.connect(aggregateNode)
 
-		return new KTableImpl<K, number>(this.app, aggregateNode, {
-			keyCodec,
-			valueCodec,
-		})
+		return new KTableImpl<K, number>(this.app, aggregateNode, { keyCodec, valueCodec }, storeRef)
 	}
 
 	reduce(reducer: (aggregate: V, value: V) => V, options?: Materialized<K, V>): KTable<K, V> {
@@ -107,7 +104,7 @@ export class KGroupedStreamImpl<K, V> implements KGroupedStream<K, V> {
 
 		this.node.connect(aggregateNode)
 
-		return new KTableImpl<K, V>(this.app, aggregateNode, { keyCodec, valueCodec })
+		return new KTableImpl<K, V>(this.app, aggregateNode, { keyCodec, valueCodec }, storeRef)
 	}
 
 	aggregate<A>(
@@ -142,7 +139,7 @@ export class KGroupedStreamImpl<K, V> implements KGroupedStream<K, V> {
 
 		this.node.connect(aggregateNode)
 
-		return new KTableImpl<K, A>(this.app, aggregateNode, { keyCodec, valueCodec })
+		return new KTableImpl<K, A>(this.app, aggregateNode, { keyCodec, valueCodec }, storeRef)
 	}
 
 	windowedBy(windows: TimeWindows | SessionWindows | SlidingWindows): WindowedKGroupedStream<K, V> {

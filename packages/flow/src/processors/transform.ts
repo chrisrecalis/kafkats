@@ -150,3 +150,62 @@ export class BranchNode<K, V> extends Processor<K, V, K, V> {
 		}
 	}
 }
+
+/**
+ * mapValues for a KTable. A tombstone is a deletion and must stay a deletion, so the mapper is
+ * never invoked with null. The prior value (when known) is mapped too so downstream table nodes
+ * keep seeing a prior value of the right shape.
+ */
+export class TableMapValuesNode<K, V, V2> extends Processor<K, V, K, V2> {
+	constructor(private readonly fn: (value: V) => V2 | null) {
+		super()
+	}
+
+	clone(worker: WorkerContext): Processor<K, V, K, V2> {
+		void worker
+		return new TableMapValuesNode(this.fn)
+	}
+
+	async process(record: StreamRecord<K, V>): Promise<void> {
+		const old = record.oldValue as V | null | undefined
+		const next: StreamRecord<K, V2> = {
+			...record,
+			value: record.value === null ? null : this.fn(record.value),
+			oldValue: old === undefined || old === null ? old : this.fn(old),
+		}
+		await this.forward(next)
+	}
+}
+
+/**
+ * filter for a KTable. Unlike a stream filter, a row that stops matching must be retracted with a
+ * tombstone, otherwise downstream tables/aggregations keep the stale row forever. Tombstones are
+ * forwarded as-is and never passed to the predicate.
+ */
+export class TableFilterNode<K, V> extends Processor<K, V, K, V> {
+	constructor(private readonly fn: (key: K | null, value: V) => boolean) {
+		super()
+	}
+
+	clone(worker: WorkerContext): Processor<K, V, K, V> {
+		void worker
+		return new TableFilterNode(this.fn)
+	}
+
+	async process(record: StreamRecord<K, V>): Promise<void> {
+		const old = record.oldValue as V | null | undefined
+		// undefined = upstream doesn't track prior values; otherwise the prior value as seen
+		// through this filter (null when the prior row was absent or filtered out).
+		const filteredOld = old === undefined ? undefined : old !== null && this.fn(record.key, old) ? old : null
+
+		if (record.value !== null && this.fn(record.key, record.value)) {
+			await this.forward({ ...record, oldValue: filteredOld })
+			return
+		}
+
+		// Row deleted or no longer matching. Skip the tombstone only when we know the row was
+		// not visible downstream before.
+		if (filteredOld === null) return
+		await this.forward({ ...record, value: null, oldValue: filteredOld })
+	}
+}

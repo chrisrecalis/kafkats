@@ -1,8 +1,30 @@
 import { Processor, type StreamRecord, type WorkerContext } from '@/processors/base.js'
-import { maybeExpire, type CleanupState } from '@/processors/aggregation.js'
+import { maybeExpire, StreamTimeTracker } from '@/processors/aggregation.js'
 import type { WindowStore } from '@/state.js'
 
-const newCleanupState = (): CleanupState => ({ lastCleanupStreamTimeMs: 0, streamTimeMs: 0 })
+const newCleanupState = (): StreamTimeTracker => new StreamTimeTracker()
+
+/**
+ * Buffer a join record without overwriting an earlier record of the same key and timestamp.
+ *
+ * The window store is keyed by (key, windowStart, windowEnd), so two records sharing a key and
+ * timestamp would collide and the first would silently lose all of its future matches. Lookups
+ * only use windowStart, so windowEnd is bumped to the first free slot to keep duplicates distinct
+ * (the store format and changelog layout stay unchanged).
+ */
+async function putRetainingDuplicates<K, V>(
+	store: WindowStore<K, V>,
+	key: K,
+	windowStart: number,
+	windowEnd: number,
+	value: V
+): Promise<void> {
+	let end = windowEnd
+	while ((await store.get({ key, windowStart, windowEnd: end })) !== undefined) {
+		end += 1
+	}
+	await store.put({ key, windowStart, windowEnd: end }, value)
+}
 
 /**
  * Processor node for Stream-Stream join (inner join).
@@ -14,19 +36,18 @@ export class StreamStreamJoinNode<K, V1, V2, VR> extends Processor<K, V1, K, VR>
 		private readonly otherStoreRef: { store: WindowStore<K, V2> | null },
 		private readonly joiner: (value: V1, otherValue: V2) => VR,
 		private readonly joinWindowMs: number,
-		private readonly cleanupState: CleanupState = newCleanupState()
+		private readonly cleanupState: StreamTimeTracker = newCleanupState()
 	) {
 		super()
 	}
 
 	clone(worker: WorkerContext): Processor<K, V1, K, VR> {
-		void worker
 		return new StreamStreamJoinNode<K, V1, V2, VR>(
 			this.myStoreRef,
 			this.otherStoreRef,
 			this.joiner,
 			this.joinWindowMs,
-			this.cleanupState
+			this.cleanupState.attach(worker)
 		)
 	}
 
@@ -47,7 +68,7 @@ export class StreamStreamJoinNode<K, V1, V2, VR> extends Processor<K, V1, K, VR>
 		const windowStart = timestamp
 		const windowEnd = timestamp + this.joinWindowMs
 
-		await myStore.put({ key, windowStart, windowEnd }, value)
+		await putRetainingDuplicates(myStore, key, windowStart, windowEnd, value)
 
 		const searchFrom = timestamp - this.joinWindowMs
 		const searchTo = timestamp + this.joinWindowMs
@@ -61,7 +82,7 @@ export class StreamStreamJoinNode<K, V1, V2, VR> extends Processor<K, V1, K, VR>
 
 		// Stream-time-driven retention: expire both stores so neither grows unbounded
 		// (the other stream's node may be idle, so each node expires both).
-		await maybeExpire(this.cleanupState, timestamp, async cutoff => {
+		await maybeExpire(this.cleanupState, record, timestamp, async cutoff => {
 			await myStore.expireOldWindows(cutoff)
 			await otherStore.expireOldWindows(cutoff)
 		})
@@ -77,19 +98,18 @@ export class StreamStreamLeftJoinNode<K, V1, V2, VR> extends Processor<K, V1, K,
 		private readonly otherStoreRef: { store: WindowStore<K, V2> | null },
 		private readonly joiner: (value: V1, otherValue: V2 | null) => VR,
 		private readonly joinWindowMs: number,
-		private readonly cleanupState: CleanupState = newCleanupState()
+		private readonly cleanupState: StreamTimeTracker = newCleanupState()
 	) {
 		super()
 	}
 
 	clone(worker: WorkerContext): Processor<K, V1, K, VR> {
-		void worker
 		return new StreamStreamLeftJoinNode<K, V1, V2, VR>(
 			this.myStoreRef,
 			this.otherStoreRef,
 			this.joiner,
 			this.joinWindowMs,
-			this.cleanupState
+			this.cleanupState.attach(worker)
 		)
 	}
 
@@ -110,7 +130,7 @@ export class StreamStreamLeftJoinNode<K, V1, V2, VR> extends Processor<K, V1, K,
 		const windowStart = timestamp
 		const windowEnd = timestamp + this.joinWindowMs
 
-		await myStore.put({ key, windowStart, windowEnd }, value)
+		await putRetainingDuplicates(myStore, key, windowStart, windowEnd, value)
 
 		const searchFrom = timestamp - this.joinWindowMs
 		const searchTo = timestamp + this.joinWindowMs
@@ -132,7 +152,7 @@ export class StreamStreamLeftJoinNode<K, V1, V2, VR> extends Processor<K, V1, K,
 
 		// Stream-time-driven retention: expire both stores so neither grows unbounded
 		// (the other stream's node may be idle, so each node expires both).
-		await maybeExpire(this.cleanupState, timestamp, async cutoff => {
+		await maybeExpire(this.cleanupState, record, timestamp, async cutoff => {
 			await myStore.expireOldWindows(cutoff)
 			await otherStore.expireOldWindows(cutoff)
 		})
@@ -148,19 +168,18 @@ export class StreamStreamOuterJoinNode<K, V1, V2, VR> extends Processor<K, V1, K
 		private readonly otherStoreRef: { store: WindowStore<K, V2> | null },
 		private readonly joiner: (value: V1 | null, otherValue: V2 | null) => VR,
 		private readonly joinWindowMs: number,
-		private readonly cleanupState: CleanupState = newCleanupState()
+		private readonly cleanupState: StreamTimeTracker = newCleanupState()
 	) {
 		super()
 	}
 
 	clone(worker: WorkerContext): Processor<K, V1, K, VR> {
-		void worker
 		return new StreamStreamOuterJoinNode<K, V1, V2, VR>(
 			this.myStoreRef,
 			this.otherStoreRef,
 			this.joiner,
 			this.joinWindowMs,
-			this.cleanupState
+			this.cleanupState.attach(worker)
 		)
 	}
 
@@ -181,7 +200,7 @@ export class StreamStreamOuterJoinNode<K, V1, V2, VR> extends Processor<K, V1, K
 		const windowStart = timestamp
 		const windowEnd = timestamp + this.joinWindowMs
 
-		await myStore.put({ key, windowStart, windowEnd }, value)
+		await putRetainingDuplicates(myStore, key, windowStart, windowEnd, value)
 
 		const searchFrom = timestamp - this.joinWindowMs
 		const searchTo = timestamp + this.joinWindowMs
@@ -203,7 +222,7 @@ export class StreamStreamOuterJoinNode<K, V1, V2, VR> extends Processor<K, V1, K
 
 		// Stream-time-driven retention: expire both stores so neither grows unbounded
 		// (the other stream's node may be idle, so each node expires both).
-		await maybeExpire(this.cleanupState, timestamp, async cutoff => {
+		await maybeExpire(this.cleanupState, record, timestamp, async cutoff => {
 			await myStore.expireOldWindows(cutoff)
 			await otherStore.expireOldWindows(cutoff)
 		})

@@ -30,7 +30,13 @@ export type ActiveTransaction = {
 	readonly signal: AbortSignal
 	send(
 		topic: string,
-		messages: { key?: Buffer | null; value: Buffer | null; headers?: Record<string, Buffer>; partition?: number }
+		messages: {
+			key?: Buffer | null
+			value: Buffer | null
+			headers?: Record<string, Buffer>
+			partition?: number
+			timestamp?: Date
+		}
 	): Promise<SendResult>
 	sendOffsets(
 		context: ConsumeContext,

@@ -707,6 +707,10 @@ class FlowAppImpl implements FlowApp {
 			? await this.resolvePartition(topic, record.key, record.value, options.partitioner)
 			: undefined
 
+		// Preserve event time: downstream windowing/joins on the output topic must see the
+		// record's timestamp, not the wall-clock time at which it happened to be produced.
+		const timestamp = record.timestamp > 0n ? new Date(Number(record.timestamp)) : undefined
+
 		if (this.eosEnabled) {
 			if (!worker.activeTransaction) {
 				throw new Error('exactly_once requires a transactional context')
@@ -716,6 +720,7 @@ class FlowAppImpl implements FlowApp {
 				value,
 				headers: record.headers,
 				partition,
+				timestamp,
 			})
 			return
 		}
@@ -725,6 +730,7 @@ class FlowAppImpl implements FlowApp {
 			value,
 			headers: record.headers,
 			partition,
+			timestamp,
 		})
 	}
 
