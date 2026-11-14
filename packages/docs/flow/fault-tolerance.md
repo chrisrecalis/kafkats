@@ -132,7 +132,6 @@ A [global table](/flow/tables#global-tables) is fully loaded before any record i
 
 - **Stream-stream `leftJoin()` and `outerJoin()` emit the unmatched result eagerly.** When a later record matches, a second record is emitted for the same input.
 - **Derived tables are not materialized.** The result of `filter()` or `mapValues()` on a table, a table-table join, or a windowed aggregation has no state store of its own and cannot be the lookup side of a join. Join the table it was derived from instead, or write it to a topic and read it back with `app.table()`. Tables from `count()`, `reduce()` and `aggregate()` can be joined.
-- **LMDB:** an app cannot be `start()`ed again after `close()`, because `close()` closes the provider. Create a new provider and a new app instead.
 
 ## Next Steps
 

@@ -49,7 +49,7 @@ src/
 - **Fail-stop workers**: a worker that fails never continues past the failure. Recoverable failures (Kafka/infrastructure errors) abort the transaction, drop buffered state, rejoin and resume from committed offsets with backoff (0.5s to 30s), unless `restartOnError: false`. User-code errors and fatal Kafka errors set `state()` to `'ERROR'`; see `app.getError()`.
 - **Restoration**: newly assigned partitions are paused, restored from the changelog, then resumed. A restore with no progress for `changelog.restoration.idleTimeoutMs` (default 30000) fails. Checkpoints are ignored (wipe + rebuild) when outside the changelog offset range or when the local store is empty.
 - **Stream time** is tracked per source partition (late-record dropping, window expiry).
-- **Known limitations**: stream-stream left/outer joins emit the unmatched result eagerly; derived tables (`filter`/`mapValues`/joins/windowed results) are not materialized and cannot be a join lookup side; an LMDB-backed app cannot be restarted after `close()`.
+- **Known limitations**: stream-stream left/outer joins emit the unmatched result eagerly; derived tables (`filter`/`mapValues`/joins/windowed results) are not materialized and cannot be a join lookup side.
 
 User-facing documentation: `packages/docs/flow/fault-tolerance.md`.
 

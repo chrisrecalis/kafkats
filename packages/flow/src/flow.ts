@@ -132,6 +132,11 @@ type GlobalTableDef = {
 	topic: string
 	storeName: string
 	store: KeyValueStore<unknown, unknown>
+	/** Shared with the table's processors; re-pointed when the store is re-created on start. */
+	storeRef: { store: KeyValueStore<unknown, unknown> | null }
+	/** Codecs the store was created with. */
+	storeKeyCodec: Codec<unknown>
+	storeValueCodec: Codec<unknown>
 	keyCodec: Codec<unknown>
 	valueCodec: Codec<unknown>
 	source: SourceNode<unknown, unknown>
@@ -223,6 +228,8 @@ class FlowAppImpl implements FlowApp {
 	private clusterAvailable = false
 	private startupError: Error | null = null
 	private restorationQueue: Promise<void> = Promise.resolve()
+	/** True once the provider has been closed: stores created at build time must be re-created. */
+	private globalStoresStale = false
 
 	/** Get the next store ID and increment the counter */
 	nextStoreId(): number {
@@ -644,6 +651,9 @@ class FlowAppImpl implements FlowApp {
 			topic: resolved.topic,
 			storeName,
 			store: store as KeyValueStore<unknown, unknown>,
+			storeRef: storeRef as { store: KeyValueStore<unknown, unknown> | null },
+			storeKeyCodec: keyCodec as Codec<unknown>,
+			storeValueCodec: valueCodec as Codec<unknown>,
 			keyCodec: resolved.format.keyCodec as Codec<unknown>,
 			valueCodec: resolved.format.valueCodec as Codec<unknown>,
 			source: sourceNode as SourceNode<unknown, unknown>,
@@ -1078,6 +1088,7 @@ class FlowAppImpl implements FlowApp {
 				def.partitions.forget(partition)
 			}
 		}
+		this.globalStoresStale = true
 		await this.stateStoreProvider.close().catch(err => {
 			this.logger.warn('state store provider close failed', { error: toError(err).message })
 		})
@@ -1616,6 +1627,15 @@ class FlowAppImpl implements FlowApp {
 	 * Resolves once the table has caught up to the end of its topic as of startup.
 	 */
 	private async startGlobalTable(table: GlobalTableDef): Promise<void> {
+		if (this.globalStoresStale) {
+			// The provider was closed by a previous close(); get a live store from it again.
+			table.store = this.stateStoreProvider.createKeyValueStore(table.storeName, {
+				keyCodec: table.storeKeyCodec,
+				valueCodec: table.storeValueCodec,
+			})
+			table.storeRef.store = table.store
+			this.stateStores.set(table.storeName, table.store)
+		}
 		await table.store.init()
 		// The topic is the source of truth: rebuild from scratch so removed rows don't survive.
 		await clearStore(table.store)

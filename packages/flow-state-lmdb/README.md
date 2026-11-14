@@ -45,8 +45,6 @@ lmdb({
 
 State is partitioned, so each partition of a store is its own LMDB database named `<storeName>.p<partition>`. Size `maxDbs` for the number of stores times the number of partitions.
 
-An app that uses an LMDB provider cannot be `start()`ed again after `close()`: create a new provider and a new app.
-
 ## Documentation
 
 Full documentation at [chrisrecalis.github.io/kafkats](https://chrisrecalis.github.io/kafkats)

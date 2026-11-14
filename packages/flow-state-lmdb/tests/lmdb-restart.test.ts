@@ -153,4 +153,24 @@ describe.skipIf(!brokers)('lmdb-restart: flow restart cycles on LMDB', () => {
 			}, 120_000)
 		}
 	}
+	it('the same app can be started again after close()', async () => {
+		const input = uniq('lmdb-reopen-in')
+		const out = uniq('lmdb-reopen-out')
+		await createTopic(input)
+		await createTopic(out)
+		const stateDir = mkdtempSync(join(tmpdir(), 'lmdb-reopen-'))
+		try {
+			const app = build(uniq('lmdb-reopen'), input, out, stateDir, 'exactly_once')
+			for (let cycle = 1; cycle <= 2; cycle++) {
+				await app.start()
+				for (let i = 0; i < 3; i++) await producer.send(input, { key: 'a', value: numberCodec.encode(1) })
+				await waitForValue(out, cycle * 3)
+				await app.close()
+			}
+		} finally {
+			rmSync(stateDir, { recursive: true, force: true })
+		}
+		const unique = [...new Set((await readAll(out)).map(m => m.value))]
+		expect(unique).toEqual([1, 2, 3, 4, 5, 6])
+	}, 120_000)
 })

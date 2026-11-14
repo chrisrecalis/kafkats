@@ -36,4 +36,4 @@ Redesign the `@kafkats/flow` runtime for correctness: partitioned state, reparti
 - `CoPartitioningError`, exported from `@kafkats/flow`.
 - `Grouped.name` for stable repartition topic names.
 
-**Known limitations**: stream-stream left and outer joins emit the unmatched result eagerly; derived tables (`filter()`/`mapValues()` results) cannot be the lookup side of a join; an LMDB-backed app cannot be started again after `close()`. See the new fault tolerance guide.
+**Known limitations**: stream-stream left and outer joins emit the unmatched result eagerly; derived tables (`filter()`/`mapValues()` results) cannot be the lookup side of a join. See the new fault tolerance guide.

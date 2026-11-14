@@ -56,27 +56,35 @@ console.log(`== ${label}: ${inputs.length} records`)
 let sentCount = 0
 let producerDone = false
 const sendLoop = (async () => {
+	// own client + producer, recreated whenever a send fails, so a harness-side dead connection can't mask the app's behaviour
+	let pc = await makeClient()
+	let p = pc.producer({ lingerMs: 0 })
 	const batch = 12
 	for (let i = 0; i < inputs.length; i += batch) {
 		const slice: Rec[] = inputs.slice(i, i + batch)
 		for (;;) {
 			try {
-				const c = (globalThis as any).__pc ?? client
-				const p = c.producer({ lingerMs: 0 })
 				await p.send(
 					input,
 					slice.map(r => ({ key: r.key, value: Buffer.from(r.value) }))
 				)
-				await p.disconnect()
 				break
 			} catch {
 				await sleep(500)
+				try {
+					await pc.disconnect()
+				} catch {}
+				try {
+					pc = await makeClient()
+					p = pc.producer({ lingerMs: 0 })
+				} catch {}
 			}
 		}
 		sentCount = i + slice.length
 		await sleep(200)
 	}
 	producerDone = true
+	await pc.disconnect().catch(() => {})
 })()
 
 const w = new Worker('w0', workerEnv({ appId, input, output, mode, guarantee })).start()
