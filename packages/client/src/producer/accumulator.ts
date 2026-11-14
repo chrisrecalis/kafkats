@@ -196,8 +196,9 @@ export class RecordAccumulator extends EventEmitter<AccumulatorEvents> {
 		let size = 0
 		if (message.key) size += message.key.length
 		if (message.value) size += message.value.length
-		for (const value of Object.values(message.headers)) {
-			size += value.length
+		for (const [name, value] of Object.entries(message.headers)) {
+			// Name and value bytes plus their two length prefixes.
+			size += Buffer.byteLength(name) + value.length + 10
 		}
 		// Add overhead for record encoding (attributes, offsets, lengths, varints)
 		size += 50

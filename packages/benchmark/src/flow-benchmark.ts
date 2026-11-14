@@ -99,7 +99,7 @@ const SCENARIOS: Scenario[] = [
 					.stream(t.input, { key: str, value: event })
 					.groupByKey()
 					.windowedBy(TimeWindows.of('1m'))
-					.count({ storeName: 'windowed-counts', key: str, value: num })
+					.count({ storeName: 'windowed-counts', value: num })
 					.toStream()
 					.map(
 						(windowed, count) =>
@@ -119,7 +119,7 @@ const SCENARIOS: Scenario[] = [
 					.stream(t.input, { key: str, value: event })
 					.groupByKey()
 					.windowedBy(SessionWindows.withInactivityGap('1m'))
-					.count({ storeName: 'session-counts', key: str, value: num })
+					.count({ storeName: 'session-counts', value: num })
 					.toStream()
 					// Merging a record into a session retracts the previous session (a null value).
 					.filter((_, count) => count !== null)
