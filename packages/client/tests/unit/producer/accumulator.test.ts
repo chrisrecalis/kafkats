@@ -126,8 +126,8 @@ describe('RecordAccumulator', () => {
 			accumulator.append(message)
 			accumulator.flush()
 
-			// Size should be: key(3) + value(5) + header(6) + overhead(50) = 64
-			expect(batches[0]!.sizeBytes).toBe(64)
+			// Size should be: key(3) + value(5) + header name(2) + value(6) + lengths(10) + overhead(50) = 76
+			expect(batches[0]!.sizeBytes).toBe(76)
 		})
 	})
 
