@@ -124,12 +124,21 @@ abstract class BufferedStoreBase<SK, V, S extends KeyValueStore<SK, V>> implemen
 		const buffer = this.buffers.get(scope)
 		if (!buffer) return
 		this.buffers.delete(scope)
-		for (const entry of buffer.values()) {
-			if (entry.value === null) {
-				await this.inner.delete(entry.key)
-			} else {
-				await this.inner.put(entry.key, this.valueCodec.decode(entry.value))
-			}
+		// Issue every write before waiting for any: a provider that batches the writes of an event
+		// turn (LMDB commits them in one transaction) then applies the buffer in one go instead of
+		// one commit per entry. The entries have distinct keys, so the order they land in is irrelevant.
+		// Wait for all of them even when one fails, so that none lands after this has returned.
+		const results = await Promise.allSettled(
+			Array.from(buffer.values(), async entry => {
+				if (entry.value === null) {
+					await this.inner.delete(entry.key)
+				} else {
+					await this.inner.put(entry.key, this.valueCodec.decode(entry.value))
+				}
+			})
+		)
+		for (const result of results) {
+			if (result.status === 'rejected') throw result.reason
 		}
 	}
 
