@@ -1,5 +1,9 @@
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { KafkaClient } from '@kafkats/client'
-import { TimeWindows, codec, flow, type FlowApp, type FlowConfig, type KStream } from '@kafkats/flow'
+import { SessionWindows, TimeWindows, codec, flow, type FlowApp, type FlowConfig, type KStream } from '@kafkats/flow'
+import { lmdb } from '@kafkats/flow-state-lmdb'
 
 import { uniqueName } from './utils.js'
 
@@ -14,6 +18,7 @@ import { uniqueName } from './utils.js'
  *   KAFKA_BROKERS=localhost:9092 pnpm -C packages/benchmark bench:flow
  *   ... bench:flow -- --records 200000 --scenario count,restore --guarantee exactly_once --runs 3
  *   ... bench:flow -- --scenario stateless --threads 2
+ *   ... bench:flow -- --scenario count,session-count --provider lmdb
  */
 
 type Guarantee = NonNullable<FlowConfig['processingGuarantee']>
@@ -27,6 +32,8 @@ interface Options {
 	runs: number
 	scenarios: string[]
 	guarantees: Guarantee[]
+	/** State store provider: 'memory' (the default provider) or 'lmdb'. */
+	provider: 'memory' | 'lmdb'
 }
 
 interface Event {
@@ -105,6 +112,28 @@ const SCENARIOS: Scenario[] = [
 		},
 	},
 	{
+		name: 'session-count',
+		build(app, t, done) {
+			sink(
+				app
+					.stream(t.input, { key: str, value: event })
+					.groupByKey()
+					.windowedBy(SessionWindows.withInactivityGap('1m'))
+					.count({ storeName: 'session-counts', key: str, value: num })
+					.toStream()
+					// Merging a record into a session retracts the previous session (a null value).
+					.filter((_, count) => count !== null)
+					.map(
+						(windowed, count) =>
+							[`${windowed!.key}@${windowed!.window.start}`, count] as [string, number | null]
+					),
+				t.output,
+				num,
+				done
+			)
+		},
+	},
+	{
 		name: 'table-join',
 		usesTable: true,
 		build(app, t, done) {
@@ -170,6 +199,7 @@ function parseArgs(argv: string[]): Options {
 		runs: Number(arg('runs') ?? 3),
 		scenarios: arg('scenario')?.split(',') ?? [...SCENARIOS.map(s => s.name), 'restore'],
 		guarantees: (arg('guarantee')?.split(',') as Guarantee[] | undefined) ?? ['at_least_once', 'exactly_once'],
+		provider: arg('provider') === 'lmdb' ? 'lmdb' : 'memory',
 	}
 }
 
@@ -222,13 +252,19 @@ async function setUp(brokers: string[], scenario: Scenario, options: Options): P
 	return topics
 }
 
+/** State directories of LMDB runs, removed when the benchmark ends. */
+const stateDirs: string[] = []
+
 function createApp(brokers: string[], applicationId: string, guarantee: Guarantee, options: Options): FlowApp {
+	const stateDir = options.provider === 'lmdb' ? mkdtempSync(join(tmpdir(), 'flow-bench-')) : undefined
+	if (stateDir) stateDirs.push(stateDir)
 	return flow({
 		applicationId,
 		client: { brokers, clientId: 'flow-bench', logLevel: 'silent' },
 		processingGuarantee: guarantee,
 		numStreamThreads: options.threads,
 		consumer: { autoOffsetReset: 'earliest' },
+		...(stateDir ? { stateStoreProvider: lmdb({ stateDir }) } : {}),
 	})
 }
 
@@ -298,7 +334,7 @@ async function main(): Promise<void> {
 	console.log(
 		`flow benchmark: ${options.records} records, ${options.keys} keys, ${options.partitions} partitions, ` +
 			`${options.threads} stream thread(s), ` +
-			`~${options.valueBytes} byte values, best of ${options.runs} runs\n`
+			`~${options.valueBytes} byte values, ${options.provider} state, best of ${options.runs} runs\n`
 	)
 	const rows: Array<{ scenario: string; guarantee: string; 'records/s': string; runs: string }> = []
 	const measurements = SCENARIOS.filter(s => options.scenarios.includes(s.name)).map(scenario => ({
@@ -325,6 +361,7 @@ async function main(): Promise<void> {
 	}
 	console.log()
 	console.table(rows)
+	for (const dir of stateDirs) rmSync(dir, { recursive: true, force: true })
 }
 
 main().catch(err => {

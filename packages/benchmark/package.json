@@ -17,7 +17,7 @@
 		"bench:consumer": "tsx src/index.ts --operation consumer",
 		"bench:share": "tsx src/index.ts --operation share",
 		"bench:eos": "tsx src/eos-benchmark.ts",
-		"prebench:flow": "pnpm -C ../client build && pnpm -C ../flow build",
+		"prebench:flow": "pnpm -C ../client build && pnpm -C ../flow build && pnpm -C ../flow-state-lmdb build",
 		"bench:flow": "tsx src/flow-benchmark.ts",
 		"bench:all": "tsx src/index.ts",
 		"preprofile:producer": "pnpm -C ../client build && pnpm build",
@@ -35,6 +35,7 @@
 	"dependencies": {
 		"@kafkats/client": "workspace:*",
 		"@kafkats/flow": "workspace:*",
+		"@kafkats/flow-state-lmdb": "workspace:*",
 		"@platformatic/kafka": "^1.22.0",
 		"kafkajs": "^2.2.4"
 	},

@@ -29,6 +29,9 @@ importers:
       '@kafkats/flow':
         specifier: workspace:*
         version: link:../flow
+      '@kafkats/flow-state-lmdb':
+        specifier: workspace:*
+        version: link:../flow-state-lmdb
       '@platformatic/kafka':
         specifier: ^1.22.0
         version: 1.22.0
