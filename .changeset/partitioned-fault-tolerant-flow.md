@@ -15,6 +15,7 @@ Redesign the `@kafkats/flow` runtime for correctness: partitioned state, reparti
 - `through(topic)` now continues from what is read back from the topic instead of passing records straight on. The topic must exist. Internal and `through()` topics are read from the beginning when the group has no committed offset.
 - `globalTable()` is read in full by every instance outside the consumer group and loaded before processing starts. It writes no changelog and can only be the lookup side of a stream join.
 - Consumers always use the `range` partition assignor. Stop all instances before upgrading from an earlier version (no rolling upgrade). Windowed and session state and join buffers written by earlier versions were not partition-aligned and restart from empty; key-value state is rebuilt from the changelog.
+- Reusing a store name for a different kind of store (key-value, window, session) now throws when the topology is built instead of silently returning the wrong store.
 - A restore that makes no progress for `changelog.restoration.idleTimeoutMs` (now 30000 by default) fails instead of completing with partial state.
 
 **Fixes**
