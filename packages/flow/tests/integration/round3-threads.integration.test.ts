@@ -72,7 +72,7 @@ describe('round3: multi-thread EOS topologies with commit failures', () => {
 				.count({ storeName: 'cnt', key: str, value: num })
 				.toStream()
 				.to(T.oCount, { key: str, value: num })
-			a.groupBy((k, _v) => `grp${Number(k.slice(1)) % 3}`, { key: str, value: str })
+			a.groupBy((k, _v) => `grp${Number(k!.slice(1)) % 3}`, { key: str, value: str })
 				.count({ storeName: 'gcnt', key: str, value: num })
 				.toStream()
 				.to(T.oGroup, { key: str, value: num })

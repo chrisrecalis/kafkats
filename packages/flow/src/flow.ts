@@ -151,10 +151,16 @@ type GlobalTableDef = {
 	run: Promise<void> | null
 }
 
-/** Error codes that restarting a worker cannot fix. */
+/**
+ * Error codes that restarting a worker cannot fix.
+ *
+ * ProducerFenced / InvalidProducerEpoch are deliberately not here: the broker answers with them
+ * after it aborted a transaction that outlived `transactionTimeoutMs` (a stalled broker, a long
+ * GC pause), which is indistinguishable from being fenced by another instance. Either way the
+ * transaction is gone, so the worker drops its uncommitted state, re-initializes the producer and
+ * resumes from the committed offsets.
+ */
 const FATAL_ERROR_CODES = new Set<number>([
-	ErrorCode.ProducerFenced,
-	ErrorCode.InvalidProducerEpoch,
 	ErrorCode.FencedInstanceId,
 	ErrorCode.TopicAuthorizationFailed,
 	ErrorCode.GroupAuthorizationFailed,
@@ -212,6 +218,12 @@ class FlowAppImpl implements FlowApp {
 	private readonly changelogCheckpointStore: ChangelogCheckpointStore
 	private readonly durableCheckpoints: boolean
 	private readonly processCheckpoints = new Map<string, bigint>()
+	/**
+	 * Where this process started reading source partitions that had no committed offset under the
+	 * 'latest' reset policy. Until the first commit lands, a worker restart or rebalance resumes
+	 * from here instead of jumping to the (new) end of the topic and skipping records.
+	 */
+	private readonly initialPositions = new Map<string, bigint>()
 	private pruneTimer: ReturnType<typeof setTimeout> | null = null
 	readonly stateStores = new Map<string, KeyValueStore<unknown, unknown>>()
 	private readonly storeDefs = new Map<string, StoreDef>()
@@ -1089,6 +1101,7 @@ class FlowAppImpl implements FlowApp {
 			this.pruneTimer = null
 		}
 		this.processCheckpoints.clear()
+		this.initialPositions.clear()
 
 		// Drop in-process store instances; the provider owns (and closes) the underlying stores.
 		for (const def of this.storeDefs.values()) {
@@ -1487,18 +1500,24 @@ class FlowAppImpl implements FlowApp {
 	}
 
 	/**
-	 * Start reading newly assigned repartition-topic partitions from the beginning when the group
-	 * has no committed offset for them. With the consumer default ('latest'), records written to
-	 * an internal topic before this worker resolved its position would be skipped, i.e. lost.
+	 * Settle where newly assigned partitions without a committed offset start.
+	 *
+	 * Internal (repartition / through) topics are read from the beginning: with the consumer
+	 * default ('latest'), records written before this worker resolved its position would be lost.
+	 *
+	 * Source topics read from 'latest' are pinned to the position this process first started at.
+	 * Otherwise a worker that restarts (or gets the partition back) before its first commit would
+	 * re-resolve 'latest' and silently skip everything it had read but not committed.
 	 */
-	private async resetRepartitionPositions(worker: WorkerContext, partitions: TopicPartition[]): Promise<void> {
-		const internal = partitions.filter(
-			tp => this.repartitionTopics.has(tp.topic) || this.throughTopics.has(tp.topic)
-		)
-		if (internal.length === 0 || !this.clusterAvailable) return
+	private async settleInitialPositions(worker: WorkerContext, partitions: TopicPartition[]): Promise<void> {
+		const isInternal = (topic: string) => this.repartitionTopics.has(topic) || this.throughTopics.has(topic)
+		const policy = this.resolveOffsetReset() ?? 'latest'
+		// With 'earliest' (and 'none') the start position of a source partition is already stable.
+		const relevant = partitions.filter(tp => isInternal(tp.topic) || policy === 'latest')
+		if (relevant.length === 0 || !this.clusterAvailable) return
 
 		const byTopic = new Map<string, number[]>()
-		for (const tp of internal) {
+		for (const tp of relevant) {
 			byTopic.set(tp.topic, [...(byTopic.get(tp.topic) ?? []), tp.partition])
 		}
 
@@ -1537,10 +1556,35 @@ class FlowAppImpl implements FlowApp {
 				if (partition.committedOffset < 0n) uncommitted.push(partition.partitionIndex)
 			}
 			if (uncommitted.length === 0) continue
-			const earliest = await admin.fetchTopicOffsets(topic.name, uncommitted, 'earliest')
+			if (isInternal(topic.name)) {
+				const earliest = await admin.fetchTopicOffsets(topic.name, uncommitted, 'earliest')
+				for (const partition of uncommitted) {
+					if (!worker.assignedPartitions.has(`${topic.name}:${partition}`)) continue
+					worker.consumer.seek(topic.name, partition, earliest.get(partition) ?? 0n)
+				}
+				continue
+			}
+			// Source topic read from 'latest': pin the first start position for this process.
+			const unpinned = uncommitted.filter(p => !this.initialPositions.has(`${topic.name}:${p}`))
+			if (unpinned.length > 0) {
+				const latest = await admin.fetchTopicOffsets(topic.name, unpinned, 'latest', {
+					isolationLevel: this.eosEnabled
+						? 'read_committed'
+						: (this.config.consumer?.isolationLevel ?? 'read_uncommitted'),
+				})
+				for (const partition of unpinned) {
+					const key = `${topic.name}:${partition}`
+					const offset = latest.get(partition)
+					if (offset !== undefined && !this.initialPositions.has(key)) {
+						this.initialPositions.set(key, offset)
+					}
+				}
+			}
 			for (const partition of uncommitted) {
-				if (!worker.assignedPartitions.has(`${topic.name}:${partition}`)) continue
-				worker.consumer.seek(topic.name, partition, earliest.get(partition) ?? 0n)
+				const key = `${topic.name}:${partition}`
+				const pinned = this.initialPositions.get(key)
+				if (pinned === undefined || !worker.assignedPartitions.has(`${topic.name}:${partition}`)) continue
+				worker.consumer.seek(topic.name, partition, pinned)
 			}
 		}
 	}
@@ -1549,6 +1593,7 @@ class FlowAppImpl implements FlowApp {
 	private needsAssignmentPreparation(): boolean {
 		if (!this.clusterAvailable) return false
 		if (this.repartitionTopics.size > 0 || this.throughTopics.size > 0) return true
+		if ((this.resolveOffsetReset() ?? 'latest') === 'latest') return true
 		for (const def of this.storeDefs.values()) {
 			if (def.scope === 'partition') return true
 		}
@@ -2212,7 +2257,7 @@ class FlowAppImpl implements FlowApp {
 				}
 
 				void this.enqueueRestoration(partitions)
-					.then(() => this.resetRepartitionPositions(worker, partitions))
+					.then(() => this.settleInitialPositions(worker, partitions))
 					.then(() => {
 						const stillAssigned = partitions.filter(tp =>
 							worker.assignedPartitions.has(`${tp.topic}:${tp.partition}`)

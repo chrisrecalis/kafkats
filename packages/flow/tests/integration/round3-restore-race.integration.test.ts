@@ -19,13 +19,13 @@ class SlowProvider extends DurableMemoryProvider {
 	slow = false
 	override createKeyValueStore<K, V>(name: string, o: KeyValueStoreOptions<K, V>): KeyValueStore<K, V> {
 		const inner = super.createKeyValueStore(name, o)
-		const self = this
+		const isSlow = () => this.slow
 		return new Proxy(inner, {
 			get(target, prop) {
 				const v = Reflect.get(target, prop, target) as unknown
 				if (prop === 'put') {
 					return async (...args: unknown[]) => {
-						if (self.slow) await sleep(5)
+						if (isSlow()) await sleep(5)
 						return (v as (...a: unknown[]) => Promise<void>).apply(target, args)
 					}
 				}

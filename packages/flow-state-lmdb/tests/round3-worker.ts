@@ -2,7 +2,7 @@
  * Child worker for round3 LMDB crash tests (spawned, never run directly by vitest).
  * Env: R3_BROKERS, R3_APP, R3_IN, R3_OUT, R3_STATE, R3_MODE=count|window, R3_GUARANTEE, R3_RESTORE_DELAY_MS (slow restore)
  */
-import { codec, flow, TimeWindows } from '@kafkats/flow'
+import { codec, flow, SessionWindows, TimeWindows } from '@kafkats/flow'
 import { lmdb } from '../src/lmdb.js'
 import { KafkaClient } from '../../client/dist/index.js'
 
@@ -80,6 +80,16 @@ const app = flow({
 const grouped = app.stream(env('R3_IN'), { key: str, value: str }).groupByKey()
 if (env('R3_MODE') === 'count') {
 	grouped.count({ storeName: 'counts', key: str, value: num }).toStream().to(env('R3_OUT'), { key: str, value: num })
+} else if (env('R3_MODE') === 'session') {
+	grouped
+		.windowedBy(SessionWindows.withInactivityGap(1_000))
+		.count({ storeName: 'scounts', value: num })
+		.toStream()
+		.selectKey((_v, k) => {
+			const w = k as unknown as { key: string; window: { start: number; end: number } }
+			return `${w.key}@${w.window.start}-${w.window.end}`
+		})
+		.to(env('R3_OUT'), { key: str, value: num })
 } else {
 	grouped
 		.windowedBy(TimeWindows.of(1_000))

@@ -22,7 +22,10 @@ function withTimeout<T>(label: string, p: Promise<T>, ms: number): Promise<T> {
 }
 
 // an app that creates its client from a config object owns (and must disconnect) it
-const ownedClient = () => ({ clientId: `r3-lc-${Math.random().toString(36).slice(2, 8)}`, brokers: requireKafkaBrokers() })
+const ownedClient = () => ({
+	clientId: `r3-lc-${Math.random().toString(36).slice(2, 8)}`,
+	brokers: requireKafkaBrokers(),
+})
 const sockets = () =>
 	(process as unknown as { _getActiveHandles(): Array<{ constructor: { name: string } }> })
 		._getActiveHandles()
@@ -57,7 +60,12 @@ describe('round3: lifecycle storms', () => {
 			client,
 			processingGuarantee: guarantee,
 			commitIntervalMs: 100,
-			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 50, sessionTimeoutMs: 6_000, rebalanceTimeoutMs: 10_000 },
+			consumer: {
+				autoOffsetReset: 'earliest',
+				maxWaitMs: 50,
+				sessionTimeoutMs: 6_000,
+				rebalanceTimeoutMs: 10_000,
+			},
 			producer: { lingerMs: 0 },
 			changelog: { restoration: { idleTimeoutMs: 1_000, initialIdleTimeoutMs: 3_000, checkIntervalMs: 50 } },
 		})

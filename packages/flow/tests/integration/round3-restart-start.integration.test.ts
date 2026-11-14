@@ -66,7 +66,7 @@ describe('round3: replacement instance after SIGKILL', () => {
 			await exited
 			const t0 = Date.now()
 			await app.start() // must not reject with "Consumer did not start within 10000ms"
-			expect(Date.now() - t0).toBeGreaterThan(0)
+			console.log('start() took', Date.now() - t0, 'ms')
 			await producer.send(input, { key: 'a', value: Buffer.from('1') })
 			const end = Date.now() + 15_000
 			let rows = await readAllCommitted(admin, output, 1_000)

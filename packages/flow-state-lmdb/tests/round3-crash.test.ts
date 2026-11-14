@@ -27,7 +27,11 @@ describe.skipIf(!brokers)('round3: SIGKILL + LMDB', () => {
 		await client?.disconnect()
 	})
 
-	async function scenario(guarantee: 'exactly_once' | 'at_least_once', mode: 'count' | 'window', kills: number) {
+	async function scenario(
+		guarantee: 'exactly_once' | 'at_least_once',
+		mode: 'count' | 'window' | 'session',
+		kills: number
+	) {
 		const input = uniq('r3c-in')
 		const out = uniq('r3c-out')
 		const app = uniq('r3c-app')
@@ -89,10 +93,12 @@ describe.skipIf(!brokers)('round3: SIGKILL + LMDB', () => {
 					const finals = new Map<string, number>()
 					for (const r of rows) finals.set(r.key, Math.max(finals.get(r.key) ?? 0, r.value!))
 					if ([...finals.values()].filter(v => v >= PER_KEY).length === KEYS) break
-				} else {
+				} else if (mode === 'window') {
 					const sum = new Map<string, number>()
 					for (const r of rows) sum.set(r.key, Math.max(sum.get(r.key) ?? 0, r.value!))
 					if ([...sum.values()].reduce((a, b) => a + b, 0) >= total) break
+				} else if (rows.filter(r => r.value === PER_KEY).length === KEYS) {
+					break // session: every key's single session has absorbed all records
 				}
 			}
 			void total
@@ -168,6 +174,27 @@ describe.skipIf(!brokers)('round3: SIGKILL + LMDB', () => {
 			if (JSON.stringify(got) !== JSON.stringify(want)) bad.push(`${k}: got ${JSON.stringify(got)} want ${n}`)
 		}
 		expect(bad).toEqual([])
+	}, 180_000)
+
+	it('exactly_once session windows: live sessions after >=8 SIGKILLs equal ground truth', async () => {
+		// records are 300ms apart with a 1s inactivity gap => exactly one session per key spanning all of them;
+		// every extension re-emits the grown session and retracts the previous one
+		const { rows } = await scenario('exactly_once', 'session', 8)
+		const view = new Map<string, number | null>()
+		for (const r of rows) view.set(r.key, r.value)
+		const live = Object.fromEntries([...view].filter(([, v]) => v !== null).sort())
+		const truth: Record<string, number> = {}
+		for (let k = 0; k < KEYS; k++) {
+			const start = BASE
+			let end = BASE
+			let n = 1
+			for (let s = 1; s < PER_KEY; s++) {
+				end = BASE + s * 300
+				n++
+			}
+			truth[`k${k}@${start}-${end}`] = n
+		}
+		expect(live).toEqual(truth)
 	}, 180_000)
 
 	it('at_least_once count: no record lost (final >= N per key) and final is never below truth', async () => {

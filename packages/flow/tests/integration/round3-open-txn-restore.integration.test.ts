@@ -29,7 +29,7 @@ describe('round3: restore with an open transaction on the changelog', () => {
 		await admin.disconnect()
 	})
 
-	it('a successor restoring after a rebalance sees everything committed after the dead instance\'s open transaction', async () => {
+	it("a successor restoring after a rebalance sees everything committed after the dead instance's open transaction", async () => {
 		const input = uniqueTopicName('r3-ot-in')
 		const output = uniqueTopicName('r3-ot-out')
 		const applicationId = uniqueTopicName('r3-ot-app')
@@ -68,7 +68,11 @@ describe('round3: restore with an open transaction on the changelog', () => {
 		const changelog = `${applicationId}-counts-changelog`
 		const rogueClient = newClient('r3-ot-rogue')
 		await rogueClient.connect()
-		const rogue = rogueClient.producer({ transactionalId: `rogue-${applicationId}`, transactionTimeoutMs: 12_000, lingerMs: 0 })
+		const rogue = rogueClient.producer({
+			transactionalId: `rogue-${applicationId}`,
+			transactionTimeoutMs: 12_000,
+			lingerMs: 0,
+		})
 		let release: () => void = () => {}
 		const hold = new Promise<void>(res => (release = res))
 		const rogueTx = rogue
