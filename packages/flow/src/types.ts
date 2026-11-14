@@ -29,6 +29,14 @@ export interface FlowConfig {
 	producer?: ProducerConfig
 	runEach?: RunEachOptions
 	/**
+	 * Whether a stream worker that fails with a recoverable error (broker outage, failed commit,
+	 * lost session, ...) restarts itself and resumes from the last committed offsets.
+	 * Errors thrown by user code and fatal errors (fencing, authorization) always stop the worker
+	 * and put the app in the ERROR state.
+	 * Default: true
+	 */
+	restartOnError?: boolean
+	/**
 	 * Default changelog topic configuration.
 	 */
 	changelog?: {
@@ -60,6 +68,8 @@ export interface Produced<K, V> {
 }
 
 export interface Grouped<K, V> {
+	/** Name used for the internal repartition topic (`<applicationId>-<name>-repartition`). */
+	name?: string
 	key?: Codec<K>
 	value?: Codec<V>
 }
@@ -107,6 +117,8 @@ export interface FlowApp {
 	start(): Promise<void>
 	close(): Promise<void>
 	state(): StreamState
+	/** The most recent error observed by the app (null if none). */
+	getError(): Error | null
 }
 
 export interface KStream<K, V> {

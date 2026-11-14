@@ -104,21 +104,23 @@ describe('exactly-once stress', () => {
 					},
 				})
 
-				app.stream(inputTopic, { key: stringCodec, value: numberCodec })
+				const counts = app
+					.stream(inputTopic, { key: stringCodec, value: numberCodec })
 					.groupByKey()
 					.count({ storeName: 'counts', key: stringCodec, value: numberCodec })
 					.toStream()
-					.through(outputTopic)
-					.peek((key, count) => {
-						if (key !== 'key-0' || count === null || !FAILURE_COUNTS.has(count)) {
-							return
-						}
+				// Write the result first, then fail in the same transaction.
+				counts.to(outputTopic)
+				counts.peek((key, count) => {
+					if (key !== 'key-0' || count === null || !FAILURE_COUNTS.has(count)) {
+						return
+					}
 
-						if (!failedOnce.has(count)) {
-							failedOnce.add(count)
-							throw new Error(`injected failure after transactional writes at ${key}:${count}`)
-						}
-					})
+					if (!failedOnce.has(count)) {
+						failedOnce.add(count)
+						throw new Error(`injected failure after transactional writes at ${key}:${count}`)
+					}
+				})
 
 				return app
 			}

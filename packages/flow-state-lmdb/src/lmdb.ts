@@ -504,7 +504,7 @@ export class LMDBStateStoreProvider implements StateStoreProvider {
 		this.rootDb = open({
 			path: options.stateDir,
 			mapSize: options.mapSize ?? 1024 * 1024 * 1024, // 1GB default
-			maxDbs: options.maxDbs ?? 100,
+			maxDbs: options.maxDbs ?? 4096,
 			keyEncoding: 'binary',
 			encoding: 'binary',
 		})

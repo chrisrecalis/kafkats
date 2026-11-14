@@ -1,4 +1,4 @@
-import type { KTable, KStream, KGroupedTable, Grouped, Joined, KeyValue, Produced } from '@/types.js'
+import type { KTable, KStream, KGroupedTable, Grouped, Joined, KeyValue, Produced, Consumed } from '@/types.js'
 import type { KeyValueStore, SessionStore, StateStoreProvider, WindowStore } from '@/state.js'
 import type { Codec } from '@/codec.js'
 import {
@@ -69,6 +69,14 @@ export interface FlowAppInterface {
 	): Promise<void>
 	/** True when processingGuarantee is exactly_once. */
 	isExactlyOnce(): boolean
+	/** Declare topics that must have the same partition count (they share state partitions). */
+	requireCopartitioned(topics: Set<string>): void
+	/** Register an internal repartition topic fed by the given topics; returns its name. */
+	createRepartitionTopic(name: string | undefined, upstreamTopics: Set<string>): string
+	/** Mark a user topic written by through() as one that must be read from the beginning. */
+	registerThroughTopic(topic: string): void
+	/** Create a stream from a topic (used to re-consume repartition topics). */
+	stream<K = Buffer, V = Buffer>(source: string, options?: Consumed<K, V>): KStream<K, V>
 }
 
 export class KTableImpl<K, V> implements KTable<K, V> {
@@ -78,28 +86,44 @@ export class KTableImpl<K, V> implements KTable<K, V> {
 		readonly app: FlowAppInterface,
 		readonly node: OutputProcessor<K, V>,
 		readonly format: StreamFormat<K, V>,
-		storeRef?: { store: KeyValueStore<K, V> | null }
+		storeRef?: { store: KeyValueStore<K, V> | null },
+		/** Source topics the table's state is co-partitioned with. */
+		readonly sourceTopics: Set<string> = new Set(),
+		/** True for globalTable(): fully replicated, only usable as the lookup side of a stream join. */
+		readonly global: boolean = false
 	) {
 		this.storeRef = storeRef ?? { store: null }
 	}
 
+	assertNotGlobal(operation: string): void {
+		if (this.global) {
+			throw new Error(
+				`${operation} is not supported on a globalTable(); a global table can only be joined from a stream`
+			)
+		}
+	}
+
 	toStream(): KStream<K, V> {
-		return new KStreamImpl(this.app, this.node, this.format)
+		this.assertNotGlobal('toStream()')
+		return new KStreamImpl(this.app, this.node, this.format, this.sourceTopics)
 	}
 
 	mapValues<V2>(fn: (value: V | null) => V2 | null): KTable<K, V2> {
+		this.assertNotGlobal('mapValues()')
 		const node = new TableMapValuesNode<K, V, V2>(fn)
 		this.node.connect(node)
-		return new KTableImpl<K, V2>(this.app, node, { keyCodec: this.format.keyCodec })
+		return new KTableImpl<K, V2>(this.app, node, { keyCodec: this.format.keyCodec }, undefined, this.sourceTopics)
 	}
 
 	filter(fn: (key: K | null, value: V | null) => boolean): KTable<K, V> {
+		this.assertNotGlobal('filter()')
 		const node = new TableFilterNode<K, V>(fn)
 		this.node.connect(node)
-		return new KTableImpl<K, V>(this.app, node, this.format)
+		return new KTableImpl<K, V>(this.app, node, this.format, undefined, this.sourceTopics)
 	}
 
 	groupBy<K2>(fn: (key: K, value: V) => KeyValue<K2, V>, options?: Grouped<K2, V>): KGroupedTable<K2, V> {
+		this.assertNotGlobal('groupBy()')
 		const sourceKeyCodec = this.format.keyCodec
 		const groupedKeyCodec = options?.key
 		const valueCodec = options?.value ?? this.format.valueCodec
@@ -136,6 +160,15 @@ export class KTableImpl<K, V> implements KTable<K, V> {
 		)
 	}
 
+	/** Table-table joins look up the other side's state by key, so both sides must be co-partitioned. */
+	private joinTopics<V2>(other: KTableImpl<K, V2>): Set<string> {
+		this.assertNotGlobal('A table-table join')
+		other.assertNotGlobal('A table-table join')
+		const topics = new Set([...this.sourceTopics, ...other.sourceTopics])
+		this.app.requireCopartitioned(topics)
+		return topics
+	}
+
 	join<V2, VR>(
 		other: KTable<K, V2>,
 		joiner: (value: V, otherValue: V2) => VR,
@@ -151,6 +184,7 @@ export class KTableImpl<K, V> implements KTable<K, V> {
 		if (!this.storeRef.store || !otherTable.storeRef.store) {
 			throw new Error('Cannot join tables without state stores')
 		}
+		const joinTopics = this.joinTopics(otherTable)
 
 		// Create a PassThrough node to merge results from both join paths
 		const mergeNode = new PassThroughNode<K, VR>()
@@ -167,7 +201,7 @@ export class KTableImpl<K, V> implements KTable<K, V> {
 		otherTable.node.connect(rightJoinNode)
 		rightJoinNode.connect(mergeNode)
 
-		return new KTableImpl<K, VR>(this.app, mergeNode, { keyCodec: this.format.keyCodec })
+		return new KTableImpl<K, VR>(this.app, mergeNode, { keyCodec: this.format.keyCodec }, undefined, joinTopics)
 	}
 
 	leftJoin<V2, VR>(
@@ -185,6 +219,7 @@ export class KTableImpl<K, V> implements KTable<K, V> {
 		if (!this.storeRef.store || !otherTable.storeRef.store) {
 			throw new Error('Cannot join tables without state stores')
 		}
+		const joinTopics = this.joinTopics(otherTable)
 
 		// Create a PassThrough node to merge results from both join paths
 		const mergeNode = new PassThroughNode<K, VR>()
@@ -201,7 +236,7 @@ export class KTableImpl<K, V> implements KTable<K, V> {
 		otherTable.node.connect(rightJoinNode)
 		rightJoinNode.connect(mergeNode)
 
-		return new KTableImpl<K, VR>(this.app, mergeNode, { keyCodec: this.format.keyCodec })
+		return new KTableImpl<K, VR>(this.app, mergeNode, { keyCodec: this.format.keyCodec }, undefined, joinTopics)
 	}
 
 	outerJoin<V2, VR>(
@@ -219,6 +254,7 @@ export class KTableImpl<K, V> implements KTable<K, V> {
 		if (!this.storeRef.store || !otherTable.storeRef.store) {
 			throw new Error('Cannot join tables without state stores')
 		}
+		const joinTopics = this.joinTopics(otherTable)
 
 		// Create a PassThrough node to merge results from both join paths
 		const mergeNode = new PassThroughNode<K, VR>()
@@ -235,6 +271,6 @@ export class KTableImpl<K, V> implements KTable<K, V> {
 		otherTable.node.connect(rightJoinNode)
 		rightJoinNode.connect(mergeNode)
 
-		return new KTableImpl<K, VR>(this.app, mergeNode, { keyCodec: this.format.keyCodec })
+		return new KTableImpl<K, VR>(this.app, mergeNode, { keyCodec: this.format.keyCodec }, undefined, joinTopics)
 	}
 }

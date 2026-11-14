@@ -15,7 +15,7 @@
  * producing structurally different (not just numerically inflated) output.
  */
 
-import { Processor, type StreamRecord, type TopicPartitionKey, type WorkerContext } from '@/processors/base.js'
+import { Processor, type StreamRecord, type WorkerContext } from '@/processors/base.js'
 import type { KeyValueStore, WindowStore, SessionStore, WindowedKey } from '@/state.js'
 import type { Windowed } from '@/types.js'
 
@@ -141,80 +141,48 @@ type TimedRecord = { topic: string; partition: number }
  *
  * Stream time must be per partition: partitions progress independently (lag, backfill, rebalance),
  * so a single shared clock would let one partition that is far ahead mark in-order records of
- * another partition as "late" and silently drop them.
+ * another partition as "late" and silently drop them. State is partitioned the same way, so both
+ * late-record decisions and store expiry use the clock of the record's own partition.
  *
- * - Late-record decisions use the record's own partition clock ({@link streamTime}).
- * - Store expiry uses the minimum clock across the live partitions ({@link observe}'s cutoff),
- *   because the store is shared and expiring by the fastest partition would delete windows a slower
- *   partition is still updating.
- *
- * One tracker is shared by all worker clones of a node; partitions no longer assigned to any
- * attached worker are forgotten so a revoked partition cannot hold expiry back forever.
+ * One tracker is shared by all worker clones of a node.
  */
 export class StreamTimeTracker {
-	private readonly byPartition = new Map<string, number>()
-	private readonly workers = new Set<WorkerContext>()
-	private lastCleanupStreamTimeMs = 0
+	private readonly byPartition = new Map<string, { streamTimeMs: number; lastCleanupMs: number }>()
 
 	attach(worker: WorkerContext): this {
-		this.workers.add(worker)
+		void worker
 		return this
 	}
 
 	/** Stream time of the record's partition (0 if nothing observed yet). */
 	streamTime(record: TimedRecord): number {
-		return this.byPartition.get(`${record.topic}:${record.partition}`) ?? 0
+		return this.byPartition.get(`${record.topic}:${record.partition}`)?.streamTimeMs ?? 0
 	}
 
 	/**
-	 * Advance the record's partition clock. Returns an expiry cutoff when a cleanup pass is due
-	 * (once per CLEANUP_INTERVAL_MS of minimum stream time), otherwise undefined.
+	 * Advance the record's partition clock. Returns an expiry cutoff when a cleanup pass is due for
+	 * that partition (once per CLEANUP_INTERVAL_MS of stream time), otherwise undefined.
 	 */
 	observe(record: TimedRecord, timestamp: number): number | undefined {
 		const key = `${record.topic}:${record.partition}`
-		const current = this.byPartition.get(key)
-		if (current === undefined || timestamp > current) {
-			this.byPartition.set(key, timestamp)
+		let state = this.byPartition.get(key)
+		if (!state) {
+			state = { streamTimeMs: 0, lastCleanupMs: 0 }
+			this.byPartition.set(key, state)
 		}
-
-		this.forgetUnassigned(key)
-		let min = Infinity
-		for (const time of this.byPartition.values()) {
-			if (time < min) min = time
+		if (timestamp > state.streamTimeMs) {
+			state.streamTimeMs = timestamp
 		}
-		if (min === Infinity || min - this.lastCleanupStreamTimeMs <= CLEANUP_INTERVAL_MS) {
+		if (state.streamTimeMs - state.lastCleanupMs <= CLEANUP_INTERVAL_MS) {
 			return undefined
 		}
-		this.lastCleanupStreamTimeMs = min
-		return min
-	}
-
-	private forgetUnassigned(currentKey: string): void {
-		let anyAssignment = false
-		for (const worker of this.workers) {
-			if (worker.assignedPartitions.size > 0) {
-				anyAssignment = true
-				break
-			}
-		}
-		// No assignment information (e.g. mocked consumers): keep everything.
-		if (!anyAssignment) return
-		for (const key of this.byPartition.keys()) {
-			if (key === currentKey) continue
-			let assigned = false
-			for (const worker of this.workers) {
-				if (worker.assignedPartitions.has(key as TopicPartitionKey)) {
-					assigned = true
-					break
-				}
-			}
-			if (!assigned) this.byPartition.delete(key)
-		}
+		state.lastCleanupMs = state.streamTimeMs
+		return state.streamTimeMs
 	}
 }
 
 // Stream-time-driven retention: advance the record's partition clock and fire expiry once per
-// CLEANUP_INTERVAL_MS of (minimum) stream time. Caller passes the store's expire method (windows or
+// CLEANUP_INTERVAL_MS of stream time. Caller passes the store's expire method (windows or
 // sessions); without this, state-store-backed processors leak. Shared by the windowed/session
 // aggregation nodes and the stream-stream join nodes.
 export async function maybeExpire(
@@ -290,7 +258,8 @@ export class WindowedReduceNode<K, V> extends Processor<K, V, Windowed<K>, V> {
 		if (value === null) return
 
 		const timestamp = Number(record.timestamp)
-		const retentionCutoff = this.cleanupState.streamTime(record) - this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER
+		const retentionCutoff =
+			this.cleanupState.streamTime(record) - this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER
 		for (const { start, end } of windowStartsFor(timestamp, this.windowSizeMs, this.advanceMs)) {
 			// Drop a late record whose window has already passed retention: re-creating the
 			// window from an empty aggregate emits a wrong partial result that contradicts the
@@ -330,7 +299,13 @@ export class SessionReduceNode<K, V> extends Processor<K, V, Windowed<K>, V> {
 	}
 
 	clone(worker: WorkerContext): Processor<K, V, Windowed<K>, V> {
-		return new SessionReduceNode<K, V>(this.storeName, this.storeRef, this.reducer, this.gapMs, this.cleanupState.attach(worker))
+		return new SessionReduceNode<K, V>(
+			this.storeName,
+			this.storeRef,
+			this.reducer,
+			this.gapMs,
+			this.cleanupState.attach(worker)
+		)
 	}
 
 	async process(record: StreamRecord<K, V>): Promise<void> {
@@ -445,7 +420,8 @@ export class WindowedAggregateNode<K, V, A> extends Processor<K, V, Windowed<K>,
 		}
 
 		const timestamp = Number(record.timestamp)
-		const retentionCutoff = this.cleanupState.streamTime(record) - this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER
+		const retentionCutoff =
+			this.cleanupState.streamTime(record) - this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER
 		for (const { start, end } of windowStartsFor(timestamp, this.windowSizeMs, this.advanceMs)) {
 			// Drop a late record whose window has already passed retention: re-creating the
 			// window from the initializer emits a wrong partial result that contradicts the

@@ -1,5 +1,6 @@
 import type { ConsumeContext, Consumer, Producer, SendResult } from '@kafkats/client'
 import type { Codec } from '@/codec.js'
+import type { TransactionalBuffer } from '@/runtime/context.js'
 
 // Internal types (not exported from public API)
 
@@ -58,6 +59,12 @@ export type WorkerContext = {
 	// Transaction batching state for EOS
 	pendingOffsets: Map<TopicPartitionKey, { topic: string; partition: number; offset: bigint }>
 	pendingChangelogOffsets: Map<TopicPartitionKey, { topic: string; partition: number; offset: bigint }>
+	/** Stores holding writes buffered by the open transaction. */
+	dirtyStores: Set<TransactionalBuffer>
+	/** Set once the worker has failed; it processes nothing more until restarted. */
+	failure: { error: Error; recoverable: boolean } | null
+	/** Whether the worker made progress since it last (re)started; resets the restart backoff. */
+	processedSinceRestart?: boolean
 	eosQueue: Promise<void>
 	transactionActive: boolean
 	commitTimer: ReturnType<typeof setTimeout> | null

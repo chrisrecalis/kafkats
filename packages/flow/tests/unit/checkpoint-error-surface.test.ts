@@ -60,9 +60,9 @@ describe('checkpoint persistence errors surface, not swallow', () => {
 			]),
 		}
 
-		await flowAny.flushChangelogCheckpoints(worker)
+		await flowAny.flushChangelogCheckpoints([...worker.pendingChangelogOffsets.values()])
 
-		// set() called with offset+1 for both partitions.
+		// set() called one past the pending offset (the commit marker) for both partitions.
 		expect(checkpointStore.set).toHaveBeenCalledWith('t', 0, 42n)
 		expect(checkpointStore.set).toHaveBeenCalledWith('t', 1, 100n)
 		// lastError reflects the failure even though we didn't halt.
@@ -84,9 +84,7 @@ describe('checkpoint persistence errors surface, not swallow', () => {
 
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const flowAny = driver.flow as any
-		await flowAny.flushChangelogCheckpoints({
-			pendingChangelogOffsets: new Map([['t:0', { topic: 't', partition: 0, offset: 0n }]]),
-		})
+		await flowAny.flushChangelogCheckpoints([{ topic: 't', partition: 0, offset: 1n }])
 
 		expect(checkpointStore.flush).toHaveBeenCalled()
 		expect(flowAny.lastError).toBe(flushError)
@@ -111,17 +109,17 @@ describe('checkpoint persistence errors surface, not swallow', () => {
 		const worker = { pendingChangelogOffsets: new Map([['t:0', { topic: 't', partition: 0, offset: 0n }]]) }
 
 		// First failure → message recorded.
-		await flowAny.flushChangelogCheckpoints(worker)
+		await flowAny.flushChangelogCheckpoints([...worker.pendingChangelogOffsets.values()])
 		const firstMsg = flowAny.lastCheckpointErrorMessage
 		expect(firstMsg).toBe('disk full')
 
 		// Repeat failure → no log re-emit; lastCheckpointErrorMessage stays the same.
-		await flowAny.flushChangelogCheckpoints(worker)
+		await flowAny.flushChangelogCheckpoints([...worker.pendingChangelogOffsets.values()])
 		expect(flowAny.lastCheckpointErrorMessage).toBe(firstMsg)
 
 		// Subsequent success → recovery, message cleared.
 		setShouldFail = false
-		await flowAny.flushChangelogCheckpoints(worker)
+		await flowAny.flushChangelogCheckpoints([...worker.pendingChangelogOffsets.values()])
 		expect(flowAny.lastCheckpointErrorMessage).toBeNull()
 	})
 })

@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events'
 import { describe, expect, it, vi, afterEach } from 'vitest'
 import { KafkaClient, type ConsumeContext, type Message, type ProducerConfig } from '@kafkats/client'
 import { codec, flow, TimeWindows, SessionWindows } from '../../src/index.js'
-import { ChangelogBackedWindowStore, ChangelogBackedSessionStore } from '../../src/state/changelog.js'
+import { PartitionedWindowStore, PartitionedSessionStore } from '../../src/state/partitioned.js'
 
 type TestMessage = Omit<Message<Buffer>, 'value'> & { value: Buffer | null }
 type TestContext = ConsumeContext
@@ -12,7 +12,11 @@ class TestConsumer extends EventEmitter {
 	private handler: TestHandler | null = null
 	private stopResolve: (() => void) | null = null
 	private messageOnStop: { topic: string; value: Buffer | null; key?: Buffer | null } | null = null
-	async runEach(_subscription: string[], handler: TestHandler): Promise<void> {
+	subscription: string[] = []
+	/** Records produced to a subscribed topic (through()/repartition), delivered after the current record. */
+	readonly loopback: Array<{ topic: string; value: Buffer | null; key?: Buffer | null }> = []
+	async runEach(subscription: string[], handler: TestHandler): Promise<void> {
+		this.subscription = subscription
 		this.handler = handler
 		this.emit('running')
 		return new Promise(resolve => {
@@ -60,10 +64,15 @@ class TestConsumer extends EventEmitter {
 			groupId: 'test-app',
 		}
 		await this.handler(message, ctx)
+		const next = this.loopback.shift()
+		if (next) {
+			await this.emitMessage(next.topic, next.value, next.key, timestamp)
+		}
 	}
 }
 
 class TestProducer {
+	consumers: TestConsumer[] = []
 	messages: Array<{ topic: string; key?: Buffer | null; value: Buffer; partition?: number }> = []
 	transactions: Array<{
 		offsetContext: ConsumeContext | null
@@ -73,6 +82,8 @@ class TestProducer {
 
 	async send(topic: string, message: { key?: Buffer | null; value: Buffer; partition?: number }): Promise<void> {
 		this.messages.push({ topic, key: message.key, value: message.value, partition: message.partition })
+		const consumer = this.consumers.find(c => c.subscription.includes(topic))
+		consumer?.loopback.push({ topic, value: message.value, key: message.key })
 	}
 
 	async transaction(
@@ -125,6 +136,7 @@ function createTestApp(overrides: Partial<Parameters<typeof flow>[0]> = {}) {
 	})
 	vi.spyOn(client, 'producer').mockImplementation(config => {
 		const producer = new TestProducer()
+		producer.consumers = consumers
 		producers.push(producer)
 		producerConfigs.push(config)
 		return producer as unknown as never
@@ -1789,7 +1801,8 @@ describe('windowed/session store changelog wiring', () => {
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	function internals(app: unknown): { stateStores: Map<string, unknown>; changelogTopics: Map<string, any> } {
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		return app as any
+		const impl = app as any
+		return { stateStores: impl.stateStores, changelogTopics: impl.changelogSpecs }
 	}
 
 	it('time-windowed aggregations create a changelog-backed window store with a registered spec', () => {
@@ -1801,7 +1814,7 @@ describe('windowed/session store changelog wiring', () => {
 			.count({ storeName: 'win-counts' })
 
 		const { stateStores, changelogTopics } = internals(app)
-		expect(stateStores.get('win-counts')).toBeInstanceOf(ChangelogBackedWindowStore)
+		expect(stateStores.get('win-counts')).toBeInstanceOf(PartitionedWindowStore)
 
 		const spec = changelogTopics.get('win-counts')
 		expect(spec).toBeDefined()
@@ -1825,7 +1838,7 @@ describe('windowed/session store changelog wiring', () => {
 			.count({ storeName: 'session-counts' })
 
 		const { stateStores, changelogTopics } = internals(app)
-		expect(stateStores.get('session-counts')).toBeInstanceOf(ChangelogBackedSessionStore)
+		expect(stateStores.get('session-counts')).toBeInstanceOf(PartitionedSessionStore)
 		expect(changelogTopics.get('session-counts')).toBeDefined()
 	})
 
@@ -1845,7 +1858,7 @@ describe('windowed/session store changelog wiring', () => {
 		for (const name of joinStoreNames) {
 			// Both side stores must be changelog-backed so a restarted/rebalanced task rebuilds
 			// its in-flight join window instead of silently dropping matches.
-			expect(stateStores.get(name)).toBeInstanceOf(ChangelogBackedWindowStore)
+			expect(stateStores.get(name)).toBeInstanceOf(PartitionedWindowStore)
 			const spec = changelogTopics.get(name)
 			expect(spec).toBeDefined()
 			// Changelog key round-trips a WindowedKey so restoration can decode it.
@@ -1865,7 +1878,8 @@ describe('windowed/session store changelog wiring', () => {
 			.windowedBy(TimeWindows.of('10s'))
 			.count({ storeName: 'by-key' })
 
-		// groupBy() re-keys -> restoration must NOT be restricted to source partitions.
+		// groupBy() re-keys through a repartition topic, so its state is co-partitioned with that
+		// topic and restoration is restricted to the assigned partitions as well.
 		app.stream('events2', { key: codec.string(), value: codec.json<{ region: string }>() })
 			.groupBy((_key, value) => value!.region, { key: codec.string() })
 			.windowedBy(TimeWindows.of('10s'))
@@ -1873,6 +1887,7 @@ describe('windowed/session store changelog wiring', () => {
 
 		const { changelogTopics } = internals(app)
 		expect(changelogTopics.get('by-key').restrictRestorationToSourcePartitions).toBe(true)
-		expect(changelogTopics.get('by-region').restrictRestorationToSourcePartitions).toBe(false)
+		expect(changelogTopics.get('by-region').restrictRestorationToSourcePartitions).toBe(true)
+		expect([...changelogTopics.get('by-region').sourceTopics]).toEqual(['test-app-repartition-0-repartition'])
 	})
 })

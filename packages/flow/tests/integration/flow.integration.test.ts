@@ -840,7 +840,7 @@ describe('changelog topics and restoration', () => {
 		await app.close()
 	})
 
-	it('infers changelog partitions from the maximum partition count of merged sources', async () => {
+	it('rejects merged sources with different partition counts feeding one state store', async () => {
 		const a = uniqueTopicName('flow-it-changelog-merge-a')
 		const b = uniqueTopicName('flow-it-changelog-merge-b')
 		const outputTopic = uniqueTopicName('flow-it-changelog-merge-out')
@@ -860,8 +860,10 @@ describe('changelog topics and restoration', () => {
 			.toStream()
 			.to(outputTopic)
 
-		await app.start()
-		await waitForTopicPartitionCount(changelogTopic, 4)
+		// State is kept per partition: the same key from a 1-partition and a 4-partition topic
+		// would be aggregated in different state partitions, so this must fail loudly.
+		await expect(app.start()).rejects.toThrow(/same number of partitions/)
+		void changelogTopic
 
 		await app.close()
 	})
@@ -1005,6 +1007,9 @@ describe('changelog topics and restoration', () => {
 			valueCodec: numberCodec,
 		})
 		await store.init()
+		// The local store already holds what the checkpoint covers (a checkpoint is only
+		// trusted when the store can actually contain the state it describes).
+		await store.put('a', 1)
 
 		const checkpoint = new MemoryCheckpointStore()
 		await checkpoint.set(changelogTopic, 0, r1.offset + 1n)

@@ -69,7 +69,13 @@ export class MockConsumer extends EventEmitter {
 	private stopResolve: (() => void) | null = null
 	private offsetCounter = 0n
 
-	async runEach(_subscription: string[], handler: TestHandler, _options?: RunEachOptions): Promise<void> {
+	/** Topics this consumer subscribed to. */
+	subscription: string[] = []
+	private readonly loopback: Array<{ topic: string; value: Buffer | null; options: SendOptions }> = []
+	private delivering = false
+
+	async runEach(subscription: string[], handler: TestHandler, _options?: RunEachOptions): Promise<void> {
+		this.subscription = subscription
 		this.handler = handler
 		super.emit('running')
 		return new Promise(resolve => {
@@ -88,10 +94,36 @@ export class MockConsumer extends EventEmitter {
 	/**
 	 * Send a message to be processed by the topology
 	 */
-	async sendMessage(topic: string, value: Buffer, options: SendOptions = {}): Promise<void> {
+	async sendMessage(topic: string, value: Buffer | null, options: SendOptions = {}): Promise<void> {
 		if (!this.handler) {
 			throw new Error('Consumer not started - call driver.start() first')
 		}
+		if (this.delivering) {
+			// Produced by the topology while a record is being processed (through()/repartition
+			// topics): deliver once the current record is done, like a real consumer would.
+			this.loopback.push({ topic, value, options })
+			return
+		}
+
+		this.delivering = true
+		try {
+			await this.deliver(topic, value, options)
+			for (let next = this.loopback.shift(); next; next = this.loopback.shift()) {
+				await this.deliver(next.topic, next.value, next.options)
+			}
+		} finally {
+			this.delivering = false
+			this.loopback.length = 0
+		}
+	}
+
+	/** Whether the topology reads the given topic. */
+	subscribes(topic: string): boolean {
+		return this.subscription.includes(topic)
+	}
+
+	private async deliver(topic: string, value: Buffer | null, options: SendOptions): Promise<void> {
+		if (!this.handler) return
 
 		const offset = this.offsetCounter++
 		const message: Message<Buffer> = {
@@ -100,7 +132,7 @@ export class MockConsumer extends EventEmitter {
 			offset,
 			timestamp: options.timestamp ?? BigInt(Date.now()),
 			key: options.key ?? null,
-			value,
+			value: value as Buffer,
 			headers: options.headers ?? {},
 		}
 
@@ -128,16 +160,30 @@ export class MockProducer {
 
 	private currentTxMessages: Array<TestRecord<Buffer, Buffer>> = []
 
-	send(topic: string, message: { key?: Buffer | null; value: Buffer | null; partition?: number }): Promise<void> {
+	/** Set by the TestDriver: feeds records written to a topic the topology also reads back into it. */
+	loopback: ((record: TestRecord<Buffer, Buffer>) => Promise<void>) | null = null
+
+	async send(
+		topic: string,
+		message: {
+			key?: Buffer | null
+			value: Buffer | null
+			partition?: number
+			timestamp?: Date
+			headers?: Record<string, Buffer>
+		}
+	): Promise<void> {
 		const record: TestRecord<Buffer, Buffer> = {
 			topic,
 			key: message.key ?? null,
 			value: message.value,
 			partition: message.partition,
+			timestamp: message.timestamp ? BigInt(message.timestamp.getTime()) : undefined,
+			headers: message.headers,
 		}
 		this.messages.push(record)
 		this.currentTxMessages.push(record)
-		return Promise.resolve()
+		await this.loopback?.(record)
 	}
 
 	async transaction(
@@ -248,6 +294,16 @@ export class TestDriver {
 
 		vi.spyOn(this.client, 'producer').mockImplementation(() => {
 			const producer = new MockProducer()
+			producer.loopback = async record => {
+				const consumer = this.consumers.find(c => c.subscribes(record.topic))
+				if (!consumer) return
+				await consumer.sendMessage(record.topic, record.value, {
+					key: record.key,
+					partition: record.partition,
+					timestamp: record.timestamp,
+					headers: record.headers,
+				})
+			}
 			this.producers.push(producer)
 			return producer as unknown as never
 		})

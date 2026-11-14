@@ -24,8 +24,9 @@ export interface ChangelogConfig {
 
 export interface ChangelogRestorationOptions {
 	/**
-	 * Abort restoration if no progress is made for this many milliseconds while restoration is incomplete.
-	 * Default: 5000ms.
+	 * Fail restoration if no progress is made for this many milliseconds while restoration is incomplete.
+	 * A stalled restore is always an error; it is never treated as complete.
+	 * Default: 30000ms.
 	 */
 	idleTimeoutMs?: number
 	/**
@@ -84,6 +85,24 @@ export class SourceTopicNotFoundError extends Error {
 		super(
 			`Source topic "${topic}" does not exist. Cannot determine partition count for ` +
 				`changelog topic of store "${storeName}". Create the source topic first.`
+		)
+	}
+}
+
+/**
+ * Error thrown when topics that must be co-partitioned have different partition counts.
+ *
+ * State is partitioned by source partition, so records with the same key from every topic feeding a
+ * stateful operation (join sides, merged streams) must land in the same partition index.
+ */
+export class CoPartitioningError extends Error {
+	override readonly name = 'CoPartitioningError'
+
+	constructor(public readonly partitionCounts: Map<string, number>) {
+		super(
+			`Topics [${[...partitionCounts].map(([topic, count]) => `${topic} (${count})`).join(', ')}] feed the same ` +
+				'stateful operation and must have the same number of partitions. ' +
+				'Repartition one side with through(), or use a globalTable() for lookups.'
 		)
 	}
 }
@@ -159,6 +178,11 @@ interface TransactionLike {
 
 /**
  * Writes state mutations to a changelog topic.
+ *
+ * Records are written to the changelog partition with the same index as the source partition of
+ * the record being processed (`getPartition`). Restoration reads changelog partition N to rebuild
+ * the state of source partition N, so the two must line up regardless of how the changelog key
+ * hashes (windowed keys, custom input partitioners, differing key codecs, ...).
  */
 export class ChangelogWriter<K, V> {
 	constructor(
@@ -167,62 +191,71 @@ export class ChangelogWriter<K, V> {
 		private readonly valueCodec: Codec<V>,
 		private readonly getProducer: () => Producer,
 		private readonly getTransaction: () => TransactionLike | null,
-		private readonly onWriteAck?: (result: SendResult) => void | Promise<void>
+		private readonly onWriteAck?: (result: SendResult) => void | Promise<void>,
+		private readonly getPartition?: () => number | undefined
 	) {}
 
 	/**
 	 * Write a key-value pair to the changelog.
 	 */
 	async write(key: K, value: V): Promise<void> {
-		const keyBuffer = this.keyCodec.encode(key)
-		const valueBuffer = this.valueCodec.encode(value)
-		const transaction = this.getTransaction()
-
-		if (transaction) {
-			const result = await transaction.send(this.topicName, {
-				key: keyBuffer,
-				value: valueBuffer,
-			})
-			await this.onWriteAck?.(result)
-		} else {
-			const result = await this.getProducer().send(this.topicName, {
-				key: keyBuffer,
-				value: valueBuffer,
-			})
-			await this.onWriteAck?.(result)
-		}
+		await this.send(this.keyCodec.encode(key), this.valueCodec.encode(value))
 	}
 
 	/**
 	 * Write a tombstone (null value) to the changelog.
 	 */
 	async writeTombstone(key: K): Promise<void> {
-		const keyBuffer = this.keyCodec.encode(key)
-		const transaction = this.getTransaction()
-
-		if (transaction) {
-			const result = await transaction.send(this.topicName, { key: keyBuffer, value: null })
-			await this.onWriteAck?.(result)
-		} else {
-			const result = await this.getProducer().send(this.topicName, { key: keyBuffer, value: null })
-			await this.onWriteAck?.(result)
-		}
+		await this.send(this.keyCodec.encode(key), null)
 	}
+
+	private async send(key: Buffer, value: Buffer | null): Promise<void> {
+		const partition = this.getPartition?.()
+		const message = partition === undefined ? { key, value } : { key, value, partition }
+		const target = this.getTransaction() ?? this.getProducer()
+		const result = await target.send(this.topicName, message)
+		await this.onWriteAck?.(result)
+	}
+}
+
+/** Resolves the store that holds the state of one changelog partition. */
+export type RestoreTarget<K, V> = KeyValueStore<K, V> | ((partition: number) => Promise<KeyValueStore<K, V>>)
+
+type PartitionProgress = {
+	endOffset: bigint
+	/** Next offset the restore consumer will fetch. */
+	position: bigint
+	/** Records handed to the consumer by fetches so far. */
+	fetched: number
+	/** Records the handler has finished with so far. */
+	handled: number
 }
 
 /**
  * Restores state from a changelog topic.
+ *
+ * Guarantees:
+ * - restore() only returns once every requested partition has been replayed up to the end offset
+ *   captured at the start; a stall is an error, never a silent partial restore
+ * - a checkpoint is only trusted when it can describe the local store (within the log's offset
+ *   range and the store is not empty); otherwise the store is wiped and rebuilt from the start, so
+ *   stale local entries cannot survive
+ * - checkpoints are only advanced for partitions that were fully replayed
  */
 export class ChangelogRestorer<K, V> {
 	constructor(
 		private readonly topicName: string,
 		private readonly keyCodec: Codec<K>,
 		private readonly valueCodec: Codec<V>,
-		private readonly store: KeyValueStore<K, V>
+		private readonly target: RestoreTarget<K, V>
 	) {}
 
+	private storeFor(partition: number): Promise<KeyValueStore<K, V>> {
+		return typeof this.target === 'function' ? this.target(partition) : Promise.resolve(this.target)
+	}
+
 	/**
-	 * Restore state by consuming the changelog topic from the beginning.
+	 * Restore state by replaying the changelog topic.
 	 * @returns Number of records restored
 	 */
 	async restore(
@@ -237,87 +270,139 @@ export class ChangelogRestorer<K, V> {
 			return 0
 		}
 
-		const topicPartitions = partitions ?? desc.partitions.map(p => p.partitionIndex)
-
-		if (topicPartitions.length === 0) {
+		const assigned = [...new Set(partitions ?? desc.partitions.map(p => p.partitionIndex))].sort((a, b) => a - b)
+		if (assigned.length === 0) {
 			return 0
 		}
 
-		const uniqueGroupId = `${this.topicName}-restorer-${Date.now()}-${Math.random().toString(36).slice(2)}`
-
-		const consumer = client.consumer({
-			groupId: uniqueGroupId,
-			autoOffsetReset: 'earliest',
-			...(options?.consumerMaxWaitMs !== undefined ? { maxWaitMs: options.consumerMaxWaitMs } : {}),
-		})
-
 		const [startOffsets, endOffsets] = await Promise.all([
-			admin.fetchTopicOffsets(this.topicName, topicPartitions, 'earliest', { isolationLevel: 'read_committed' }),
-			admin.fetchTopicOffsets(this.topicName, topicPartitions, 'latest', { isolationLevel: 'read_committed' }),
+			admin.fetchTopicOffsets(this.topicName, assigned, 'earliest', { isolationLevel: 'read_committed' }),
+			admin.fetchTopicOffsets(this.topicName, assigned, 'latest', { isolationLevel: 'read_committed' }),
 		])
 
-		const assigned = [...new Set(topicPartitions)].sort((a, b) => a - b)
-		const checkpointOffsets = checkpointStore
-			? new Map<number, bigint>(
-					(
-						await Promise.all(
-							assigned.map(async partition => {
-								const offset = await checkpointStore.get(this.topicName, partition)
-								return offset !== undefined ? ([partition, offset] as const) : null
-							})
-						)
-					).filter((pair): pair is readonly [number, bigint] => pair !== null)
-				)
-			: new Map<number, bigint>()
+		// Decide, per partition, whether the checkpoint can be trusted.
+		const plan = await Promise.all(
+			assigned.map(async partition => {
+				const earliest = startOffsets.get(partition)
+				const end = endOffsets.get(partition)
+				if (earliest === undefined || end === undefined) {
+					throw new Error(`Missing offset information for ${this.topicName}-${partition}`)
+				}
+				const checkpoint = checkpointStore ? await checkpointStore.get(this.topicName, partition) : undefined
+				const store = await this.storeFor(partition)
+				let resumable = checkpoint !== undefined && checkpoint >= earliest && checkpoint <= end
+				if (resumable && checkpoint! > earliest && (await store.approximateNumEntries()) === 0) {
+					// The checkpoint claims progress the (empty) store cannot contain, e.g. the
+					// state directory was replaced. Rebuild from the start.
+					resumable = false
+				}
+				return { partition, earliest, end, checkpoint, resumable, store }
+			})
+		)
 
-		const pendingPartitions = new Set<number>()
-		const assignment = assigned.flatMap(partition => {
-			const earliestOffset = startOffsets.get(partition)
-			const endOffset = endOffsets.get(partition)
-			const checkpointOffset = checkpointOffsets.get(partition)
-			const startOffset =
-				checkpointOffset !== undefined && earliestOffset !== undefined && checkpointOffset > earliestOffset
-					? checkpointOffset
-					: earliestOffset
+		// A single shared target can't be wiped per partition: if any partition needs a full
+		// rebuild, rebuild them all.
+		const sharedTarget = typeof this.target !== 'function'
+		const rebuildAll = sharedTarget && plan.some(p => !p.resumable)
+		const wiped = new Set<KeyValueStore<K, V>>()
+		const progress = new Map<number, PartitionProgress>()
+		const assignment: Array<{ topic: string; partition: number; offset: bigint }> = []
+		const rebuilt: number[] = []
 
-			if (startOffset === undefined || endOffset === undefined) {
-				throw new Error(`Missing offset information for ${this.topicName}-${partition}`)
+		for (const p of plan) {
+			const resumable = p.resumable && !rebuildAll
+			if (!resumable) {
+				if (!wiped.has(p.store)) {
+					wiped.add(p.store)
+					await clearAll(p.store)
+				}
+				rebuilt.push(p.partition)
 			}
-
-			if (startOffset >= endOffset) {
-				return []
-			}
-
-			pendingPartitions.add(partition)
-			return [{ topic: this.topicName, partition, offset: startOffset }]
-		})
-
-		if (pendingPartitions.size === 0) {
-			return 0
+			const startOffset = resumable ? p.checkpoint! : p.earliest
+			if (startOffset >= p.end) continue
+			progress.set(p.partition, { endOffset: p.end, position: startOffset, fetched: 0, handled: 0 })
+			assignment.push({ topic: this.topicName, partition: p.partition, offset: startOffset })
 		}
 
 		let restoredCount = 0
 
-		const abortController = new AbortController()
-		const pausedPartitions = new Set<number>()
+		if (assignment.length > 0) {
+			restoredCount = await this.replay(client, options, assignment, progress)
+		}
 
-		let lastProgressTime = Date.now()
-		let isRunning = false
-		let hasConsumedMessage = false
-		const idleTimeoutMs = options?.idleTimeoutMs ?? 5000
+		if (checkpointStore) {
+			const logger = client.cluster.getLogger()
+			// Partitions that were replayed, plus partitions that were wiped because their
+			// checkpoint was unusable (their state is now exactly "empty as of end offset").
+			const toCheckpoint = new Set<number>([...assignment.map(a => a.partition), ...rebuilt])
+			await Promise.all(
+				plan
+					.filter(p => toCheckpoint.has(p.partition))
+					.map(async p => {
+						try {
+							await checkpointStore.set(this.topicName, p.partition, p.end)
+						} catch (err) {
+							// Restored state is in place regardless; failing to record this means a future
+							// restart will re-restore (idempotent but wasteful). Log so it is visible.
+							const error = err instanceof Error ? err : new Error(String(err))
+							logger.error('post-restore checkpoint persistence failed', {
+								topic: this.topicName,
+								partition: p.partition,
+								error: error.message,
+							})
+						}
+					})
+			)
+			await checkpointStore.flush?.()
+		}
+
+		return restoredCount
+	}
+
+	private async replay(
+		client: KafkaClient,
+		options: ChangelogRestorationOptions | undefined,
+		assignment: Array<{ topic: string; partition: number; offset: bigint }>,
+		progress: Map<number, PartitionProgress>
+	): Promise<number> {
+		const uniqueGroupId = `${this.topicName}-restorer-${Date.now()}-${Math.random().toString(36).slice(2)}`
+		const consumer = client.consumer({
+			groupId: uniqueGroupId,
+			autoOffsetReset: 'earliest',
+			isolationLevel: 'read_committed',
+			...(options?.consumerMaxWaitMs !== undefined ? { maxWaitMs: options.consumerMaxWaitMs } : {}),
+		})
+
+		const pending = new Set<number>(progress.keys())
+		const abortController = new AbortController()
+		const restoreCompleteReason = Symbol('changelogRestoreComplete')
+		const idleTimeoutMs = options?.idleTimeoutMs ?? DEFAULT_RESTORE_IDLE_TIMEOUT_MS
 		const initialIdleTimeoutMs = options?.initialIdleTimeoutMs ?? idleTimeoutMs
 		const checkIntervalMs = options?.checkIntervalMs ?? 1000
-		const restoreCompleteReason = Symbol('changelogRestoreComplete')
-		const completePartition = (partition: number) => {
-			pendingPartitions.delete(partition)
-			if (pendingPartitions.size === 0) {
+
+		let restoredCount = 0
+		let lastProgressTime = Date.now()
+		let isRunning = false
+		let madeProgress = false
+		let inFlight = 0
+
+		// A partition is complete once the consumer's fetch position has reached the end offset
+		// AND every record it fetched has been applied. Position alone is not enough (fetched
+		// records may still be queued); reaching the last record is not enough either (on
+		// transactional changelogs the end offset sits past trailing commit markers).
+		const maybeComplete = (partition: number) => {
+			const state = progress.get(partition)
+			if (!state || !pending.has(partition)) return
+			if (state.position < state.endOffset || state.handled < state.fetched) return
+			pending.delete(partition)
+			try {
+				consumer.pause([{ topic: this.topicName, partition }])
+			} catch {
+				// best effort; the consumer is stopped once all partitions complete
+			}
+			if (pending.size === 0) {
 				abortController.abort(restoreCompleteReason)
 			}
-		}
-		const pausePartition = (topic: string, partition: number) => {
-			if (pausedPartitions.has(partition)) return
-			pausedPartitions.add(partition)
-			consumer.pause([{ topic, partition }])
 		}
 
 		consumer.once('running', () => {
@@ -325,77 +410,62 @@ export class ChangelogRestorer<K, V> {
 			lastProgressTime = Date.now()
 		})
 		consumer.on('fetchPosition', (position, recordCount) => {
-			if (recordCount !== 0 || position.topic !== this.topicName || !pendingPartitions.has(position.partition)) {
-				return
-			}
-
+			if (position.topic !== this.topicName) return
+			const state = progress.get(position.partition)
+			if (!state) return
 			lastProgressTime = Date.now()
-			const endOffset = endOffsets.get(position.partition)
-			if (endOffset === undefined || position.offset < endOffset) return
-
-			completePartition(position.partition)
+			madeProgress = true
+			state.fetched += recordCount
+			if (position.offset > state.position) state.position = position.offset
+			maybeComplete(position.partition)
 		})
 
 		const checkIdle = setInterval(() => {
-			if (!isRunning) return
-			if (abortController.signal.aborted) return
-			if (pendingPartitions.size === 0) return
-
-			const timeoutMs = hasConsumedMessage ? idleTimeoutMs : initialIdleTimeoutMs
+			if (!isRunning || abortController.signal.aborted || pending.size === 0) return
+			// A slow store write is progress in the making, not a stall.
+			if (inFlight > 0) return
+			const timeoutMs = madeProgress ? idleTimeoutMs : initialIdleTimeoutMs
 			if (Date.now() - lastProgressTime > timeoutMs) {
-				if (hasConsumedMessage) {
-					// Idle after progress = topic drained. On read_committed transactional changelogs the
-					// consumer can't reach endOffset because control markers sit past the last user record
-					// (LSO = lastUserOffset + N). Gracefully complete instead of erroring (F7b).
-					abortController.abort(restoreCompleteReason)
-				} else {
-					abortController.abort(
-						new Error(
-							`Timed out restoring changelog "${this.topicName}" (pending partitions: ${[
-								...pendingPartitions,
-							].join(', ')})`
-						)
+				abortController.abort(
+					new Error(
+						`Timed out restoring changelog "${this.topicName}": no progress for ${timeoutMs}ms ` +
+							`(pending partitions: ${[...pending].join(', ')})`
 					)
-				}
+				)
 			}
 		}, checkIntervalMs)
 
+		let handlerError: unknown = null
 		try {
 			await consumer.runEach(
 				[this.topicName],
 				async message => {
-					const endOffset = endOffsets.get(message.partition)
-					if (endOffset === undefined) {
-						return
-					}
-
-					// Ignore any records that arrive beyond the captured end offset (e.g. concurrent writers).
-					if (message.offset >= endOffset) {
-						pausePartition(message.topic, message.partition)
-						completePartition(message.partition)
-						return
-					}
-
-					lastProgressTime = Date.now()
-					hasConsumedMessage = true
-
-					if (message.key !== null) {
-						const key = this.keyCodec.decode(message.key)
-
-						if (message.value === null) {
-							// Tombstone - delete from store
-							await this.store.delete(key)
-						} else {
-							const value = this.valueCodec.decode(message.value)
-							await this.store.put(key, value)
-							restoredCount++
+					const state = progress.get(message.partition)
+					if (!state) return
+					inFlight += 1
+					try {
+						// Records past the captured end offset belong to a concurrent writer; the
+						// partition's owner will have them in its own state.
+						if (message.offset < state.endOffset && message.key !== null) {
+							const store = await this.storeFor(message.partition)
+							const key = this.keyCodec.decode(message.key)
+							if (message.value === null) {
+								await store.delete(key)
+							} else {
+								await store.put(key, this.valueCodec.decode(message.value))
+								restoredCount++
+							}
 						}
+					} catch (err) {
+						handlerError = err
+						throw err
+					} finally {
+						inFlight -= 1
+						state.handled += 1
+						lastProgressTime = Date.now()
+						madeProgress = true
 					}
-
-					if (message.offset + 1n >= endOffset) {
-						pausePartition(message.topic, message.partition)
-						completePartition(message.partition)
-					}
+					maybeComplete(message.partition)
 				},
 				{
 					commitOffsets: false,
@@ -407,41 +477,34 @@ export class ChangelogRestorer<K, V> {
 			clearInterval(checkIdle)
 		}
 
-		const abortReason: unknown = abortController.signal.reason
-		if (abortReason !== restoreCompleteReason) {
-			if (abortReason instanceof Error) {
-				throw abortReason
-			}
-			if (pendingPartitions.size > 0) {
-				throw new Error(`Aborted restoring changelog "${this.topicName}"`, { cause: abortReason })
-			}
+		if (handlerError) {
+			throw handlerError instanceof Error ? handlerError : new Error(String(handlerError))
 		}
-
-		if (checkpointStore) {
-			const logger = client.cluster.getLogger()
-			await Promise.all(
-				assigned.map(async partition => {
-					const endOffset = endOffsets.get(partition)
-					if (endOffset === undefined) {
-						return
-					}
-					try {
-						await checkpointStore.set(this.topicName, partition, endOffset)
-					} catch (err) {
-						// Restored state is in memory regardless; failing to record this means a future restart
-						// will re-restore (idempotent but wasteful). Log so a stuck checkpoint store is visible.
-						const error = err instanceof Error ? err : new Error(String(err))
-						logger.error('post-restore checkpoint persistence failed', {
-							topic: this.topicName,
-							partition,
-							error: error.message,
-						})
-					}
-				})
+		const abortReason: unknown = abortController.signal.reason
+		if (abortReason instanceof Error) {
+			throw abortReason
+		}
+		if (pending.size > 0) {
+			throw new Error(
+				`Restoring changelog "${this.topicName}" stopped before completion ` +
+					`(pending partitions: ${[...pending].join(', ')})`,
+				{ cause: abortReason }
 			)
 		}
 
 		return restoredCount
+	}
+}
+
+const DEFAULT_RESTORE_IDLE_TIMEOUT_MS = 30_000
+
+async function clearAll<K, V>(store: KeyValueStore<K, V>): Promise<void> {
+	const keys: K[] = []
+	for await (const [key] of store.all()) {
+		keys.push(key)
+	}
+	for (const key of keys) {
+		await store.delete(key)
 	}
 }
 
