@@ -703,6 +703,11 @@ export class FetchManager {
 		}
 	}
 
+	/** The offset the next fetch of an assigned partition starts at, if the partition is assigned. */
+	getFetchPosition(topic: string, partition: number): bigint | undefined {
+		return this.partitionStates.get(tpKey(topic, partition))?.offset
+	}
+
 	/**
 	 * Seek to a specific offset for a partition
 	 *

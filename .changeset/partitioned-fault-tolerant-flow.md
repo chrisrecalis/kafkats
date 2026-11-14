@@ -42,6 +42,7 @@ Redesign the `@kafkats/flow` runtime for correctness: partitioned state, reparti
 - `startTimeoutMs` (default 120000) for how long `start()` waits for workers to join the group. Exactly-once producers now default to a 10 second `transactionTimeoutMs`.
 - `@kafkats/flow-state-lmdb`: the environment is reopened on demand, so an app can be started again after `close()`.
 - `CoPartitioningError`, exported from `@kafkats/flow`.
+- `@kafkats/client`: `consumer.position(topic, partition)` returns the offset the next fetch of an assigned partition starts at.
 - `Grouped.name` for stable repartition topic names.
 
 **Known limitations**: stream-stream left and outer joins emit the unmatched result eagerly; derived tables (`filter()`/`mapValues()` results) cannot be the lookup side of a join. See the new fault tolerance guide.

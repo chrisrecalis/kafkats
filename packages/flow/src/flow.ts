@@ -1522,7 +1522,11 @@ class FlowAppImpl implements FlowApp {
 	 * Otherwise a worker that restarts (or gets the partition back) before its first commit would
 	 * re-resolve 'latest' and silently skip everything it had read but not committed.
 	 */
-	private async settleInitialPositions(worker: WorkerContext, partitions: TopicPartition[]): Promise<void> {
+	private async settleInitialPositions(
+		worker: WorkerContext,
+		partitions: TopicPartition[],
+		startPositions: Map<string, bigint>
+	): Promise<void> {
 		const isInternal = (topic: string) => this.repartitionTopics.has(topic) || this.throughTopics.has(topic)
 		const policy = this.resolveOffsetReset() ?? 'latest'
 		// With 'earliest' (and 'none') the start position of a source partition is already stable.
@@ -1577,27 +1581,18 @@ class FlowAppImpl implements FlowApp {
 				}
 				continue
 			}
-			// Source topic read from 'latest': pin the first start position for this process.
-			const unpinned = uncommitted.filter(p => !this.initialPositions.has(`${topic.name}:${p}`))
-			if (unpinned.length > 0) {
-				const latest = await admin.fetchTopicOffsets(topic.name, unpinned, 'latest', {
-					isolationLevel: this.eosEnabled
-						? 'read_committed'
-						: (this.config.consumer?.isolationLevel ?? 'read_uncommitted'),
-				})
-				for (const partition of unpinned) {
-					const key = `${topic.name}:${partition}`
-					const offset = latest.get(partition)
-					if (offset !== undefined && !this.initialPositions.has(key)) {
-						this.initialPositions.set(key, offset)
-					}
-				}
-			}
+			// Source topic read from 'latest': the first position this process started the partition
+			// at stays its start position until an offset is committed.
 			for (const partition of uncommitted) {
 				const key = `${topic.name}:${partition}`
+				if (!worker.assignedPartitions.has(`${topic.name}:${partition}`)) continue
 				const pinned = this.initialPositions.get(key)
-				if (pinned === undefined || !worker.assignedPartitions.has(`${topic.name}:${partition}`)) continue
-				worker.consumer.seek(topic.name, partition, pinned)
+				const resolved = startPositions.get(key)
+				if (pinned === undefined) {
+					if (resolved !== undefined) this.initialPositions.set(key, resolved)
+				} else if (pinned !== resolved) {
+					worker.consumer.seek(topic.name, partition, pinned)
+				}
 			}
 		}
 	}
@@ -2269,8 +2264,16 @@ class FlowAppImpl implements FlowApp {
 					// Ignore - pause is best effort and may fail if the consumer is stopping
 				}
 
+				// Where the consumer starts each partition (committed offset or reset policy), read
+				// before anything can move it.
+				const startPositions = new Map<string, bigint>()
+				for (const tp of partitions) {
+					const position = consumer.position(tp.topic, tp.partition)
+					if (position !== undefined) startPositions.set(`${tp.topic}:${tp.partition}`, position)
+				}
+
 				void this.enqueueRestoration(partitions)
-					.then(() => this.settleInitialPositions(worker, partitions))
+					.then(() => this.settleInitialPositions(worker, partitions, startPositions))
 					.then(() => {
 						const stillAssigned = partitions.filter(tp =>
 							worker.assignedPartitions.has(`${tp.topic}:${tp.partition}`)

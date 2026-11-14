@@ -375,6 +375,17 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	}
 
 	/**
+	 * The offset the next fetch of an assigned partition starts at.
+	 *
+	 * Inside a `partitionsAssigned` listener this is the position the partition starts from (the
+	 * committed offset, or the one resolved by `autoOffsetReset`). Returns undefined when the
+	 * partition is not assigned to this consumer.
+	 */
+	position(topic: string, partition: number): bigint | undefined {
+		return this.fetchManager?.getFetchPosition(topic, partition)
+	}
+
+	/**
 	 * Seek to a specific offset for a partition.
 	 *
 	 * Repositions the fetch position for the specified partition to the given offset.
