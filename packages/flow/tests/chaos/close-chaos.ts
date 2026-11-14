@@ -31,7 +31,7 @@ const arg = (n: string, d: string) => {
 }
 const scenario = arg('scenario', 'drain')
 const guarantee = arg('guarantee', 'eos') === 'eos' ? 'exactly_once' : 'at_least_once'
-const mode = arg('mode', 'count') as 'stateless' | 'count'
+const mode = arg('mode', 'count') as "stateless" | "count" | "regroup"
 const cycles = Number(arg('cycles', '4'))
 const keys = Number(arg('keys', '12'))
 const perKey = Number(arg('per-key', '100'))
@@ -168,7 +168,7 @@ if (scenario === 'drain') {
 	const down = arg('down', 'pause')
 	console.log(`== close while broker down (${down}) ${guarantee}/${mode}`)
 	const inputs = genInput(keys, perKey)
-	const producing = produceBatches(client, input, inputs, 12, 100)
+	const producing = produceBatches(client, input, inputs, 12, 100).catch(() => {})
 	const w = new Worker('w', env).start()
 	for (let i = 0; i < 60 && (w.last('status')?.processed ?? 0) < 40; i++) await sleep(500)
 	ev(`processing: ${w.last('status')?.processed}`)

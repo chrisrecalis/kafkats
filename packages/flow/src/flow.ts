@@ -96,7 +96,14 @@ export const workerContextStorage = recordContextStorage
 /** Default transaction commit interval for exactly_once mode (100ms) */
 const DEFAULT_COMMIT_INTERVAL_MS = 100
 
-const WORKER_START_TIMEOUT_MS = 10_000
+/** Default transaction timeout for exactly_once producers (same as Kafka Streams). */
+const DEFAULT_TRANSACTION_TIMEOUT_MS = 10_000
+
+/**
+ * Default time to wait for a worker to join the group. Joining can legitimately take as long as
+ * the session timeout of a member that crashed (the group waits for it before rebalancing).
+ */
+const DEFAULT_START_TIMEOUT_MS = 120_000
 const RESTART_INITIAL_BACKOFF_MS = 500
 const RESTART_MAX_BACKOFF_MS = 30_000
 /** How long after a revocation unowned in-memory state partitions are kept before being dropped. */
@@ -818,10 +825,11 @@ class FlowAppImpl implements FlowApp {
 
 			workerReady.push(
 				new Promise<void>((resolve, reject) => {
+					const startTimeoutMs = this.config.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS
 					const timer = setTimeout(() => {
 						cleanup()
-						reject(new Error(`Consumer did not start within ${WORKER_START_TIMEOUT_MS}ms`))
-					}, WORKER_START_TIMEOUT_MS)
+						reject(new Error(`Consumer did not start within ${startTimeoutMs}ms`))
+					}, startTimeoutMs)
 
 					const onRunning = () => {
 						cleanup()
@@ -1845,6 +1853,9 @@ class FlowAppImpl implements FlowApp {
 			transactionalId,
 			idempotent: true,
 			retries: base.retries ?? 10,
+			// How long a crashed instance's open transaction can block restoration and
+			// read_committed readers of its output before the broker aborts it.
+			transactionTimeoutMs: base.transactionTimeoutMs ?? DEFAULT_TRANSACTION_TIMEOUT_MS,
 		}
 	}
 

@@ -275,9 +275,16 @@ export class ChangelogRestorer<K, V> {
 			return 0
 		}
 
+		// The restore target is the END of the log (high watermark), not the last stable offset.
+		// While a crashed instance's transaction is still open, the last stable offset is pinned at
+		// that transaction's start even though later transactions (of a successor instance) have
+		// already committed beyond it. Stopping there would restore state that is behind the
+		// committed input offsets. Reading up to the log end with read_committed waits for the
+		// broker to abort the dangling transaction (bounded by its transaction timeout) and then
+		// delivers everything that was committed.
 		const [startOffsets, endOffsets] = await Promise.all([
 			admin.fetchTopicOffsets(this.topicName, assigned, 'earliest', { isolationLevel: 'read_committed' }),
-			admin.fetchTopicOffsets(this.topicName, assigned, 'latest', { isolationLevel: 'read_committed' }),
+			admin.fetchTopicOffsets(this.topicName, assigned, 'latest', { isolationLevel: 'read_uncommitted' }),
 		])
 
 		// Decide, per partition, whether the checkpoint can be trusted.
@@ -420,19 +427,58 @@ export class ChangelogRestorer<K, V> {
 			maybeComplete(position.partition)
 		})
 
+		const admin = client.admin()
+		const startedAt = Date.now()
+		let checking = false
+		let warnedOpenTransaction = false
+		// True when every pending partition has consumed all stable data and is only held back by
+		// an open transaction (last stable offset below the restore target).
+		const blockedByOpenTransaction = async (): Promise<boolean> => {
+			const stable = await admin.fetchTopicOffsets(this.topicName, [...pending], 'latest', {
+				isolationLevel: 'read_committed',
+			})
+			for (const partition of pending) {
+				const state = progress.get(partition)
+				const lastStable = stable.get(partition)
+				if (!state || lastStable === undefined) return false
+				if (lastStable >= state.endOffset || state.position < lastStable) return false
+			}
+			return true
+		}
+
 		const checkIdle = setInterval(() => {
-			if (!isRunning || abortController.signal.aborted || pending.size === 0) return
+			if (checking || !isRunning || abortController.signal.aborted || pending.size === 0) return
 			// A slow store write is progress in the making, not a stall.
 			if (inFlight > 0) return
 			const timeoutMs = madeProgress ? idleTimeoutMs : initialIdleTimeoutMs
-			if (Date.now() - lastProgressTime > timeoutMs) {
-				abortController.abort(
-					new Error(
-						`Timed out restoring changelog "${this.topicName}": no progress for ${timeoutMs}ms ` +
-							`(pending partitions: ${[...pending].join(', ')})`
+			if (Date.now() - lastProgressTime <= timeoutMs) return
+
+			checking = true
+			void blockedByOpenTransaction()
+				.catch(() => false)
+				.then(blocked => {
+					checking = false
+					if (abortController.signal.aborted || pending.size === 0) return
+					if (blocked && Date.now() - startedAt < MAX_OPEN_TRANSACTION_WAIT_MS) {
+						// Not a stall: the broker will abort the dangling transaction once its
+						// transaction timeout expires, after which the remaining records arrive.
+						lastProgressTime = Date.now()
+						if (!warnedOpenTransaction) {
+							warnedOpenTransaction = true
+							client.cluster.getLogger().warn(
+								'changelog restore is waiting for an open transaction to complete',
+								{ topic: this.topicName, partitions: [...pending] }
+							)
+						}
+						return
+					}
+					abortController.abort(
+						new Error(
+							`Timed out restoring changelog "${this.topicName}": no progress for ${timeoutMs}ms ` +
+								`(pending partitions: ${[...pending].join(', ')})`
+						)
 					)
-				)
-			}
+				})
 		}, checkIntervalMs)
 
 		let handlerError: unknown = null
@@ -497,6 +543,8 @@ export class ChangelogRestorer<K, V> {
 }
 
 const DEFAULT_RESTORE_IDLE_TIMEOUT_MS = 30_000
+/** Upper bound for waiting on a dangling transaction (brokers cap transaction timeouts at 15 minutes by default). */
+const MAX_OPEN_TRANSACTION_WAIT_MS = 16 * 60_000
 
 async function clearAll<K, V>(store: KeyValueStore<K, V>): Promise<void> {
 	const keys: K[] = []

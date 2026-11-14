@@ -12,6 +12,7 @@ export class ChildWorker {
 	proc!: ChildProcess
 	lines: string[] = []
 	exited!: Promise<void>
+	pid = 0
 	constructor(readonly env: Record<string, string>) {}
 	start(): this {
 		this.proc = spawn(process.execPath, ['--import', TSX, path.join(here, 'round3-worker.ts')], {
@@ -19,6 +20,7 @@ export class ChildWorker {
 			env: { ...process.env, ...this.env },
 			stdio: ['ignore', 'pipe', 'pipe'],
 		})
+		this.pid = this.proc.pid ?? 0
 		this.proc.stdout!.on('data', d => this.lines.push(...d.toString().split('\n').filter(Boolean)))
 		this.proc.stderr!.on('data', d => this.lines.push(`STDERR ${d}`))
 		this.exited = new Promise(res => this.proc.on('exit', () => res()))

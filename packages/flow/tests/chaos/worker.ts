@@ -86,7 +86,7 @@ let processed = 0
 
 const app = flow({
 	applicationId: env('CHAOS_APP_ID'),
-	client: { clientId: `chaos-${process.pid}`, brokers: env('CHAOS_BROKERS').split(',') },
+	client: { clientId: `chaos-${process.pid}`, brokers: env('CHAOS_BROKERS').split(','), ...(process.env.CHAOS_LOG_LEVEL ? { logLevel: process.env.CHAOS_LOG_LEVEL as any } : {}) },
 	numStreamThreads: Number(env('CHAOS_THREADS', '1')),
 	processingGuarantee: guarantee,
 	commitIntervalMs: 100,

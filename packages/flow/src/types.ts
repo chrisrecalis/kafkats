@@ -37,6 +37,13 @@ export interface FlowConfig {
 	 */
 	restartOnError?: boolean
 	/**
+	 * How long start() waits for each stream worker to join the consumer group.
+	 * Joining can take as long as the session timeout of a crashed member the group is still
+	 * waiting for.
+	 * Default: 120000
+	 */
+	startTimeoutMs?: number
+	/**
 	 * Default changelog topic configuration.
 	 */
 	changelog?: {

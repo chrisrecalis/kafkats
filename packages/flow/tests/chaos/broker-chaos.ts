@@ -9,6 +9,7 @@
  *        --recover-ms 120000 (how long to wait for self-recovery before declaring HANG)
  * Timeline: produce; once worker is processing inject fault while producer keeps going; then watch the worker:
  *   state, processed counter progress, errors. Reports precise phases: stall start, broker back, resume (or never).
+ * CHAOS_DEBUG=1 (+ KAFKA_TS_LOG_LEVEL=debug) prints the worker's raw log lines at the end.
  * Exit 0 PASS / 1 FAIL.
  */
 import { execSync } from 'node:child_process'
@@ -32,7 +33,7 @@ const arg = (n: string, d: string) => {
 	return i >= 0 ? process.argv[i + 1]! : d
 }
 const guarantee = arg('guarantee', 'alo') === 'eos' ? 'exactly_once' : 'at_least_once'
-const mode = arg('mode', 'stateless') as 'stateless' | 'count'
+const mode = arg('mode', 'stateless') as "stateless" | "count" | "regroup"
 const fault = arg('fault', 'restart')
 const pauseS = Number(arg('pause-s', '25'))
 const keys = Number(arg('keys', '12'))
@@ -168,7 +169,7 @@ for (const r of actualRecs) expectedByKey.set(r.key, (expectedByKey.get(r.key) ?
 const dedupInput = new Set(actualRecs.map(r => r.value)).size !== actualRecs.length
 let outs = await readAll(client, output, isolation, { quietMs: 8000, maxMs: 60000 })
 const sum =
-	mode === 'stateless' ? summarizeStateless(actualRecs, outs) : summarizeCount(keys, perKey, outs, expectedByKey)
+	mode === 'stateless' ? summarizeStateless(actualRecs, outs) : summarizeCount(keys, perKey, outs, expectedByKey, mode === 'regroup' ? 'nk' : 'k')
 
 // Is the app actually dead? Produce 1 sentinel per key and see if it still processes.
 let stillAlive = 'n/a'
@@ -226,6 +227,17 @@ console.log(
 		.slice(0, 12)
 		.map(l => JSON.stringify(l))
 )
+if (process.env.CHAOS_DEBUG) {
+	const raw = w.lines.filter(l => l.type === 'raw' || l.type === 'stderr').map(l => String(l.line ?? '').trim())
+	const counts = new Map<string, number>()
+	for (const r of raw) {
+		let key = r.slice(0, 200)
+		try { const j = JSON.parse(r); key = `${j.level} ${j.component ?? ''}: ${j.message} | ${String(j.error ?? '').slice(0, 100)}` } catch {}
+		counts.set(key, (counts.get(key) ?? 0) + 1)
+	}
+	console.log('  worker client log summary (count x message):')
+	for (const [k, v] of [...counts].sort((a, b) => b[1] - a[1]).slice(0, 25)) console.log(`    ${v} x ${k}`)
+}
 await w.kill()
 await client.disconnect().catch(() => {})
 process.exit(pass ? 0 : 1)

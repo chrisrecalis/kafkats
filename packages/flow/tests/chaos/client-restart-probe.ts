@@ -10,7 +10,9 @@ const fault = process.argv[2] ?? 'restart'
 const client = await makeClient()
 const topic = uid('probe')
 await createTopics(client, [topic], 2)
-const consumer = client.consumer({
+// consumer on its OWN client; producer/admin on `client` (sharing one client masks the bug because producer retries reconnect the shared broker pool)
+const cclient = await makeClient()
+const consumer = cclient.consumer({
 	groupId: uid('g'),
 	autoOffsetReset: 'earliest',
 	maxWaitMs: 100,
