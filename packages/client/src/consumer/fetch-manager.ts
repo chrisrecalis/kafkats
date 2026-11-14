@@ -518,6 +518,9 @@ export class FetchManager {
 	// Buffered poll mode fields
 	private fetchBuffer: FetchBuffer | null = null
 	private brokerInFlight: Map<number, boolean> = new Map()
+	// Brokers this fetch manager has fetched from. It fetches on connections of its own (see
+	// Broker.fetch), which stop() closes.
+	private readonly fetchBrokers = new Set<Broker>()
 	// Per-broker retry gate after failed fetches (exponential backoff), so a down broker is polled
 	// at a bounded rate instead of in a hot loop. Cleared by the first successful fetch.
 	private readonly brokerBackoff: Map<number, { strategy: ReconnectionStrategy; until: number; failures: number }> =
@@ -865,6 +868,11 @@ export class FetchManager {
 			this.fetchBuffer = null
 		}
 		this.brokerInFlight.clear()
+		// Closing the connections also ends a long poll in flight; its result would be discarded anyway.
+		for (const broker of this.fetchBrokers) {
+			broker.closeFetchConnection(this).catch(() => {})
+		}
+		this.fetchBrokers.clear()
 	}
 
 	/** Log and surface a background failure, at most once per FETCH_ERROR_REPORT_INTERVAL_MS. */
@@ -1000,6 +1008,8 @@ export class FetchManager {
 							this.brokerBackoff.delete(brokerId)
 						})
 						.catch(error => {
+							// stop() closed the connection under it.
+							if (signal?.aborted) return
 							this.handleBrokerFetchFailure(
 								brokerId,
 								partitions,
@@ -1130,14 +1140,18 @@ export class FetchManager {
 			})),
 		}))
 
-		const response = await broker.fetch({
-			replicaId: -1,
-			maxWaitMs: this.config.maxWaitMs,
-			minBytes: this.config.minBytes,
-			maxBytes,
-			isolationLevel: this.config.isolationLevel === 'read_committed' ? 1 : 0,
-			topics,
-		})
+		this.fetchBrokers.add(broker)
+		const response = await broker.fetch(
+			{
+				replicaId: -1,
+				maxWaitMs: this.config.maxWaitMs,
+				minBytes: this.config.minBytes,
+				maxBytes,
+				isolationLevel: this.config.isolationLevel === 'read_committed' ? 1 : 0,
+				topics,
+			},
+			this
+		)
 
 		for (const topicResponse of response.topics) {
 			for (const partitionResponse of topicResponse.partitions) {
