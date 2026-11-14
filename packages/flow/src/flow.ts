@@ -240,15 +240,13 @@ class FlowAppImpl implements FlowApp {
 
 			// Validate topology against the cluster and create internal topics
 			// (returns false if skipped because no cluster is reachable, e.g. mocked clients).
-			status.setClusterAvailable(
-				await validateTopicsOnceVisible({
-					client: this.client,
-					config: this.config,
-					topology: this.topology,
-					stores: this.stores,
-					status,
-				})
-			)
+			status.clusterAvailable = await validateTopicsOnceVisible({
+				client: this.client,
+				config: this.config,
+				topology: this.topology,
+				stores: this.stores,
+				status,
+			})
 			status.assertNotClosing()
 
 			if (status.clusterAvailable) {
@@ -265,17 +263,17 @@ class FlowAppImpl implements FlowApp {
 			}
 
 			status.assertNotClosing()
-			status.markStarted()
+			status.started = true
 			if (status.state !== 'ERROR') {
-				status.setState('RUNNING')
+				status.state = 'RUNNING'
 			}
 		} catch (err) {
 			const error = toError(err)
 			const wasClosing = status.closing
 			await this.shutdown()
 			// Not started: surface the failure and allow start() to be called again.
-			status.recordError(error)
-			status.setState(wasClosing ? 'STOPPED' : 'ERROR')
+			status.lastError = error
+			status.state = wasClosing ? 'STOPPED' : 'ERROR'
 			throw error
 		}
 	}
@@ -285,7 +283,7 @@ class FlowAppImpl implements FlowApp {
 			return this.closePromise
 		}
 		if (this.status.state === 'STOPPED' || (this.status.state === 'CREATED' && !this.startPromise)) {
-			this.status.setState('STOPPED')
+			this.status.state = 'STOPPED'
 			return Promise.resolve()
 		}
 
@@ -302,7 +300,7 @@ class FlowAppImpl implements FlowApp {
 				await this.startPromise.catch(() => {})
 			}
 			await this.shutdown()
-			this.status.setState('STOPPED')
+			this.status.state = 'STOPPED'
 			this.startPromise = null
 		})()
 		return this.closePromise
@@ -333,7 +331,7 @@ class FlowAppImpl implements FlowApp {
 		if (this.ownsClient) {
 			await this.client.disconnect().catch(() => {})
 		}
-		this.status.markShutDown()
+		this.status.started = false
 	}
 
 	state(): StreamState {

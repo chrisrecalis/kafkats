@@ -122,7 +122,7 @@ export class GlobalTables {
 				})
 				runner.consumer = consumer
 				consumer.on('error', error => {
-					status.recordError(error)
+					status.lastError = error
 				})
 				consumer.on('fetchPosition', (position, recordCount) => {
 					if (position.topic !== table.topic) return
@@ -165,7 +165,7 @@ export class GlobalTables {
 				} catch (err) {
 					if (status.closing) return
 					const error = toError(err)
-					status.recordError(error)
+					status.lastError = error
 					if (pending.size > 0) {
 						// Still bootstrapping: fail startup rather than serve a partial table.
 						rejectBootstrap(error)
@@ -173,7 +173,7 @@ export class GlobalTables {
 					}
 					if (!isInfrastructureRecoverable(error)) {
 						logger.error('global table consumer failed', { topic: table.topic, error: error.message })
-						status.setState('ERROR')
+						status.state = 'ERROR'
 						return
 					}
 					attempt += 1

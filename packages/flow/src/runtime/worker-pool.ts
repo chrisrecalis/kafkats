@@ -45,7 +45,7 @@ export class WorkerPool {
 		for (const worker of this.active) {
 			await worker.commit().catch(err => {
 				const error = toError(err)
-				this.deps.status.recordError(error)
+				this.deps.status.lastError = error
 				this.deps.logger.warn('final transaction commit failed during close', {
 					worker: worker.id,
 					error: error.message,

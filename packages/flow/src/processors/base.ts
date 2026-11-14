@@ -56,7 +56,6 @@ export type WorkerContext = {
 	producer: Producer
 	consumer: Consumer
 	activeTransaction: ActiveTransaction | null
-	activeTransactionPromise: Promise<void> | null
 	offsetCommitContext: ConsumeContext | null
 	sourcesByTopic: Map<string, SourceNode<unknown, unknown>[]>
 	assignedPartitions: Map<TopicPartitionKey, { topic: string; partition: number }>
@@ -76,7 +75,6 @@ export type WorkerContext = {
 	/** Whether the worker made progress since it last (re)started; resets the restart backoff. */
 	processedSinceRestart?: boolean
 	eosQueue: Promise<void>
-	transactionActive: boolean
 	commitTimer: ReturnType<typeof setTimeout> | null
 	lastCommitTime: number
 }

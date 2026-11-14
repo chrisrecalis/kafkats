@@ -70,7 +70,6 @@ export class StreamWorker {
 			producer,
 			consumer,
 			activeTransaction: null,
-			activeTransactionPromise: null,
 			offsetCommitContext: null,
 			sourcesByTopic: new Map(),
 			assignedPartitions: new Map(),
@@ -80,7 +79,6 @@ export class StreamWorker {
 			streamClocks: new Map(),
 			failure: null,
 			eosQueue: Promise.resolve(),
-			transactionActive: false,
 			commitTimer: null,
 			lastCommitTime: 0,
 		}
@@ -169,7 +167,7 @@ export class StreamWorker {
 				return
 			}
 
-			status.recordError(failure.error)
+			status.lastError = failure.error
 			if (!status.started) {
 				// Failures during startup are reported by start() itself.
 				status.failStartup(failure.error)
@@ -177,7 +175,7 @@ export class StreamWorker {
 			}
 			if (!failure.recoverable || config.restartOnError === false) {
 				logger.error('stream worker failed', { worker: worker.id, error: failure.error.message })
-				status.setState('ERROR')
+				status.state = 'ERROR'
 				return
 			}
 
@@ -193,7 +191,7 @@ export class StreamWorker {
 				backoffMs,
 				error: failure.error.message,
 			})
-			status.setState('REBALANCING')
+			status.state = 'REBALANCING'
 			await status.sleepUnlessClosing(backoffMs)
 			if (status.closing) return
 
@@ -238,7 +236,7 @@ export class StreamWorker {
 		if (!worker.failure) {
 			worker.failure = { error: toError(err), recoverable }
 		}
-		this.deps.status.recordError(worker.failure.error)
+		this.deps.status.lastError = worker.failure.error
 		try {
 			worker.consumer.stop()
 		} catch {
@@ -303,7 +301,7 @@ export class StreamWorker {
 		// onBeforeRebalance (passed to the consumer config) which is awaited by the rebalance protocol.
 		consumer.on('rebalance', () => {
 			if (status.state === 'RUNNING') {
-				status.setState('REBALANCING')
+				status.state = 'REBALANCING'
 			}
 		})
 		consumer.on('partitionsAssigned', partitions => this.onPartitionsAssigned(partitions))
@@ -317,7 +315,7 @@ export class StreamWorker {
 			for (const tp of partitions) {
 				worker.assignedPartitions.delete(`${tp.topic}:${tp.partition}`)
 			}
-			if (eosEnabled && worker.transactionActive) {
+			if (eosEnabled && this.transactions.active) {
 				// The open transaction contains work for partitions we no longer own; it can
 				// never commit. Abort it, and restart the worker if it still holds partitions
 				// whose uncommitted records must be re-read.
@@ -333,7 +331,7 @@ export class StreamWorker {
 		consumer.on('error', error => {
 			// Informational: the consumer reports transient errors here too. Fatal failures
 			// surface through the worker's run loop, which decides between restart and ERROR.
-			status.recordError(error)
+			status.lastError = error
 		})
 	}
 
@@ -392,7 +390,7 @@ export class StreamWorker {
 		}
 
 		if (status.started && status.state === 'REBALANCING') {
-			status.setState('RUNNING')
+			status.state = 'RUNNING'
 		}
 	}
 

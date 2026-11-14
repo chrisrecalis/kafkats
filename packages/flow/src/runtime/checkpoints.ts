@@ -121,7 +121,7 @@ export class Checkpoints {
 
 	private recordError(err: unknown, context: Record<string, unknown>): void {
 		const error = toError(err)
-		this.status.recordError(error)
+		this.status.lastError = error
 		// Dedupe log lines: persistent disk-full would otherwise emit per-partition every commit interval.
 		if (this.lastErrorMessage !== error.message) {
 			this.lastErrorMessage = error.message
