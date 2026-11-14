@@ -6,19 +6,13 @@ export class MapNode<K, V, K2, V2> extends Processor<K, V, K2, V2> {
 		super()
 	}
 
-	clone(worker: WorkerContext): Processor<K, V, K2, V2> {
-		void worker
+	clone(): Processor<K, V, K2, V2> {
 		return new MapNode(this.fn)
 	}
 
 	async process(record: StreamRecord<K, V>): Promise<void> {
-		const [nextKey, nextValue] = this.fn(record.key, record.value)
-		const next: StreamRecord<K2, V2> = {
-			...record,
-			key: nextKey,
-			value: nextValue,
-		}
-		await this.forward(next)
+		const [key, value] = this.fn(record.key, record.value)
+		await this.forward({ ...record, key, value })
 	}
 }
 
@@ -27,17 +21,12 @@ export class MapValuesNode<K, V, V2> extends Processor<K, V, K, V2> {
 		super()
 	}
 
-	clone(worker: WorkerContext): Processor<K, V, K, V2> {
-		void worker
+	clone(): Processor<K, V, K, V2> {
 		return new MapValuesNode(this.fn)
 	}
 
 	async process(record: StreamRecord<K, V>): Promise<void> {
-		const next: StreamRecord<K, V2> = {
-			...record,
-			value: this.fn(record.value),
-		}
-		await this.forward(next)
+		await this.forward({ ...record, value: this.fn(record.value) })
 	}
 }
 
@@ -46,18 +35,13 @@ export class FlatMapValuesNode<K, V, V2> extends Processor<K, V, K, V2> {
 		super()
 	}
 
-	clone(worker: WorkerContext): Processor<K, V, K, V2> {
-		void worker
+	clone(): Processor<K, V, K, V2> {
 		return new FlatMapValuesNode(this.fn)
 	}
 
 	async process(record: StreamRecord<K, V>): Promise<void> {
 		for (const value of this.fn(record.value)) {
-			const next: StreamRecord<K, V2> = {
-				...record,
-				value,
-			}
-			await this.forward(next)
+			await this.forward({ ...record, value })
 		}
 	}
 }
@@ -67,8 +51,7 @@ export class FilterNode<K, V> extends Processor<K, V, K, V> {
 		super()
 	}
 
-	clone(worker: WorkerContext): Processor<K, V, K, V> {
-		void worker
+	clone(): Processor<K, V, K, V> {
 		return new FilterNode(this.fn)
 	}
 
@@ -84,8 +67,7 @@ export class PeekNode<K, V> extends Processor<K, V, K, V> {
 		super()
 	}
 
-	clone(worker: WorkerContext): Processor<K, V, K, V> {
-		void worker
+	clone(): Processor<K, V, K, V> {
 		return new PeekNode(this.fn)
 	}
 
@@ -100,17 +82,12 @@ export class SelectKeyNode<K, V, K2> extends Processor<K, V, K2, V> {
 		super()
 	}
 
-	clone(worker: WorkerContext): Processor<K, V, K2, V> {
-		void worker
+	clone(): Processor<K, V, K2, V> {
 		return new SelectKeyNode(this.fn)
 	}
 
 	async process(record: StreamRecord<K, V>): Promise<void> {
-		const next: StreamRecord<K2, V> = {
-			...record,
-			key: this.fn(record.value, record.key),
-		}
-		await this.forward(next)
+		await this.forward({ ...record, key: this.fn(record.value, record.key) })
 	}
 }
 
@@ -120,8 +97,7 @@ export class BranchNode<K, V> extends Processor<K, V, K, V> {
 		node: Processor<K, V, unknown, unknown>
 	}> = []
 
-	clone(worker: WorkerContext): Processor<K, V, K, V> {
-		void worker
+	clone(): Processor<K, V, K, V> {
 		return new BranchNode<K, V>()
 	}
 
@@ -161,19 +137,17 @@ export class TableMapValuesNode<K, V, V2> extends Processor<K, V, K, V2> {
 		super()
 	}
 
-	clone(worker: WorkerContext): Processor<K, V, K, V2> {
-		void worker
+	clone(): Processor<K, V, K, V2> {
 		return new TableMapValuesNode(this.fn)
 	}
 
 	async process(record: StreamRecord<K, V>): Promise<void> {
 		const old = record.oldValue as V | null | undefined
-		const next: StreamRecord<K, V2> = {
+		await this.forward({
 			...record,
 			value: record.value === null ? null : this.fn(record.value),
 			oldValue: old === undefined || old === null ? old : this.fn(old),
-		}
-		await this.forward(next)
+		})
 	}
 }
 
@@ -187,8 +161,7 @@ export class TableFilterNode<K, V> extends Processor<K, V, K, V> {
 		super()
 	}
 
-	clone(worker: WorkerContext): Processor<K, V, K, V> {
-		void worker
+	clone(): Processor<K, V, K, V> {
 		return new TableFilterNode(this.fn)
 	}
 

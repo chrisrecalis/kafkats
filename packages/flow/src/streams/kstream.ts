@@ -1,7 +1,11 @@
 import type { Codec } from '@/codec.js'
 import type { KStream, KTable, KGroupedStream, Produced, Grouped, Materialized, Joined, KeyValue } from '@/types.js'
+import type { KeyValueStore, WindowStore } from '@/state.js'
 import {
 	type OutputProcessor,
+	type Processor,
+	type StoreRef,
+	type StreamFormat,
 	PassThroughNode,
 	MapNode,
 	MapValuesNode,
@@ -11,18 +15,22 @@ import {
 	SelectKeyNode,
 	BranchNode,
 	ProduceNode,
-	type StreamFormat,
-} from '@/processors/index.js'
-import { TableStateNode } from '@/processors/table.js'
-import { StreamTableJoinNode, StreamTableLeftJoinNode } from '@/processors/joins/stream-table.js'
-import {
+	TableStateNode,
+	StreamTableJoinNode,
+	StreamTableLeftJoinNode,
 	StreamStreamJoinNode,
 	StreamStreamLeftJoinNode,
 	StreamStreamOuterJoinNode,
-} from '@/processors/joins/stream-stream.js'
+} from '@/processors/index.js'
 import { joinWindowMs as resolveJoinWindowMs } from '@/helpers.js'
 import { KTableImpl, type FlowAppInterface } from '@/streams/ktable.js'
 import { KGroupedStreamImpl } from '@/streams/grouped.js'
+
+type WindowJoinNodes<K, V, V2, VR> = (
+	leftStoreRef: StoreRef<WindowStore<K, V>>,
+	rightStoreRef: StoreRef<WindowStore<K, V2>>,
+	joinWindowMs: number
+) => [Processor<K, V, K, VR>, Processor<K, V2, K, VR>]
 
 export class KStreamImpl<K, V> implements KStream<K, V> {
 	constructor(
@@ -55,8 +63,7 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 			)
 		}
 		const topic = this.app.createRepartitionTopic(name, this.sourceTopics)
-		const node = new ProduceNode<K, V>(this.app, topic, { key, value }, this.format, false)
-		this.node.connect(node)
+		this.node.connect(new ProduceNode<K, V>(this.app, topic, { key, value }, this.format))
 		return this.app.stream<K, V>(topic, { key, value }) as KStreamImpl<K, V>
 	}
 
@@ -64,52 +71,38 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 		return this.repartitionRequired ? this.repartitioned(name, keyCodec, valueCodec) : this
 	}
 
-	map<K2, V2>(fn: (key: K | null, value: V | null) => KeyValue<K2, V2>): KStream<K2, V2> {
-		const node = new MapNode<K, V, K2, V2>(fn)
+	/** Continue the stream through `node`, keeping its source topics. */
+	private chain<K2, V2>(
+		node: Processor<K, V, K2, V2>,
+		format: StreamFormat<K2, V2>,
+		repartitionRequired = this.repartitionRequired
+	): KStreamImpl<K2, V2> {
 		this.node.connect(node)
-		return new KStreamImpl<K2, V2>(this.app, node, {}, this.sourceTopics, true)
+		return new KStreamImpl<K2, V2>(this.app, node, format, this.sourceTopics, repartitionRequired)
+	}
+
+	map<K2, V2>(fn: (key: K | null, value: V | null) => KeyValue<K2, V2>): KStream<K2, V2> {
+		return this.chain(new MapNode<K, V, K2, V2>(fn), {}, true)
 	}
 
 	mapValues<V2>(fn: (value: V | null) => V2 | null): KStream<K, V2> {
-		const node = new MapValuesNode<K, V, V2>(fn)
-		this.node.connect(node)
-		return new KStreamImpl<K, V2>(
-			this.app,
-			node,
-			{ keyCodec: this.format.keyCodec },
-			this.sourceTopics,
-			this.repartitionRequired
-		)
+		return this.chain(new MapValuesNode<K, V, V2>(fn), { keyCodec: this.format.keyCodec })
 	}
 
 	flatMapValues<V2>(fn: (value: V | null) => Iterable<V2>): KStream<K, V2> {
-		const node = new FlatMapValuesNode<K, V, V2>(fn)
-		this.node.connect(node)
-		return new KStreamImpl<K, V2>(
-			this.app,
-			node,
-			{ keyCodec: this.format.keyCodec },
-			this.sourceTopics,
-			this.repartitionRequired
-		)
+		return this.chain(new FlatMapValuesNode<K, V, V2>(fn), { keyCodec: this.format.keyCodec })
 	}
 
 	filter(fn: (key: K | null, value: V | null) => boolean): KStream<K, V> {
-		const node = new FilterNode<K, V>(fn)
-		this.node.connect(node)
-		return new KStreamImpl<K, V>(this.app, node, this.format, this.sourceTopics, this.repartitionRequired)
+		return this.chain(new FilterNode<K, V>(fn), this.format)
 	}
 
 	peek(fn: (key: K | null, value: V | null) => void): KStream<K, V> {
-		const node = new PeekNode<K, V>(fn)
-		this.node.connect(node)
-		return new KStreamImpl<K, V>(this.app, node, this.format, this.sourceTopics, this.repartitionRequired)
+		return this.chain(new PeekNode<K, V>(fn), this.format)
 	}
 
 	selectKey<K2>(fn: (value: V | null, key: K | null) => K2): KStream<K2, V> {
-		const node = new SelectKeyNode<K, V, K2>(fn)
-		this.node.connect(node)
-		return new KStreamImpl<K2, V>(this.app, node, { valueCodec: this.format.valueCodec }, this.sourceTopics, true)
+		return this.chain(new SelectKeyNode<K, V, K2>(fn), { valueCodec: this.format.valueCodec }, true)
 	}
 
 	merge(other: KStream<K, V>): KStream<K, V> {
@@ -121,14 +114,11 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 		const keyCodec = this.format.keyCodec === otherStream.format.keyCodec ? this.format.keyCodec : undefined
 		const valueCodec = this.format.valueCodec === otherStream.format.valueCodec ? this.format.valueCodec : undefined
 
-		// Merge source topics from both streams
-		const mergedTopics = new Set([...this.sourceTopics, ...otherStream.sourceTopics])
-
 		return new KStreamImpl<K, V>(
 			this.app,
 			node,
 			{ keyCodec, valueCodec },
-			mergedTopics,
+			new Set([...this.sourceTopics, ...otherStream.sourceTopics]),
 			this.repartitionRequired || otherStream.repartitionRequired
 		)
 	}
@@ -145,16 +135,13 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 	}
 
 	to(topic: string, options?: Produced<K, V>): void {
-		// FlowAppInterface satisfies ProduceNode's FlowAppInterface (both have sendToTopic)
-		const node = new ProduceNode<K, V>(this.app, topic, options, this.format, false)
-		this.node.connect(node)
+		this.node.connect(new ProduceNode<K, V>(this.app, topic, options, this.format))
 	}
 
 	through(topic: string, options?: Produced<K, V>): KStream<K, V> {
 		// Write to the topic, then continue from what is read back: downstream operations see
 		// records in the partition they were written to (and after a restart, replayed from it).
-		const node = new ProduceNode<K, V>(this.app, topic, options, this.format, false)
-		this.node.connect(node)
+		this.to(topic, options)
 		this.app.registerThroughTopic(topic)
 		return this.app.stream<K, V>(topic, {
 			key: options?.key ?? this.format.keyCodec,
@@ -180,7 +167,6 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 		)
 		const storeRef = { store }
 
-		// Create table state node that maintains state
 		const tableStateNode = new TableStateNode<K, V>(storeName, storeRef)
 		self.node.connect(tableStateNode)
 
@@ -188,19 +174,19 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 	}
 
 	groupBy<K2>(fn: (key: K | null, value: V | null) => K2, options?: Grouped<K2, V>): KGroupedStream<K2, V> {
-		// Re-key, then repartition so all records of a new key meet in one state partition.
-		const selectNode = new SelectKeyNode<K, V, K2>((value, key) => fn(key, value))
-		this.node.connect(selectNode)
-
 		const keyCodec = options?.key
 		const valueCodec = options?.value ?? this.format.valueCodec
 		if (!keyCodec) {
 			throw new Error('groupBy() requires a key codec for the new key. Provide one via groupBy(fn, { key }).')
 		}
 
-		const rekeyed = new KStreamImpl<K2, V>(this.app, selectNode, { keyCodec, valueCodec }, this.sourceTopics, true)
-		const stream = rekeyed.repartitioned(options?.name, keyCodec, valueCodec)
-		return new KGroupedStreamImpl(this.app, stream.node, stream.format, stream.sourceTopics, true)
+		// Re-key, then repartition so all records of a new key meet in one state partition.
+		const stream = this.chain(
+			new SelectKeyNode<K, V, K2>((value, key) => fn(key, value)),
+			{ keyCodec, valueCodec },
+			true
+		).repartitioned(options?.name, keyCodec, valueCodec)
+		return new KGroupedStreamImpl(this.app, stream.node, stream.format, stream.sourceTopics)
 	}
 
 	groupByKey(options?: Grouped<K, V>): KGroupedStream<K, V> {
@@ -208,7 +194,7 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 		const valueCodec = options?.value ?? this.format.valueCodec
 
 		const stream = this.copartitioned(options?.name, keyCodec, valueCodec)
-		return new KGroupedStreamImpl(this.app, stream.node, { keyCodec, valueCodec }, stream.sourceTopics, true)
+		return new KGroupedStreamImpl(this.app, stream.node, { keyCodec, valueCodec }, stream.sourceTopics)
 	}
 
 	join<V2, VR>(
@@ -216,106 +202,18 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 		joiner: (value: V, otherValue: V2) => VR,
 		options?: Joined<K, V, V2>
 	): KStream<K, VR> {
-		// Check if joining with a KTable (Stream-Table join)
-		// A global table holds every key on every instance, so its lookups need no repartitioning.
-		const self =
-			other instanceof KTableImpl && other.global
-				? this
-				: this.copartitioned(undefined, options?.key, options?.value)
-
 		if (other instanceof KTableImpl) {
-			const tableImpl = other as KTableImpl<K, V2>
-			if (!tableImpl.storeRef.store) {
-				throw new Error('Cannot join with a KTable that has no state store')
-			}
-
-			const joinNode = new StreamTableJoinNode<K, V, V2, VR>(tableImpl.storeRef, joiner)
-			if (!tableImpl.global) {
-				// The lookup hits the table's state partition of the stream record's partition.
-				this.app.requireCopartitioned(new Set([...self.sourceTopics, ...tableImpl.sourceTopics]))
-			}
-			self.node.connect(joinNode)
-
-			// Stream-table join: only stream's source topics affect partitioning
-			return new KStreamImpl<K, VR>(this.app, joinNode, { keyCodec: self.format.keyCodec }, self.sourceTopics)
+			return this.tableJoin(other, options, storeRef => new StreamTableJoinNode<K, V, V2, VR>(storeRef, joiner))
 		}
-
-		// Stream-Stream join requires windowing
-		if (!(other instanceof KStreamImpl)) {
-			throw new Error('Can only join with KStreamImpl or KTableImpl instances')
-		}
-
-		const otherStream = (other as KStreamImpl<K, V2>).copartitioned(undefined, options?.key, options?.otherValue)
-		const joinWindow = options?.within
-		if (!joinWindow) {
-			throw new Error('Stream-stream join requires a join window. Provide options.within.')
-		}
-
-		const joinWindowMs = resolveJoinWindowMs(joinWindow)
-
-		const keyCodec = self.format.keyCodec
-		const valueCodec = self.format.valueCodec
-		const otherValueCodec = otherStream.format.valueCodec
-
-		if (!keyCodec || !valueCodec || !otherValueCodec) {
-			throw new Error('Stream-stream join requires key and value codecs')
-		}
-
-		// Merge source topics from both streams for stream-stream join
-		const mergedTopics = new Set([...self.sourceTopics, ...otherStream.sourceTopics])
-		this.app.requireCopartitioned(mergedTopics)
-
-		// Create window stores for both streams
-		const leftStoreName = `stream-join-left-${this.app.nextStoreId()}`
-		const rightStoreName = `stream-join-right-${this.app.nextStoreId()}`
-
-		// Back both side stores with a changelog so a restarted/rebalanced task rebuilds its
-		// in-flight join window instead of silently dropping matches. A stream-stream join
-		// requires its inputs to be co-partitioned (same key, same partition count) — the caller's
-		// responsibility, as in Kafka Streams, since this library does not auto-insert a
-		// repartition topic. Given that, each side's store is co-partitioned with its own stream's
-		// source topics, so restoration is restricted to the assigned source partitions.
-		const windowOptions = { retentionMs: joinWindowMs * 2, windowSizeMs: joinWindowMs }
-		const leftStore = this.app.getOrCreateWindowStore<K, V>(
-			leftStoreName,
-			keyCodec,
-			valueCodec,
-			windowOptions,
-			options?.changelog,
-			self.sourceTopics
-		)
-		const rightStore = this.app.getOrCreateWindowStore<K, V2>(
-			rightStoreName,
-			keyCodec,
-			otherValueCodec,
-			windowOptions,
-			options?.changelog,
-			otherStream.sourceTopics
-		)
-
-		const leftStoreRef = { store: leftStore }
-		const rightStoreRef = { store: rightStore }
-
-		// Create merge node for results
-		const mergeNode = new PassThroughNode<K, VR>()
-
-		// Left stream join processor
-		const leftJoinNode = new StreamStreamJoinNode<K, V, V2, VR>(leftStoreRef, rightStoreRef, joiner, joinWindowMs)
-		self.node.connect(leftJoinNode)
-		leftJoinNode.connect(mergeNode)
-
-		// Right stream join processor - swap args so joiner receives (left, right) order
-		const rightJoiner = (value: V2, otherValue: V) => joiner(otherValue, value)
-		const rightJoinNode = new StreamStreamJoinNode<K, V2, V, VR>(
-			rightStoreRef,
-			leftStoreRef,
-			rightJoiner,
-			joinWindowMs
-		)
-		otherStream.node.connect(rightJoinNode)
-		rightJoinNode.connect(mergeNode)
-
-		return new KStreamImpl<K, VR>(this.app, mergeNode, { keyCodec: self.format.keyCodec }, mergedTopics)
+		return this.windowedJoin(other, options, 'join', 'stream-join', (left, right, windowMs) => [
+			new StreamStreamJoinNode<K, V, V2, VR>(left, right, joiner, windowMs),
+			new StreamStreamJoinNode<K, V2, V, VR>(
+				right,
+				left,
+				(value, otherValue) => joiner(otherValue, value),
+				windowMs
+			),
+		])
 	}
 
 	leftJoin<V2, VR>(
@@ -323,111 +221,23 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 		joiner: (value: V, otherValue: V2 | null) => VR,
 		options?: Joined<K, V, V2>
 	): KStream<K, VR> {
-		// Check if joining with a KTable (Stream-Table left join)
-		// A global table holds every key on every instance, so its lookups need no repartitioning.
-		const self =
-			other instanceof KTableImpl && other.global
-				? this
-				: this.copartitioned(undefined, options?.key, options?.value)
-
 		if (other instanceof KTableImpl) {
-			const tableImpl = other as KTableImpl<K, V2>
-			if (!tableImpl.storeRef.store) {
-				throw new Error('Cannot join with a KTable that has no state store')
-			}
-
-			const joinNode = new StreamTableLeftJoinNode<K, V, V2, VR>(tableImpl.storeRef, joiner)
-			if (!tableImpl.global) {
-				// The lookup hits the table's state partition of the stream record's partition.
-				this.app.requireCopartitioned(new Set([...self.sourceTopics, ...tableImpl.sourceTopics]))
-			}
-			self.node.connect(joinNode)
-
-			// Stream-table join: only stream's source topics affect partitioning
-			return new KStreamImpl<K, VR>(this.app, joinNode, { keyCodec: self.format.keyCodec }, self.sourceTopics)
+			return this.tableJoin(
+				other,
+				options,
+				storeRef => new StreamTableLeftJoinNode<K, V, V2, VR>(storeRef, joiner)
+			)
 		}
-
-		// Stream-Stream left join
-		if (!(other instanceof KStreamImpl)) {
-			throw new Error('Can only join with KStreamImpl or KTableImpl instances')
-		}
-
-		const otherStream = (other as KStreamImpl<K, V2>).copartitioned(undefined, options?.key, options?.otherValue)
-		const joinWindow = options?.within
-		if (!joinWindow) {
-			throw new Error('Stream-stream left join requires a join window. Provide options.within.')
-		}
-
-		const joinWindowMs = resolveJoinWindowMs(joinWindow)
-
-		const keyCodec = self.format.keyCodec
-		const valueCodec = self.format.valueCodec
-		const otherValueCodec = otherStream.format.valueCodec
-
-		if (!keyCodec || !valueCodec || !otherValueCodec) {
-			throw new Error('Stream-stream join requires key and value codecs')
-		}
-
-		// Merge source topics from both streams
-		const mergedTopics = new Set([...self.sourceTopics, ...otherStream.sourceTopics])
-		this.app.requireCopartitioned(mergedTopics)
-
-		// Create window stores for both streams
-		const leftStoreName = `stream-left-join-left-${this.app.nextStoreId()}`
-		const rightStoreName = `stream-left-join-right-${this.app.nextStoreId()}`
-
-		// Back both side stores with a changelog so a restarted/rebalanced task rebuilds its
-		// in-flight join window instead of silently dropping matches. A stream-stream join
-		// requires its inputs to be co-partitioned (same key, same partition count) — the caller's
-		// responsibility, as in Kafka Streams, since this library does not auto-insert a
-		// repartition topic. Given that, each side's store is co-partitioned with its own stream's
-		// source topics, so restoration is restricted to the assigned source partitions.
-		const windowOptions = { retentionMs: joinWindowMs * 2, windowSizeMs: joinWindowMs }
-		const leftStore = this.app.getOrCreateWindowStore<K, V>(
-			leftStoreName,
-			keyCodec,
-			valueCodec,
-			windowOptions,
-			options?.changelog,
-			self.sourceTopics
-		)
-		const rightStore = this.app.getOrCreateWindowStore<K, V2>(
-			rightStoreName,
-			keyCodec,
-			otherValueCodec,
-			windowOptions,
-			options?.changelog,
-			otherStream.sourceTopics
-		)
-
-		const leftStoreRef = { store: leftStore }
-		const rightStoreRef = { store: rightStore }
-
-		// Create merge node for results
-		const mergeNode = new PassThroughNode<K, VR>()
-
-		// Left stream left-join processor (emits with null if no match)
-		const leftJoinNode = new StreamStreamLeftJoinNode<K, V, V2, VR>(
-			leftStoreRef,
-			rightStoreRef,
-			joiner,
-			joinWindowMs
-		)
-		self.node.connect(leftJoinNode)
-		leftJoinNode.connect(mergeNode)
-
-		// Right stream inner-join processor (only emits if left exists)
-		const rightJoiner = (value: V2, otherValue: V) => joiner(otherValue, value)
-		const rightJoinNode = new StreamStreamJoinNode<K, V2, V, VR>(
-			rightStoreRef,
-			leftStoreRef,
-			rightJoiner,
-			joinWindowMs
-		)
-		otherStream.node.connect(rightJoinNode)
-		rightJoinNode.connect(mergeNode)
-
-		return new KStreamImpl<K, VR>(this.app, mergeNode, { keyCodec: self.format.keyCodec }, mergedTopics)
+		// The left side emits unmatched records with null; the right side only emits matches.
+		return this.windowedJoin(other, options, 'left join', 'stream-left-join', (left, right, windowMs) => [
+			new StreamStreamLeftJoinNode<K, V, V2, VR>(left, right, joiner, windowMs),
+			new StreamStreamJoinNode<K, V2, V, VR>(
+				right,
+				left,
+				(value, otherValue) => joiner(otherValue, value),
+				windowMs
+			),
+		])
 	}
 
 	outerJoin<V2, VR>(
@@ -435,86 +245,93 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 		joiner: (value: V | null, otherValue: V2 | null) => VR,
 		options?: Joined<K, V, V2>
 	): KStream<K, VR> {
-		const self = this.copartitioned(undefined, options?.key, options?.value)
+		return this.windowedJoin(other, options, 'outer join', 'stream-outer-join', (left, right, windowMs) => [
+			new StreamStreamOuterJoinNode<K, V, V2, VR>(left, right, joiner, windowMs),
+			new StreamStreamOuterJoinNode<K, V2, V, VR>(
+				right,
+				left,
+				(value, otherValue) => joiner(otherValue, value),
+				windowMs
+			),
+		])
+	}
 
+	private tableJoin<V2, VR>(
+		table: KTableImpl<K, V2>,
+		options: Joined<K, V, V2> | undefined,
+		createNode: (storeRef: StoreRef<KeyValueStore<K, V2>>) => Processor<K, V, K, VR>
+	): KStream<K, VR> {
+		// A global table holds every key on every instance, so its lookups need no repartitioning.
+		const self = table.global ? this : this.copartitioned(undefined, options?.key, options?.value)
+		if (!table.storeRef.store) {
+			throw new Error('Cannot join with a KTable that has no state store')
+		}
+		if (!table.global) {
+			// The lookup hits the table's state partition of the stream record's partition.
+			this.app.requireCopartitioned(new Set([...self.sourceTopics, ...table.sourceTopics]))
+		}
+		// Only the stream's source topics affect the partitioning of the result.
+		return self.chain(createNode(table.storeRef), { keyCodec: self.format.keyCodec }, false)
+	}
+
+	/** Stream-stream join: each side buffers its records in a window store and looks up the other's. */
+	private windowedJoin<V2, VR>(
+		other: KStream<K, V2> | KTable<K, V2>,
+		options: Joined<K, V, V2> | undefined,
+		kind: string,
+		storePrefix: string,
+		createNodes: WindowJoinNodes<K, V, V2, VR>
+	): KStream<K, VR> {
+		const self = this.copartitioned(undefined, options?.key, options?.value)
 		if (!(other instanceof KStreamImpl)) {
-			throw new Error('Can only outer join with KStreamImpl instances')
+			throw new Error('Can only join with KStreamImpl or KTableImpl instances')
 		}
 
 		const otherStream = (other as KStreamImpl<K, V2>).copartitioned(undefined, options?.key, options?.otherValue)
-		const joinWindow = options?.within
-		if (!joinWindow) {
-			throw new Error('Stream-stream outer join requires a join window. Provide options.within.')
+		if (!options?.within) {
+			throw new Error(`Stream-stream ${kind} requires a join window. Provide options.within.`)
 		}
-
-		const joinWindowMs = resolveJoinWindowMs(joinWindow)
+		const joinWindowMs = resolveJoinWindowMs(options.within)
 
 		const keyCodec = self.format.keyCodec
 		const valueCodec = self.format.valueCodec
 		const otherValueCodec = otherStream.format.valueCodec
-
 		if (!keyCodec || !valueCodec || !otherValueCodec) {
 			throw new Error('Stream-stream join requires key and value codecs')
 		}
 
-		// Create window stores for both streams
-		const leftStoreName = `stream-outer-join-left-${this.app.nextStoreId()}`
-		const rightStoreName = `stream-outer-join-right-${this.app.nextStoreId()}`
+		const mergedTopics = new Set([...self.sourceTopics, ...otherStream.sourceTopics])
+		this.app.requireCopartitioned(mergedTopics)
 
 		// Back both side stores with a changelog so a restarted/rebalanced task rebuilds its
-		// in-flight join window instead of silently dropping matches. A stream-stream join
-		// requires its inputs to be co-partitioned (same key, same partition count) — the caller's
-		// responsibility, as in Kafka Streams, since this library does not auto-insert a
-		// repartition topic. Given that, each side's store is co-partitioned with its own stream's
-		// source topics, so restoration is restricted to the assigned source partitions.
+		// in-flight join window instead of silently dropping matches. Each side's store is
+		// co-partitioned with its own stream's source topics, so restoration is restricted to the
+		// assigned source partitions.
 		const windowOptions = { retentionMs: joinWindowMs * 2, windowSizeMs: joinWindowMs }
 		const leftStore = this.app.getOrCreateWindowStore<K, V>(
-			leftStoreName,
+			`${storePrefix}-left-${this.app.nextStoreId()}`,
 			keyCodec,
 			valueCodec,
 			windowOptions,
-			options?.changelog,
+			options.changelog,
 			self.sourceTopics
 		)
 		const rightStore = this.app.getOrCreateWindowStore<K, V2>(
-			rightStoreName,
+			`${storePrefix}-right-${this.app.nextStoreId()}`,
 			keyCodec,
 			otherValueCodec,
 			windowOptions,
-			options?.changelog,
+			options.changelog,
 			otherStream.sourceTopics
 		)
 
-		const leftStoreRef = { store: leftStore }
-		const rightStoreRef = { store: rightStore }
-
-		// Create merge node for results
+		const [leftNode, rightNode] = createNodes({ store: leftStore }, { store: rightStore }, joinWindowMs)
 		const mergeNode = new PassThroughNode<K, VR>()
+		self.node.connect(leftNode)
+		leftNode.connect(mergeNode)
+		otherStream.node.connect(rightNode)
+		rightNode.connect(mergeNode)
 
-		// Left stream outer-join processor
-		const leftJoinNode = new StreamStreamOuterJoinNode<K, V, V2, VR>(
-			leftStoreRef,
-			rightStoreRef,
-			joiner,
-			joinWindowMs
-		)
-		self.node.connect(leftJoinNode)
-		leftJoinNode.connect(mergeNode)
-
-		// Right stream outer-join processor - swap args so joiner receives (left, right) order
-		const rightJoiner = (value: V2 | null, otherValue: V | null) => joiner(otherValue, value)
-		const rightJoinNode = new StreamStreamOuterJoinNode<K, V2, V, VR>(
-			rightStoreRef,
-			leftStoreRef,
-			rightJoiner,
-			joinWindowMs
-		)
-		otherStream.node.connect(rightJoinNode)
-		rightJoinNode.connect(mergeNode)
-
-		// Merge source topics from both streams for partition inference
-		const mergedTopics = new Set([...self.sourceTopics, ...otherStream.sourceTopics])
-		this.app.requireCopartitioned(mergedTopics)
 		return new KStreamImpl<K, VR>(this.app, mergeNode, { keyCodec: self.format.keyCodec }, mergedTopics)
 	}
 }

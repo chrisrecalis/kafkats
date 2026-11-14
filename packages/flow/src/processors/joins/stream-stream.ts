@@ -1,8 +1,6 @@
-import { Processor, type StreamRecord, type WorkerContext } from '@/processors/base.js'
-import { maybeExpire, StreamTimeTracker } from '@/processors/aggregation.js'
+import { Processor, requireStore, type StoreRef, type StreamRecord, type WorkerContext } from '@/processors/base.js'
+import { StreamTimeTracker } from '@/processors/stream-time.js'
 import type { WindowStore } from '@/state.js'
-
-const newCleanupState = (): StreamTimeTracker => new StreamTimeTracker()
 
 /**
  * Buffer a join record without overwriting an earlier record of the same key and timestamp.
@@ -27,204 +25,78 @@ async function putRetainingDuplicates<K, V>(
 }
 
 /**
- * Processor node for Stream-Stream join (inner join).
- * Stores records in a window store and looks up matching records from the other stream.
+ * One side of a stream-stream join: buffers the record in this side's window store and joins it
+ * with every record of the other side's store within the join window. A record without a match
+ * is passed to `unmatched` when given (left/outer joins), otherwise dropped (inner join).
  */
 export class StreamStreamJoinNode<K, V1, V2, VR> extends Processor<K, V1, K, VR> {
 	constructor(
-		private readonly myStoreRef: { store: WindowStore<K, V1> | null },
-		private readonly otherStoreRef: { store: WindowStore<K, V2> | null },
+		private readonly myStoreRef: StoreRef<WindowStore<K, V1>>,
+		private readonly otherStoreRef: StoreRef<WindowStore<K, V2>>,
 		private readonly joiner: (value: V1, otherValue: V2) => VR,
 		private readonly joinWindowMs: number,
-		private readonly cleanupState: StreamTimeTracker = newCleanupState()
+		private readonly unmatched?: (value: V1) => VR,
+		private readonly streamTime: StreamTimeTracker = new StreamTimeTracker()
 	) {
 		super()
 	}
 
 	clone(worker: WorkerContext): Processor<K, V1, K, VR> {
-		return new StreamStreamJoinNode<K, V1, V2, VR>(
+		return new StreamStreamJoinNode(
 			this.myStoreRef,
 			this.otherStoreRef,
 			this.joiner,
 			this.joinWindowMs,
-			this.cleanupState.attach(worker)
+			this.unmatched,
+			this.streamTime.attach(worker)
 		)
 	}
 
 	async process(record: StreamRecord<K, V1>): Promise<void> {
-		const myStore = this.myStoreRef.store
-		const otherStore = this.otherStoreRef.store
-		if (!myStore || !otherStore) {
-			throw new Error('Window stores not initialized for stream-stream join')
-		}
-
-		const key = record.key
-		if (key === null) return
-
-		const value = record.value
-		if (value === null) return
+		const myStore = requireStore(this.myStoreRef, 'stream-stream join window')
+		const otherStore = requireStore(this.otherStoreRef, 'stream-stream join window')
+		const { key, value } = record
+		if (key === null || value === null) return
 
 		const timestamp = Number(record.timestamp)
-		const windowStart = timestamp
-		const windowEnd = timestamp + this.joinWindowMs
+		await putRetainingDuplicates(myStore, key, timestamp, timestamp + this.joinWindowMs, value)
 
-		await putRetainingDuplicates(myStore, key, windowStart, windowEnd, value)
-
-		const searchFrom = timestamp - this.joinWindowMs
-		const searchTo = timestamp + this.joinWindowMs
-
-		for await (const [windowedKey, otherValue] of otherStore.fetch(key, searchFrom, searchTo)) {
-			void windowedKey
-			const joinedValue = this.joiner(value, otherValue)
-			const next: StreamRecord<K, VR> = { ...record, value: joinedValue }
-			await this.forward(next)
+		let hasMatch = false
+		for await (const [, otherValue] of otherStore.fetch(
+			key,
+			timestamp - this.joinWindowMs,
+			timestamp + this.joinWindowMs
+		)) {
+			hasMatch = true
+			await this.forward({ ...record, value: this.joiner(value, otherValue) })
+		}
+		if (!hasMatch && this.unmatched) {
+			await this.forward({ ...record, value: this.unmatched(value) })
 		}
 
-		// Stream-time-driven retention: expire both stores so neither grows unbounded
-		// (the other stream's node may be idle, so each node expires both).
-		await maybeExpire(this.cleanupState, record, timestamp, async cutoff => {
+		// Expire both stores so neither grows unbounded (the other stream's node may be idle, so
+		// each node expires both).
+		await this.streamTime.advance(record, timestamp, async cutoff => {
 			await myStore.expireOldWindows(cutoff)
 			await otherStore.expireOldWindows(cutoff)
 		})
+	}
+}
+
+/** Left side of a stream-stream left join: an unmatched record is joined with null. */
+export class StreamStreamLeftJoinNode<K, V1, V2, VR> extends StreamStreamJoinNode<K, V1, V2, VR> {
+	constructor(
+		myStoreRef: StoreRef<WindowStore<K, V1>>,
+		otherStoreRef: StoreRef<WindowStore<K, V2>>,
+		joiner: (value: V1, otherValue: V2 | null) => VR,
+		joinWindowMs: number
+	) {
+		super(myStoreRef, otherStoreRef, joiner, joinWindowMs, value => joiner(value, null))
 	}
 }
 
 /**
- * Processor node for Stream-Stream left join.
+ * Either side of a stream-stream outer join. Each side emits its unmatched records like a left
+ * join does; the outer join is the pair of them with the joiner's arguments swapped on one side.
  */
-export class StreamStreamLeftJoinNode<K, V1, V2, VR> extends Processor<K, V1, K, VR> {
-	constructor(
-		private readonly myStoreRef: { store: WindowStore<K, V1> | null },
-		private readonly otherStoreRef: { store: WindowStore<K, V2> | null },
-		private readonly joiner: (value: V1, otherValue: V2 | null) => VR,
-		private readonly joinWindowMs: number,
-		private readonly cleanupState: StreamTimeTracker = newCleanupState()
-	) {
-		super()
-	}
-
-	clone(worker: WorkerContext): Processor<K, V1, K, VR> {
-		return new StreamStreamLeftJoinNode<K, V1, V2, VR>(
-			this.myStoreRef,
-			this.otherStoreRef,
-			this.joiner,
-			this.joinWindowMs,
-			this.cleanupState.attach(worker)
-		)
-	}
-
-	async process(record: StreamRecord<K, V1>): Promise<void> {
-		const myStore = this.myStoreRef.store
-		const otherStore = this.otherStoreRef.store
-		if (!myStore || !otherStore) {
-			throw new Error('Window stores not initialized for stream-stream join')
-		}
-
-		const key = record.key
-		if (key === null) return
-
-		const value = record.value
-		if (value === null) return
-
-		const timestamp = Number(record.timestamp)
-		const windowStart = timestamp
-		const windowEnd = timestamp + this.joinWindowMs
-
-		await putRetainingDuplicates(myStore, key, windowStart, windowEnd, value)
-
-		const searchFrom = timestamp - this.joinWindowMs
-		const searchTo = timestamp + this.joinWindowMs
-
-		let hasMatch = false
-		for await (const [windowedKey, otherValue] of otherStore.fetch(key, searchFrom, searchTo)) {
-			void windowedKey
-			hasMatch = true
-			const joinedValue = this.joiner(value, otherValue)
-			const next: StreamRecord<K, VR> = { ...record, value: joinedValue }
-			await this.forward(next)
-		}
-
-		if (!hasMatch) {
-			const joinedValue = this.joiner(value, null)
-			const next: StreamRecord<K, VR> = { ...record, value: joinedValue }
-			await this.forward(next)
-		}
-
-		// Stream-time-driven retention: expire both stores so neither grows unbounded
-		// (the other stream's node may be idle, so each node expires both).
-		await maybeExpire(this.cleanupState, record, timestamp, async cutoff => {
-			await myStore.expireOldWindows(cutoff)
-			await otherStore.expireOldWindows(cutoff)
-		})
-	}
-}
-
-/**
- * Processor node for Stream-Stream outer join.
- */
-export class StreamStreamOuterJoinNode<K, V1, V2, VR> extends Processor<K, V1, K, VR> {
-	constructor(
-		private readonly myStoreRef: { store: WindowStore<K, V1> | null },
-		private readonly otherStoreRef: { store: WindowStore<K, V2> | null },
-		private readonly joiner: (value: V1 | null, otherValue: V2 | null) => VR,
-		private readonly joinWindowMs: number,
-		private readonly cleanupState: StreamTimeTracker = newCleanupState()
-	) {
-		super()
-	}
-
-	clone(worker: WorkerContext): Processor<K, V1, K, VR> {
-		return new StreamStreamOuterJoinNode<K, V1, V2, VR>(
-			this.myStoreRef,
-			this.otherStoreRef,
-			this.joiner,
-			this.joinWindowMs,
-			this.cleanupState.attach(worker)
-		)
-	}
-
-	async process(record: StreamRecord<K, V1>): Promise<void> {
-		const myStore = this.myStoreRef.store
-		const otherStore = this.otherStoreRef.store
-		if (!myStore || !otherStore) {
-			throw new Error('Window stores not initialized for stream-stream join')
-		}
-
-		const key = record.key
-		if (key === null) return
-
-		const value = record.value
-		if (value === null) return
-
-		const timestamp = Number(record.timestamp)
-		const windowStart = timestamp
-		const windowEnd = timestamp + this.joinWindowMs
-
-		await putRetainingDuplicates(myStore, key, windowStart, windowEnd, value)
-
-		const searchFrom = timestamp - this.joinWindowMs
-		const searchTo = timestamp + this.joinWindowMs
-
-		let hasMatch = false
-		for await (const [windowedKey, otherValue] of otherStore.fetch(key, searchFrom, searchTo)) {
-			void windowedKey
-			hasMatch = true
-			const joinedValue = this.joiner(value, otherValue)
-			const next: StreamRecord<K, VR> = { ...record, value: joinedValue }
-			await this.forward(next)
-		}
-
-		if (!hasMatch) {
-			const joinedValue = this.joiner(value, null)
-			const next: StreamRecord<K, VR> = { ...record, value: joinedValue }
-			await this.forward(next)
-		}
-
-		// Stream-time-driven retention: expire both stores so neither grows unbounded
-		// (the other stream's node may be idle, so each node expires both).
-		await maybeExpire(this.cleanupState, record, timestamp, async cutoff => {
-			await myStore.expireOldWindows(cutoff)
-			await otherStore.expireOldWindows(cutoff)
-		})
-	}
-}
+export class StreamStreamOuterJoinNode<K, V1, V2, VR> extends StreamStreamLeftJoinNode<K, V1, V2, VR> {}

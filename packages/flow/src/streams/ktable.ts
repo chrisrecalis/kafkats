@@ -1,23 +1,24 @@
-import type { KTable, KStream, KGroupedTable, Grouped, Joined, KeyValue, Produced, Consumed } from '@/types.js'
+import type { KTable, KStream, KGroupedTable, Grouped, KeyValue, Produced, Consumed } from '@/types.js'
 import type { KeyValueStore, SessionStore, StateStoreProvider, WindowStore } from '@/state.js'
 import type { Codec } from '@/codec.js'
 import {
 	PassThroughNode,
 	TableMapValuesNode,
 	TableFilterNode,
-	type StreamFormat,
-	type StreamRecord,
-	type WorkerContext,
-	type OutputProcessor,
-} from '@/processors/index.js'
-import { TableGroupByNode, type GroupedTableMapping, groupedTableMappingCodec } from '@/processors/table.js'
-import {
+	TableGroupByNode,
 	TableTableJoinNode,
 	TableTableLeftJoinNode,
 	TableTableLeftJoinOtherNode,
-	TableTableOuterJoinLeftNode,
-	TableTableOuterJoinRightNode,
-} from '@/processors/joins/index.js'
+	TableTableOuterJoinNode,
+	groupedTableMappingCodec,
+	type GroupedTableMapping,
+	type OutputProcessor,
+	type Processor,
+	type StoreRef,
+	type StreamFormat,
+	type StreamRecord,
+	type WorkerContext,
+} from '@/processors/index.js'
 import { KGroupedTableImpl } from '@/streams/grouped.js'
 // Note: Circular import with kstream.ts - ESM handles this at runtime
 import { KStreamImpl } from '@/streams/kstream.js'
@@ -80,13 +81,13 @@ export interface FlowAppInterface {
 }
 
 export class KTableImpl<K, V> implements KTable<K, V> {
-	readonly storeRef: { store: KeyValueStore<K, V> | null }
+	readonly storeRef: StoreRef<KeyValueStore<K, V>>
 
 	constructor(
 		readonly app: FlowAppInterface,
 		readonly node: OutputProcessor<K, V>,
 		readonly format: StreamFormat<K, V>,
-		storeRef?: { store: KeyValueStore<K, V> | null },
+		storeRef?: StoreRef<KeyValueStore<K, V>>,
 		/** Source topics the table's state is co-partitioned with. */
 		readonly sourceTopics: Set<string> = new Set(),
 		/** True for globalTable(): fully replicated, only usable as the lookup side of a stream join. */
@@ -140,18 +141,16 @@ export class KTableImpl<K, V> implements KTable<K, V> {
 
 		// Source key -> (grouped key, value) of the row's last contribution, so an update or delete
 		// can retract it. Partitioned like the table itself.
-		const mappingStoreName = `groupby-mapping-${this.app.nextStoreId()}`
 		const mappingStore = this.app.getOrCreateStore<K, GroupedTableMapping<K2, V>>(
-			mappingStoreName,
+			`groupby-mapping-${this.app.nextStoreId()}`,
 			sourceKeyCodec,
 			groupedTableMappingCodec(groupedKeyCodec, valueCodec),
 			undefined,
 			this.sourceTopics
 		)
-		const mappingStoreRef = { store: mappingStore }
 
 		// Emits a retraction for the old grouping and an addition for the new one.
-		const groupByNode = new TableGroupByNode<K, V, K2>(fn, mappingStoreRef, groupedKeyCodec)
+		const groupByNode = new TableGroupByNode<K, V, K2>(fn, { store: mappingStore })
 		this.node.connect(groupByNode)
 
 		// Rows of one group come from every source partition: route them through a repartition
@@ -167,117 +166,67 @@ export class KTableImpl<K, V> implements KTable<K, V> {
 		return new KGroupedTableImpl<K2, V>(this.app, deltas.node, deltas.format, deltas.sourceTopics)
 	}
 
-	/** Table-table joins look up the other side's state by key, so both sides must be co-partitioned. */
-	private joinTopics<V2>(other: KTableImpl<K, V2>): Set<string> {
+	join<V2, VR>(other: KTable<K, V2>, joiner: (value: V, otherValue: V2) => VR): KTable<K, VR> {
+		const otherTable = this.joinable(other)
+		return this.joined(
+			otherTable,
+			new TableTableJoinNode<K, V, V2, VR>(otherTable.storeRef, joiner),
+			new TableTableJoinNode<K, V2, V, VR>(this.storeRef, (value, otherValue) => joiner(otherValue, value))
+		)
+	}
+
+	leftJoin<V2, VR>(other: KTable<K, V2>, joiner: (value: V, otherValue: V2 | null) => VR): KTable<K, VR> {
+		const otherTable = this.joinable(other)
+		// An update of the right table re-joins the left row; the result only exists while the left
+		// row exists, and a right-side tombstone re-emits joiner(left, null) instead of deleting it.
+		return this.joined(
+			otherTable,
+			new TableTableLeftJoinNode<K, V, V2, VR>(otherTable.storeRef, joiner),
+			new TableTableLeftJoinOtherNode<K, V, V2, VR>(this.storeRef, joiner)
+		)
+	}
+
+	outerJoin<V2, VR>(other: KTable<K, V2>, joiner: (value: V | null, otherValue: V2 | null) => VR): KTable<K, VR> {
+		const otherTable = this.joinable(other)
+		return this.joined(
+			otherTable,
+			new TableTableOuterJoinNode<K, V, V2, VR>(otherTable.storeRef, joiner),
+			new TableTableOuterJoinNode<K, V2, V, VR>(this.storeRef, (value, otherValue) => joiner(otherValue, value))
+		)
+	}
+
+	/** Table-table joins look up the other side's state by key, so both sides need a state store. */
+	private joinable<V2>(other: KTable<K, V2>): KTableImpl<K, V2> {
+		if (!(other instanceof KTableImpl)) {
+			throw new Error('Can only join with KTableImpl instances')
+		}
+		const otherTable = other as KTableImpl<K, V2>
+		if (!this.storeRef.store || !otherTable.storeRef.store) {
+			throw new Error('Cannot join tables without state stores')
+		}
 		this.assertNotGlobal('A table-table join')
-		other.assertNotGlobal('A table-table join')
+		otherTable.assertNotGlobal('A table-table join')
+		return otherTable
+	}
+
+	/**
+	 * Connect the join node of each side and merge their results. Both sides must be
+	 * co-partitioned: each side's node looks up the other side's state partition.
+	 */
+	private joined<V2, VR>(
+		other: KTableImpl<K, V2>,
+		thisSide: Processor<K, V, K, VR>,
+		otherSide: Processor<K, V2, K, VR>
+	): KTable<K, VR> {
 		const topics = new Set([...this.sourceTopics, ...other.sourceTopics])
 		this.app.requireCopartitioned(topics)
-		return topics
-	}
 
-	join<V2, VR>(
-		other: KTable<K, V2>,
-		joiner: (value: V, otherValue: V2) => VR,
-		options?: Joined<K, V, V2>
-	): KTable<K, VR> {
-		void options
-
-		if (!(other instanceof KTableImpl)) {
-			throw new Error('Can only join with KTableImpl instances')
-		}
-
-		const otherTable = other as KTableImpl<K, V2>
-		if (!this.storeRef.store || !otherTable.storeRef.store) {
-			throw new Error('Cannot join tables without state stores')
-		}
-		const joinTopics = this.joinTopics(otherTable)
-
-		// Create a PassThrough node to merge results from both join paths
 		const mergeNode = new PassThroughNode<K, VR>()
+		this.node.connect(thisSide)
+		thisSide.connect(mergeNode)
+		other.node.connect(otherSide)
+		otherSide.connect(mergeNode)
 
-		// When this table updates, look up other table
-		const leftJoinNode = new TableTableJoinNode<K, V, V2, VR>(otherTable.storeRef, joiner)
-		this.node.connect(leftJoinNode)
-		leftJoinNode.connect(mergeNode)
-
-		// When other table updates, look up this table (reverse joiner args)
-		const rightJoinNode = new TableTableJoinNode<K, V2, V, VR>(this.storeRef, (rightVal, leftVal) =>
-			joiner(leftVal, rightVal)
-		)
-		otherTable.node.connect(rightJoinNode)
-		rightJoinNode.connect(mergeNode)
-
-		return new KTableImpl<K, VR>(this.app, mergeNode, { keyCodec: this.format.keyCodec }, undefined, joinTopics)
-	}
-
-	leftJoin<V2, VR>(
-		other: KTable<K, V2>,
-		joiner: (value: V, otherValue: V2 | null) => VR,
-		options?: Joined<K, V, V2>
-	): KTable<K, VR> {
-		void options
-
-		if (!(other instanceof KTableImpl)) {
-			throw new Error('Can only join with KTableImpl instances')
-		}
-
-		const otherTable = other as KTableImpl<K, V2>
-		if (!this.storeRef.store || !otherTable.storeRef.store) {
-			throw new Error('Cannot join tables without state stores')
-		}
-		const joinTopics = this.joinTopics(otherTable)
-
-		// Create a PassThrough node to merge results from both join paths
-		const mergeNode = new PassThroughNode<K, VR>()
-
-		// When this (left) table updates, look up other (right) table - left join
-		const leftJoinNode = new TableTableLeftJoinNode<K, V, V2, VR>(otherTable.storeRef, joiner)
-		this.node.connect(leftJoinNode)
-		leftJoinNode.connect(mergeNode)
-
-		// When other (right) table updates, look up this (left) table. The result only exists
-		// while the left row exists; a right-side tombstone re-emits joiner(left, null) instead
-		// of deleting the still-valid left row.
-		const rightJoinNode = new TableTableLeftJoinOtherNode<K, V, V2, VR>(this.storeRef, joiner)
-		otherTable.node.connect(rightJoinNode)
-		rightJoinNode.connect(mergeNode)
-
-		return new KTableImpl<K, VR>(this.app, mergeNode, { keyCodec: this.format.keyCodec }, undefined, joinTopics)
-	}
-
-	outerJoin<V2, VR>(
-		other: KTable<K, V2>,
-		joiner: (value: V | null, otherValue: V2 | null) => VR,
-		options?: Joined<K, V, V2>
-	): KTable<K, VR> {
-		void options
-
-		if (!(other instanceof KTableImpl)) {
-			throw new Error('Can only join with KTableImpl instances')
-		}
-
-		const otherTable = other as KTableImpl<K, V2>
-		if (!this.storeRef.store || !otherTable.storeRef.store) {
-			throw new Error('Cannot join tables without state stores')
-		}
-		const joinTopics = this.joinTopics(otherTable)
-
-		// Create a PassThrough node to merge results from both join paths
-		const mergeNode = new PassThroughNode<K, VR>()
-
-		// When this (left) table updates, look up other (right) table. A left-side tombstone
-		// only deletes the result when the right side is also absent; otherwise it re-emits
-		// joiner(null, right).
-		const leftJoinNode = new TableTableOuterJoinLeftNode<K, V, V2, VR>(otherTable.storeRef, joiner)
-		this.node.connect(leftJoinNode)
-		leftJoinNode.connect(mergeNode)
-
-		// When other (right) table updates, look up this (left) table
-		const rightJoinNode = new TableTableOuterJoinRightNode<K, V, V2, VR>(this.storeRef, joiner)
-		otherTable.node.connect(rightJoinNode)
-		rightJoinNode.connect(mergeNode)
-
-		return new KTableImpl<K, VR>(this.app, mergeNode, { keyCodec: this.format.keyCodec }, undefined, joinTopics)
+		return new KTableImpl<K, VR>(this.app, mergeNode, { keyCodec: this.format.keyCodec }, undefined, topics)
 	}
 }

@@ -39,15 +39,10 @@ describe('TableGroupByNode mapping ordering', () => {
 		} as any
 
 		const storeRef = { store }
-		const codec = {
-			encode: (k: string) => Buffer.from(k),
-			decode: (b: Buffer) => b.toString(),
-		}
 
 		const node = new TableGroupByNode<string, number, string>(
 			(_k, v) => ['new-group', v],
-			storeRef as unknown as { store: KeyValueStore<string, MappingEntry<string, number>> | null },
-			codec
+			storeRef as unknown as { store: KeyValueStore<string, MappingEntry<string, number>> | null }
 		)
 		const forwards: Array<{ key: string | null; value: number | null; headers: Record<string, Buffer> }> = []
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any

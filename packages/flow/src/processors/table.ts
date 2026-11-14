@@ -1,4 +1,4 @@
-import { Processor, type StreamRecord, type WorkerContext } from '@/processors/base.js'
+import { Processor, requireStore, type StoreRef, type StreamRecord } from '@/processors/base.js'
 import type { KeyValueStore } from '@/state.js'
 import type { Codec } from '@/codec.js'
 import type { KeyValue } from '@/types.js'
@@ -8,11 +8,7 @@ const DELTA_OP_HEADER = '__kafkats_delta_op'
 const DELTA_ADD = Buffer.from('add')
 const DELTA_SUB = Buffer.from('sub')
 
-export function isDeltaAdd(record: StreamRecord<unknown, unknown>): boolean {
-	return record.headers[DELTA_OP_HEADER]?.equals(DELTA_ADD) ?? false
-}
-
-export function isDeltaSub(record: StreamRecord<unknown, unknown>): boolean {
+function isDeltaSub(record: StreamRecord<unknown, unknown>): boolean {
 	return record.headers[DELTA_OP_HEADER]?.equals(DELTA_SUB) ?? false
 }
 
@@ -57,22 +53,17 @@ export function groupedTableMappingCodec<K, V>(
 export class TableStateNode<K, V> extends Processor<K, V> {
 	constructor(
 		private readonly storeName: string,
-		private readonly storeRef: { store: KeyValueStore<K, V> | null }
+		private readonly storeRef: StoreRef<KeyValueStore<K, V>>
 	) {
 		super()
 	}
 
-	clone(worker: WorkerContext): Processor<K, V, K, V> {
-		void worker
+	clone(): Processor<K, V, K, V> {
 		return new TableStateNode<K, V>(this.storeName, this.storeRef)
 	}
 
 	async process(record: StreamRecord<K, V>): Promise<void> {
-		const store = this.storeRef.store
-		if (!store) {
-			throw new Error(`Table state store '${this.storeName}' not initialized`)
-		}
-
+		const store = requireStore(this.storeRef, this.storeName)
 		const key = record.key
 		// Capture the prior value before mutating so downstream join nodes can tell whether a join
 		// result previously existed (and thus whether a tombstone is a real retraction, not a no-op).
@@ -105,49 +96,26 @@ export class TableStateNode<K, V> extends Processor<K, V> {
 export class TableGroupByNode<K, V, K2> extends Processor<K, V, K2, V> {
 	constructor(
 		private readonly fn: (key: K, value: V) => KeyValue<K2, V>,
-		private readonly keyMappingStoreRef: { store: KeyValueStore<K, GroupedTableMapping<K2, V>> | null },
-		private readonly groupedKeyCodec: Codec<K2>
+		private readonly keyMappingStoreRef: StoreRef<KeyValueStore<K, GroupedTableMapping<K2, V>>>
 	) {
 		super()
 	}
 
-	clone(worker: WorkerContext): Processor<K, V, K2, V> {
-		void worker
-		return new TableGroupByNode<K, V, K2>(this.fn, this.keyMappingStoreRef, this.groupedKeyCodec)
+	clone(): Processor<K, V, K2, V> {
+		return new TableGroupByNode<K, V, K2>(this.fn, this.keyMappingStoreRef)
 	}
 
 	async process(record: StreamRecord<K, V>): Promise<void> {
-		const store = this.keyMappingStoreRef.store
-		if (!store) {
-			throw new Error('Key mapping store not initialized for table groupBy')
-		}
-
+		const store = requireStore(this.keyMappingStoreRef, 'table groupBy key mapping')
 		const sourceKey = record.key
 		if (sourceKey === null) return
 
 		const previousMapping = await store.get(sourceKey)
+		const added = record.value === null ? undefined : this.fn(sourceKey, record.value)
 
 		// Deltas are forwarded BEFORE the mapping is updated. If processing is interrupted in
 		// between, the replay sees the old mapping and emits the same deltas again (at-least-once);
 		// updating first would make the replay emit a net-zero pair and lose the change for good.
-
-		// Handle tombstone: source row deleted
-		if (record.value === null) {
-			if (previousMapping !== undefined) {
-				await this.forward({
-					...record,
-					key: previousMapping.groupedKey,
-					value: previousMapping.value,
-					headers: { ...record.headers, [DELTA_OP_HEADER]: DELTA_SUB },
-				})
-				await store.delete(sourceKey)
-			}
-			return
-		}
-
-		const [newGroupedKey, newValue] = this.fn(sourceKey, record.value)
-
-		// Retract old mapping if it exists
 		if (previousMapping !== undefined) {
 			await this.forward({
 				...record,
@@ -157,15 +125,22 @@ export class TableGroupByNode<K, V, K2> extends Processor<K, V, K2, V> {
 			})
 		}
 
-		// Emit ADD for the new value
+		// Source row deleted
+		if (added === undefined) {
+			if (previousMapping !== undefined) {
+				await store.delete(sourceKey)
+			}
+			return
+		}
+
+		const [groupedKey, value] = added
 		await this.forward({
 			...record,
-			key: newGroupedKey,
-			value: newValue,
+			key: groupedKey,
+			value,
 			headers: { ...record.headers, [DELTA_OP_HEADER]: DELTA_ADD },
 		})
-
-		await store.put(sourceKey, { groupedKey: newGroupedKey, value: newValue })
+		await store.put(sourceKey, { groupedKey, value })
 	}
 }
 
@@ -177,151 +152,68 @@ export class TableGroupByNode<K, V, K2> extends Processor<K, V, K2, V> {
 export class TableDeltaCountNode<K, V> extends Processor<K, V, K, number> {
 	constructor(
 		private readonly storeName: string,
-		private readonly storeRef: { store: KeyValueStore<K, number> | null }
+		private readonly storeRef: StoreRef<KeyValueStore<K, number>>
 	) {
 		super()
 	}
 
-	clone(worker: WorkerContext): Processor<K, V, K, number> {
-		void worker
+	clone(): Processor<K, V, K, number> {
 		return new TableDeltaCountNode<K, V>(this.storeName, this.storeRef)
 	}
 
 	async process(record: StreamRecord<K, V>): Promise<void> {
-		const store = this.storeRef.store
-		if (!store) {
-			throw new Error(`State store '${this.storeName}' not initialized`)
-		}
-
+		const store = requireStore(this.storeRef, this.storeName)
 		const key = record.key
 		if (key === null || record.value === null) return
 
-		const current = (await store.get(key)) ?? 0
-
-		let newCount: number
-		if (isDeltaSub(record)) {
-			newCount = current - 1
-		} else {
-			newCount = current + 1
-		}
-
-		if (newCount <= 0) {
+		const count = ((await store.get(key)) ?? 0) + (isDeltaSub(record) ? -1 : 1)
+		if (count <= 0) {
 			await store.delete(key)
-			// Emit tombstone for downstream
-			await this.forward({ ...record, key, value: null as unknown as number, headers: {} })
+			await this.forward({ ...record, key, value: null, headers: {} })
 		} else {
-			await store.put(key, newCount)
-			await this.forward({ ...record, key, value: newCount, headers: {} })
+			await store.put(key, count)
+			await this.forward({ ...record, key, value: count, headers: {} })
 		}
 	}
 }
 
 /**
- * Delta-aware reduce node for table groupBy.
- * Applies adder on ADD, subtractor on SUB.
- * Requires both adder and subtractor functions.
+ * Delta-aware aggregation for table groupBy: applies `add` on ADD and `subtract` on SUB. A SUB
+ * for a group that has no aggregate is ignored.
  */
-export class TableDeltaReduceNode<K, V> extends Processor<K, V> {
+class TableDeltaAggregationNode<K, V, A> extends Processor<K, V, K, A> {
 	constructor(
 		private readonly storeName: string,
-		private readonly storeRef: { store: KeyValueStore<K, V> | null },
-		private readonly adder: (aggregate: V, value: V) => V,
-		private readonly subtractor: (aggregate: V, value: V) => V
-	) {
-		super()
-	}
-
-	clone(worker: WorkerContext): Processor<K, V, K, V> {
-		void worker
-		return new TableDeltaReduceNode<K, V>(this.storeName, this.storeRef, this.adder, this.subtractor)
-	}
-
-	async process(record: StreamRecord<K, V>): Promise<void> {
-		const store = this.storeRef.store
-		if (!store) {
-			throw new Error(`State store '${this.storeName}' not initialized`)
-		}
-
-		const key = record.key
-		if (key === null || record.value === null) return
-
-		const current = await store.get(key)
-
-		let newAggregate: V
-		if (isDeltaSub(record)) {
-			if (current === undefined) return
-			newAggregate = this.subtractor(current, record.value)
-		} else {
-			newAggregate = current === undefined ? record.value : this.adder(current, record.value)
-		}
-
-		// A null result means the group is now empty (e.g. the last member was subtracted out).
-		// Delete the entry and forward a tombstone, matching KGroupedTable.reduce semantics. Storing
-		// the null instead would leak it into the next ADD's adder(current, value) call.
-		if (newAggregate === null || newAggregate === undefined) {
-			await store.delete(key)
-			await this.forward({ ...record, key, value: null as unknown as V, headers: {} })
-			return
-		}
-
-		await store.put(key, newAggregate)
-		await this.forward({ ...record, key, value: newAggregate, headers: {} })
-	}
-}
-
-/**
- * Delta-aware aggregate node for table groupBy.
- * Applies aggregator on ADD, subtractor on SUB.
- * Requires both aggregator and subtractor functions.
- */
-export class TableDeltaAggregateNode<K, V, A> extends Processor<K, V, K, A> {
-	constructor(
-		private readonly storeName: string,
-		private readonly storeRef: { store: KeyValueStore<K, A> | null },
-		private readonly initializer: () => A,
-		private readonly aggregator: (key: K, value: V, aggregate: A) => A,
-		private readonly subtractor: (key: K, value: V, aggregate: A) => A,
+		private readonly storeRef: StoreRef<KeyValueStore<K, A>>,
+		private readonly add: (key: K, value: V, current: A | undefined) => A,
+		private readonly subtract: (key: K, value: V, current: A) => A,
 		/** Number of rows currently in each group, so an emptied group can be deleted. */
-		private readonly membersRef?: { store: KeyValueStore<K, number> | null }
+		private readonly membersRef?: StoreRef<KeyValueStore<K, number>>
 	) {
 		super()
 	}
 
-	clone(worker: WorkerContext): Processor<K, V, K, A> {
-		void worker
-		return new TableDeltaAggregateNode<K, V, A>(
-			this.storeName,
-			this.storeRef,
-			this.initializer,
-			this.aggregator,
-			this.subtractor,
-			this.membersRef
-		)
+	clone(): Processor<K, V, K, A> {
+		return new TableDeltaAggregationNode(this.storeName, this.storeRef, this.add, this.subtract, this.membersRef)
 	}
 
 	async process(record: StreamRecord<K, V>): Promise<void> {
-		const store = this.storeRef.store
-		if (!store) {
-			throw new Error(`State store '${this.storeName}' not initialized`)
-		}
-
+		const store = requireStore(this.storeRef, this.storeName)
 		const key = record.key
 		if (key === null || record.value === null) return
 
 		const current = await store.get(key)
-		const members = this.membersRef?.store ?? null
 		const sub = isDeltaSub(record)
-
 		let newAggregate: A
 		if (sub) {
 			if (current === undefined) return
-			newAggregate = this.subtractor(key, record.value, current)
+			newAggregate = this.subtract(key, record.value, current)
 		} else {
-			const aggregate = current ?? this.initializer()
-			newAggregate = this.aggregator(key, record.value, aggregate)
+			newAggregate = this.add(key, record.value, current)
 		}
 
 		let groupEmpty = false
+		const members = this.membersRef?.store ?? null
 		if (members) {
 			const count = ((await members.get(key)) ?? 0) + (sub ? -1 : 1)
 			if (count <= 0) {
@@ -332,16 +224,53 @@ export class TableDeltaAggregateNode<K, V, A> extends Processor<K, V, K, A> {
 			}
 		}
 
-		// An emptied group (or a null result) is deleted and forwarded as a tombstone rather than
-		// kept as a "zero" aggregate, matching count() and reduce(). Storing a null instead would
-		// leak it into the next ADD via `current ?? initializer()`.
+		// An emptied group (or a null result, e.g. the last member was subtracted out) is deleted and
+		// forwarded as a tombstone rather than kept as a "zero" aggregate, matching count(). Storing a
+		// null instead would leak it into the next ADD's add(current) call.
 		if (groupEmpty || newAggregate === null || newAggregate === undefined) {
 			await store.delete(key)
-			await this.forward({ ...record, key, value: null as unknown as A, headers: {} })
+			await this.forward({ ...record, key, value: null, headers: {} })
 			return
 		}
 
 		await store.put(key, newAggregate)
 		await this.forward({ ...record, key, value: newAggregate, headers: {} })
+	}
+}
+
+/** KGroupedTable.reduce(): adder on ADD, subtractor on SUB. */
+export class TableDeltaReduceNode<K, V> extends TableDeltaAggregationNode<K, V, V> {
+	constructor(
+		storeName: string,
+		storeRef: StoreRef<KeyValueStore<K, V>>,
+		adder: (aggregate: V, value: V) => V,
+		subtractor: (aggregate: V, value: V) => V
+	) {
+		super(
+			storeName,
+			storeRef,
+			(_key, value, current) => (current === undefined ? value : adder(current, value)),
+			(_key, value, current) => subtractor(current, value)
+		)
+	}
+}
+
+/** KGroupedTable.aggregate(): aggregator on ADD, subtractor on SUB. */
+export class TableDeltaAggregateNode<K, V, A> extends TableDeltaAggregationNode<K, V, A> {
+	constructor(
+		storeName: string,
+		storeRef: StoreRef<KeyValueStore<K, A>>,
+		initializer: () => A,
+		aggregator: (key: K, value: V, aggregate: A) => A,
+		subtractor: (key: K, value: V, aggregate: A) => A,
+		membersRef?: StoreRef<KeyValueStore<K, number>>
+	) {
+		super(
+			storeName,
+			storeRef,
+			(key, value, current) => aggregator(key, value, current ?? initializer()),
+			subtractor,
+			membersRef
+		)
 	}
 }

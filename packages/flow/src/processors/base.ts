@@ -1,6 +1,7 @@
 import type { ConsumeContext, Consumer, Producer, SendResult } from '@kafkats/client'
 import type { Codec } from '@/codec.js'
 import type { TransactionalBuffer } from '@/runtime/context.js'
+import type { SourceNode } from '@/processors/source-sink.js'
 
 // Internal types (not exported from public API)
 
@@ -78,8 +79,15 @@ export type WorkerContext = {
 	lastCommitTime: number
 }
 
-// Forward declaration for WorkerContext type
-import type { SourceNode } from '@/processors/source-sink.js'
+/** Holder of a state store, shared by every worker clone of the node that uses it. */
+export type StoreRef<S> = { store: S | null }
+
+export function requireStore<S>(ref: StoreRef<S>, name: string): S {
+	if (!ref.store) {
+		throw new Error(`State store '${name}' not initialized`)
+	}
+	return ref.store
+}
 
 export type AnyProcessor = Processor<unknown, unknown, unknown, unknown>
 export type OutputProcessor<K, V> = Processor<unknown, unknown, K, V>
@@ -130,8 +138,7 @@ export abstract class Processor<IK, IV, OK = IK, OV = IV> {
 }
 
 export class PassThroughNode<K, V> extends Processor<K, V, K, V> {
-	clone(worker: WorkerContext): Processor<K, V, K, V> {
-		void worker
+	clone(): Processor<K, V, K, V> {
 		return new PassThroughNode<K, V>()
 	}
 
