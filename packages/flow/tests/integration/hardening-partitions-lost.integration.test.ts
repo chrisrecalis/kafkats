@@ -77,7 +77,9 @@ describe('hardening: session loss (blocked event loop) with a second instance', 
 				return app
 			}
 			const a = build(true)
-			const b = build(false)
+			// Both apps share this process, so the busy wait stalls both. Either may trigger it:
+			// which one sees the 40th record depends on the partition assignment.
+			const b = build(true)
 			try {
 				await Promise.all([a.start(), b.start()])
 				for (let s = 0; s < PER_KEY; s++) {
