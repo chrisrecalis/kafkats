@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { KafkaClient, Producer } from '@kafkats/client'
 import { codec, flow, type FlowApp } from '../../src/index.js'
 import { createTopics, uniqueTopicName } from './test-helpers.js'
-import { DurableMemoryProvider, injectCommitFailures, newClient, readAllCommitted, sleep } from './round2-util.js'
+import { DurableMemoryProvider, injectCommitFailures, newClient, readAllCommitted, sleep } from './eos-test-util.js'
 
 const stringCodec = codec.string()
 const numberCodec = codec.json<number>()
@@ -15,7 +15,7 @@ function sequences(msgs: Awaited<ReturnType<typeof readAllCommitted>>): Record<s
 	return out
 }
 
-describe('round2: exactly_once exactness across rebalances and commit failures', () => {
+describe('exactly_once exactness across rebalances and commit failures', () => {
 	let admin: KafkaClient
 	let producer: Producer
 	beforeAll(async () => {

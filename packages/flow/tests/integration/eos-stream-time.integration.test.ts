@@ -2,12 +2,12 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { KafkaClient, Producer } from '@kafkats/client'
 import { codec, flow, TimeWindows, type FlowApp } from '../../src/index.js'
 import { createTopics, uniqueTopicName } from './test-helpers.js'
-import { injectCommitFailures, newClient, readAllCommitted, sleep } from './round2-util.js'
+import { injectCommitFailures, newClient, readAllCommitted, sleep } from './eos-test-util.js'
 
 const stringCodec = codec.string()
 const numberCodec = codec.json<number>()
 
-describe('round2: stream time across aborted transactions', () => {
+describe('stream time across aborted transactions', () => {
 	let admin: KafkaClient
 	let producer: Producer
 	beforeAll(async () => {

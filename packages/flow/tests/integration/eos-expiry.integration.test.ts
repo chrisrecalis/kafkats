@@ -2,11 +2,11 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { KafkaClient, Producer } from '@kafkats/client'
 import { codec, flow, TimeWindows, type FlowApp } from '../../src/index.js'
 import { createTopics, uniqueTopicName } from './test-helpers.js'
-import { DurableMemoryProvider, injectCommitFailures, newClient, readAllCommitted, sleep } from './round2-util.js'
+import { DurableMemoryProvider, injectCommitFailures, newClient, readAllCommitted, sleep } from './eos-test-util.js'
 
 const stringCodec = codec.string()
 
-describe('round2: store expiry vs aborted transactions (durable local state)', () => {
+describe('store expiry vs aborted transactions (durable local state)', () => {
 	let admin: KafkaClient
 	let producer: Producer
 	beforeAll(async () => {

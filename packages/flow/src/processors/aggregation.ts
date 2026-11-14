@@ -15,7 +15,7 @@
  * producing structurally different (not just numerically inflated) output.
  */
 
-import { Processor, type StreamRecord, type WorkerContext } from '@/processors/base.js'
+import { Processor, type StreamClock, type StreamRecord, type WorkerContext } from '@/processors/base.js'
 import type { KeyValueStore, WindowStore, SessionStore, WindowedKey } from '@/state.js'
 import type { Windowed } from '@/types.js'
 
@@ -144,19 +144,32 @@ type TimedRecord = { topic: string; partition: number }
  * another partition as "late" and silently drop them. State is partitioned the same way, so both
  * late-record decisions and store expiry use the clock of the record's own partition.
  *
- * One tracker is shared by all worker clones of a node.
+ * Each worker clone of a node gets its own view (see {@link StreamTimeTracker.attach}).
  */
 export class StreamTimeTracker {
-	private readonly byPartition = new Map<string, { streamTimeMs: number; lastCleanupMs: number }>()
+	private static nextId = 0
 
-	attach(worker: WorkerContext): this {
-		void worker
-		return this
+	constructor(
+		private readonly id: number = StreamTimeTracker.nextId++,
+		private readonly clocks: Map<string, StreamClock> = new Map()
+	) {}
+
+	/**
+	 * The tracker as seen by one worker. Clocks live on the worker so the runtime can reset them
+	 * with the rest of the worker's uncommitted progress: stream time advanced by records of an
+	 * aborted transaction must not make those same records look late when they are replayed.
+	 */
+	attach(worker: WorkerContext): StreamTimeTracker {
+		return new StreamTimeTracker(this.id, worker.streamClocks)
+	}
+
+	private key(record: TimedRecord): string {
+		return `${this.id}|${record.topic}:${record.partition}`
 	}
 
 	/** Stream time of the record's partition (0 if nothing observed yet). */
 	streamTime(record: TimedRecord): number {
-		return this.byPartition.get(`${record.topic}:${record.partition}`)?.streamTimeMs ?? 0
+		return this.clocks.get(this.key(record))?.streamTimeMs ?? 0
 	}
 
 	/**
@@ -164,11 +177,11 @@ export class StreamTimeTracker {
 	 * that partition (once per CLEANUP_INTERVAL_MS of stream time), otherwise undefined.
 	 */
 	observe(record: TimedRecord, timestamp: number): number | undefined {
-		const key = `${record.topic}:${record.partition}`
-		let state = this.byPartition.get(key)
+		const key = this.key(record)
+		let state = this.clocks.get(key)
 		if (!state) {
 			state = { streamTimeMs: 0, lastCleanupMs: 0 }
-			this.byPartition.set(key, state)
+			this.clocks.set(key, state)
 		}
 		if (timestamp > state.streamTimeMs) {
 			state.streamTimeMs = timestamp

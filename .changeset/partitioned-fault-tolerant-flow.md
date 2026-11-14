@@ -24,6 +24,7 @@ Redesign the `@kafkats/flow` runtime for correctness: partitioned state, reparti
 - Restoration no longer completes early with partial state, and an unusable checkpoint wipes and rebuilds the store.
 - State is no longer lost or mixed across instances for windowed stores, joins and non-default partitioning.
 - `globalTable()` is now really global.
+- `KTable.groupBy()` aggregations are repartitioned by the grouped key and are now correct with several instances or threads; an emptied group is removed in both processing modes.
 - Stream time is tracked per partition, stream-stream joins keep records with the same key and timestamp, `KTable.filter()` emits a tombstone when a row stops matching, `filter()`/`mapValues()` on tables never call your function for tombstones, session `reduce()` merges sessions in time order with `(aggregate, value)` argument order, `aggregate()` on session windows uses real sessions (and requires a `merger` option) instead of silently running as fixed windows, `to()`/`through()` keep the input record's timestamp, and tables from `count()`/`reduce()`/`aggregate()` can be joined.
 - `@kafkats/client`: multiple consumers on one `KafkaClient` no longer deadlock. Each consumer group member now uses a dedicated coordinator connection.
 - `TestDriver` feeds records written to a topic the topology also reads back into the topology, and `MockProducer` records timestamps and headers.
@@ -35,4 +36,4 @@ Redesign the `@kafkats/flow` runtime for correctness: partitioned state, reparti
 - `CoPartitioningError`, exported from `@kafkats/flow`.
 - `Grouped.name` for stable repartition topic names.
 
-**Known limitations**: `KTable.groupBy()` aggregations keep app-wide state and are only correct with a single instance and `numStreamThreads: 1`; stream-stream left and outer joins emit the unmatched result eagerly; derived tables (`filter()`/`mapValues()` results) cannot be the lookup side of a join; an LMDB-backed app cannot be started again after `close()`. See the new fault tolerance guide.
+**Known limitations**: stream-stream left and outer joins emit the unmatched result eagerly; derived tables (`filter()`/`mapValues()` results) cannot be the lookup side of a join; an LMDB-backed app cannot be started again after `close()`. See the new fault tolerance guide.

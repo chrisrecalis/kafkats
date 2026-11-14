@@ -99,6 +99,8 @@ export class TableStateNode<K, V> extends Processor<K, V> {
  * 1. Emits a SUB record with old grouped key + old value (retraction)
  * 2. Emits an ADD record with new grouped key + new value
  * 3. Updates the source-key → {groupedKey, value} mapping store
+ *
+ * The deltas are meant to be repartitioned by the grouped key before they are aggregated.
  */
 export class TableGroupByNode<K, V, K2> extends Processor<K, V, K2, V> {
 	constructor(
@@ -125,27 +127,25 @@ export class TableGroupByNode<K, V, K2> extends Processor<K, V, K2, V> {
 
 		const previousMapping = await store.get(sourceKey)
 
+		// Deltas are forwarded BEFORE the mapping is updated. If processing is interrupted in
+		// between, the replay sees the old mapping and emits the same deltas again (at-least-once);
+		// updating first would make the replay emit a net-zero pair and lose the change for good.
+
 		// Handle tombstone: source row deleted
 		if (record.value === null) {
 			if (previousMapping !== undefined) {
-				// Mutate mapping before forwarding (see put-then-deltas comment below).
-				await store.delete(sourceKey)
 				await this.forward({
 					...record,
 					key: previousMapping.groupedKey,
 					value: previousMapping.value,
 					headers: { ...record.headers, [DELTA_OP_HEADER]: DELTA_SUB },
 				})
+				await store.delete(sourceKey)
 			}
 			return
 		}
 
 		const [newGroupedKey, newValue] = this.fn(sourceKey, record.value)
-
-		// Persist mapping before forwarding deltas: TableGroupedCompute* nodes recompute by re-scanning the
-		// mapping store, so they need the new mapping visible when SUB/ADD arrive. Pinned by
-		// flow.test.ts "retracts counts when grouped key changes" + table-groupby-ordering.test.ts.
-		await store.put(sourceKey, { groupedKey: newGroupedKey, value: newValue })
 
 		// Retract old mapping if it exists
 		if (previousMapping !== undefined) {
@@ -164,6 +164,8 @@ export class TableGroupByNode<K, V, K2> extends Processor<K, V, K2, V> {
 			value: newValue,
 			headers: { ...record.headers, [DELTA_OP_HEADER]: DELTA_ADD },
 		})
+
+		await store.put(sourceKey, { groupedKey: newGroupedKey, value: newValue })
 	}
 }
 
@@ -278,7 +280,9 @@ export class TableDeltaAggregateNode<K, V, A> extends Processor<K, V, K, A> {
 		private readonly storeRef: { store: KeyValueStore<K, A> | null },
 		private readonly initializer: () => A,
 		private readonly aggregator: (key: K, value: V, aggregate: A) => A,
-		private readonly subtractor: (key: K, value: V, aggregate: A) => A
+		private readonly subtractor: (key: K, value: V, aggregate: A) => A,
+		/** Number of rows currently in each group, so an emptied group can be deleted. */
+		private readonly membersRef?: { store: KeyValueStore<K, number> | null }
 	) {
 		super()
 	}
@@ -290,7 +294,8 @@ export class TableDeltaAggregateNode<K, V, A> extends Processor<K, V, K, A> {
 			this.storeRef,
 			this.initializer,
 			this.aggregator,
-			this.subtractor
+			this.subtractor,
+			this.membersRef
 		)
 	}
 
@@ -304,9 +309,11 @@ export class TableDeltaAggregateNode<K, V, A> extends Processor<K, V, K, A> {
 		if (key === null || record.value === null) return
 
 		const current = await store.get(key)
+		const members = this.membersRef?.store ?? null
+		const sub = isDeltaSub(record)
 
 		let newAggregate: A
-		if (isDeltaSub(record)) {
+		if (sub) {
 			if (current === undefined) return
 			newAggregate = this.subtractor(key, record.value, current)
 		} else {
@@ -314,10 +321,21 @@ export class TableDeltaAggregateNode<K, V, A> extends Processor<K, V, K, A> {
 			newAggregate = this.aggregator(key, record.value, aggregate)
 		}
 
-		// A null result means the group is now empty (e.g. the last member was subtracted out).
-		// Delete the entry and forward a tombstone, matching KGroupedTable.aggregate semantics.
-		// Storing the null instead would leak it into the next ADD via `current ?? initializer()`.
-		if (newAggregate === null || newAggregate === undefined) {
+		let groupEmpty = false
+		if (members) {
+			const count = ((await members.get(key)) ?? 0) + (sub ? -1 : 1)
+			if (count <= 0) {
+				groupEmpty = true
+				await members.delete(key)
+			} else {
+				await members.put(key, count)
+			}
+		}
+
+		// An emptied group (or a null result) is deleted and forwarded as a tombstone rather than
+		// kept as a "zero" aggregate, matching count() and reduce(). Storing a null instead would
+		// leak it into the next ADD via `current ?? initializer()`.
+		if (groupEmpty || newAggregate === null || newAggregate === undefined) {
 			await store.delete(key)
 			await this.forward({ ...record, key, value: null as unknown as A, headers: {} })
 			return
@@ -325,253 +343,5 @@ export class TableDeltaAggregateNode<K, V, A> extends Processor<K, V, K, A> {
 
 		await store.put(key, newAggregate)
 		await this.forward({ ...record, key, value: newAggregate, headers: {} })
-	}
-}
-
-/**
- * Recompute count from mapping store for at_least_once safety.
- * This avoids subtractor drift after crash/replay by rebuilding grouped state from source mappings.
- */
-export class TableGroupedComputeCountNode<KSrc, K, V> extends Processor<K, V, K, number> {
-	private readonly inflightByKey: Map<string, Promise<void>>
-
-	constructor(
-		private readonly storeName: string,
-		private readonly storeRef: { store: KeyValueStore<K, number> | null },
-		private readonly keyMappingStoreRef: { store: KeyValueStore<KSrc, GroupedTableMapping<K, V>> | null },
-		private readonly groupedKeyCodec: Codec<K>,
-		inflightByKey?: Map<string, Promise<void>>
-	) {
-		super()
-		this.inflightByKey = inflightByKey ?? new Map<string, Promise<void>>()
-	}
-
-	clone(worker: WorkerContext): Processor<K, V, K, number> {
-		void worker
-		return new TableGroupedComputeCountNode<KSrc, K, V>(
-			this.storeName,
-			this.storeRef,
-			this.keyMappingStoreRef,
-			this.groupedKeyCodec,
-			this.inflightByKey
-		)
-	}
-
-	async process(record: StreamRecord<K, V>): Promise<void> {
-		const store = this.storeRef.store
-		const keyMappingStore = this.keyMappingStoreRef.store
-		if (!store) {
-			throw new Error(`State store '${this.storeName}' not initialized`)
-		}
-		if (!keyMappingStore) {
-			throw new Error('Key mapping store not initialized for grouped-table recomputation')
-		}
-
-		const key = record.key
-		if (key === null) return
-
-		const encodedKey = this.groupedKeyCodec.encode(key).toString('hex')
-		const previous = this.inflightByKey.get(encodedKey) ?? Promise.resolve()
-		const current = previous
-			.catch(() => {})
-			.then(async () => {
-				const targetBytes = this.groupedKeyCodec.encode(key)
-				let count = 0
-
-				for await (const [, mapping] of keyMappingStore.all()) {
-					const mappingKeyBytes = this.groupedKeyCodec.encode(mapping.groupedKey)
-					if (mappingKeyBytes.equals(targetBytes)) {
-						count += 1
-					}
-				}
-
-				if (count <= 0) {
-					await store.delete(key)
-					await this.forward({ ...record, key, value: null as unknown as number, headers: {} })
-					return
-				}
-
-				await store.put(key, count)
-				await this.forward({ ...record, key, value: count, headers: {} })
-			})
-
-		this.inflightByKey.set(encodedKey, current)
-		try {
-			await current
-		} finally {
-			if (this.inflightByKey.get(encodedKey) === current) {
-				this.inflightByKey.delete(encodedKey)
-			}
-		}
-	}
-}
-
-/**
- * Recompute reduce from mapping store for at_least_once safety.
- */
-export class TableGroupedComputeReduceNode<KSrc, K, V> extends Processor<K, V, K, V> {
-	private readonly inflightByKey: Map<string, Promise<void>>
-
-	constructor(
-		private readonly storeName: string,
-		private readonly storeRef: { store: KeyValueStore<K, V> | null },
-		private readonly keyMappingStoreRef: { store: KeyValueStore<KSrc, GroupedTableMapping<K, V>> | null },
-		private readonly groupedKeyCodec: Codec<K>,
-		private readonly reducer: (aggregate: V, value: V) => V,
-		inflightByKey?: Map<string, Promise<void>>
-	) {
-		super()
-		this.inflightByKey = inflightByKey ?? new Map<string, Promise<void>>()
-	}
-
-	clone(worker: WorkerContext): Processor<K, V, K, V> {
-		void worker
-		return new TableGroupedComputeReduceNode<KSrc, K, V>(
-			this.storeName,
-			this.storeRef,
-			this.keyMappingStoreRef,
-			this.groupedKeyCodec,
-			this.reducer,
-			this.inflightByKey
-		)
-	}
-
-	async process(record: StreamRecord<K, V>): Promise<void> {
-		const store = this.storeRef.store
-		const keyMappingStore = this.keyMappingStoreRef.store
-		if (!store) {
-			throw new Error(`State store '${this.storeName}' not initialized`)
-		}
-		if (!keyMappingStore) {
-			throw new Error('Key mapping store not initialized for grouped-table recomputation')
-		}
-
-		const key = record.key
-		if (key === null) return
-
-		const encodedKey = this.groupedKeyCodec.encode(key).toString('hex')
-		const previous = this.inflightByKey.get(encodedKey) ?? Promise.resolve()
-		const current = previous
-			.catch(() => {})
-			.then(async () => {
-				const targetBytes = this.groupedKeyCodec.encode(key)
-
-				let hasAggregate = false
-				let aggregate: V | undefined
-
-				for await (const [, mapping] of keyMappingStore.all()) {
-					const mappingKeyBytes = this.groupedKeyCodec.encode(mapping.groupedKey)
-					if (!mappingKeyBytes.equals(targetBytes)) continue
-					if (!hasAggregate) {
-						aggregate = mapping.value
-						hasAggregate = true
-					} else {
-						aggregate = this.reducer(aggregate as V, mapping.value)
-					}
-				}
-
-				if (!hasAggregate || aggregate === undefined) {
-					await store.delete(key)
-					await this.forward({ ...record, key, value: null as unknown as V, headers: {} })
-					return
-				}
-
-				await store.put(key, aggregate)
-				await this.forward({ ...record, key, value: aggregate, headers: {} })
-			})
-
-		this.inflightByKey.set(encodedKey, current)
-		try {
-			await current
-		} finally {
-			if (this.inflightByKey.get(encodedKey) === current) {
-				this.inflightByKey.delete(encodedKey)
-			}
-		}
-	}
-}
-
-/**
- * Recompute aggregate from mapping store for at_least_once safety.
- */
-export class TableGroupedComputeAggregateNode<KSrc, K, V, A> extends Processor<K, V, K, A> {
-	private readonly inflightByKey: Map<string, Promise<void>>
-
-	constructor(
-		private readonly storeName: string,
-		private readonly storeRef: { store: KeyValueStore<K, A> | null },
-		private readonly keyMappingStoreRef: { store: KeyValueStore<KSrc, GroupedTableMapping<K, V>> | null },
-		private readonly groupedKeyCodec: Codec<K>,
-		private readonly initializer: () => A,
-		private readonly aggregator: (key: K, value: V, aggregate: A) => A,
-		inflightByKey?: Map<string, Promise<void>>
-	) {
-		super()
-		this.inflightByKey = inflightByKey ?? new Map<string, Promise<void>>()
-	}
-
-	clone(worker: WorkerContext): Processor<K, V, K, A> {
-		void worker
-		return new TableGroupedComputeAggregateNode<KSrc, K, V, A>(
-			this.storeName,
-			this.storeRef,
-			this.keyMappingStoreRef,
-			this.groupedKeyCodec,
-			this.initializer,
-			this.aggregator,
-			this.inflightByKey
-		)
-	}
-
-	async process(record: StreamRecord<K, V>): Promise<void> {
-		const store = this.storeRef.store
-		const keyMappingStore = this.keyMappingStoreRef.store
-		if (!store) {
-			throw new Error(`State store '${this.storeName}' not initialized`)
-		}
-		if (!keyMappingStore) {
-			throw new Error('Key mapping store not initialized for grouped-table recomputation')
-		}
-
-		const key = record.key
-		if (key === null) return
-
-		const encodedKey = this.groupedKeyCodec.encode(key).toString('hex')
-		const previous = this.inflightByKey.get(encodedKey) ?? Promise.resolve()
-		const current = previous
-			.catch(() => {})
-			.then(async () => {
-				const targetBytes = this.groupedKeyCodec.encode(key)
-				let hasValues = false
-				let aggregate = this.initializer()
-
-				for await (const [, mapping] of keyMappingStore.all()) {
-					const mappingKeyBytes = this.groupedKeyCodec.encode(mapping.groupedKey)
-					if (!mappingKeyBytes.equals(targetBytes)) continue
-					hasValues = true
-					aggregate = this.aggregator(key, mapping.value, aggregate)
-				}
-
-				if (!hasValues) {
-					// No members remain in the group, so the result is retracted with a
-					// tombstone — consistent with the count and reduce recompute nodes. Emitting
-					// the initializer instead would leave a phantom entry for an empty group.
-					await store.delete(key)
-					await this.forward({ ...record, key, value: null as unknown as A, headers: {} })
-					return
-				}
-
-				await store.put(key, aggregate)
-				await this.forward({ ...record, key, value: aggregate, headers: {} })
-			})
-
-		this.inflightByKey.set(encodedKey, current)
-		try {
-			await current
-		} finally {
-			if (this.inflightByKey.get(encodedKey) === current) {
-				this.inflightByKey.delete(encodedKey)
-			}
-		}
 	}
 }

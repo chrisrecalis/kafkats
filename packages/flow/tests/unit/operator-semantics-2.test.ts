@@ -146,8 +146,7 @@ describe('operator semantics 2: tables', () => {
 		})
 	})
 
-	// Known divergence: outside exactly_once the grouped-table result is recomputed with the adder only (replay-safe by design).
-	it.skip('KGroupedTable reduce non-commutative / non-inverse subtractor uses adder+subtractor', async () => {
+	it('KGroupedTable reduce non-commutative / non-inverse subtractor uses adder+subtractor', async () => {
 		const d = new TestDriver()
 		d.table('t', S)
 			.groupBy((_k, v) => ['g', v] as [string, string], S)

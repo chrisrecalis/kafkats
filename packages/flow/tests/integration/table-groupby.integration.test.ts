@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { KafkaClient, Producer } from '@kafkats/client'
 import { codec, flow, type FlowApp } from '../../src/index.js'
 import { createTopics, uniqueTopicName } from './test-helpers.js'
-import { injectCommitFailures, newClient, readAllCommitted, sleep } from './round2-util.js'
+import { injectCommitFailures, newClient, readAllCommitted, sleep } from './eos-test-util.js'
 
 const stringCodec = codec.string()
 const numberCodec = codec.json<number>()
@@ -28,7 +28,7 @@ async function eventually(admin: KafkaClient, topic: string, expected: Record<st
 	return last
 }
 
-describe('round2: KTable.groupBy aggregates across several consumers', () => {
+describe('KTable.groupBy aggregates across several consumers', () => {
 	let admin: KafkaClient
 	let producer: Producer
 	beforeAll(async () => {

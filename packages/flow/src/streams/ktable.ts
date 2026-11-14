@@ -138,26 +138,33 @@ export class KTableImpl<K, V> implements KTable<K, V> {
 			throw new Error('KTable.groupBy() requires a value codec.')
 		}
 
-		// Create a key mapping store to track source key -> grouped key + source value.
+		// Source key -> (grouped key, value) of the row's last contribution, so an update or delete
+		// can retract it. Partitioned like the table itself.
 		const mappingStoreName = `groupby-mapping-${this.app.nextStoreId()}`
 		const mappingStore = this.app.getOrCreateStore<K, GroupedTableMapping<K2, V>>(
 			mappingStoreName,
 			sourceKeyCodec,
-			groupedTableMappingCodec(groupedKeyCodec, valueCodec)
+			groupedTableMappingCodec(groupedKeyCodec, valueCodec),
+			undefined,
+			this.sourceTopics
 		)
 		const mappingStoreRef = { store: mappingStore }
 
-		// Use TableGroupByNode to properly handle retractions
+		// Emits a retraction for the old grouping and an addition for the new one.
 		const groupByNode = new TableGroupByNode<K, V, K2>(fn, mappingStoreRef, groupedKeyCodec)
 		this.node.connect(groupByNode)
 
-		return new KGroupedTableImpl<K2, V>(
+		// Rows of one group come from every source partition: route them through a repartition
+		// topic keyed by the grouped key so each group is aggregated in exactly one place.
+		const deltas = new KStreamImpl<K2, V>(
 			this.app,
 			groupByNode,
 			{ keyCodec: groupedKeyCodec, valueCodec },
-			mappingStoreRef as { store: KeyValueStore<unknown, GroupedTableMapping<K2, V>> | null },
-			groupedKeyCodec
-		)
+			this.sourceTopics,
+			true
+		).repartitioned(options?.name, groupedKeyCodec, valueCodec)
+
+		return new KGroupedTableImpl<K2, V>(this.app, deltas.node, deltas.format, deltas.sourceTopics)
 	}
 
 	/** Table-table joins look up the other side's state by key, so both sides must be co-partitioned. */

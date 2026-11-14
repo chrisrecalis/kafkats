@@ -2,12 +2,12 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { KafkaClient, Producer } from '@kafkats/client'
 import { codec, flow, type FlowApp } from '../../src/index.js'
 import { createTopics, requireKafkaBrokers, uniqueTopicName } from './test-helpers.js'
-import { injectCommitFailures, newClient, readAllCommitted, sleep } from './round2-util.js'
+import { injectCommitFailures, newClient, readAllCommitted, sleep } from './eos-test-util.js'
 
 const stringCodec = codec.string()
 const numberCodec = codec.json<number>()
 
-describe('round2: global tables and worker lifecycle', () => {
+describe('global tables and worker lifecycle', () => {
 	let admin: KafkaClient
 	let producer: Producer
 	beforeAll(async () => {
@@ -128,7 +128,7 @@ describe('round2: global tables and worker lifecycle', () => {
 	}, 60_000)
 })
 
-describe('round2: start() retry', () => {
+describe('start() retry', () => {
 	let admin: KafkaClient
 	let producer: Producer
 	beforeAll(async () => {

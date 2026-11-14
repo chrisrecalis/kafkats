@@ -1,5 +1,4 @@
 import type { KTable, KGroupedStream, KGroupedTable, WindowedKGroupedStream, Materialized, Windowed } from '@/types.js'
-import type { KeyValueStore } from '@/state.js'
 import type { Codec } from '@/codec.js'
 import type { Processor, OutputProcessor, StreamFormat } from '@/processors/base.js'
 import {
@@ -11,15 +10,7 @@ import {
 	SessionReduceNode,
 	WINDOW_STORE_RETENTION_MULTIPLIER,
 } from '@/processors/aggregation.js'
-import {
-	TableDeltaCountNode,
-	TableDeltaReduceNode,
-	TableDeltaAggregateNode,
-	TableGroupedComputeCountNode,
-	TableGroupedComputeReduceNode,
-	TableGroupedComputeAggregateNode,
-	type GroupedTableMapping,
-} from '@/processors/table.js'
+import { TableDeltaCountNode, TableDeltaReduceNode, TableDeltaAggregateNode } from '@/processors/table.js'
 import { TimeWindows, SessionWindows, SlidingWindows } from '@/windows.js'
 import { parseWindowDuration, SLIDING_WINDOWS_NOT_IMPLEMENTED } from '@/helpers.js'
 import { KTableImpl, type FlowAppInterface } from '@/streams/ktable.js'
@@ -456,8 +447,8 @@ export class KGroupedTableImpl<K, V> implements KGroupedTable<K, V> {
 		private readonly app: FlowAppInterface,
 		private readonly node: OutputProcessor<K, V>,
 		private readonly format: StreamFormat<K, V>,
-		private readonly keyMappingStoreRef: { store: KeyValueStore<unknown, GroupedTableMapping<K, V>> | null },
-		private readonly groupedKeyCodec: Codec<K>
+		/** The repartition topic carrying the grouped rows; the aggregate state is co-partitioned with it. */
+		private readonly sourceTopics: Set<string>
 	) {}
 
 	count(options?: Materialized<K, number>): KTable<K, number> {
@@ -481,22 +472,14 @@ export class KGroupedTableImpl<K, V> implements KGroupedTable<K, V> {
 			keyCodec,
 			valueCodec,
 			options?.changelog,
-			undefined,
-			false
+			this.sourceTopics
 		)
 		const storeRef = { store }
 
-		const countNode = this.app.isExactlyOnce()
-			? new TableDeltaCountNode<K, V>(storeName, storeRef)
-			: new TableGroupedComputeCountNode<unknown, K, V>(
-					storeName,
-					storeRef,
-					this.keyMappingStoreRef,
-					this.groupedKeyCodec
-				)
+		const countNode = new TableDeltaCountNode<K, V>(storeName, storeRef)
 		this.node.connect(countNode)
 
-		return new KTableImpl<K, number>(this.app, countNode, { keyCodec, valueCodec }, storeRef)
+		return new KTableImpl<K, number>(this.app, countNode, { keyCodec, valueCodec }, storeRef, this.sourceTopics)
 	}
 
 	reduce(
@@ -520,23 +503,14 @@ export class KGroupedTableImpl<K, V> implements KGroupedTable<K, V> {
 			keyCodec,
 			valueCodec,
 			options?.changelog,
-			undefined,
-			false
+			this.sourceTopics
 		)
 		const storeRef = { store }
 
-		const reduceNode = this.app.isExactlyOnce()
-			? new TableDeltaReduceNode<K, V>(storeName, storeRef, adder, subtractor)
-			: new TableGroupedComputeReduceNode<unknown, K, V>(
-					storeName,
-					storeRef,
-					this.keyMappingStoreRef,
-					this.groupedKeyCodec,
-					adder
-				)
+		const reduceNode = new TableDeltaReduceNode<K, V>(storeName, storeRef, adder, subtractor)
 		this.node.connect(reduceNode)
 
-		return new KTableImpl<K, V>(this.app, reduceNode, { keyCodec, valueCodec }, storeRef)
+		return new KTableImpl<K, V>(this.app, reduceNode, { keyCodec, valueCodec }, storeRef, this.sourceTopics)
 	}
 
 	aggregate<A>(
@@ -561,23 +535,37 @@ export class KGroupedTableImpl<K, V> implements KGroupedTable<K, V> {
 			keyCodec,
 			valueCodec,
 			options?.changelog,
-			undefined,
-			false
+			this.sourceTopics
 		)
 		const storeRef = { store }
 
-		const aggregateNode = this.app.isExactlyOnce()
-			? new TableDeltaAggregateNode<K, V, A>(storeName, storeRef, initializer, adder, subtractor)
-			: new TableGroupedComputeAggregateNode<unknown, K, V, A>(
-					storeName,
-					storeRef,
-					this.keyMappingStoreRef,
-					this.groupedKeyCodec,
-					initializer,
-					adder
-				)
+		// Row count per group, so a group whose last row leaves is removed instead of lingering
+		// as whatever the subtractor returns for "nothing".
+		const members = this.app.getOrCreateStore<K, number>(
+			`${storeName}-members`,
+			keyCodec,
+			{
+				encode: (v: number) => {
+					const buf = Buffer.alloc(8)
+					buf.writeDoubleLE(v, 0)
+					return buf
+				},
+				decode: (b: Buffer) => b.readDoubleLE(0),
+			},
+			options?.changelog === false ? false : undefined,
+			this.sourceTopics
+		)
+
+		const aggregateNode = new TableDeltaAggregateNode<K, V, A>(
+			storeName,
+			storeRef,
+			initializer,
+			adder,
+			subtractor,
+			{ store: members }
+		)
 		this.node.connect(aggregateNode)
 
-		return new KTableImpl<K, A>(this.app, aggregateNode, { keyCodec, valueCodec }, storeRef)
+		return new KTableImpl<K, A>(this.app, aggregateNode, { keyCodec, valueCodec }, storeRef, this.sourceTopics)
 	}
 }

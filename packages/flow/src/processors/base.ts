@@ -45,6 +45,8 @@ export type ActiveTransaction = {
 	): Promise<void>
 }
 
+export type StreamClock = { streamTimeMs: number; lastCleanupMs: number }
+
 export type TopicPartitionKey = `${string}:${number}`
 
 export type WorkerContext = {
@@ -59,6 +61,11 @@ export type WorkerContext = {
 	// Transaction batching state for EOS
 	pendingOffsets: Map<TopicPartitionKey, { topic: string; partition: number; offset: bigint }>
 	pendingChangelogOffsets: Map<TopicPartitionKey, { topic: string; partition: number; offset: bigint }>
+	/**
+	 * Stream-time clocks of this worker, keyed `<trackerId>|<topic>:<partition>`. Reset whenever the
+	 * worker's uncommitted progress is discarded or a partition is (re)assigned.
+	 */
+	streamClocks: Map<string, StreamClock>
 	/** Stores holding writes buffered by the open transaction. */
 	dirtyStores: Set<TransactionalBuffer>
 	/** Set once the worker has failed; it processes nothing more until restarted. */

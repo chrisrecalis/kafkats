@@ -21,11 +21,11 @@ async function collect<T>(it: AsyncIterable<T>): Promise<T[]> {
 	return out
 }
 async function commit(c: RecordContext) {
-	for (const s of [...c.worker.dirtyStores]) await s.commitBuffer()
+	for (const s of c.worker.dirtyStores) await s.commitBuffer(c.worker.dirtyStores)
 	c.worker.dirtyStores.clear()
 }
 function abort(c: RecordContext) {
-	for (const s of c.worker.dirtyStores) s.discardBuffer()
+	for (const s of c.worker.dirtyStores) s.discardBuffer(c.worker.dirtyStores)
 	c.worker.dirtyStores.clear()
 }
 
@@ -36,14 +36,14 @@ function windowStore() {
 		retentionMs: 1_000,
 		windowSizeMs: 100,
 	})
-	return { raw, buf: new BufferedWindowStore<string, string>(raw, windowedKeyCodec(str), str, str) }
+	return { raw, buf: new BufferedWindowStore<string, string>(raw, windowedKeyCodec(str), str, str, 1_000) }
 }
 function sessionStore() {
 	const raw = new InMemorySessionStore<string, string>('s', { keyCodec: str, valueCodec: str, retentionMs: 1_000 })
-	return { raw, buf: new BufferedSessionStore<string, string>(raw, windowedKeyCodec(str), str, str) }
+	return { raw, buf: new BufferedSessionStore<string, string>(raw, windowedKeyCodec(str), str, str, 1_000) }
 }
 
-describe('round2: Buffered stores - expiry must be transactional', () => {
+describe('Buffered stores - expiry must be transactional', () => {
 	// BUG (F3): expireOldWindows bypasses the buffer, so an aborted transaction permanently deletes committed windows.
 	it('window expiry performed inside an aborted transaction leaves committed windows in place', async () => {
 		const { raw, buf } = windowStore()
@@ -84,7 +84,7 @@ describe('round2: Buffered stores - expiry must be transactional', () => {
 	})
 })
 
-describe('round2: Buffered stores - one buffer shared by two workers', () => {
+describe('Buffered stores - one buffer shared by two workers', () => {
 	// BUG (F4): the buffer is per store, not per worker/transaction. App-scoped stores (KTable.groupBy mapping and
 	// aggregate stores) are one StoreStack shared by every worker (numStreamThreads > 1), so worker B's commit applies
 	// worker A's uncommitted writes and worker B's abort throws away worker A's writes.
@@ -122,7 +122,7 @@ describe('round2: Buffered stores - one buffer shared by two workers', () => {
 	})
 })
 
-describe('round2: Buffered stores - overlay iterators behave as if writes were applied (guards)', () => {
+describe('Buffered stores - overlay iterators behave as if writes were applied (guards)', () => {
 	it('kv: delete then re-insert, all() and range()', async () => {
 		const raw = new InMemoryKeyValueStore<string, string>('kv', { keyCodec: str, valueCodec: str })
 		for (const k of ['a', 'b', 'c', 'd']) await raw.put(k, `raw-${k}`)
@@ -172,9 +172,9 @@ describe('round2: Buffered stores - overlay iterators behave as if writes were a
 				[12, 'r3'],
 			] as const) {
 				const found = await collect(buf.findSessions('k', ts - 20, ts + 20))
-				let start = ts
-				let end = ts
-				let value = tag
+				let start: number = ts
+				let end: number = ts
+				let value: string = tag
 				for (const [wk, v] of found) {
 					await buf.delete(wk)
 					start = Math.min(start, wk.windowStart)

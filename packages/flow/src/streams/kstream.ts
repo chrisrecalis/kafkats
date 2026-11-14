@@ -44,7 +44,7 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 	 * is processed in the partition its (new) key hashes to. State is kept per partition; without
 	 * this, the same key arriving on different source partitions would be aggregated separately.
 	 */
-	private repartitioned(name: string | undefined, keyCodec?: Codec<K>, valueCodec?: Codec<V>): KStreamImpl<K, V> {
+	repartitioned(name: string | undefined, keyCodec?: Codec<K>, valueCodec?: Codec<V>): KStreamImpl<K, V> {
 		const key = keyCodec ?? this.format.keyCodec
 		const value = valueCodec ?? this.format.valueCodec
 		if (!key || !value) {

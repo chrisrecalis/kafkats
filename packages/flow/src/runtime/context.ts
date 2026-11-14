@@ -16,22 +16,33 @@ export interface RecordContext {
 /** Tracks the record being processed across the async processor chain. */
 export const recordContextStorage = new AsyncLocalStorage<RecordContext>()
 
+/**
+ * Identity of a worker's open transaction: the set of stores it has buffered writes in.
+ * Each worker has its own, so buffers of different workers never mix.
+ */
+export type TransactionScope = Set<TransactionalBuffer>
+
 /** A store whose writes are buffered until the surrounding transaction commits. */
 export interface TransactionalBuffer {
-	/** Apply buffered writes to the underlying store (the transaction committed). */
-	commitBuffer(): Promise<void>
-	/** Drop buffered writes (the transaction aborted). */
-	discardBuffer(): void
+	/** Apply the writes buffered by the given transaction scope to the underlying store (it committed). */
+	commitBuffer(scope: TransactionScope): Promise<void>
+	/** Drop the writes buffered by the given transaction scope (it aborted), or by all scopes. */
+	discardBuffer(scope?: TransactionScope): void
 }
 
 /**
  * Returns the set collecting stores written by the current transaction, or null when the current
  * record is not being processed inside a transaction (at-least-once mode, restoration, tests).
  */
-export function currentTransactionScope(): Set<TransactionalBuffer> | null {
+export function currentTransactionScope(): TransactionScope | null {
 	const ctx = recordContextStorage.getStore()
 	if (!ctx || !ctx.worker.activeTransaction) {
 		return null
 	}
 	return ctx.worker.dirtyStores
+}
+
+/** The transaction scope of the worker processing the current record (even if none is open). */
+export function currentWorkerScope(): TransactionScope | null {
+	return recordContextStorage.getStore()?.worker.dirtyStores ?? null
 }

@@ -83,7 +83,7 @@ const stats = stream.groupByKey().aggregate<Stats>(
 KGroupedTable has different aggregation semantics.
 
 ::: warning
-`KTable.groupBy()` aggregations keep app-wide (not partitioned) state. They are only correct with a single application instance and `numStreamThreads: 1`. See [Known Limitations](/flow/fault-tolerance#known-limitations).
+`KTable.groupBy()` writes each row's contribution through an internal repartition topic keyed by the grouped key (like `KStream.groupBy()`), so its aggregates are correct across instances and threads. Under `at_least_once`, a redelivered table update can be added or subtracted twice; use `exactly_once` when the aggregate must be exact.
 :::
 
 ```typescript

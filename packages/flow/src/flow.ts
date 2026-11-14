@@ -453,7 +453,13 @@ class FlowAppImpl implements FlowApp {
 						windowSizeMs: windowOptions.windowSizeMs,
 					}
 				)
-				const buffered = new BufferedWindowStore<K, V>(raw, storeKeyCodec, valueCodec, keyCodec)
+				const buffered = new BufferedWindowStore<K, V>(
+					raw,
+					storeKeyCodec,
+					valueCodec,
+					keyCodec,
+					windowOptions.retentionMs
+				)
 				const store = writer ? new ChangelogBackedWindowStore<K, V>(buffered, writer) : buffered
 				return { store, raw, buffer: buffered }
 			},
@@ -510,7 +516,13 @@ class FlowAppImpl implements FlowApp {
 					scope === 'partition' ? partitionStoreName(storeName, partition) : storeName,
 					{ keyCodec, valueCodec, retentionMs: sessionOptions.retentionMs }
 				)
-				const buffered = new BufferedSessionStore<K, V>(raw, storeKeyCodec, valueCodec, keyCodec)
+				const buffered = new BufferedSessionStore<K, V>(
+					raw,
+					storeKeyCodec,
+					valueCodec,
+					keyCodec,
+					sessionOptions.retentionMs
+				)
 				const store = writer ? new ChangelogBackedSessionStore<K, V>(buffered, writer) : buffered
 				return { store, raw, buffer: buffered }
 			},
@@ -662,6 +674,7 @@ class FlowAppImpl implements FlowApp {
 	private async doStart(): Promise<void> {
 		this.closing = false
 		this.started = false
+		this.currentState = 'CREATED'
 		this.startupError = null
 		this.lastError = null
 		this.shutdownController = new AbortController()
@@ -691,7 +704,7 @@ class FlowAppImpl implements FlowApp {
 
 			this.assertNotClosing()
 			this.started = true
-			if (this.currentState !== 'ERROR') {
+			if ((this.currentState as StreamState) !== 'ERROR') {
 				this.currentState = 'RUNNING'
 			}
 		} catch (err) {
@@ -780,6 +793,7 @@ class FlowAppImpl implements FlowApp {
 				pendingOffsets: new Map(),
 				pendingChangelogOffsets: new Map(),
 				dirtyStores: new Set(),
+				streamClocks: new Map(),
 				failure: null,
 				eosQueue: Promise.resolve(),
 				transactionActive: false,
@@ -974,6 +988,7 @@ class FlowAppImpl implements FlowApp {
 		await this.abortTransactionBatch(worker, worker.failure?.error ?? new Error('worker stopped'))
 		const released = [...worker.assignedPartitions.values()]
 		worker.assignedPartitions.clear()
+		worker.streamClocks.clear()
 		this.releasePartitions(released)
 		worker.failure = null
 	}
@@ -1961,7 +1976,7 @@ class FlowAppImpl implements FlowApp {
 			const txWithReject = tx as ActiveTransaction & { _reject?: (err: Error) => void }
 			txWithReject._reject?.(toError(err))
 			await txPromise.catch(() => {})
-			for (const store of dirtyStores) store.discardBuffer()
+			for (const store of dirtyStores) store.discardBuffer(worker.dirtyStores)
 			this.clearTransactionState(worker)
 			// The consumer's position is already past the records of this batch: it must not
 			// continue, or the next commit would acknowledge records whose effects were aborted.
@@ -1976,7 +1991,7 @@ class FlowAppImpl implements FlowApp {
 		worker.processedSinceRestart = true
 		try {
 			for (const store of dirtyStores) {
-				await store.commitBuffer()
+				await store.commitBuffer(worker.dirtyStores)
 			}
 		} catch (err) {
 			// Local state is now behind the committed changelog; only a restore can repair it.
@@ -2003,8 +2018,10 @@ class FlowAppImpl implements FlowApp {
 		const tx = worker.activeTransaction as (ActiveTransaction & { _reject?: (err: Error) => void }) | null
 		const txPromise = worker.activeTransactionPromise
 
-		for (const store of worker.dirtyStores) store.discardBuffer()
+		for (const store of worker.dirtyStores) store.discardBuffer(worker.dirtyStores)
 		this.clearTransactionState(worker)
+		// Stream time advanced by the aborted records must not make their replay look late.
+		worker.streamClocks.clear()
 
 		if (tx && txPromise) {
 			tx._reject?.(toError(error))
@@ -2147,6 +2164,11 @@ class FlowAppImpl implements FlowApp {
 		consumer.on('partitionsAssigned', partitions => {
 			for (const tp of partitions) {
 				worker.assignedPartitions.set(`${tp.topic}:${tp.partition}`, tp)
+				// A (re)assigned partition restarts from its committed offset; so does its clock.
+				const suffix = `|${tp.topic}:${tp.partition}`
+				for (const key of worker.streamClocks.keys()) {
+					if (key.endsWith(suffix)) worker.streamClocks.delete(key)
+				}
 			}
 
 			if (this.needsAssignmentPreparation()) {

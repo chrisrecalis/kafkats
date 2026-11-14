@@ -14,7 +14,12 @@ class TestConsumer extends EventEmitter {
 	private messageOnStop: { topic: string; value: Buffer | null; key?: Buffer | null } | null = null
 	subscription: string[] = []
 	/** Records produced to a subscribed topic (through()/repartition), delivered after the current record. */
-	readonly loopback: Array<{ topic: string; value: Buffer | null; key?: Buffer | null }> = []
+	readonly loopback: Array<{
+		topic: string
+		value: Buffer | null
+		key?: Buffer | null
+		headers?: Record<string, Buffer>
+	}> = []
 	async runEach(subscription: string[], handler: TestHandler): Promise<void> {
 		this.subscription = subscription
 		this.handler = handler
@@ -43,7 +48,13 @@ class TestConsumer extends EventEmitter {
 		this.messageOnStop = { topic, value, key }
 	}
 
-	async emitMessage(topic: string, value: Buffer | null, key?: Buffer | null, timestamp?: bigint): Promise<void> {
+	async emitMessage(
+		topic: string,
+		value: Buffer | null,
+		key?: Buffer | null,
+		timestamp?: bigint,
+		headers?: Record<string, Buffer>
+	): Promise<void> {
 		if (!this.handler) {
 			throw new Error('consumer not started')
 		}
@@ -54,7 +65,7 @@ class TestConsumer extends EventEmitter {
 			timestamp: timestamp ?? 0n,
 			key: key ?? null,
 			value,
-			headers: {},
+			headers: headers ?? {},
 		}
 		const ctx = {
 			signal: new AbortController().signal,
@@ -66,7 +77,7 @@ class TestConsumer extends EventEmitter {
 		await this.handler(message, ctx)
 		const next = this.loopback.shift()
 		if (next) {
-			await this.emitMessage(next.topic, next.value, next.key, timestamp)
+			await this.emitMessage(next.topic, next.value, next.key, timestamp, next.headers)
 		}
 	}
 }
@@ -83,7 +94,12 @@ class TestProducer {
 	async send(topic: string, message: { key?: Buffer | null; value: Buffer; partition?: number }): Promise<void> {
 		this.messages.push({ topic, key: message.key, value: message.value, partition: message.partition })
 		const consumer = this.consumers.find(c => c.subscription.includes(topic))
-		consumer?.loopback.push({ topic, value: message.value, key: message.key })
+		consumer?.loopback.push({
+			topic,
+			value: message.value,
+			key: message.key,
+			headers: (message as { headers?: Record<string, Buffer> }).headers,
+		})
 	}
 
 	async transaction(
