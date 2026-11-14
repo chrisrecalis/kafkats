@@ -99,17 +99,23 @@ describe('round3: restore race on re-assignment', () => {
 		const a = mk(slow)
 		let b: FlowApp | null = null
 		try {
-			const startingA = a.start()
+			const T0 = Date.now()
+			const lap = (m: string) => console.log(`[restore-race] +${Date.now() - T0}ms ${m}`)
+			const startingA = a.start().then(() => lap('A.start resolved (restoration #1 done)'))
 			await sleep(1_500)
 			b = mk()
+			lap('B.start begin')
 			await b.start() // rebalance: A is revoked mid-restore and keeps only half of the partitions
+			lap('B started')
 			await sendAll() // phase 2: B advances partitions 2/3 (count 2 for those users)
 			await sleep(2_500)
+			lap('B.close begin')
 			await b.close() // rebalance: A is assigned everything again, restoration #1 still running
 			b = null
+			lap('B closed')
+			await sendAll() // phase 3: queued while A is still restoring; consumed as soon as A resumes the partitions
 			await startingA
 			slow.slow = false
-			await sendAll() // phase 3
 			const want = [1, 2, 3]
 			const seqs = new Map<string, number[]>()
 			const done = async () => {
