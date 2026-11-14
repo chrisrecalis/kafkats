@@ -66,10 +66,17 @@ describe('round3: churn during slow restoration', () => {
 					client: newClient('r3-ch-app'),
 					processingGuarantee: 'exactly_once',
 					commitIntervalMs: 100,
-					consumer: { autoOffsetReset: 'earliest', maxWaitMs: 50, sessionTimeoutMs: 6_000, rebalanceTimeoutMs: 15_000 },
+					consumer: {
+						autoOffsetReset: 'earliest',
+						maxWaitMs: 50,
+						sessionTimeoutMs: 6_000,
+						rebalanceTimeoutMs: 15_000,
+					},
 					producer: { lingerMs: 0 },
 					...(durable ? { stateStoreProvider: providers[slot]! } : {}),
-					changelog: { restoration: { idleTimeoutMs: 3_000, initialIdleTimeoutMs: 8_000, checkIntervalMs: 50 } },
+					changelog: {
+						restoration: { idleTimeoutMs: 3_000, initialIdleTimeoutMs: 8_000, checkIntervalMs: 50 },
+					},
 				})
 				app.stream(input, { key: str, value: str })
 					.groupByKey()

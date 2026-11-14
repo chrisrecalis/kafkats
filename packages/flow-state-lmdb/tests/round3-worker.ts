@@ -30,20 +30,31 @@ if (process.env.R3_TRACE) {
 			const id = ++n
 			log('tx_begin', { id, t: Date.now() - t0 })
 			try {
-				const r = await tx0(async (tx: any) => {
-					const so = tx.sendOffsets.bind(tx)
-					tx.sendOffsets = async (...a: any[]) => {
-						log('tx_sendOffsets', { id, t: Date.now() - t0, offsets: JSON.stringify(a[1], (_k, v) => (typeof v === 'bigint' ? String(v) : v)) })
-						return so(...a)
-					}
-					const send = tx.send.bind(tx)
-					tx.send = async (topic: string, ...a: any[]) => {
-						const res = await send(topic, ...a)
-						log('tx_send', { id, topic, res: JSON.stringify(res, (_k, v) => (typeof v === 'bigint' ? String(v) : v)) })
-						return res
-					}
-					return fn(tx)
-				}, ...rest)
+				const r = await tx0(
+					async (tx: any) => {
+						const so = tx.sendOffsets.bind(tx)
+						tx.sendOffsets = async (...a: any[]) => {
+							log('tx_sendOffsets', {
+								id,
+								t: Date.now() - t0,
+								offsets: JSON.stringify(a[1], (_k, v) => (typeof v === 'bigint' ? String(v) : v)),
+							})
+							return so(...a)
+						}
+						const send = tx.send.bind(tx)
+						tx.send = async (topic: string, ...a: any[]) => {
+							const res = await send(topic, ...a)
+							log('tx_send', {
+								id,
+								topic,
+								res: JSON.stringify(res, (_k, v) => (typeof v === 'bigint' ? String(v) : v)),
+							})
+							return res
+						}
+						return fn(tx)
+					},
+					...rest
+				)
 				log('tx_committed', { id, t: Date.now() - t0 })
 				return r
 			} catch (e) {

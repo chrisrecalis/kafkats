@@ -33,6 +33,7 @@ const app = flow({
 | `stateDir`            | `string`                            | -                 | State directory (used by some store providers)                                                   |
 | `stateStoreProvider`  | `StateStoreProvider`                | in-memory         | State store backend (in-memory by default)                                                       |
 | `restartOnError`      | `boolean`                           | `true`            | Restart a worker after a recoverable failure. See [Fault Tolerance](/flow/fault-tolerance)       |
+| `startTimeoutMs`      | `number`                            | `120000`          | How long `start()` waits for each worker to join the consumer group                              |
 | `changelog`           | `object`                            | -                 | Changelog topic settings: `replicationFactor`, `topicConfigs`, `autoCreate`, `restoration`       |
 | `consumer`            | `Omit<ConsumerConfig, 'groupId'>`   | -                 | Consumer overrides (Flow sets `groupId` to `applicationId` and always uses the `range` assignor) |
 | `producer`            | `ProducerConfig`                    | -                 | Producer overrides                                                                               |

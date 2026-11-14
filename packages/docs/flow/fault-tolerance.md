@@ -76,6 +76,12 @@ If a failure happens during `start()`, `start()` rejects, the state is `'ERROR'`
 `getError()` returns the most recent error the app observed. It can also be set by transient errors the app recovered from, so check `state()` to find out whether the app has failed.
 :::
 
+### Recovering From a Crash Under Exactly-Once
+
+A crashed instance leaves its last transaction open until the broker aborts it after the producer's `transactionTimeoutMs`. Until then, `read_committed` consumers of its output topics and the state restoration of its successor wait. Flow sets `transactionTimeoutMs` to 10 seconds for exactly-once producers (override it via `producer.transactionTimeoutMs`); a transaction that stays open longer than that, for example because a single record takes that long to process, is aborted and retried.
+
+`start()` waits up to `startTimeoutMs` (default `120000`) for each worker to join the consumer group. After a crash the group may wait for the dead member's session timeout before it rebalances.
+
 ### Application States
 
 | State         | Meaning                                                                                                                                      |
@@ -92,6 +98,7 @@ On every assignment, the newly assigned partitions are **paused**, their state i
 
 - State partition `N` is restored from changelog partition `N` (see [Partitioned State](/flow/state-stores#partitioned-state)).
 - A restore that makes no progress for `changelog.restoration.idleTimeoutMs` (default `30000`) **fails**. It never completes with partial state. During `start()` the failure rejects `start()`; afterwards it is a recoverable failure and the worker restarts.
+- Restoration reads to the end of the changelog. If an instance crashed with a transaction open, the restore waits until the broker aborts that transaction (after its transaction timeout) instead of stopping at an older position; this wait is not treated as a stall.
 - `start()` resolves once the partitions assigned at startup are restored.
 
 ```typescript

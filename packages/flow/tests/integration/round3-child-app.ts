@@ -6,7 +6,11 @@ const app = flow({
 	applicationId: process.env.R3_APP!,
 	client: { clientId: `r3-child-${process.pid}`, brokers: process.env.R3_BROKERS!.split(',') },
 	processingGuarantee: 'at_least_once',
-	consumer: { autoOffsetReset: 'earliest', maxWaitMs: 100, sessionTimeoutMs: Number(process.env.R3_SESSION_MS ?? 30_000) },
+	consumer: {
+		autoOffsetReset: 'earliest',
+		maxWaitMs: 100,
+		sessionTimeoutMs: Number(process.env.R3_SESSION_MS ?? 30_000),
+	},
 	producer: { lingerMs: 0 },
 })
 app.stream(process.env.R3_IN!, { key: str, value: str })

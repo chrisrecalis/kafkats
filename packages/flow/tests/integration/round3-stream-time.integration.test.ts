@@ -40,7 +40,10 @@ describe('round3: stream time survives a restart', () => {
 			.windowedBy(TimeWindows.of(1_000))
 			.count({ storeName: 'w', value: num })
 			.toStream()
-			.selectKey((_v, k) => `${(k as unknown as { key: string }).key}@${(k as unknown as { window: { start: number } }).window.start % 1_000_000}`)
+			.selectKey(
+				(_v, k) =>
+					`${(k as unknown as { key: string }).key}@${(k as unknown as { window: { start: number } }).window.start % 1_000_000}`
+			)
 			.to(output, { key: str, value: num })
 		return app
 	}

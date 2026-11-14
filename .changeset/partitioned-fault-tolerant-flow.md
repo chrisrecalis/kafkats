@@ -21,7 +21,7 @@ Redesign the `@kafkats/flow` runtime for correctness: partitioned state, reparti
 
 - Exactly-once: a failed transaction commit no longer loses records. The worker stops, aborts and resumes from the last committed offsets.
 - Exactly-once: uncommitted state updates no longer survive an abort or crash, including in persistent LMDB stores. Store writes are buffered and applied only after the commit.
-- Restoration no longer completes early with partial state, and an unusable checkpoint wipes and rebuilds the store.
+- Restoration no longer completes early with partial state, and an unusable checkpoint wipes and rebuilds the store. It reads to the end of the changelog and waits out a crashed instance's open transaction instead of stopping at an older position (which left exactly-once state behind the committed offsets).
 - State is no longer lost or mixed across instances for windowed stores, joins and non-default partitioning.
 - `globalTable()` is now really global.
 - `KTable.groupBy()` aggregations are repartitioned by the grouped key and are now correct with several instances or threads; an emptied group is removed in both processing modes.
@@ -33,6 +33,8 @@ Redesign the `@kafkats/flow` runtime for correctness: partitioned state, reparti
 
 - `restartOnError` (default `true`): workers restart after recoverable failures with exponential backoff. Errors thrown by user code and fatal Kafka errors set `state()` to `'ERROR'`.
 - `app.getError()` on `FlowApp`.
+- `startTimeoutMs` (default 120000) for how long `start()` waits for workers to join the group. Exactly-once producers now default to a 10 second `transactionTimeoutMs`.
+- `@kafkats/flow-state-lmdb`: the environment is reopened on demand, so an app can be started again after `close()`.
 - `CoPartitioningError`, exported from `@kafkats/flow`.
 - `Grouped.name` for stable repartition topic names.
 

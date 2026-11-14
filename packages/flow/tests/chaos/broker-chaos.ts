@@ -33,7 +33,7 @@ const arg = (n: string, d: string) => {
 	return i >= 0 ? process.argv[i + 1]! : d
 }
 const guarantee = arg('guarantee', 'alo') === 'eos' ? 'exactly_once' : 'at_least_once'
-const mode = arg('mode', 'stateless') as "stateless" | "count" | "regroup"
+const mode = arg('mode', 'stateless') as 'stateless' | 'count' | 'regroup'
 const fault = arg('fault', 'restart')
 const pauseS = Number(arg('pause-s', '25'))
 const keys = Number(arg('keys', '12'))
@@ -169,7 +169,9 @@ for (const r of actualRecs) expectedByKey.set(r.key, (expectedByKey.get(r.key) ?
 const dedupInput = new Set(actualRecs.map(r => r.value)).size !== actualRecs.length
 let outs = await readAll(client, output, isolation, { quietMs: 8000, maxMs: 60000 })
 const sum =
-	mode === 'stateless' ? summarizeStateless(actualRecs, outs) : summarizeCount(keys, perKey, outs, expectedByKey, mode === 'regroup' ? 'nk' : 'k')
+	mode === 'stateless'
+		? summarizeStateless(actualRecs, outs)
+		: summarizeCount(keys, perKey, outs, expectedByKey, mode === 'regroup' ? 'nk' : 'k')
 
 // Is the app actually dead? Produce 1 sentinel per key and see if it still processes.
 let stillAlive = 'n/a'
@@ -232,7 +234,10 @@ if (process.env.CHAOS_DEBUG) {
 	const counts = new Map<string, number>()
 	for (const r of raw) {
 		let key = r.slice(0, 200)
-		try { const j = JSON.parse(r); key = `${j.level} ${j.component ?? ''}: ${j.message} | ${String(j.error ?? '').slice(0, 100)}` } catch {}
+		try {
+			const j = JSON.parse(r)
+			key = `${j.level} ${j.component ?? ''}: ${j.message} | ${String(j.error ?? '').slice(0, 100)}`
+		} catch {}
 		counts.set(key, (counts.get(key) ?? 0) + 1)
 	}
 	console.log('  worker client log summary (count x message):')

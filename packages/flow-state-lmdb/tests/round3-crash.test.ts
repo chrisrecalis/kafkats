@@ -120,10 +120,31 @@ describe.skipIf(!brokers)('round3: SIGKILL + LMDB', () => {
 		if (bad.length) {
 			const again = await readCommitted(client, out_(rows), 2_500)
 			console.log('OUTTOPIC', lastOut)
-			console.log('RAW partition of k0', JSON.stringify(again.filter(r => r.partition === (rows.find(x => x.key === 'k0')?.partition ?? 0)).slice(0, 60).map(r => `${String(r.offset)}:${r.key}=${r.value}`)))
-			console.log('RAW k0 first read', JSON.stringify(rows.filter(r => r.key === 'k0').map(r => [r.partition, String(r.offset), r.value])))
-			console.log('RAW k0 re-read', JSON.stringify(again.filter(r => r.key === 'k0').map(r => [r.partition, String(r.offset), r.value])))
-			for (const x of lastWorkers) console.log(`--- worker pid ${x.pid}\n` + x.lines.filter(l => !l.includes('tx_send')).slice(0, 60).join('\n'))
+			console.log(
+				'RAW partition of k0',
+				JSON.stringify(
+					again
+						.filter(r => r.partition === (rows.find(x => x.key === 'k0')?.partition ?? 0))
+						.slice(0, 60)
+						.map(r => `${String(r.offset)}:${r.key}=${r.value}`)
+				)
+			)
+			console.log(
+				'RAW k0 first read',
+				JSON.stringify(rows.filter(r => r.key === 'k0').map(r => [r.partition, String(r.offset), r.value]))
+			)
+			console.log(
+				'RAW k0 re-read',
+				JSON.stringify(again.filter(r => r.key === 'k0').map(r => [r.partition, String(r.offset), r.value]))
+			)
+			for (const x of lastWorkers)
+				console.log(
+					`--- worker pid ${x.pid}\n` +
+						x.lines
+							.filter(l => !l.includes('tx_send'))
+							.slice(0, 60)
+							.join('\n')
+				)
 			void lines
 		}
 		expect(bad).toEqual([])

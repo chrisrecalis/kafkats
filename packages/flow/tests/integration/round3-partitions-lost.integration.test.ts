@@ -53,7 +53,9 @@ describe('round3: session loss (blocked event loop) with a second instance', () 
 						rebalanceTimeoutMs: 10_000,
 					},
 					producer: { lingerMs: 0 },
-					changelog: { restoration: { idleTimeoutMs: 1_000, initialIdleTimeoutMs: 5_000, checkIntervalMs: 50 } },
+					changelog: {
+						restoration: { idleTimeoutMs: 1_000, initialIdleTimeoutMs: 5_000, checkIntervalMs: 50 },
+					},
 				})
 				app.stream(input, { key: str, value: str })
 					.peek(() => {

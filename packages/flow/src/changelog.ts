@@ -465,10 +465,12 @@ export class ChangelogRestorer<K, V> {
 						lastProgressTime = Date.now()
 						if (!warnedOpenTransaction) {
 							warnedOpenTransaction = true
-							client.cluster.getLogger().warn(
-								'changelog restore is waiting for an open transaction to complete',
-								{ topic: this.topicName, partitions: [...pending] }
-							)
+							client.cluster
+								.getLogger()
+								.warn('changelog restore is waiting for an open transaction to complete', {
+									topic: this.topicName,
+									partitions: [...pending],
+								})
 						}
 						return
 					}

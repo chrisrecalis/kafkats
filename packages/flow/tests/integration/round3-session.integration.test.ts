@@ -72,7 +72,12 @@ describe('round3: session windows under EOS', () => {
 		return `${w.key}@${w.window.start}-${w.window.end}`
 	}
 
-	const build = (applicationId: string, input: string, outs: Record<'count' | 'reduce' | 'agg', string>, client: KafkaClient): FlowApp => {
+	const build = (
+		applicationId: string,
+		input: string,
+		outs: Record<'count' | 'reduce' | 'agg', string>,
+		client: KafkaClient
+	): FlowApp => {
 		const app = flow({
 			applicationId,
 			client,
@@ -138,12 +143,16 @@ describe('round3: session windows under EOS', () => {
 			const events: Ev[] = []
 			for (let k = 0; k < KEYS; k++) {
 				let t = 0
-				for (let i = 0; i < 14; i++) { // keep total event-time span < retention (24 x gap) so nothing is legitimately dropped as late
+				for (let i = 0; i < 14; i++) {
+					// keep total event-time span < retention (24 x gap) so nothing is legitimately dropped as late
 					t += rnd() < 0.3 ? 1_500 + Math.floor(rnd() * 1_500) : Math.floor(rnd() * 900)
 					events.push({ key: `k${k}`, ts: base + t, v: 1 + Math.floor(rnd() * 5) })
 				}
 			}
-			const order = events.map(e => ({ e, r: rnd() })).sort((a, b) => a.r - b.r).map(x => x.e)
+			const order = events
+				.map(e => ({ e, r: rnd() }))
+				.sort((a, b) => a.r - b.r)
+				.map(x => x.e)
 
 			let commits = 0
 			const mk = (fail: boolean) => {
@@ -189,6 +198,7 @@ describe('round3: session windows under EOS', () => {
 					;[c, r, a] = [await view(outs.count), await view(outs.reduce), await view(outs.agg)]
 				}
 				if (variant.startsWith('commit')) expect(commits).toBeGreaterThan(6)
+				expect(c.tombstones, 'merged-away sessions must be retracted').toBeGreaterThan(0)
 				expect(c.live).toEqual(wantCount)
 				expect(r.live).toEqual(wantSum)
 				expect(a.live).toEqual(wantSum)

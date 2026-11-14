@@ -66,7 +66,10 @@ describe('round3: changelog edge cases', () => {
 		}
 		let app = mk()
 		await app.start()
-		await producer.send(input, Array.from({ length: 5 }, () => ({ key: 'k', value: Buffer.from('x') })))
+		await producer.send(
+			input,
+			Array.from({ length: 5 }, () => ({ key: 'k', value: Buffer.from('x') }))
+		)
 		expect(await waitVals(output, 5)).toEqual([1, 2, 3, 4, 5])
 		await app.close()
 		const changelog = `${applicationId}-counts-changelog`
@@ -91,7 +94,11 @@ describe('round3: changelog edge cases', () => {
 		await createTopics(admin, [{ name: input }, { name: out1 }, { name: out2 }])
 		const v1 = () => {
 			const app: FlowApp = flow(baseCfg(applicationId))
-			app.stream(input, { key: str, value: str }).groupByKey().count({ key: str, value: num }).toStream().to(out1, { key: str, value: num })
+			app.stream(input, { key: str, value: str })
+				.groupByKey()
+				.count({ key: str, value: num })
+				.toStream()
+				.to(out1, { key: str, value: num })
 			return app
 		}
 		const v2 = () => {
@@ -104,7 +111,10 @@ describe('round3: changelog edge cases', () => {
 		}
 		let app = v1()
 		await app.start()
-		await producer.send(input, Array.from({ length: 3 }, () => ({ key: 'k', value: Buffer.from('x') })))
+		await producer.send(
+			input,
+			Array.from({ length: 3 }, () => ({ key: 'k', value: Buffer.from('x') }))
+		)
 		expect(await waitVals(out1, 3)).toEqual([1, 2, 3])
 		await app.close()
 		app = v2()
@@ -136,7 +146,10 @@ describe('round3: changelog edge cases', () => {
 		}
 		let app = mk()
 		await app.start()
-		await producer.send(input, Array.from({ length: 3 }, () => ({ key: 'k', value: Buffer.from('x') })))
+		await producer.send(
+			input,
+			Array.from({ length: 3 }, () => ({ key: 'k', value: Buffer.from('x') }))
+		)
 		expect(await waitVals(output, 3)).toEqual([1, 2, 3])
 		await app.close()
 		app = mk()

@@ -40,13 +40,24 @@ describe('round3: lifecycle storms', () => {
 		await admin.disconnect()
 	})
 
-	const build = (applicationId: string, input: string, output: string, guarantee: 'at_least_once' | 'exactly_once', client = newClient('r3-lc-app')): FlowApp => {
+	const build = (
+		applicationId: string,
+		input: string,
+		output: string,
+		guarantee: 'at_least_once' | 'exactly_once',
+		client = newClient('r3-lc-app')
+	): FlowApp => {
 		const app = flow({
 			applicationId,
 			client,
 			processingGuarantee: guarantee,
 			commitIntervalMs: 100,
-			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 50, sessionTimeoutMs: 6_000, rebalanceTimeoutMs: 10_000 },
+			consumer: {
+				autoOffsetReset: 'earliest',
+				maxWaitMs: 50,
+				sessionTimeoutMs: 6_000,
+				rebalanceTimeoutMs: 10_000,
+			},
 			producer: { lingerMs: 0 },
 			changelog: { restoration: { idleTimeoutMs: 1_000, initialIdleTimeoutMs: 3_000, checkIntervalMs: 50 } },
 		})
@@ -64,7 +75,10 @@ describe('round3: lifecycle storms', () => {
 			const output = uniqueTopicName('r3-lc-out')
 			const applicationId = uniqueTopicName('r3-lc-app')
 			await createTopics(admin, [{ name: input, partitions: 4 }, { name: output }])
-			await producer.send(input, Array.from({ length: 40 }, (_, i) => ({ key: `k${i % 8}`, value: Buffer.from('x') })))
+			await producer.send(
+				input,
+				Array.from({ length: 40 }, (_, i) => ({ key: `k${i % 8}`, value: Buffer.from('x') }))
+			)
 			const peer = build(applicationId, input, output, guarantee)
 			await peer.start()
 			await sleep(1_000)
@@ -102,7 +116,10 @@ describe('round3: lifecycle storms', () => {
 		const app = build(applicationId, input, output, 'exactly_once', client)
 		try {
 			await app.start()
-			await producer.send(input, Array.from({ length: 10 }, (_, i) => ({ key: `k${i}`, value: Buffer.from('x') })))
+			await producer.send(
+				input,
+				Array.from({ length: 10 }, (_, i) => ({ key: `k${i}`, value: Buffer.from('x') }))
+			)
 			// every commit fails: the worker keeps failing and backing off (0.5s .. 30s)
 			const deadline = Date.now() + 15_000
 			while (Date.now() < deadline && app.state() !== 'REBALANCING') await sleep(100)

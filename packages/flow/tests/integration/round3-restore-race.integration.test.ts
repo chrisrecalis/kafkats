@@ -59,7 +59,12 @@ describe('round3: restore race on re-assignment', () => {
 				client: newClient('r3-rr-app'),
 				processingGuarantee: 'exactly_once',
 				commitIntervalMs: 100,
-				consumer: { autoOffsetReset: 'earliest', maxWaitMs: 50, sessionTimeoutMs: 10_000, rebalanceTimeoutMs: 20_000 },
+				consumer: {
+					autoOffsetReset: 'earliest',
+					maxWaitMs: 50,
+					sessionTimeoutMs: 10_000,
+					rebalanceTimeoutMs: 20_000,
+				},
 				producer: { lingerMs: 0 },
 				...(provider ? { stateStoreProvider: provider } : {}),
 				changelog: { restoration: { idleTimeoutMs: 5_000, initialIdleTimeoutMs: 10_000, checkIntervalMs: 50 } },
@@ -75,7 +80,10 @@ describe('round3: restore race on re-assignment', () => {
 			for (let i = 0; i < USERS; i += 500)
 				await producer.send(
 					input,
-					Array.from({ length: Math.min(500, USERS - i) }, (_, j) => ({ key: `u${i + j}`, value: Buffer.from('x') }))
+					Array.from({ length: Math.min(500, USERS - i) }, (_, j) => ({
+						key: `u${i + j}`,
+						value: Buffer.from('x'),
+					}))
 				)
 		}
 		// phase 1: build a big changelog with a fast app, then stop it

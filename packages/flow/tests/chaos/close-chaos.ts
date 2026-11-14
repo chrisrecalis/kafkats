@@ -31,7 +31,7 @@ const arg = (n: string, d: string) => {
 }
 const scenario = arg('scenario', 'drain')
 const guarantee = arg('guarantee', 'eos') === 'eos' ? 'exactly_once' : 'at_least_once'
-const mode = arg('mode', 'count') as "stateless" | "count" | "regroup"
+const mode = arg('mode', 'count') as 'stateless' | 'count' | 'regroup'
 const cycles = Number(arg('cycles', '4'))
 const keys = Number(arg('keys', '12'))
 const perKey = Number(arg('per-key', '100'))

@@ -68,7 +68,10 @@ describe('round3: multi-thread EOS topologies with commit failures', () => {
 				changelog: { restoration: { idleTimeoutMs: 1_000, initialIdleTimeoutMs: 5_000, checkIntervalMs: 50 } },
 			})
 			const a = app.stream(T.a, { key: str, value: str })
-			a.groupByKey().count({ storeName: 'cnt', key: str, value: num }).toStream().to(T.oCount, { key: str, value: num })
+			a.groupByKey()
+				.count({ storeName: 'cnt', key: str, value: num })
+				.toStream()
+				.to(T.oCount, { key: str, value: num })
 			a.groupBy((k, _v) => `grp${Number(k.slice(1)) % 3}`, { key: str, value: str })
 				.count({ storeName: 'gcnt', key: str, value: num })
 				.toStream()
@@ -93,15 +96,33 @@ describe('round3: multi-thread EOS topologies with commit failures', () => {
 				await sleep(3_000)
 				const now = Date.now()
 				for (let i = 0; i < N; i++) {
-					await producer.send(T.a, Array.from({ length: KEYS }, (_, k) => ({ key: `k${k}`, value: Buffer.from(`a${i}`), timestamp: new Date(now) })))
+					await producer.send(
+						T.a,
+						Array.from({ length: KEYS }, (_, k) => ({
+							key: `k${k}`,
+							value: Buffer.from(`a${i}`),
+							timestamp: new Date(now),
+						}))
+					)
 					if (i < 3)
-						await producer.send(T.b, Array.from({ length: KEYS }, (_, k) => ({ key: `k${k}`, value: Buffer.from(`b${i}`), timestamp: new Date(now) })))
-					await producer.send(T.s, Array.from({ length: KEYS }, (_, k) => ({ key: `k${k}`, value: Buffer.from(`s${i}`) })))
+						await producer.send(
+							T.b,
+							Array.from({ length: KEYS }, (_, k) => ({
+								key: `k${k}`,
+								value: Buffer.from(`b${i}`),
+								timestamp: new Date(now),
+							}))
+						)
+					await producer.send(
+						T.s,
+						Array.from({ length: KEYS }, (_, k) => ({ key: `k${k}`, value: Buffer.from(`s${i}`) }))
+					)
 					await sleep(120)
 				}
 				// expectations
 				const wantJoin = new Set<string>()
-				for (let k = 0; k < KEYS; k++) for (let i = 0; i < N; i++) for (let j = 0; j < 3; j++) wantJoin.add(`k${k}:a${i}|b${j}`)
+				for (let k = 0; k < KEYS; k++)
+					for (let i = 0; i < N; i++) for (let j = 0; j < 3; j++) wantJoin.add(`k${k}:a${i}|b${j}`)
 				const wantTj = new Set<string>()
 				for (let k = 0; k < KEYS; k++) for (let i = 0; i < N; i++) wantTj.add(`k${k}:s${i}|T${k}`)
 
@@ -121,12 +142,21 @@ describe('round3: multi-thread EOS topologies with commit failures', () => {
 						const k = r.key!.toString()
 						groups.set(k, [...(groups.get(k) ?? []), num.decode(r.value!)])
 					}
-					joins = (await readAllCommitted(admin, T.oJoin, 1_200)).map(r => `${r.key!.toString()}:${r.value!.toString()}`)
-					tjs = (await readAllCommitted(admin, T.oTj, 1_200)).map(r => `${r.key!.toString()}:${r.value!.toString()}`)
+					joins = (await readAllCommitted(admin, T.oJoin, 1_200)).map(
+						r => `${r.key!.toString()}:${r.value!.toString()}`
+					)
+					tjs = (await readAllCommitted(admin, T.oTj, 1_200)).map(
+						r => `${r.key!.toString()}:${r.value!.toString()}`
+					)
 				}
 				for (;;) {
 					await load()
-					if (joins.length >= wantJoin.size && tjs.length >= wantTj.size && counts.size === KEYS && groups.size === 3) {
+					if (
+						joins.length >= wantJoin.size &&
+						tjs.length >= wantTj.size &&
+						counts.size === KEYS &&
+						groups.size === 3
+					) {
 						const fin = [...counts.values()].every(v => v.length >= N)
 						if (fin) break
 					}

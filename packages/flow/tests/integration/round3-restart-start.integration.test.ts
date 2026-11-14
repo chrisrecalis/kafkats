@@ -35,7 +35,14 @@ describe('round3: replacement instance after SIGKILL', () => {
 		await createTopics(admin, [{ name: input, partitions: 2 }, { name: output }])
 		const child = spawn(process.execPath, ['--import', 'tsx', path.join(here, 'round3-child-app.ts')], {
 			cwd: path.resolve(here, '../..'),
-			env: { ...process.env, R3_BROKERS: process.env.KAFKA_BROKERS!, R3_APP: applicationId, R3_IN: input, R3_OUT: output, R3_SESSION_MS: '20000' },
+			env: {
+				...process.env,
+				R3_BROKERS: process.env.KAFKA_BROKERS!,
+				R3_APP: applicationId,
+				R3_IN: input,
+				R3_OUT: output,
+				R3_SESSION_MS: '20000',
+			},
 			stdio: ['ignore', 'pipe', 'inherit'],
 		})
 		let out = ''
