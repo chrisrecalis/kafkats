@@ -31,7 +31,7 @@ const sockets = () =>
 		._getActiveHandles()
 		.filter(h => h.constructor.name === 'Socket').length
 
-describe('round3: lifecycle storms', () => {
+describe('hardening: lifecycle storms', () => {
 	let admin: KafkaClient
 	let producer: Producer
 	const rejections: unknown[] = []

@@ -39,7 +39,6 @@ process.on('uncaughtException', (err: Error) => {
 	log('UNCAUGHT_EXCEPTION', { message: err.message, stack: err.stack?.split('\n').slice(0, 6).join(' | ') })
 })
 
-
 const guarantee = env('CHAOS_GUARANTEE', 'at_least_once') as 'at_least_once' | 'exactly_once'
 const mode = env('CHAOS_MODE', 'stateless')
 const str = codec.string()

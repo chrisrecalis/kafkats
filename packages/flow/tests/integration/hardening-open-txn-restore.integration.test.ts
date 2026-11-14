@@ -16,7 +16,7 @@ import { newClient, readAllCommitted, sleep } from './eos-test-util.js'
 const str = codec.string()
 const num = codec.json<number>()
 
-describe('round3: restore with an open transaction on the changelog', () => {
+describe('hardening: restore with an open transaction on the changelog', () => {
 	let admin: KafkaClient
 	let producer: Producer
 	beforeAll(async () => {

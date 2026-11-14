@@ -14,7 +14,7 @@ const num = codec.json<number>()
 const KEYS = 8
 const PER_KEY = 50
 
-describe('round3: session loss (blocked event loop) with a second instance', () => {
+describe('hardening: session loss (blocked event loop) with a second instance', () => {
 	let admin: KafkaClient
 	let producer: Producer
 	const rejections: unknown[] = []

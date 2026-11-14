@@ -43,7 +43,7 @@ function makeSessionStore(overlapping: Array<[WindowedKey<string>, number]> = []
 		get: vi.fn(async () => undefined),
 		put: putSpy,
 		delete: vi.fn(async () => {}),
-		all: vi.fn(),
+		all: vi.fn(() => (async function* () {})()),
 		range: vi.fn(),
 		findSessions: vi.fn(() => sessions()),
 		remove: vi.fn(async () => {}),

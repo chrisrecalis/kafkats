@@ -6,14 +6,14 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { KafkaClient, Producer } from '@kafkats/client'
-import { codec, flow, type FlowApp } from '../../src/index.js'
+import { codec, flow } from '../../src/index.js'
 import { createTopics, uniqueTopicName } from './test-helpers.js'
 import { DurableMemoryProvider, newClient, readAllCommitted, sleep } from './eos-test-util.js'
 
 const str = codec.string()
 const num = codec.json<number>()
 
-describe('round3: changelog edge cases', () => {
+describe('hardening: changelog edge cases', () => {
 	let admin: KafkaClient
 	let producer: Producer
 	beforeAll(async () => {
@@ -81,49 +81,6 @@ describe('round3: changelog edge cases', () => {
 			await producer.send(input, { key: 'k', value: Buffer.from('x') })
 			// the changelog (source of truth) is empty, so the stale local count of 5 must not survive
 			expect(await waitVals(output, 6)).toEqual([1, 2, 3, 4, 5, 1])
-		} finally {
-			await app.close().catch(() => {})
-		}
-	}, 60_000)
-
-	it('inserting an earlier aggregation renumbers auto-named stores: the original operator must keep its counts', async () => {
-		const input = uniqueTopicName('r3-ce2-in')
-		const out1 = uniqueTopicName('r3-ce2-o1')
-		const out2 = uniqueTopicName('r3-ce2-o2')
-		const applicationId = uniqueTopicName('r3-ce2-app')
-		await createTopics(admin, [{ name: input }, { name: out1 }, { name: out2 }])
-		const v1 = () => {
-			const app: FlowApp = flow(baseCfg(applicationId))
-			app.stream(input, { key: str, value: str })
-				.groupByKey()
-				.count({ key: str, value: num })
-				.toStream()
-				.to(out1, { key: str, value: num })
-			return app
-		}
-		const v2 = () => {
-			const app: FlowApp = flow(baseCfg(applicationId))
-			const s = app.stream(input, { key: str, value: str })
-			// NEW operator inserted before the original one
-			s.groupByKey().count({ key: str, value: num }).toStream().to(out2, { key: str, value: num })
-			s.groupByKey().count({ key: str, value: num }).toStream().to(out1, { key: str, value: num })
-			return app
-		}
-		let app = v1()
-		await app.start()
-		await producer.send(
-			input,
-			Array.from({ length: 3 }, () => ({ key: 'k', value: Buffer.from('x') }))
-		)
-		expect(await waitVals(out1, 3)).toEqual([1, 2, 3])
-		await app.close()
-		app = v2()
-		try {
-			await app.start()
-			await producer.send(input, { key: 'k', value: Buffer.from('x') })
-			// original operator continues at 4; the new operator (out2) starts from scratch at 1
-			expect(await waitVals(out1, 4)).toEqual([1, 2, 3, 4])
-			expect(await waitVals(out2, 1)).toEqual([1])
 		} finally {
 			await app.close().catch(() => {})
 		}

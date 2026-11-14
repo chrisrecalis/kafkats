@@ -329,7 +329,7 @@ class FlowAppImpl implements FlowApp {
 			storeName,
 			partition => {
 				const raw = this.stateStoreProvider.createKeyValueStore<K, V>(
-					scope === 'partition' ? partitionStoreName(storeName, partition) : storeName,
+					this.providerStoreName(storeName, scope === 'partition' ? partition : undefined),
 					{ keyCodec, valueCodec }
 				)
 				const buffered = new BufferedKeyValueStore<K, V>(raw, keyCodec, valueCodec)
@@ -471,7 +471,7 @@ class FlowAppImpl implements FlowApp {
 			storeName,
 			partition => {
 				const raw = this.stateStoreProvider.createWindowStore<K, V>(
-					scope === 'partition' ? partitionStoreName(storeName, partition) : storeName,
+					this.providerStoreName(storeName, scope === 'partition' ? partition : undefined),
 					{
 						keyCodec,
 						valueCodec,
@@ -539,7 +539,7 @@ class FlowAppImpl implements FlowApp {
 			storeName,
 			partition => {
 				const raw = this.stateStoreProvider.createSessionStore<K, V>(
-					scope === 'partition' ? partitionStoreName(storeName, partition) : storeName,
+					this.providerStoreName(storeName, scope === 'partition' ? partition : undefined),
 					{ keyCodec, valueCodec, retentionMs: sessionOptions.retentionMs }
 				)
 				const buffered = new BufferedSessionStore<K, V>(
@@ -659,7 +659,10 @@ class FlowAppImpl implements FlowApp {
 		}
 
 		const storeName = options?.materialized?.storeName ?? `global-table-${resolved.topic}-${this.nextStoreId()}`
-		const store = this.stateStoreProvider.createKeyValueStore<K, V>(storeName, { keyCodec, valueCodec })
+		const store = this.stateStoreProvider.createKeyValueStore<K, V>(this.providerStoreName(storeName), {
+			keyCodec,
+			valueCodec,
+		})
 		this.stateStores.set(storeName, store as KeyValueStore<unknown, unknown>)
 		const storeRef = { store }
 
@@ -1062,6 +1065,16 @@ class FlowAppImpl implements FlowApp {
 	}
 
 	/** Stop and release everything. Safe to call on a partially started app. */
+	/**
+	 * Name under which a store (or one partition of it) is kept by the state store provider.
+	 * Prefixed with the application id so applications sharing one provider (e.g. one LMDB
+	 * directory) can never read or wipe each other's state.
+	 */
+	private providerStoreName(storeName: string, partition?: number): string {
+		const scoped = `${this.config.applicationId}.${storeName}`
+		return partition === undefined ? scoped : partitionStoreName(scoped, partition)
+	}
+
 	private async shutdown(): Promise<void> {
 		this.closing = true
 		this.shutdownController.abort()
@@ -1682,7 +1695,7 @@ class FlowAppImpl implements FlowApp {
 	private async startGlobalTable(table: GlobalTableDef): Promise<void> {
 		if (this.globalStoresStale) {
 			// The provider was closed by a previous close(); get a live store from it again.
-			table.store = this.stateStoreProvider.createKeyValueStore(table.storeName, {
+			table.store = this.stateStoreProvider.createKeyValueStore(this.providerStoreName(table.storeName), {
 				keyCodec: table.storeKeyCodec,
 				valueCodec: table.storeValueCodec,
 			})

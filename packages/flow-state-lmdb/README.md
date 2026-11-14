@@ -43,7 +43,7 @@ lmdb({
 })
 ```
 
-State is partitioned, so each partition of a store is its own LMDB database named `<storeName>.p<partition>`. Size `maxDbs` for the number of stores times the number of partitions.
+State is partitioned, so each partition of a store is its own LMDB database named `<applicationId>.<storeName>.p<partition>`. Size `maxDbs` for the number of stores times the number of partitions.
 
 ## Documentation
 

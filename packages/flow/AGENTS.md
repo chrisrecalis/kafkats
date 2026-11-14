@@ -21,7 +21,7 @@ src/
 ├── state.ts       # State store interfaces
 ├── state/
 │   ├── memory.ts       # In-memory state store implementation
-│   ├── partitioned.ts  # Per-partition slices of a store (<storeName>.p<partition>)
+│   ├── partitioned.ts  # Per-partition slices of a store (<applicationId>.<storeName>.p<partition>)
 │   ├── buffered.ts     # Transactional write buffer (exactly_once)
 │   └── changelog.ts    # Changelog-backed store wrappers
 ├── streams/       # KStream / KTable / grouped stream implementations
@@ -41,14 +41,15 @@ src/
 
 ### Runtime Model
 
-- **Partitioned state**: every source partition has its own slice of every state store. State partition N is logged to changelog partition N and restored from it. Provider-level store names are `<storeName>.p<partition>` (default LMDB `maxDbs` is 4096 for that reason).
+- **Partitioned state**: every source partition has its own slice of every state store. State partition N is logged to changelog partition N and restored from it. Provider-level store names are `<applicationId>.<storeName>.p<partition>` (default LMDB `maxDbs` is 4096 for that reason).
 - **Co-partitioning**: all topics feeding one stateful operation must have the same partition count, otherwise `start()` throws `CoPartitioningError`. Consumers always use the `range` assignor so partition N of every co-partitioned topic lands on the same worker.
 - **Repartitioning**: `groupBy()`, and `selectKey()`/`map()` followed by `groupByKey()`, a join or `toTable()`, write through an internal topic `<applicationId>-<name | repartition-N>-repartition` and read it back. `through(topic)` does the same with a user topic. Both are read from the beginning when the group has no committed offset. Needs key and value codecs.
 - **Global tables**: `globalTable()` is read in full by every instance outside the consumer group, loaded before processing starts, has no changelog and is only usable as the lookup side of a stream join.
 - **Exactly-once**: offsets, outputs and changelog records commit in one transaction. Store writes are buffered (`state/buffered.ts`) and applied only after the commit; an abort or crash never leaves uncommitted updates in a store.
-- **Fail-stop workers**: a worker that fails never continues past the failure. Recoverable failures (Kafka/infrastructure errors) abort the transaction, drop buffered state, rejoin and resume from committed offsets with backoff (0.5s to 30s), unless `restartOnError: false`. User-code errors and fatal Kafka errors set `state()` to `'ERROR'`; see `app.getError()`.
+- **Fail-stop workers**: a worker that fails never continues past the failure. Recoverable failures (Kafka/infrastructure errors) abort the transaction, drop buffered state, rejoin and resume from committed offsets with backoff (0.5s to 30s), unless `restartOnError: false`. A broker-aborted transaction (fenced producer after `transactionTimeoutMs`) is recoverable too. User-code errors and fatal Kafka errors set `state()` to `'ERROR'`; see `app.getError()`.
 - **Restoration**: newly assigned partitions are paused, restored from the changelog, then resumed. A restore with no progress for `changelog.restoration.idleTimeoutMs` (default 30000) fails. Checkpoints are ignored (wipe + rebuild) when outside the changelog offset range or when the local store is empty.
-- **Stream time** is tracked per source partition (late-record dropping, window expiry).
+- **Stream time** is tracked per source partition (late-record dropping, window expiry). Clocks are in memory and are re-seeded from the restored window/session store after a restart, rebalance or abort.
+- **Start position**: source partitions read from `'latest'` with no committed offset are pinned to the position the process first started at until the first commit.
 - **Known limitations**: stream-stream left/outer joins emit the unmatched result eagerly; derived tables (`filter`/`mapValues`/joins/windowed results) are not materialized and cannot be a join lookup side.
 
 User-facing documentation: `packages/docs/flow/fault-tolerance.md`.

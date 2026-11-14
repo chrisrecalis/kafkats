@@ -1,5 +1,5 @@
 /**
- * Child worker for round3 LMDB crash tests (spawned, never run directly by vitest).
+ * Child worker for hardening LMDB crash tests (spawned, never run directly by vitest).
  * Env: R3_BROKERS, R3_APP, R3_IN, R3_OUT, R3_STATE, R3_MODE=count|window, R3_GUARANTEE, R3_RESTORE_DELAY_MS (slow restore)
  */
 import { codec, flow, SessionWindows, TimeWindows } from '@kafkats/flow'
@@ -111,7 +111,7 @@ app.start().then(
 	() => log('started'),
 	e => {
 		log('start_failed', { message: (e as Error).message })
-		process.exit(2) // let the harness respawn (start() fails when the group join takes > 10s, see round3-restart-start test)
+		process.exit(2) // let the harness respawn (start() fails when the group join takes > 10s, see hardening-restart-start test)
 	}
 )
 setInterval(() => {}, 1 << 30)

@@ -12,7 +12,7 @@ import { newClient, readAllCommitted, sleep } from './eos-test-util.js'
 const str = codec.string()
 const num = codec.json<number>()
 
-describe('round3: stream time survives a restart', () => {
+describe('hardening: stream time survives a restart', () => {
 	let admin: KafkaClient
 	let producer: Producer
 	beforeAll(async () => {

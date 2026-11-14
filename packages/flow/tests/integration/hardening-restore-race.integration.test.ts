@@ -35,7 +35,7 @@ class SlowProvider extends DurableMemoryProvider {
 	}
 }
 
-describe('round3: restore race on re-assignment', () => {
+describe('hardening: restore race on re-assignment', () => {
 	let admin: KafkaClient
 	let producer: Producer
 	beforeAll(async () => {

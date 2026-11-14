@@ -30,7 +30,7 @@ describe('windowed/session reduce + session aggregate retention', () => {
 				data.set(JSON.stringify(k), v)
 			}),
 			delete: vi.fn(),
-			all: vi.fn(),
+			all: vi.fn(() => (async function* () {})()),
 			range: vi.fn(),
 			fetch: vi.fn(),
 			fetchAll: vi.fn(),
@@ -51,7 +51,7 @@ describe('windowed/session reduce + session aggregate retention', () => {
 			get: vi.fn().mockResolvedValue(undefined),
 			put: vi.fn(),
 			delete: vi.fn(),
-			all: vi.fn(),
+			all: vi.fn(() => (async function* () {})()),
 			range: vi.fn(),
 			findSessions: async function* () {
 				/* no overlapping sessions */

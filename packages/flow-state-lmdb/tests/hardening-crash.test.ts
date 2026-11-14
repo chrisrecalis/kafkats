@@ -1,13 +1,13 @@
 /**
  * Round 3 / attack 1: SIGKILL a flow app (LMDB state) many times while input flows, restart on the SAME state dir.
  * Requires built dists (pnpm -C packages/client build && pnpm -C packages/flow build) and KAFKA_BROKERS.
- * Run: KAFKA_BROKERS=127.0.0.1:19092 pnpm exec vitest run tests/round3-crash.test.ts
+ * Run: KAFKA_BROKERS=127.0.0.1:19092 pnpm exec vitest run tests/hardening-crash.test.ts
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { ChildWorker, createTopic, makeClient, readCommitted, sleep, uniq } from './round3-util.js'
+import { ChildWorker, createTopic, makeClient, readCommitted, sleep, uniq } from './hardening-util.js'
 
 const brokers = process.env.KAFKA_BROKERS?.split(',').map(b => b.trim())
 const KEYS = 8
@@ -15,7 +15,7 @@ const PER_KEY = 60
 // NOTE: timestamps must be near wall-clock: ancient record timestamps make the broker's time-based retention delete the output log
 const BASE = Math.floor(Date.now() / 1000) * 1000
 
-describe.skipIf(!brokers)('round3: SIGKILL + LMDB', () => {
+describe.skipIf(!brokers)('hardening: SIGKILL + LMDB', () => {
 	let client: any
 	let lastOut = ''
 	let lastWorkers: ChildWorker[] = []

@@ -54,7 +54,7 @@ function truthSessions(events: Ev[]): Record<string, { count: number; sum: numbe
 	return out
 }
 
-describe('round3: session windows under EOS', () => {
+describe('hardening: session windows under EOS', () => {
 	let admin: KafkaClient
 	let producer: Producer
 	beforeAll(async () => {

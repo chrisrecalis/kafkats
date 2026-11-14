@@ -1,4 +1,4 @@
-/** Child process app for round3 tests (spawned, not a test). Env: R3_BROKERS, R3_APP, R3_IN, R3_OUT, R3_SESSION_MS */
+/** Child process app for hardening tests (spawned, not a test). Env: R3_BROKERS, R3_APP, R3_IN, R3_OUT, R3_SESSION_MS */
 import { codec, flow } from '../../src/index.js'
 
 const str = codec.string()

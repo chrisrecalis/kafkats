@@ -36,7 +36,7 @@ class SlowProvider extends DurableMemoryProvider {
 	}
 }
 
-describe('round3: churn during slow restoration', () => {
+describe('hardening: churn during slow restoration', () => {
 	let admin: KafkaClient
 	let producer: Producer
 	const rejections: unknown[] = []

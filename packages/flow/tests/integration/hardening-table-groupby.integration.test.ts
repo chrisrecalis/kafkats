@@ -31,7 +31,7 @@ function lcg(seed: number) {
 	}
 }
 
-describe('round3: KTable.groupBy vs ground truth', () => {
+describe('hardening: KTable.groupBy vs ground truth', () => {
 	let admin: KafkaClient
 	let producer: Producer
 	beforeAll(async () => {

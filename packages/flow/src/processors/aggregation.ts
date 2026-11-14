@@ -173,6 +173,23 @@ export class StreamTimeTracker {
 	}
 
 	/**
+	 * Make sure the record's partition has a clock, seeding a new one from durable state.
+	 *
+	 * Clocks only live in memory and are dropped whenever the partition restarts from its committed
+	 * offset (restart, rebalance, aborted transaction). Starting again from 0 would accept a late
+	 * record that had already been dropped as past retention and overwrite the final result of an
+	 * expired window, so the clock resumes from the newest timestamp found in the restored store.
+	 */
+	async ensureClock(record: TimedRecord, seed: () => Promise<number>): Promise<void> {
+		const key = this.key(record)
+		if (this.clocks.has(key)) return
+		const streamTimeMs = await seed()
+		if (!this.clocks.has(key)) {
+			this.clocks.set(key, { streamTimeMs, lastCleanupMs: 0 })
+		}
+	}
+
+	/**
 	 * Advance the record's partition clock. Returns an expiry cutoff when a cleanup pass is due for
 	 * that partition (once per CLEANUP_INTERVAL_MS of stream time), otherwise undefined.
 	 */
@@ -192,6 +209,24 @@ export class StreamTimeTracker {
 		state.lastCleanupMs = state.streamTimeMs
 		return state.streamTimeMs
 	}
+}
+
+/** Newest window start in a window store: a lower bound of the stream time that produced it. */
+export async function newestWindowStart(store: { all(): AsyncIterable<[WindowedKey<unknown>, unknown]> }) {
+	let newest = 0
+	for await (const [windowedKey] of store.all()) {
+		if (windowedKey.windowStart > newest) newest = windowedKey.windowStart
+	}
+	return newest
+}
+
+/** Newest session end in a session store: the highest record timestamp that produced it. */
+export async function newestSessionEnd(store: { all(): AsyncIterable<[WindowedKey<unknown>, unknown]> }) {
+	let newest = 0
+	for await (const [windowedKey] of store.all()) {
+		if (windowedKey.windowEnd > newest) newest = windowedKey.windowEnd
+	}
+	return newest
 }
 
 // Stream-time-driven retention: advance the record's partition clock and fire expiry once per
@@ -271,6 +306,7 @@ export class WindowedReduceNode<K, V> extends Processor<K, V, Windowed<K>, V> {
 		if (value === null) return
 
 		const timestamp = Number(record.timestamp)
+		await this.cleanupState.ensureClock(record, () => newestWindowStart(store))
 		const retentionCutoff =
 			this.cleanupState.streamTime(record) - this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER
 		for (const { start, end } of windowStartsFor(timestamp, this.windowSizeMs, this.advanceMs)) {
@@ -334,6 +370,7 @@ export class SessionReduceNode<K, V> extends Processor<K, V, Windowed<K>, V> {
 		if (value === null) return
 
 		const timestamp = Number(record.timestamp)
+		await this.cleanupState.ensureClock(record, () => newestSessionEnd(store))
 		const searchFrom = timestamp - this.gapMs
 		const searchTo = timestamp + this.gapMs
 
@@ -433,6 +470,7 @@ export class WindowedAggregateNode<K, V, A> extends Processor<K, V, Windowed<K>,
 		}
 
 		const timestamp = Number(record.timestamp)
+		await this.cleanupState.ensureClock(record, () => newestWindowStart(store))
 		const retentionCutoff =
 			this.cleanupState.streamTime(record) - this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER
 		for (const { start, end } of windowStartsFor(timestamp, this.windowSizeMs, this.advanceMs)) {
@@ -505,6 +543,7 @@ export class SessionAggregateNode<K, V, A> extends Processor<K, V, Windowed<K>, 
 		}
 
 		const timestamp = Number(record.timestamp)
+		await this.cleanupState.ensureClock(record, () => newestSessionEnd(store))
 
 		// Find all sessions that could be merged with this event
 		// A session overlaps if the new event's timestamp is within gap of the session's boundaries

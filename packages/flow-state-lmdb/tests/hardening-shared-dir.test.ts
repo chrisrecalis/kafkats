@@ -2,21 +2,21 @@
  * Round 3 / attack 8: two apps with DIFFERENT applicationIds sharing one LMDB stateDir and the same store name.
  * LMDB database names are `<storeName>.p<partition>` only (no applicationId), so app B's start-up wipes/overwrites
  * app A's store, and A's (still valid) checkpoint then makes A trust B's data.
- * Run: KAFKA_BROKERS=127.0.0.1:19092 pnpm exec vitest run tests/round3-shared-dir.test.ts
+ * Run: KAFKA_BROKERS=127.0.0.1:19092 pnpm exec vitest run tests/hardening-shared-dir.test.ts
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { codec, flow } from '@kafkats/flow'
-import { createTopic, makeClient, readCommitted, sleep, uniq } from './round3-util.js'
+import { createTopic, makeClient, readCommitted, sleep, uniq } from './hardening-util.js'
 import { lmdb } from '@/lmdb.js'
 
 const brokers = process.env.KAFKA_BROKERS?.split(',').map(b => b.trim())
 const str = codec.string()
 const num = codec.json<number>()
 
-describe.skipIf(!brokers)('round3: apps with different applicationIds sharing one LMDB stateDir', () => {
+describe.skipIf(!brokers)('hardening: apps with different applicationIds sharing one LMDB stateDir', () => {
 	let client: any
 	let producer: any
 	beforeAll(async () => {

@@ -14,7 +14,7 @@ const num = codec.json<number>()
 const KEYS = 10
 const N = 30
 
-describe('round3: multi-thread EOS topologies with commit failures', () => {
+describe('hardening: multi-thread EOS topologies with commit failures', () => {
 	let admin: KafkaClient
 	let producer: Producer
 	beforeAll(async () => {

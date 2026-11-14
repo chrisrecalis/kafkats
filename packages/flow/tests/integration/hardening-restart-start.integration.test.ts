@@ -15,7 +15,7 @@ import { newClient, readAllCommitted, sleep } from './eos-test-util.js'
 const here = path.dirname(fileURLToPath(import.meta.url))
 const str = codec.string()
 
-describe('round3: replacement instance after SIGKILL', () => {
+describe('hardening: replacement instance after SIGKILL', () => {
 	let admin: KafkaClient
 	let producer: Producer
 	beforeAll(async () => {
@@ -33,7 +33,7 @@ describe('round3: replacement instance after SIGKILL', () => {
 		const output = uniqueTopicName('r3-rs-out')
 		const applicationId = uniqueTopicName('r3-rs-app')
 		await createTopics(admin, [{ name: input, partitions: 2 }, { name: output }])
-		const child = spawn(process.execPath, ['--import', 'tsx', path.join(here, 'round3-child-app.ts')], {
+		const child = spawn(process.execPath, ['--import', 'tsx', path.join(here, 'hardening-child-app.ts')], {
 			cwd: path.resolve(here, '../..'),
 			env: {
 				...process.env,

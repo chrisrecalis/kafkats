@@ -9,7 +9,7 @@ Redesign the `@kafkats/flow` runtime for correctness: partitioned state, reparti
 
 **Breaking and behaviour changes**
 
-- State is partitioned: each source partition has its own slice of every state store, logged to the changelog partition with the same index and restored from it. Provider-level store names are now `<storeName>.p<partition>`, and the default LMDB `maxDbs` is 4096.
+- State is partitioned: each source partition has its own slice of every state store, logged to the changelog partition with the same index and restored from it. Provider-level store names are now `<applicationId>.<storeName>.p<partition>`, and the default LMDB `maxDbs` is 4096.
 - Inputs to a stateful operation must be co-partitioned. All topics feeding one stateful operation (merged streams, both sides of a join, the stream and table of a join) need the same partition count, otherwise `start()` throws the new `CoPartitioningError`. Records with the same key must be in the same partition index.
 - `groupBy(fn, { key, value, name? })`, and `selectKey()`/`map()` followed by `groupByKey()`, a join or `toTable()`, now write through an internal topic `<applicationId>-<name | repartition-N>-repartition` and read it back. The topic is created at startup (it must exist with `changelog.autoCreate: false`), and key and value codecs are required. Pass `name` for a stable topic name.
 - `through(topic)` now continues from what is read back from the topic instead of passing records straight on. The topic must exist. Internal and `through()` topics are read from the beginning when the group has no committed offset.
@@ -26,6 +26,12 @@ Redesign the `@kafkats/flow` runtime for correctness: partitioned state, reparti
 - `globalTable()` is now really global.
 - `KTable.groupBy()` aggregations are repartitioned by the grouped key and are now correct with several instances or threads; an emptied group is removed in both processing modes.
 - Stream time is tracked per partition, stream-stream joins keep records with the same key and timestamp, `KTable.filter()` emits a tombstone when a row stops matching, `filter()`/`mapValues()` on tables never call your function for tombstones, session `reduce()` merges sessions in time order with `(aggregate, value)` argument order, `aggregate()` on session windows uses real sessions (and requires a `merger` option) instead of silently running as fixed windows, `to()`/`through()` keep the input record's timestamp, and tables from `count()`/`reduce()`/`aggregate()` can be joined.
+- Exactly-once: a transaction aborted by the broker after `transactionTimeoutMs` (stalled broker, frozen process) no longer stops the worker for good. It restarts with a fresh producer and reprocesses from the committed offsets.
+- A worker that restarts or gets a partition back before its first commit no longer re-resolves `'latest'` and skips the records it had read; the start position is kept until the first commit.
+- Stream time survives restarts and rebalances: it is rebuilt from the restored window or session store, so a late record that was dropped as past retention is not accepted after a restart.
+- Applications sharing one state store provider (for example one LMDB `stateDir`) no longer overwrite each other's state; provider-level store names include the application id.
+- `@kafkats/client`: consumers and producers recover after a broker restart or a dropped connection. Brokers re-dial dropped connections with backoff, the fetch loop backs off instead of spinning and reports failures through the `error` event, and group rebalance steps retry while the cluster is unreachable.
+- `@kafkats/client`: `consumer.stop()`, `producer.disconnect()` and `client.disconnect()` are bounded (about 5 seconds each) when a broker does not respond. Sends still in flight at that point are rejected.
 - `@kafkats/client`: multiple consumers on one `KafkaClient` no longer deadlock. Each consumer group member now uses a dedicated coordinator connection.
 - `TestDriver` feeds records written to a topic the topology also reads back into the topology, and `MockProducer` records timestamps and headers.
 

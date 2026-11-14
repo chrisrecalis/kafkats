@@ -15,7 +15,7 @@ export class ChildWorker {
 	pid = 0
 	constructor(readonly env: Record<string, string>) {}
 	start(): this {
-		this.proc = spawn(process.execPath, ['--import', TSX, path.join(here, 'round3-worker.ts')], {
+		this.proc = spawn(process.execPath, ['--import', TSX, path.join(here, 'hardening-worker.ts')], {
 			cwd: path.resolve(here, '..'),
 			env: { ...process.env, ...this.env },
 			stdio: ['ignore', 'pipe', 'pipe'],

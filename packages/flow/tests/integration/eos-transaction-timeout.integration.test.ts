@@ -63,7 +63,7 @@ describe('exactly_once: transaction aborted by the broker (transaction timeout)'
 			let counts: number[] = []
 			while (Date.now() < deadline) {
 				counts = (await readAllCommitted(client, out, 800)).map(m => Number(m.value))
-				if (counts.includes(6) || app.state() === "ERROR") break
+				if (counts.includes(6) || app.state() === 'ERROR') break
 			}
 			expect(app.state()).toBe('RUNNING')
 			expect(stalled).toBe(true)

@@ -45,7 +45,7 @@ A worker (one per `numStreamThreads`) that hits a failure **never continues past
 | **Recoverable**: broker or network errors, failed commits, lost sessions, restore failures     | The worker aborts its transaction, drops buffered state, rejoins the group and resumes from the last committed offsets |
 | **Not retried**: errors thrown by your code (mappers, aggregators, codecs), fatal Kafka errors | `state()` becomes `'ERROR'` and the worker stays stopped                                                               |
 
-Fatal Kafka errors are: fenced producer or instance, authorization failures, unsupported version, invalid session timeout or config, inconsistent group protocol, and message too large.
+Fatal Kafka errors are: fenced static group member, authorization failures, unsupported version, invalid session timeout or config, inconsistent group protocol, and message too large.
 
 Recoverable failures are retried with exponential backoff, starting at 0.5 seconds and capped at 30 seconds. The backoff resets once the worker has processed records again. Set `restartOnError: false` to disable restarts, so every failure puts the app in `'ERROR'`:
 
@@ -56,6 +56,10 @@ const app = flow({
 	restartOnError: false,
 })
 ```
+
+A transaction that stays open longer than `producer.transactionTimeoutMs` (a stalled broker, a frozen process) is aborted by the broker. The worker treats the resulting fenced-producer error as recoverable: it starts again with a fresh producer and reprocesses from the committed offsets.
+
+If the brokers are unreachable, workers keep retrying until they are back. `close()` stays bounded in that case, but it can take up to the request timeout plus a few seconds, because the final commit is attempted first.
 
 When the app is in `'ERROR'`, `app.getError()` returns the error. The records that were not committed are processed again after you restart the app:
 
@@ -131,11 +135,15 @@ A [global table](/flow/tables#global-tables) is fully loaded before any record i
 - **Stop all instances before upgrading.** Consumers now always use the `range` partition assignor (required for [co-partitioning](/flow/state-stores#co-partitioning)), which changes the group protocol, so old and new instances cannot be in the same group at the same time. A rolling upgrade does not work.
 - **Windowed stores, session stores and join buffers restart from empty.** Earlier versions did not write them partition-aligned, so their state cannot be reused. In-flight windows and joins start again after the upgrade.
 - **Key-value state is restored normally.** State from inputs that used the default partitioner is rebuilt from the changelog into the new per-partition stores.
-- **LMDB:** stores are now named `<storeName>.p<partition>`. The old unpartitioned databases stay in the file until you delete the state directory, and count towards `maxDbs`. Deleting it is safe, as state is rebuilt from the changelog.
+- **LMDB:** stores are now named `<applicationId>.<storeName>.p<partition>`. The old unpartitioned databases stay in the file until you delete the state directory, and count towards `maxDbs`. Deleting it is safe, as state is rebuilt from the changelog.
 - Topologies that re-key a stream (`selectKey()`, `map()`, `groupBy()`) before a stateful operation now write through [internal repartition topics](/flow/streams#repartitioning), and inputs to a stateful operation must be co-partitioned. See [Co-partitioning](/flow/state-stores#co-partitioning).
 - `through()` now reads the topic back. The topic must exist.
 
 ## Known Limitations
+
+- **Name your state stores and repartition topics before changing a topology.** Unnamed stores get names from the order in which operators are defined (`count-store-0`, `repartition-1`, ...). Adding or removing a stateful operator earlier in the topology shifts those numbers, and an operator then picks up another operator's changelog. Set `storeName` (and `name` for `groupBy()`) on every stateful operator of an application you plan to evolve.
+- **`offsetReset: 'latest'` can skip records after a crash before the first commit.** Within a running process the start position is kept until the first commit. A process that crashes before committing anything starts from the then-current end of the topic again. Use `'earliest'` when no record may be skipped.
+- **Stream time after a restart is rebuilt from the restored store.** For windowed aggregations it resumes from the newest window start, which can be up to one window size behind the stream time before the restart. A late record inside that margin can be accepted where an uninterrupted run would have dropped it.
 
 - **Stream-stream `leftJoin()` and `outerJoin()` emit the unmatched result eagerly.** When a later record matches, a second record is emitted for the same input.
 - **Derived tables are not materialized.** The result of `filter()` or `mapValues()` on a table, a table-table join, or a windowed aggregation has no state store of its own and cannot be the lookup side of a join. Join the table it was derived from instead, or write it to a topic and read it back with `app.table()`. Tables from `count()`, `reduce()` and `aggregate()` can be joined.

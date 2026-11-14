@@ -190,7 +190,7 @@ describe('changelog restorer', () => {
 
 		try {
 			await withTimeout('start', app.start(), 25_000)
-			const inner = provider.inners.get('counts.p0')!
+			const inner = [...provider.inners].find(([name]) => name.endsWith('.counts.p0'))![1]
 			for (let i = 1; i <= 5; i++) expect(await inner.get(`k${i}`)).toBe(i)
 		} finally {
 			await app.close().catch(() => {})
