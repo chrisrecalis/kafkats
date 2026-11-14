@@ -99,6 +99,8 @@ const DEFAULT_COMMIT_INTERVAL_MS = 100
 const WORKER_START_TIMEOUT_MS = 10_000
 const RESTART_INITIAL_BACKOFF_MS = 500
 const RESTART_MAX_BACKOFF_MS = 30_000
+/** How long after a revocation unowned in-memory state partitions are kept before being dropped. */
+const UNOWNED_STATE_PRUNE_DELAY_MS = 30_000
 
 type TopicPartition = { topic: string; partition: number }
 
@@ -190,7 +192,15 @@ class FlowAppImpl implements FlowApp {
 	private readonly eosEnabled: boolean
 	private readonly commitIntervalMs: number
 	readonly stateStoreProvider: StateStoreProvider
-	private readonly changelogCheckpointStore: ChangelogCheckpointStore | null
+	/**
+	 * Where changelog restore progress is tracked. Providers with durable state supply a durable
+	 * store; otherwise progress is tracked in-process, which is enough to catch a retained partition
+	 * up after a rebalance instead of rebuilding it from the start of the changelog.
+	 */
+	private readonly changelogCheckpointStore: ChangelogCheckpointStore
+	private readonly durableCheckpoints: boolean
+	private readonly processCheckpoints = new Map<string, bigint>()
+	private pruneTimer: ReturnType<typeof setTimeout> | null = null
 	readonly stateStores = new Map<string, KeyValueStore<unknown, unknown>>()
 	private readonly storeDefs = new Map<string, StoreDef>()
 	private readonly repartitionTopics = new Map<string, RepartitionTopicSpec>()
@@ -230,7 +240,16 @@ class FlowAppImpl implements FlowApp {
 			this.ownsClient = true
 		}
 		this.stateStoreProvider = config.stateStoreProvider ?? new InMemoryStateStoreProvider()
-		this.changelogCheckpointStore = this.stateStoreProvider.getChangelogCheckpointStore?.() ?? null
+		const durable = this.stateStoreProvider.getChangelogCheckpointStore?.()
+		this.durableCheckpoints = durable !== undefined
+		const inProcess = this.processCheckpoints
+		this.changelogCheckpointStore = durable ?? {
+			get: (topic, partition) => Promise.resolve(inProcess.get(`${topic}:${partition}`)),
+			set: (topic, partition, offset) => {
+				inProcess.set(`${topic}:${partition}`, offset)
+				return Promise.resolve()
+			},
+		}
 		this.logger = this.client.cluster
 			.getLogger()
 			.child({ component: 'flow', applicationId: config.applicationId, processId: this.processId })
@@ -363,9 +382,8 @@ class FlowAppImpl implements FlowApp {
 			},
 			() => recordContextStorage.getStore()?.worker.activeTransaction ?? null,
 			async result => {
-				if (!this.changelogCheckpointStore) {
-					return
-				}
+				// Mocked producers (tests) don't report offsets; nothing to checkpoint then.
+				if (!result || typeof result.offset !== 'bigint') return
 				const worker = recordContextStorage.getStore()?.worker
 				if (worker?.activeTransaction) {
 					// Checkpoint only once the transaction has committed (see commitTransactionBatch).
@@ -1033,6 +1051,12 @@ class FlowAppImpl implements FlowApp {
 			table.run = null
 		}
 
+		if (this.pruneTimer) {
+			clearTimeout(this.pruneTimer)
+			this.pruneTimer = null
+		}
+		this.processCheckpoints.clear()
+
 		// Drop in-process store instances; the provider owns (and closes) the underlying stores.
 		for (const def of this.storeDefs.values()) {
 			for (const partition of def.partitions.materializedPartitions()) {
@@ -1362,7 +1386,10 @@ class FlowAppImpl implements FlowApp {
 	 */
 	private enqueueRestoration(partitions: TopicPartition[]): Promise<void> {
 		const task = this.restorationQueue.then(() => this.restorePartitions(partitions))
-		this.restorationQueue = task.catch(() => {})
+		this.restorationQueue = task.catch(err => {
+			// A restore failure during startup fails start() (see drainRestorations).
+			if (!this.started) this.startupError ??= toError(err)
+		})
 		return task
 	}
 
@@ -1413,7 +1440,7 @@ class FlowAppImpl implements FlowApp {
 				this.client,
 				this.config.changelog?.restoration,
 				partitions,
-				this.changelogCheckpointStore ?? undefined
+				this.changelogCheckpointStore
 			)
 		} catch (err) {
 			// A changelog topic that doesn't exist yet has nothing to restore (first startup with
@@ -1442,29 +1469,37 @@ class FlowAppImpl implements FlowApp {
 		}
 
 		const groupId = this.config.applicationId
-		const coordinator = await this.client.cluster.getCoordinator('GROUP', groupId)
-		const response = await coordinator.offsetFetch({
-			groupId,
-			topics: [...byTopic].map(([name, parts]) => ({
-				name,
-				partitions: parts.map(partitionIndex => ({ partitionIndex })),
-			})),
-			requireStable: true,
-		})
-		if (response.errorCode !== ErrorCode.None) {
-			throw new KafkaError(`OffsetFetch failed for group ${groupId}`, response.errorCode)
+		const topics = [...byTopic].map(([name, parts]) => ({
+			name,
+			partitions: parts.map(partitionIndex => ({ partitionIndex })),
+		}))
+		// Offsets of an in-flight transaction (another instance committing) are reported as
+		// unstable; wait for them rather than guessing.
+		const deadline = Date.now() + 30_000
+		let response
+		for (;;) {
+			try {
+				const coordinator = await this.client.cluster.getCoordinator('GROUP', groupId)
+				response = await coordinator.offsetFetch({ groupId, topics, requireStable: true })
+				const code =
+					response.errorCode !== ErrorCode.None
+						? response.errorCode
+						: response.topics.flatMap(t => t.partitions).find(p => p.errorCode !== ErrorCode.None)
+								?.errorCode
+				if (code === undefined) break
+				throw new KafkaError(`OffsetFetch failed for group ${groupId}`, code)
+			} catch (err) {
+				const retriable = err instanceof KafkaError && err.retriable
+				if (!retriable || Date.now() > deadline || this.closing) throw err
+				this.client.cluster.invalidateCoordinator('GROUP', groupId)
+				await new Promise(resolve => setTimeout(resolve, 200))
+			}
 		}
 
 		const admin = this.client.admin()
 		for (const topic of response.topics) {
 			const uncommitted: number[] = []
 			for (const partition of topic.partitions) {
-				if (partition.errorCode !== ErrorCode.None) {
-					throw new KafkaError(
-						`OffsetFetch failed for ${topic.name}-${partition.partitionIndex}`,
-						partition.errorCode
-					)
-				}
 				if (partition.committedOffset < 0n) uncommitted.push(partition.partitionIndex)
 			}
 			if (uncommitted.length === 0) continue
@@ -1487,11 +1522,11 @@ class FlowAppImpl implements FlowApp {
 	}
 
 	/**
-	 * Drop the local state of partitions this instance no longer owns.
+	 * Partitions were revoked or lost: drop anything buffered for them and schedule a cleanup.
 	 *
-	 * Another instance is now advancing that state. Without a checkpoint store the local copy
-	 * can't be caught up incrementally, so it is cleared (and rebuilt from the changelog if the
-	 * partition ever comes back) instead of lingering as stale data.
+	 * The local copy is kept for now, because the partition often comes straight back (every
+	 * rebalance revokes before it re-assigns) and can then be caught up from its checkpoint instead
+	 * of being rebuilt from the start of the changelog.
 	 */
 	private releasePartitions(released: TopicPartition[]): void {
 		if (released.length === 0) return
@@ -1506,16 +1541,46 @@ class FlowAppImpl implements FlowApp {
 					if (!def.partitions.materializedPartitions().includes(partition)) continue
 					const stack = await def.partitions.forPartition(partition)
 					stack.buffer.discardBuffer()
-					if (!this.changelogCheckpointStore && !this.closing) {
-						await clearStore(stack.raw as unknown as KeyValueStore<unknown, unknown>)
-						def.partitions.forget(partition)
-					}
 				}
 			}
 		})
 		this.restorationQueue = task.catch(err => {
 			this.logger.warn('failed to release state of revoked partitions', { error: toError(err).message })
 		})
+		this.schedulePrune()
+	}
+
+	/**
+	 * Once assignments have settled, drop the in-memory state of partitions this instance no longer
+	 * owns. Another instance is advancing that state now, so the local copy would only go stale and
+	 * hold memory. Durable state (with durable checkpoints) is kept on disk for a later return.
+	 */
+	private schedulePrune(): void {
+		if (this.durableCheckpoints) return
+		if (this.pruneTimer) clearTimeout(this.pruneTimer)
+		this.pruneTimer = setTimeout(() => {
+			this.pruneTimer = null
+			if (this.closing) return
+			const task = this.restorationQueue.then(async () => {
+				for (const def of this.storeDefs.values()) {
+					if (def.scope !== 'partition') continue
+					for (const partition of def.partitions.materializedPartitions()) {
+						if (this.closing || this.isStatePartitionOwned(def, partition)) continue
+						const stack = await def.partitions.forPartition(partition)
+						stack.buffer.discardBuffer()
+						await clearStore(stack.raw as unknown as KeyValueStore<unknown, unknown>)
+						def.partitions.forget(partition)
+						if (def.changelog) {
+							this.processCheckpoints.delete(`${def.changelog.topicName}:${partition}`)
+						}
+					}
+				}
+			})
+			this.restorationQueue = task.catch(err => {
+				this.logger.warn('failed to prune state of unowned partitions', { error: toError(err).message })
+			})
+		}, UNOWNED_STATE_PRUNE_DELAY_MS)
+		this.pruneTimer.unref?.()
 	}
 
 	private isStatePartitionOwned(def: StoreDef, partition: number): boolean {
@@ -1950,7 +2015,7 @@ class FlowAppImpl implements FlowApp {
 	private async flushChangelogCheckpoints(
 		checkpoints: Array<{ topic: string; partition: number; offset: bigint }>
 	): Promise<void> {
-		if (!this.changelogCheckpointStore || checkpoints.length === 0) {
+		if (checkpoints.length === 0) {
 			return
 		}
 
