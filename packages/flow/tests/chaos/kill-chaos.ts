@@ -10,8 +10,19 @@
  * Exit code 0 = PASS, 1 = FAIL. Prints evidence (missing/dup/gaps, unhandled rejections, worker error states).
  */
 import {
-	Worker, workerEnv, makeClient, createTopics, genInput, produceBatches, readAll, uid, sleep, rnd,
-	summarizeStateless, summarizeCount, type Out,
+	Worker,
+	workerEnv,
+	makeClient,
+	createTopics,
+	genInput,
+	produceBatches,
+	readAll,
+	uid,
+	sleep,
+	rnd,
+	summarizeStateless,
+	summarizeCount,
+	type Out,
 } from './common.js'
 
 const arg = (n: string, d: string) => {
@@ -65,7 +76,9 @@ for (let k = 0; k < kills; k++) {
 	// prefer to kill a worker that is actively processing (wait up to 15s for its counter to be > 0)
 	for (let i = 0; i < 30 && !((victim.last('status')?.processed ?? 0) > 0); i++) await sleep(500)
 	await victim.kill()
-	console.log(`  kill #${k + 1} ${victim.label} (processed=${victim.last('status')?.processed}, state=${victim.last('status')?.state})`)
+	console.log(
+		`  kill #${k + 1} ${victim.label} (processed=${victim.last('status')?.processed}, state=${victim.last('status')?.state})`
+	)
 	await sleep(rnd(0, 1500))
 	spawnWorker(slot)
 }
@@ -92,14 +105,28 @@ const drainTook = Date.now() - t0
 // let it settle, then final re-read (catches late dupes)
 await sleep(5000)
 outs = await readAll(client, output, isolation, { quietMs: 6000, maxMs: 40000 })
-sum = mode === 'stateless' ? summarizeStateless(inputs, outs) : summarizeCount(keys, perKey, outs, undefined, mode === 'regroup' ? 'nk' : 'k')
+sum =
+	mode === 'stateless'
+		? summarizeStateless(inputs, outs)
+		: summarizeCount(keys, perKey, outs, undefined, mode === 'regroup' ? 'nk' : 'k')
 
 if (process.env.CHAOS_DUMP) {
 	const { writeFileSync } = await import('node:fs')
-	writeFileSync(process.env.CHAOS_DUMP, JSON.stringify({ outs, workers: all.map(w => ({ label: w.label, lines: w.lines.filter(l => l.type !== 'status') })) }, (_, v) => (typeof v === 'bigint' ? v.toString() : v)))
+	writeFileSync(
+		process.env.CHAOS_DUMP,
+		JSON.stringify(
+			{ outs, workers: all.map(w => ({ label: w.label, lines: w.lines.filter(l => l.type !== 'status') })) },
+			(_, v) => (typeof v === 'bigint' ? v.toString() : v)
+		)
+	)
 }
 const unhandled = all.flatMap(w => w.lines.filter(l => /UNHANDLED|UNCAUGHT/.test(l.type)))
-const errStates = all.flatMap(w => w.lines.filter(l => l.type === 'status' && (l.state === 'ERROR' || l.error)).slice(0, 1).map(l => ({ w: l.label, state: l.state, error: l.error })))
+const errStates = all.flatMap(w =>
+	w.lines
+		.filter(l => l.type === 'status' && (l.state === 'ERROR' || l.error))
+		.slice(0, 1)
+		.map(l => ({ w: l.label, state: l.state, error: l.error }))
+)
 const startFails = all.flatMap(w => w.lines.filter(l => l.type === 'start_failed'))
 
 let pass: boolean
@@ -109,8 +136,15 @@ if (guarantee === 'exactly_once') {
 	pass = mode === 'stateless' ? sum.missing === 0 : sum.belowKeys === 0 && sum.lastBelowKeys === 0
 }
 console.log(`RESULT ${label}: ${pass ? 'PASS' : 'FAIL'} (drain ${drainTook}ms)`)
-console.log('  summary:', JSON.stringify(sum, (_, v) => (typeof v === 'bigint' ? v.toString() : v)))
-console.log('  unhandled rejections/exceptions:', unhandled.length, unhandled.slice(0, 3).map(u => u.message))
+console.log(
+	'  summary:',
+	JSON.stringify(sum, (_, v) => (typeof v === 'bigint' ? v.toString() : v))
+)
+console.log(
+	'  unhandled rejections/exceptions:',
+	unhandled.length,
+	unhandled.slice(0, 3).map(u => u.message)
+)
 console.log('  worker ERROR states/errors:', JSON.stringify(errStates))
 console.log('  start failures:', JSON.stringify(startFails.map(s => s.message)))
 
@@ -118,7 +152,9 @@ for (const w of slots) {
 	if (w.alive) {
 		const s = Date.now()
 		const r = await Promise.race([w.term(), sleep(30000).then(() => 'TIMEOUT')])
-		console.log(`  graceful close of ${w.label}: ${r === 'TIMEOUT' ? 'HUNG >30s (killing)' : Date.now() - s + 'ms'}`)
+		console.log(
+			`  graceful close of ${w.label}: ${r === 'TIMEOUT' ? 'HUNG >30s (killing)' : Date.now() - s + 'ms'}`
+		)
 		if (r === 'TIMEOUT') await w.kill()
 	}
 }

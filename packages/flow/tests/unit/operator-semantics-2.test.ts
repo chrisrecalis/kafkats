@@ -234,7 +234,10 @@ describe('session window aggregate via DSL', () => {
 
 		await driver.run(async ({ consumer }) => {
 			const send = (value: string, timestamp: number) =>
-				consumer.sendMessage('events', Buffer.from(value), { key: Buffer.from('k'), timestamp: BigInt(timestamp) })
+				consumer.sendMessage('events', Buffer.from(value), {
+					key: Buffer.from('k'),
+					timestamp: BigInt(timestamp),
+				})
 			await send('a', 1000)
 			await send('c', 1200)
 			// Bridges both sessions: one session [1000, 1200] remains.

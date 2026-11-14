@@ -29,17 +29,28 @@ export async function createTopics(client: KafkaClient, names: string[], partiti
 	const deadline = Date.now() + 20000
 	while (Date.now() < deadline) {
 		const meta = await client.getMetadata(names)
-		if (names.every(n => {
-			const t = meta.topics.get(n)
-			return t && t.partitions.size === partitions && [...t.partitions.values()].every(p => p.leaderId >= 0)
-		})) return
+		if (
+			names.every(n => {
+				const t = meta.topics.get(n)
+				return t && t.partitions.size === partitions && [...t.partitions.values()].every(p => p.leaderId >= 0)
+			})
+		)
+			return
 		await sleep(100)
 	}
 	throw new Error('topics not ready')
 }
 
-export interface Rec { key: string; value: string }
-export interface Out { partition: number; offset: bigint; key: string; value: string }
+export interface Rec {
+	key: string
+	value: string
+}
+export interface Out {
+	partition: number
+	offset: bigint
+	key: string
+	value: string
+}
 
 /** Read all of `topic` with a fresh group until `done(msgs)` is true, or `quietMs` passes with no new message, or maxMs. */
 export async function readAll(
@@ -105,7 +116,8 @@ export class Worker {
 					const j = JSON.parse(line)
 					j.label = this.label
 					this.lines.push(j)
-					if (/UNHANDLED|UNCAUGHT|start_failed|close_error/.test(j.type)) console.log(`  [${this.label}]`, line)
+					if (/UNHANDLED|UNCAUGHT|start_failed|close_error/.test(j.type))
+						console.log(`  [${this.label}]`, line)
 				} catch {
 					this.lines.push({ type: 'raw', line, label: this.label })
 				}
@@ -209,7 +221,13 @@ export function summarizeStateless(inputs: Rec[], outs: Out[]) {
 }
 
 /** counts per key in output order. returns {gaps, repeats, maxByKey, finalByKey} relative to expected perKey. */
-export function summarizeCount(keys: number, perKeyDefault: number, outs: Out[], expectedByKey?: Map<string, number>, keyPrefix = 'k') {
+export function summarizeCount(
+	keys: number,
+	perKeyDefault: number,
+	outs: Out[],
+	expectedByKey?: Map<string, number>,
+	keyPrefix = 'k'
+) {
 	const byKey = new Map<string, number[]>()
 	for (const o of outs) {
 		const a = byKey.get(o.key) ?? []
@@ -235,7 +253,8 @@ export function summarizeCount(keys: number, perKeyDefault: number, outs: Out[],
 			belowKeys++
 			maxBelow = Math.max(maxBelow, perKey - max)
 		}
-		if (!exact && problems.length < 6) problems.push(`k${k}: n=${a.length} max=${max} last=${last} seq=${compress(a)}`)
+		if (!exact && problems.length < 6)
+			problems.push(`k${k}: n=${a.length} max=${max} last=${last} seq=${compress(a)}`)
 	}
 	return { keys, perKey: perKeyDefault, exactKeys, belowKeys, lastBelowKeys, nonMonotonicKeys, maxBelow, problems }
 }

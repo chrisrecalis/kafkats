@@ -24,7 +24,7 @@ describe('round2: stream time across aborted transactions', () => {
 	// transaction that is later aborted. After the worker restarts and re-reads the same records,
 	// the old record is judged "late" (its window is older than streamTime - 24 windows) and dropped,
 	// so the committed output differs from a failure-free run.
-	it('exactly_once windowed count after an aborted commit equals a failure-free pass', async () => {
+	const scenario = async (inject: boolean) => {
 		const input = uniqueTopicName('r2-st-in')
 		const output = uniqueTopicName('r2-st-out')
 		const applicationId = uniqueTopicName('r2-st-app')
@@ -37,7 +37,7 @@ describe('round2: stream time across aborted transactions', () => {
 
 		const client = newClient('r2-st-app')
 		let failures = 0
-		injectCommitFailures(client, () => failures++ < 1)
+		if (inject) injectCommitFailures(client, () => failures++ < 1)
 		const app: FlowApp = flow({
 			applicationId,
 			client,
@@ -51,16 +51,24 @@ describe('round2: stream time across aborted transactions', () => {
 			.windowedBy(TimeWindows.of(1_000))
 			.count({ storeName: 'w', value: numberCodec })
 			.toStream()
-			.selectKey((_v, k) => `${(k as unknown as { key: string }).key}@${(k as unknown as { window: { start: number } }).window.start}`)
+			.selectKey(
+				(_v, k) =>
+					`${(k as unknown as { key: string }).key}@${(k as unknown as { window: { start: number } }).window.start}`
+			)
 			.to(output, { key: stringCodec, value: numberCodec })
 		try {
 			await app.start()
 			await sleep(9_000)
-			const out = (await readAllCommitted(admin, output)).map(m => `${m.key!.toString()}=${numberCodec.decode(m.value!)}`)
-			expect(failures).toBeGreaterThanOrEqual(2) // failed once, then succeeded
+			const out = (await readAllCommitted(admin, output)).map(
+				m => `${m.key!.toString()}=${numberCodec.decode(m.value!)}`
+			)
+			if (inject) expect(failures).toBeGreaterThanOrEqual(2) // failed once, then succeeded
 			expect(out.sort()).toEqual([`a@${base}=1`, `a@${base + 100_000}=1`].sort())
 		} finally {
 			await app.close()
 		}
-	}, 60_000)
+	}
+
+	it('control: failure-free pass', () => scenario(false), 60_000)
+	it('exactly_once windowed count after an aborted commit equals a failure-free pass', () => scenario(true), 60_000)
 })

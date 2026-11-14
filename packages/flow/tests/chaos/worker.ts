@@ -32,7 +32,10 @@ const log = (type: string, extra: Record<string, unknown> = {}) =>
 
 process.on('unhandledRejection', (reason: unknown) => {
 	const r = reason as Error
-	log('UNHANDLED_REJECTION', { message: r?.message ?? String(reason), stack: r?.stack?.split('\n').slice(0, 6).join(' | ') })
+	log('UNHANDLED_REJECTION', {
+		message: r?.message ?? String(reason),
+		stack: r?.stack?.split('\n').slice(0, 6).join(' | '),
+	})
 })
 process.on('uncaughtException', (err: Error) => {
 	log('UNCAUGHT_EXCEPTION', { message: err.message, stack: err.stack?.split('\n').slice(0, 6).join(' | ') })
@@ -41,12 +44,27 @@ process.on('uncaughtException', (err: Error) => {
 // CHAOS_TRACE_RESTORE=1: wrap ChangelogRestorer.restore (runtime monkeypatch, src untouched) to log what each restoration did.
 if (process.env.CHAOS_TRACE_RESTORE) {
 	const orig = (ChangelogRestorer.prototype as any).restore
-	;(ChangelogRestorer.prototype as any).restore = async function (this: any, client: any, opts: any, partitions: any, cp: any) {
+	;(ChangelogRestorer.prototype as any).restore = async function (
+		this: any,
+		client: any,
+		opts: any,
+		partitions: any,
+		cp: any
+	) {
 		const st = Date.now()
 		const admin = client.admin()
-		const lso = await admin.fetchTopicOffsets(this.topicName, partitions, 'latest', { isolationLevel: 'read_committed' })
-		const hw = await admin.fetchTopicOffsets(this.topicName, partitions, 'latest', { isolationLevel: 'read_uncommitted' })
-		log('restore_begin', { topic: this.topicName, partitions, lso: [...lso].map(([p, o]) => `${p}:${o}`), hw: [...hw].map(([p, o]) => `${p}:${o}`) })
+		const lso = await admin.fetchTopicOffsets(this.topicName, partitions, 'latest', {
+			isolationLevel: 'read_committed',
+		})
+		const hw = await admin.fetchTopicOffsets(this.topicName, partitions, 'latest', {
+			isolationLevel: 'read_uncommitted',
+		})
+		log('restore_begin', {
+			topic: this.topicName,
+			partitions,
+			lso: [...lso].map(([p, o]) => `${p}:${o}`),
+			hw: [...hw].map(([p, o]) => `${p}:${o}`),
+		})
 		try {
 			const n = await orig.call(this, client, opts, partitions, cp)
 			const vals: unknown[] = []
@@ -82,7 +100,12 @@ const app = flow({
 	changelog: {
 		restoration: process.env.CHAOS_RESTORE_DEFAULT
 			? undefined
-			: { idleTimeoutMs: Number(env('CHAOS_RESTORE_IDLE_MS', '300')), initialIdleTimeoutMs: 5000, checkIntervalMs: 50, consumerMaxWaitMs: 50 },
+			: {
+					idleTimeoutMs: Number(env('CHAOS_RESTORE_IDLE_MS', '300')),
+					initialIdleTimeoutMs: 5000,
+					checkIntervalMs: 50,
+					consumerMaxWaitMs: 50,
+				},
 	},
 })
 
@@ -141,7 +164,12 @@ const s = Date.now()
 log('start_begin')
 const startP = app.start().then(
 	() => log('started', { ms: Date.now() - s, state: app.state() }),
-	e => log('start_failed', { ms: Date.now() - s, message: (e as Error).message, stack: (e as Error).stack?.split('\n').slice(0, 5).join(' | ') })
+	e =>
+		log('start_failed', {
+			ms: Date.now() - s,
+			message: (e as Error).message,
+			stack: (e as Error).stack?.split('\n').slice(0, 5).join(' | '),
+		})
 )
 if (process.env.CHAOS_CLOSE_DURING_START) {
 	setTimeout(() => void shutdown('close-during-start'), Number(process.env.CHAOS_CLOSE_DURING_START_DELAY_MS ?? 0))

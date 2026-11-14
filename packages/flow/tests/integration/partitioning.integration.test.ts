@@ -687,7 +687,6 @@ describe('state/changelog partitioning', () => {
 		const build = (app: FlowApp) => {
 			const gt = app.globalTable(cfg, { key: stringCodec, value: stringCodec, materialized: { storeName: 'gt' } })
 			app.stream(events, { key: stringCodec, value: stringCodec })
-				.selectKey(v => v as string) // event value names the config key to look up
 				.leftJoin(gt, (v, c) => `${v}:${c ?? 'MISSING'}`)
 				.to(out, { key: stringCodec, value: stringCodec })
 		}
@@ -707,7 +706,7 @@ describe('state/changelog partitioning', () => {
 			await waitAssign(appId, [`${appId}-a1`, `${appId}-a2`], events, 2)
 			// every event partition (one per instance) looks up keys of both table partitions
 			for (const p of [0, 1])
-				for (const k of cfgKeys) await producer.send(events, { key: 'e', value: Buffer.from(k), partition: p })
+				for (const k of cfgKeys) await producer.send(events, { key: k, value: Buffer.from(k), partition: p })
 			const expected = [...cfgKeys, ...cfgKeys].map(k => `${k}:val-${k}`)
 			await waitUntil(() => collector.getTopicMessages<string, string>(out).length >= expected.length, 20_000)
 			const results = collector.getTopicMessages<string, string>(out).map(m => String(m.value))

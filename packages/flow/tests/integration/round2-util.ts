@@ -69,14 +69,17 @@ export function injectCommitFailures(client: KafkaClient, shouldFail: () => bool
 		const originalTransaction = producer.transaction.bind(producer)
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		;(producer as any).transaction = (fn: any, ...rest: any[]) =>
-			originalTransaction(async (tx: any) => {
-				const sendOffsets = tx.sendOffsets.bind(tx)
-				tx.sendOffsets = async (...args: any[]) => {
-					if (shouldFail()) throw new KafkaError('injected commit failure', code)
-					return sendOffsets(...args)
-				}
-				return fn(tx)
-			}, ...rest)
+			originalTransaction(
+				async (tx: any) => {
+					const sendOffsets = tx.sendOffsets.bind(tx)
+					tx.sendOffsets = async (...args: any[]) => {
+						if (shouldFail()) throw new KafkaError('injected commit failure', code)
+						return sendOffsets(...args)
+					}
+					return fn(tx)
+				},
+				...rest
+			)
 		return producer
 	}
 }

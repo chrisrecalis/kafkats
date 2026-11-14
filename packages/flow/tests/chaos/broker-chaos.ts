@@ -13,8 +13,18 @@
  */
 import { execSync } from 'node:child_process'
 import {
-	Worker, workerEnv, makeClient, createTopics, genInput, readAll, uid, sleep, CONTAINER,
-	summarizeStateless, summarizeCount, type Rec,
+	Worker,
+	workerEnv,
+	makeClient,
+	createTopics,
+	genInput,
+	readAll,
+	uid,
+	sleep,
+	CONTAINER,
+	summarizeStateless,
+	summarizeCount,
+	type Rec,
 } from './common.js'
 
 const arg = (n: string, d: string) => {
@@ -53,7 +63,10 @@ const sendLoop = (async () => {
 			try {
 				const c = (globalThis as any).__pc ?? client
 				const p = c.producer({ lingerMs: 0 })
-				await p.send(input, slice.map(r => ({ key: r.key, value: Buffer.from(r.value) })))
+				await p.send(
+					input,
+					slice.map(r => ({ key: r.key, value: Buffer.from(r.value) }))
+				)
 				await p.disconnect()
 				break
 			} catch {
@@ -69,7 +82,11 @@ const sendLoop = (async () => {
 const w = new Worker('w0', workerEnv({ appId, input, output, mode, guarantee })).start()
 const sample = () => {
 	const s = w.last('status')
-	return { state: s?.state as string | undefined, processed: (s?.processed as number) ?? 0, error: s?.error as string | null }
+	return {
+		state: s?.state as string | undefined,
+		processed: (s?.processed as number) ?? 0,
+		error: s?.error as string | null,
+	}
 }
 // wait for processing to begin
 for (let i = 0; i < 60 && sample().processed < 40; i++) await sleep(500)
@@ -108,7 +125,9 @@ while (Date.now() - obsStart < recoverMs) {
 	if (s.processed > lastProcessed && resumedAt === null && Date.now() > faultAt + 500) {
 		// first progress after the fault
 		resumedAt = Date.now()
-		ev(`processing progressed after fault (processed ${lastProcessed} -> ${s.processed}) ${((resumedAt - brokerBackAt) / 1000).toFixed(1)}s after broker back`)
+		ev(
+			`processing progressed after fault (processed ${lastProcessed} -> ${s.processed}) ${((resumedAt - brokerBackAt) / 1000).toFixed(1)}s after broker back`
+		)
 	}
 	lastProcessed = s.processed
 	if (!w.alive) {
@@ -126,7 +145,10 @@ while (Date.now() - obsStart < recoverMs) {
 await sendLoop.catch(() => {})
 const final = sample()
 const unhandled = w.lines.filter(l => /UNHANDLED|UNCAUGHT/.test(l.type))
-const stderr = w.lines.filter(l => l.type === 'stderr').map(l => l.line.trim()).slice(0, 5)
+const stderr = w.lines
+	.filter(l => l.type === 'stderr')
+	.map(l => l.line.trim())
+	.slice(0, 5)
 
 // verify with a fresh client (old one may hold dead connections)
 await client.disconnect().catch(() => {})
@@ -137,7 +159,8 @@ const expectedByKey = new Map<string, number>()
 for (const r of actualRecs) expectedByKey.set(r.key, (expectedByKey.get(r.key) ?? 0) + 1)
 const dedupInput = new Set(actualRecs.map(r => r.value)).size !== actualRecs.length
 let outs = await readAll(client, output, isolation, { quietMs: 8000, maxMs: 60000 })
-const sum = mode === 'stateless' ? summarizeStateless(actualRecs, outs) : summarizeCount(keys, perKey, outs, expectedByKey)
+const sum =
+	mode === 'stateless' ? summarizeStateless(actualRecs, outs) : summarizeCount(keys, perKey, outs, expectedByKey)
 
 // Is the app actually dead? Produce 1 sentinel per key and see if it still processes.
 let stillAlive = 'n/a'
@@ -153,20 +176,48 @@ if (w.alive) {
 
 let pass: boolean
 if (guarantee === 'exactly_once') {
-	pass = mode === 'stateless' ? (sum as any).missing === 0 && (sum as any).dupes === 0 : (sum as any).exactKeys === keys
+	pass =
+		mode === 'stateless' ? (sum as any).missing === 0 && (sum as any).dupes === 0 : (sum as any).exactKeys === keys
 } else {
-	pass = mode === 'stateless' ? (sum as any).missing === 0 : (sum as any).belowKeys === 0 && (sum as any).lastBelowKeys === 0
+	pass =
+		mode === 'stateless'
+			? (sum as any).missing === 0
+			: (sum as any).belowKeys === 0 && (sum as any).lastBelowKeys === 0
 }
 if (final.state === 'ERROR' || stillAlive.startsWith('NO')) pass = false
 console.log(`RESULT ${label}: ${pass ? 'PASS' : 'FAIL'}`)
-console.log('  fault->broker back:', ((brokerBackAt - faultAt) / 1000).toFixed(1) + 's; resumed after broker back:', resumedAt ? ((resumedAt - brokerBackAt) / 1000).toFixed(1) + 's' : 'NEVER (within observation)')
+console.log(
+	'  fault->broker back:',
+	((brokerBackAt - faultAt) / 1000).toFixed(1) + 's; resumed after broker back:',
+	resumedAt ? ((resumedAt - brokerBackAt) / 1000).toFixed(1) + 's' : 'NEVER (within observation)'
+)
 console.log('  state timeline:', timeline)
-console.log('  final worker state:', JSON.stringify(final), 'process alive:', w.alive, 'processes sentinel:', stillAlive)
+console.log(
+	'  final worker state:',
+	JSON.stringify(final),
+	'process alive:',
+	w.alive,
+	'processes sentinel:',
+	stillAlive
+)
 console.log('  input harness dup:', dedupInput, 'actual input records:', actualRecs.length)
-console.log('  summary:', JSON.stringify(sum, (_, v) => (typeof v === 'bigint' ? v.toString() : v)))
-console.log('  unhandled:', unhandled.length, unhandled.slice(0, 4).map(u => `${u.message} @ ${u.stack}`))
+console.log(
+	'  summary:',
+	JSON.stringify(sum, (_, v) => (typeof v === 'bigint' ? v.toString() : v))
+)
+console.log(
+	'  unhandled:',
+	unhandled.length,
+	unhandled.slice(0, 4).map(u => `${u.message} @ ${u.stack}`)
+)
 console.log('  stderr:', stderr)
-console.log('  worker events (non-status):', w.lines.filter(l => !['status', 'stderr'].includes(l.type)).slice(0, 12).map(l => JSON.stringify(l)))
+console.log(
+	'  worker events (non-status):',
+	w.lines
+		.filter(l => !['status', 'stderr'].includes(l.type))
+		.slice(0, 12)
+		.map(l => JSON.stringify(l))
+)
 await w.kill()
 await client.disconnect().catch(() => {})
 process.exit(pass ? 0 : 1)
