@@ -715,7 +715,7 @@ describe('app lifecycle', () => {
 			await app.start()
 			// The client emits 'error' for non-fatal conditions too (e.g. auto-commit failures).
 			// eslint-disable-next-line @typescript-eslint/no-explicit-any
-			;(app as any).workers[0].consumer.emit('error', new Error('transient commit failure'))
+			;(app as any).workers.active[0].context.consumer.emit('error', new Error('transient commit failure'))
 			await producer.send(input, { key: 'a', value: numberCodec.encode(7) })
 			await collector.waitFor<string, number>(out, m => m.value === 7, 10_000) // still processing
 			await sleep(300)

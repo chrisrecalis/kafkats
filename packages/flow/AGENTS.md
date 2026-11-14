@@ -14,7 +14,7 @@ pnpm typecheck  # Type checking
 
 ```
 src/
-├── flow.ts        # FlowApp runtime: workers, topology validation, restoration, transactions, global tables
+├── flow.ts        # flow() / FlowAppImpl: DSL entry points, start/close lifecycle, wiring of runtime/
 ├── types.ts       # Public types (FlowApp, KStream, KTable, FlowConfig, ...)
 ├── changelog.ts   # Changelog config, writer/restorer, error classes (incl. CoPartitioningError)
 ├── codec.ts       # Serialization codecs (string, json, buffer)
@@ -26,7 +26,20 @@ src/
 │   └── changelog.ts    # Changelog-backed store wrappers
 ├── streams/       # KStream / KTable / grouped stream implementations
 ├── processors/    # Processor nodes (aggregations, joins, table nodes)
-├── runtime/       # Record context (worker + source partition) via AsyncLocalStorage
+├── runtime/
+│   ├── context.ts         # Record context (worker + source partition) via AsyncLocalStorage
+│   ├── status.ts          # App state, last error, closing/started flags, shutdown signal
+│   ├── errors.ts          # Failure classification (fatal vs recoverable), restart backoff
+│   ├── topology.ts        # What the DSL registered (sources, internal topics, co-partition groups, global tables)
+│   ├── store-registry.ts  # State stores: per-partition stacks, provider names, changelog specs/writers
+│   ├── checkpoints.ts     # Changelog checkpoints (durable or in-process)
+│   ├── internal-topics.ts # Co-partitioning checks, creation of changelog/repartition topics
+│   ├── restoration.ts     # Restore queue, app-/partition-scoped restore, release/prune of unowned state
+│   ├── start-positions.ts # Start position of partitions without a committed offset
+│   ├── transactions.ts    # Exactly-once batch of one worker (begin/commit/abort, commit timer)
+│   ├── worker.ts          # WorkerPool + StreamWorker: run/restart loop, message handling, rebalance events
+│   ├── global-tables.ts   # Loading and following global tables
+│   └── output.ts          # sendToTopic: encoding, partitioner, transactional send
 ├── testing.ts     # TestDriver, MockProducer/MockConsumer
 └── index.ts       # Public exports
 ```
@@ -170,7 +183,7 @@ stream.groupByKey().count({
 ### Key Files
 
 - `src/changelog.ts` - ChangelogConfig, error classes, ChangelogWriter/Restorer
-- `src/flow.ts` - validateAndCreateInternalTopics(), restoration, worker lifecycle, source topic tracking
+- `src/runtime/internal-topics.ts` - validateAndCreateInternalTopics(); `src/runtime/restoration.ts` - restoration; `src/runtime/worker.ts` - worker lifecycle
 - `src/state/partitioned.ts`, `src/state/buffered.ts` - per-partition stores and the transactional write buffer
 
 ## Testing Infrastructure
