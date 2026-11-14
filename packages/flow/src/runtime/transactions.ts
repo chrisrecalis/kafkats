@@ -168,11 +168,15 @@ export class WorkerTransactions {
 		const open = this.open
 
 		for (const store of worker.dirtyStores) store.discardBuffer(worker.dirtyStores)
-		worker.sends.discard()
+		// Acknowledgements of what the transaction produced are not acted on any more.
+		const sendsSettled = worker.sends.discard()
 		this.clearState()
 		// Stream time advanced by the aborted records must not make their replay look late.
 		worker.streamClocks.clear()
 
+		// The transaction must not end while its produce requests are still in flight: a request
+		// answered after the abort marker would leave records outside any transaction.
+		await sendsSettled
 		await open?.abort(toError(error))
 	}
 

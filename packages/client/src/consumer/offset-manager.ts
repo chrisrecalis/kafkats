@@ -216,6 +216,26 @@ export class OffsetManager {
 	}
 
 	/**
+	 * Commit explicit positions (the next offset to read) of assigned partitions.
+	 *
+	 * Unlike {@link markConsumed}, this needs no record to have been consumed: it is how a
+	 * position chosen by `autoOffsetReset` is made durable before anything was processed.
+	 */
+	async commitPositions(positions: Array<{ topic: string; partition: number; offset: bigint }>): Promise<void> {
+		for (const { topic, partition, offset } of positions) {
+			const key = tpKey(topic, partition)
+			if (!this.assignedPartitions.has(key)) continue
+			// Stored as "last consumed offset"; a position of 0 is "nothing consumed" (-1).
+			const consumed = offset - 1n
+			const current = this.consumedOffsets.get(key)
+			if (current === undefined || consumed > current) {
+				this.consumedOffsets.set(key, consumed)
+			}
+		}
+		await this.commitPendingOffsets()
+	}
+
+	/**
 	 * Commit all pending offsets
 	 * Filters to only assigned partitions (Java client model protection)
 	 */

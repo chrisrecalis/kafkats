@@ -455,11 +455,19 @@ describe('processing failures', () => {
 			await app.start()
 			for (let i = 0; i < 4; i++) await producer.send(input, { key: 'a', value: numberCodec.encode(1) })
 			await collector.waitFor<string, number>(out, m => m.value === 2, 10_000)
-			await sleep(3_000)
-			// the record whose changelog write fails (count 3) must never be emitted downstream
-			const seen = collector.getTopicMessages<string, number>(out).map(m => m.value)
-			expect(seen).not.toContain(3)
-			expect(seen).not.toContain(4)
+			// The failure is reported, and the worker stops instead of carrying on.
+			await waitUntil('app ERROR', () => app.state() === 'ERROR', 10_000)
+			expect(app.getError()?.message).toMatch(/changelog/)
+			// The record whose changelog write failed is not acknowledged: the group's committed
+			// offset stays at or before it (2 records were processed successfully). Its output may
+			// already have been produced; at-least-once allows that duplicate after a restart.
+			const coordinator = await client.cluster.getCoordinator('GROUP', appId)
+			const committed = await coordinator.offsetFetch({
+				groupId: appId,
+				topics: [{ name: input, partitions: [{ partitionIndex: 0 }] }],
+				requireStable: false,
+			})
+			expect(committed.topics[0]!.partitions[0]!.committedOffset).toBeLessThanOrEqual(2n)
 		} finally {
 			await app.close().catch(() => {})
 			await collector.stop()

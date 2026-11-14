@@ -58,6 +58,30 @@ describe('Producer: batches queued behind an in-flight request are merged', () =
 		await producer.disconnect()
 	})
 
+	it('appends back-to-back sends in call order even when their preparation takes different times', async () => {
+		// The first lookup of a topic's partition count is a metadata request; make the first
+		// one slow and later ones fast, so a later send would overtake an earlier one unless the
+		// preparation stage runs in call order.
+		const metadata = await mockCluster.refreshMetadata(['test-topic'])
+		let lookups = 0
+		mockCluster.refreshMetadata.mockImplementation(async () => {
+			const delay = lookups++ === 0 ? 20 : 0
+			await new Promise(resolve => setTimeout(resolve, delay))
+			return metadata
+		})
+		const producer = new Producer(mockCluster, { retries: 0 })
+
+		const results = await Promise.all(
+			Array.from({ length: 20 }, (_, i) =>
+				producer.send('test-topic', { value: Buffer.from(String(i)), partition: 0 })
+			)
+		)
+
+		expect(results.map(r => r.offset)).toEqual(Array.from({ length: 20 }, (_, i) => BigInt(i)))
+
+		await producer.disconnect()
+	})
+
 	it('does not merge anything into a batch that is already at the limit', async () => {
 		const maxBatchBytes = 1000
 		const producer = new Producer(mockCluster, { maxBatchBytes, retries: 0 })

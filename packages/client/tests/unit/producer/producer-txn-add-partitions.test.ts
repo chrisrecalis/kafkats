@@ -76,7 +76,7 @@ describe('Producer.addPartitionsToTransaction top-level error handling', () => {
 	})
 })
 
-describe('Producer: concurrent transactional sends share one partition registration', () => {
+describe('Producer: concurrent transactional sends register a partition once', () => {
 	let mockCluster: ReturnType<typeof createMockCluster>
 	let txnCoordinator: MockBroker
 
@@ -96,7 +96,9 @@ describe('Producer: concurrent transactional sends share one partition registrat
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const p = producer as any
 		vi.spyOn(p, 'getPartitionCount').mockResolvedValue(1)
-		vi.spyOn(p, 'internalSend').mockResolvedValue({ topic: TOPIC, partition: 0, offset: 0n, timestamp: 0n })
+		vi.spyOn(p, 'append').mockResolvedValue([
+			Promise.resolve({ topic: TOPIC, partition: 0, offset: 0n, timestamp: 0n }),
+		])
 		return p
 	}
 
@@ -119,10 +121,10 @@ describe('Producer: concurrent transactional sends share one partition registrat
 		expect(txnCoordinator.addPartitionsToTxn).toHaveBeenCalledTimes(1)
 		// None of the sends produced before the partition was part of the transaction.
 		expect(p.partitionsInTransaction.has(`${TOPIC}:0`)).toBe(true)
-		expect(p.internalSend).toHaveBeenCalledTimes(50)
+		expect(p.append).toHaveBeenCalledTimes(50)
 	})
 
-	it('fails every waiting send when the registration fails, and the next send tries again', async () => {
+	it('fails a send whose registration fails, without producing anything', async () => {
 		txnCoordinator.addPartitionsToTxn.mockImplementation(async () => {
 			await new Promise(resolve => setTimeout(resolve, 10))
 			return { throttleTimeMs: 0, errorCode: ErrorCode.InvalidTxnState, results: [] }
@@ -133,10 +135,9 @@ describe('Producer: concurrent transactional sends share one partition registrat
 
 		expect(outcomes.every(o => o.status === 'rejected')).toBe(true)
 		// Nothing was produced to a partition the transaction does not contain.
-		expect(p.internalSend).not.toHaveBeenCalled()
-		expect(p.partitionRegistrations.size).toBe(0)
+		expect(p.append).not.toHaveBeenCalled()
 
-		await expect(send(p)).rejects.toThrow()
-		expect(txnCoordinator.addPartitionsToTxn).toHaveBeenCalledTimes(2)
+		// Each send that still needs the partition asks again, one at a time.
+		expect(txnCoordinator.addPartitionsToTxn).toHaveBeenCalledTimes(20)
 	})
 })

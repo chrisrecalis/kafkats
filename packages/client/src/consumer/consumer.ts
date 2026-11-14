@@ -386,6 +386,24 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	}
 
 	/**
+	 * Commit the current fetch position of the given assigned partitions.
+	 *
+	 * Called from a `partitionsAssigned` listener (or before anything was consumed), this makes
+	 * the start position durable: a partition without a committed offset would otherwise be
+	 * resolved by `autoOffsetReset` again after a restart, and with `'latest'` skip whatever was
+	 * read but not committed. Partitions that are not assigned are ignored.
+	 */
+	async commitPosition(partitions: Array<{ topic: string; partition: number }>): Promise<void> {
+		if (!this.offsetManager) return
+		const positions: Array<{ topic: string; partition: number; offset: bigint }> = []
+		for (const { topic, partition } of partitions) {
+			const offset = this.position(topic, partition)
+			if (offset !== undefined) positions.push({ topic, partition, offset })
+		}
+		await this.offsetManager.commitPositions(positions)
+	}
+
+	/**
 	 * Seek to a specific offset for a partition.
 	 *
 	 * Repositions the fetch position for the specified partition to the given offset.

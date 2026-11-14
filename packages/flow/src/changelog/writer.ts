@@ -28,10 +28,13 @@ export class ChangelogWriter<K, V> {
 		private readonly onWriteAck?: (result: SendResult) => void | Promise<void>,
 		private readonly getPartition?: () => number | undefined,
 		/**
-		 * Takes over waiting for a write's acknowledgement (returns true if it did). Without it,
-		 * every write waits for its own acknowledgement.
+		 * Takes over a write's acknowledgement: waiting for it, and calling `onAck` when it arrives
+		 * (returns true if it did). Without it, every write waits for its own acknowledgement.
 		 */
-		private readonly deferAck?: (ack: Promise<void>) => boolean
+		private readonly defer?: (
+			send: Promise<SendResult>,
+			onAck: (result: SendResult) => void | Promise<void>
+		) => boolean
 	) {}
 
 	async write(key: K, value: V): Promise<void> {
@@ -46,8 +49,9 @@ export class ChangelogWriter<K, V> {
 		const partition = this.getPartition?.()
 		const message = partition === undefined ? { key, value } : { key, value, partition }
 		const target = this.getTransaction() ?? this.getProducer()
-		const ack = target.send(this.topicName, message).then(result => this.onWriteAck?.(result))
-		if (!this.deferAck?.(ack)) await ack
+		const send = target.send(this.topicName, message)
+		const onAck = (result: SendResult) => this.onWriteAck?.(result)
+		if (!this.defer?.(send, onAck)) await onAck(await send)
 	}
 }
 

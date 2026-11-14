@@ -202,8 +202,8 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	// settles, so at most one batch per partition is ever in flight (preserves
 	// per-partition ordering for the idempotent producer).
 	private mutedPartitions = new Set<string>()
-	// AddPartitionsToTxn requests in flight, by `topic:partition`.
-	private readonly partitionRegistrations = new Map<string, Promise<void>>()
+	// Tail of the chain that keeps the asynchronous part of send() in call order (see inSendOrder).
+	private sendOrder: Promise<unknown> = Promise.resolve()
 
 	// Transaction state (only used when transactionalId is set)
 	private transactionState: TransactionState = 'idle'
@@ -1169,16 +1169,42 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		topicDef: TopicDefinition<V, K>,
 		messages: ProducerMessage<V, K> | ProducerMessage<V, K>[]
 	): Promise<SendResult | SendResult[]> {
-		await this.ensureInitialized()
-
 		const msgArray = Array.isArray(messages) ? messages : [messages]
 		const isSingle = !Array.isArray(messages)
-		const partitionCount = await this.getPartitionCount(topicDef.topic)
 
-		const promises = this.enqueueMessages(topicDef, msgArray, partitionCount)
+		const promises = await this.inSendOrder(() => this.append(topicDef, msgArray))
 
 		const results = await Promise.all(promises)
 		return isSingle ? results[0]! : results
+	}
+
+	/**
+	 * Run the asynchronous preparation of a send (initialization, metadata lookup, transaction
+	 * registration) and its append, after every earlier send() has appended its messages.
+	 *
+	 * The preparation takes a varying number of asynchronous steps (a cache hit or a metadata
+	 * request, a partition already in the transaction or not), so without this two send() calls
+	 * issued back to back could append in the wrong order. Appending in call order is what makes
+	 * "records of a partition are written in the order they were sent" hold for sends that are
+	 * not awaited one by one.
+	 */
+	private inSendOrder<T>(prepareAndAppend: () => Promise<T>): Promise<T> {
+		const run = this.sendOrder.then(prepareAndAppend, prepareAndAppend)
+		this.sendOrder = run.then(
+			() => {},
+			() => {}
+		)
+		return run
+	}
+
+	/** Append messages to the accumulator. Must run inside {@link inSendOrder}. */
+	private async append<V, K>(
+		topicDef: TopicDefinition<V, K>,
+		msgArray: ProducerMessage<V, K>[]
+	): Promise<Promise<SendResult>[]> {
+		await this.ensureInitialized()
+		const partitionCount = await this.getPartitionCount(topicDef.topic)
+		return this.enqueueMessages(topicDef, msgArray, partitionCount)
 	}
 
 	/**
@@ -1500,15 +1526,32 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		const isSingle = !Array.isArray(messages)
 		const msgArray = Array.isArray(messages) ? messages : [messages]
 
+		// In send order: a partition is registered by the first send that needs it, and every
+		// later send finds it registered instead of issuing its own AddPartitionsToTxn.
+		const promises = await this.inSendOrder(async () => {
+			const resolved = await this.resolveTransactionPartitions(topicDef, msgArray)
+			return this.append(topicDef, resolved)
+		})
+
+		const results = await Promise.all(promises)
+		return isSingle ? results[0]! : results
+	}
+
+	/**
+	 * Fix the partition of each message and make sure those partitions are part of the open
+	 * transaction before anything is produced to them.
+	 */
+	private async resolveTransactionPartitions<V, K>(
+		topicDef: TopicDefinition<V, K>,
+		msgArray: ProducerMessage<V, K>[]
+	): Promise<Array<ProducerMessage<V, K> & { partition: number }>> {
 		const { encodeKey, encodeValue } = this.resolveEncoders(topicDef)
 
 		// Resolve partitions once and freeze them on the message. Re-invoking a
-		// stateful partitioner (e.g. round-robin) in internalSend would advance
+		// stateful partitioner (e.g. round-robin) in append would advance
 		// the counter, so addPartitionsToTxn and the actual writes would diverge.
 		const partitionCount = await this.getPartitionCount(topicDef.topic)
 		const partitionsToAdd = new Set<number>()
-		// Registrations of this send's partitions already requested by a concurrent send.
-		const registering = new Set<Promise<void>>()
 		const resolvedMessages: Array<ProducerMessage<V, K> & { partition: number }> = msgArray.map(msg => {
 			let partition = msg.partition
 			if (partition === undefined) {
@@ -1520,37 +1563,16 @@ export class Producer extends EventEmitter<ProducerEvents> {
 					partition = this.getStickyPartition(topicDef.topic, partitionCount)
 				}
 			}
-			const key = `${topicDef.topic}:${partition}`
-			if (!this.partitionsInTransaction.has(key)) {
-				const inFlight = this.partitionRegistrations.get(key)
-				if (inFlight) {
-					registering.add(inFlight)
-				} else {
-					partitionsToAdd.add(partition)
-				}
+			if (!this.partitionsInTransaction.has(`${topicDef.topic}:${partition}`)) {
+				partitionsToAdd.add(partition)
 			}
 			return { ...msg, partition }
 		})
 
 		if (partitionsToAdd.size > 0) {
-			// Sends issued before this request returns wait for it instead of each sending their
-			// own AddPartitionsToTxn for the same partition.
-			const registration = this.addPartitionsToTransaction(topicDef.topic, Array.from(partitionsToAdd))
-			const keys = Array.from(partitionsToAdd, partition => `${topicDef.topic}:${partition}`)
-			for (const key of keys) this.partitionRegistrations.set(key, registration)
-			const forget = () => {
-				for (const key of keys) {
-					if (this.partitionRegistrations.get(key) === registration) this.partitionRegistrations.delete(key)
-				}
-			}
-			registration.then(forget, forget)
-			registering.add(registration)
+			await this.addPartitionsToTransaction(topicDef.topic, Array.from(partitionsToAdd))
 		}
-		if (registering.size > 0) {
-			await Promise.all(registering)
-		}
-
-		return this.internalSend(topicDef, isSingle ? resolvedMessages[0]! : resolvedMessages)
+		return resolvedMessages
 	}
 
 	/**

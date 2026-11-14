@@ -1,4 +1,5 @@
-import { ErrorCode, KafkaError, type KafkaClient } from '@kafkats/client'
+import { ErrorCode, KafkaError, type KafkaClient, type Logger } from '@kafkats/client'
+import { toError } from '@/runtime/errors.js'
 import type { AppStatus } from '@/runtime/status.js'
 import type { TopicPartition } from '@/runtime/restoration.js'
 import type { Topology } from '@/runtime/topology.js'
@@ -9,9 +10,10 @@ import type { Topology } from '@/runtime/topology.js'
  * Internal (repartition / through) topics are read from the beginning: with the consumer
  * default ('latest'), records written before this worker resolved its position would be lost.
  *
- * Source topics read from 'latest' are pinned to the position this process first started at.
- * Otherwise a worker that restarts (or gets the partition back) before its first commit would
- * re-resolve 'latest' and silently skip everything it had read but not committed.
+ * Source topics read from 'latest' keep the position they were first started at: it is pinned in
+ * this process and committed to the group. Otherwise a restart (or getting the partition back)
+ * before the first commit would re-resolve 'latest' and silently skip everything that had been
+ * read but not committed.
  */
 export class StartPositions {
 	/**
@@ -26,17 +28,22 @@ export class StartPositions {
 		private readonly client: KafkaClient,
 		private readonly groupId: string,
 		private readonly topology: Topology,
-		private readonly status: AppStatus
+		private readonly status: AppStatus,
+		private readonly logger: Logger
 	) {}
 
 	/**
-	 * Settle where newly assigned partitions without a committed offset start, calling `seek` for
-	 * each one whose position must move. `startPositions` holds where the consumer resolved them.
+	 * Settle where newly assigned partitions without a committed offset start.
+	 * `startPositions` holds where the consumer resolved them; `consumer.seek` is called for each
+	 * one whose position must move, and `consumer.commitPosition` to make start positions durable.
 	 */
 	async settle(
 		partitions: TopicPartition[],
 		startPositions: Map<string, bigint>,
-		seek: (topic: string, partition: number, offset: bigint) => void
+		consumer: {
+			seek(topic: string, partition: number, offset: bigint): void
+			commitPosition(partitions: TopicPartition[]): Promise<void>
+		}
 	): Promise<void> {
 		const topology = this.topology
 		const policy = topology.resolveOffsetReset() ?? 'latest'
@@ -48,7 +55,7 @@ export class StartPositions {
 		for (const [topic, uncommitted] of await this.uncommittedPartitions(relevant)) {
 			if (topology.isInternalTopic(topic)) {
 				const earliest = await admin.fetchTopicOffsets(topic, uncommitted, 'earliest')
-				for (const partition of uncommitted) seek(topic, partition, earliest.get(partition) ?? 0n)
+				for (const partition of uncommitted) consumer.seek(topic, partition, earliest.get(partition) ?? 0n)
 				continue
 			}
 			// Source topic read from 'latest': the first position this process started the partition
@@ -60,9 +67,15 @@ export class StartPositions {
 				if (pinned === undefined) {
 					if (resolved !== undefined) this.initialPositions.set(key, resolved)
 				} else if (pinned !== resolved) {
-					seek(topic, partition, pinned)
+					consumer.seek(topic, partition, pinned)
 				}
 			}
+			// Commit that position, so a restart (of this or another instance) before the first
+			// commit resumes from it as well instead of resolving 'latest' again and skipping
+			// what was read in between. Best effort: the in-process pin above still holds.
+			await consumer.commitPosition(uncommitted.map(partition => ({ topic, partition }))).catch(err => {
+				this.logger.warn('could not commit the start position', { topic, error: toError(err).message })
+			})
 		}
 	}
 

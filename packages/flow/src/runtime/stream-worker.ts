@@ -287,7 +287,7 @@ export class StreamWorker {
 			await worker.sends.flush()
 			worker.processedSinceRestart = true
 		} catch (err) {
-			worker.sends.discard()
+			void worker.sends.discard()
 			this.fail(err, isRecoverable(err))
 			throw err
 		}
@@ -392,8 +392,12 @@ export class StreamWorker {
 			void restoration
 				.enqueue(partitions)
 				.then(() =>
-					startPositions.settle(partitions, positions, (topic, partition, offset) => {
-						if (heldSinceThisAssignment(topic, partition)) consumer.seek(topic, partition, offset)
+					startPositions.settle(partitions, positions, {
+						seek: (topic, partition, offset) => {
+							if (heldSinceThisAssignment(topic, partition)) consumer.seek(topic, partition, offset)
+						},
+						commitPosition: held =>
+							consumer.commitPosition(held.filter(tp => heldSinceThisAssignment(tp.topic, tp.partition))),
 					})
 				)
 				.then(() => {

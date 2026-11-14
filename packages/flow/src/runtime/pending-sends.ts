@@ -13,11 +13,18 @@ export class PendingSends {
 	/** Incremented by discard(), so that sends discarded while in flight cannot fail later work. */
 	private generation = 0
 
-	track(send: Promise<unknown>): void {
+	/**
+	 * Track a send. `onAck` runs when it is acknowledged, unless the send was discarded in the
+	 * meantime: an acknowledgement that arrives after its work was rolled back must not be
+	 * credited to whatever is being processed by then.
+	 */
+	track<T>(send: Promise<T>, onAck?: (result: T) => void | Promise<void>): void {
 		const generation = this.generation
 		this.pending.push(
 			send.then(
-				() => {},
+				result => {
+					if (onAck && generation === this.generation) return onAck(result)
+				},
 				error => {
 					if (generation === this.generation) this.failure ??= { error }
 				}
@@ -25,23 +32,33 @@ export class PendingSends {
 		)
 	}
 
-	/** Wait for every tracked send; throws the first failure. */
-	async flush(): Promise<void> {
+	/** Wait until every tracked send has been answered, whatever the answer. */
+	async settled(): Promise<void> {
 		// Acknowledgement callbacks may track further sends, hence the loop.
 		while (this.pending.length > 0) {
 			const pending = this.pending
 			this.pending = []
 			await Promise.all(pending)
 		}
+	}
+
+	/** Wait for every tracked send; throws the first failure. */
+	async flush(): Promise<void> {
+		await this.settled()
 		const failure = this.failure
 		this.failure = null
 		if (failure) throw failure.error
 	}
 
-	/** Forget the tracked sends (their outcome no longer matters: the work is being discarded). */
-	discard(): void {
+	/**
+	 * Forget the tracked sends: their work is being rolled back, so neither their failures nor
+	 * their acknowledgement callbacks count any more. Resolves once they have all been answered.
+	 */
+	discard(): Promise<void> {
 		this.generation += 1
+		const pending = this.pending
 		this.pending = []
 		this.failure = null
+		return Promise.all(pending).then(() => {})
 	}
 }

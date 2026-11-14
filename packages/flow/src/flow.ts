@@ -95,7 +95,7 @@ class FlowAppImpl implements FlowApp {
 			isStatePartitionOwned: (sourceTopics, partition) =>
 				this.workers.ownsStatePartition(sourceTopics, partition),
 		})
-		this.startPositions = new StartPositions(client, config.applicationId, this.topology, status)
+		this.startPositions = new StartPositions(client, config.applicationId, this.topology, status, logger)
 		this.globalTables = new GlobalTables({
 			client,
 			config,
