@@ -1,6 +1,6 @@
 # Windowing
 
-Windowing groups stream records by time for aggregations. kafkats/flow supports three window types.
+Windowing groups stream records by time for aggregations. kafkats/flow supports time windows (tumbling and hopping) and session windows. Sliding windows are not implemented yet.
 
 ## Time Windows
 
@@ -58,7 +58,13 @@ Sessions:
 - Extend with each new event
 - Close after inactivity gap elapses
 
+When a record bridges several sessions, they are merged in time order. `reduce()` always calls the reducer as `(aggregate, value)`. `aggregate()` on session windows needs a `merger` option that combines the aggregates of two sessions when they merge: `aggregate(init, agg, { value, merger: (a, b) => ... })`.
+
 ## Sliding Windows
+
+::: warning
+`SlidingWindows` is not implemented yet. `windowedBy(SlidingWindows.of(...))` throws. Use hopping `TimeWindows` (`TimeWindows.of(size).advanceBy(advance)`) instead.
+:::
 
 Continuous, overlapping windows:
 
@@ -79,18 +85,30 @@ const windowed = stream.groupByKey().windowedBy(TimeWindows.of('1h'))
 // Count per window
 windowed.count()
 
-// Sum per window
-windowed.reduce((sum, value) => sum + value.amount)
+// Combine values per window (the aggregate has the value type)
+windowed.reduce((latest, value) => (value.amount > latest.amount ? value : latest))
 
-// Custom aggregation
+// Custom aggregation (needs a value codec for the aggregate)
 windowed.aggregate(
 	() => ({ count: 0, total: 0 }),
 	(key, value, agg) => ({
 		count: agg.count + 1,
 		total: agg.total + value.amount,
-	})
+	}),
+	{ value: json<{ count: number; total: number }>() }
 )
 ```
+
+## Stream Time and Late Records
+
+Windows are driven by event time, not wall-clock time. **Stream time is tracked per source partition**: it is the highest record timestamp seen on that partition. Partitions progress independently, so a partition that is far ahead does not make in-order records on another partition late.
+
+Stream time is used to:
+
+- **Drop late records**: a record is dropped when its window (or session) is already past retention, which is 24 times the window size (or session gap) behind stream time. A record for a window that is still retained is applied normally, and a late session record that can merge into a live session is kept.
+- **Expire old windows**: windows and sessions past retention are removed from the store.
+
+Windowed state is partitioned like all other state, see [Partitioned State](/flow/state-stores#partitioned-state).
 
 ## Windowed Keys
 
@@ -114,31 +132,23 @@ stream
 	.windowedBy(TimeWindows.of('5m'))
 	.count()
 	.toStream()
-	.map((windowedKey, count) => ({
-		key: windowedKey.key,
-		value: {
-			key: windowedKey.key,
-			windowStart: new Date(windowedKey.window.start),
-			windowEnd: new Date(windowedKey.window.end),
-			count,
-		},
-	}))
+	.map(
+		(windowedKey, count) =>
+			[
+				windowedKey.key,
+				{
+					key: windowedKey.key,
+					windowStart: new Date(windowedKey.window.start),
+					windowEnd: new Date(windowedKey.window.end),
+					count,
+				},
+			] as const
+	)
 ```
 
 ## Grace Periods
 
-Handle late-arriving data:
-
-```typescript
-// Accept events up to 10 minutes late
-TimeWindows.of('5m').gracePeriod('10m')
-```
-
-Without grace period, late events are dropped. With grace period:
-
-- Window remains open longer
-- Late events are included in aggregation
-- Higher memory usage
+`TimeWindows` and `SessionWindows` have no configurable grace period. A late record is still applied as long as its window (or session) is retained, which is 24 times the window size (or session gap) behind stream time; see [Stream Time and Late Records](#stream-time-and-late-records).
 
 ## Window Comparison
 
@@ -147,7 +157,7 @@ Without grace period, late events are dropped. With grace period:
 | Time (Tumbling) | Fixed   | No         | Regular metrics, hourly counts   |
 | Time (Hopping)  | Fixed   | Yes        | Smoothed averages, sliding stats |
 | Session         | Dynamic | No         | User sessions, activity tracking |
-| Sliding         | Fixed   | Continuous | Event-relative windows           |
+| Sliding         | Fixed   | Continuous | Not implemented yet              |
 
 ## Example: Hourly Metrics
 
@@ -175,21 +185,25 @@ app.stream<string, MetricEvent>(metricsTopic)
 		(key, value, agg) => ({
 			sum: agg.sum + value.value,
 			count: agg.count + 1,
-		})
+		}),
+		{ value: json<{ sum: number; count: number }>() }
 	)
 	.toStream()
-	.map((windowedKey, agg) => ({
-		key: windowedKey.key,
-		value: {
-			metricName: windowedKey.key,
-			windowStart: new Date(windowedKey.window.start),
-			windowEnd: new Date(windowedKey.window.end),
-			sum: agg.sum,
-			count: agg.count,
-			average: agg.sum / agg.count,
-		} as HourlyMetric,
-	}))
-	.to(hourlyMetricsTopic)
+	.map(
+		(windowedKey, agg) =>
+			[
+				windowedKey.key,
+				{
+					metricName: windowedKey.key,
+					windowStart: new Date(windowedKey.window.start),
+					windowEnd: new Date(windowedKey.window.end),
+					sum: agg.sum,
+					count: agg.count,
+					average: agg.sum / agg.count,
+				} as HourlyMetric,
+			] as const
+	)
+	.to('hourly-metrics', { key: string(), value: json<HourlyMetric>() })
 ```
 
 ## Example: User Sessions
@@ -216,20 +230,30 @@ app.stream<string, UserAction>(actionsTopic)
 		() => ({ actions: [] as string[] }),
 		(key, action, agg) => ({
 			actions: [...agg.actions, action.action],
-		})
+		}),
+		{
+			value: json<{ actions: string[] }>(),
+			// Required for session windows: combines two sessions that merge
+			merger: (a, b) => ({ actions: [...a.actions, ...b.actions] }),
+		}
 	)
 	.toStream()
-	.map((windowedKey, agg) => ({
-		key: windowedKey.key,
-		value: {
-			userId: windowedKey.key,
-			sessionStart: new Date(windowedKey.window.start),
-			sessionEnd: new Date(windowedKey.window.end),
-			actionCount: agg.actions.length,
-			actions: agg.actions,
-		} as SessionSummary,
-	}))
-	.to(sessionsTopic)
+	// A session that grows or merges replaces the old one, which is emitted with a null value
+	.filter((_, agg) => agg !== null)
+	.map(
+		(windowedKey, agg) =>
+			[
+				windowedKey.key,
+				{
+					userId: windowedKey.key,
+					sessionStart: new Date(windowedKey.window.start),
+					sessionEnd: new Date(windowedKey.window.end),
+					actionCount: agg.actions.length,
+					actions: agg.actions,
+				} as SessionSummary,
+			] as const
+	)
+	.to('user-sessions', { key: string(), value: json<SessionSummary>() })
 ```
 
 ## State Management

@@ -63,6 +63,11 @@ export interface BrokerConfig {
 	tls?: TlsConfig
 	sasl?: SaslConfig
 	logger?: Logger
+	/**
+	 * Only open the control connection (no separate fetch connection).
+	 * Used for dedicated group-membership brokers that never serve Fetch.
+	 */
+	controlOnly?: boolean
 }
 
 /**

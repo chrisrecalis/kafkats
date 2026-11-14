@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { KafkaClient, type Producer } from '@kafkats/client'
+import type { KafkaClient, Producer } from '@kafkats/client'
 import { codec, flow, type FlowApp } from '../../src/index.js'
-import { MultiTopicCollector, createTopics, requireKafkaBrokers, uniqueTopicName } from './test-helpers.js'
+import { createTopics, MultiTopicCollector, newClient, sleep, uniqueTopicName } from './test-helpers.js'
 
 const PARTITION_COUNT = 4
 const KEY_COUNT = 12
@@ -27,7 +27,7 @@ async function waitForOutcome(
 		if (collector.getTopicMessages<string, number>(outputTopic).length >= RECORD_COUNT) {
 			return 'complete'
 		}
-		await new Promise(resolve => setTimeout(resolve, 20))
+		await sleep(20)
 	}
 
 	throw new Error(
@@ -41,10 +41,7 @@ describe('exactly-once stress', () => {
 	let producer: Producer
 
 	beforeAll(async () => {
-		client = new KafkaClient({
-			clientId: `flow-eos-stress-${Date.now()}`,
-			brokers: requireKafkaBrokers(),
-		})
+		client = newClient('flow-eos-stress')
 		await client.connect()
 		producer = client.producer({ lingerMs: 0 })
 	})
@@ -104,21 +101,23 @@ describe('exactly-once stress', () => {
 					},
 				})
 
-				app.stream(inputTopic, { key: stringCodec, value: numberCodec })
+				const counts = app
+					.stream(inputTopic, { key: stringCodec, value: numberCodec })
 					.groupByKey()
 					.count({ storeName: 'counts', key: stringCodec, value: numberCodec })
 					.toStream()
-					.through(outputTopic)
-					.peek((key, count) => {
-						if (key !== 'key-0' || count === null || !FAILURE_COUNTS.has(count)) {
-							return
-						}
+				// Write the result first, then fail in the same transaction.
+				counts.to(outputTopic)
+				counts.peek((key, count) => {
+					if (key !== 'key-0' || count === null || !FAILURE_COUNTS.has(count)) {
+						return
+					}
 
-						if (!failedOnce.has(count)) {
-							failedOnce.add(count)
-							throw new Error(`injected failure after transactional writes at ${key}:${count}`)
-						}
-					})
+					if (!failedOnce.has(count)) {
+						failedOnce.add(count)
+						throw new Error(`injected failure after transactional writes at ${key}:${count}`)
+					}
+				})
 
 				return app
 			}

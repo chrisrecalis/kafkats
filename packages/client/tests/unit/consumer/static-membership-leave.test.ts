@@ -28,6 +28,8 @@ function buildGroup(groupInstanceId: string | undefined) {
 
 	const cluster = {
 		getCoordinator: vi.fn().mockResolvedValue(coordinator),
+		getDedicatedCoordinator: vi.fn().mockResolvedValue(coordinator),
+		releaseDedicatedBroker: vi.fn().mockResolvedValue(undefined),
 		invalidateCoordinator: vi.fn(),
 		getLogger: () => null,
 	}

@@ -10,6 +10,7 @@ import {
 	CoordinatorNotAvailableError,
 	NotCoordinatorError,
 	BrokerNotAvailableError,
+	NoBrokersAvailableError,
 	shouldRefreshMetadata,
 	throwIfError,
 } from './errors.js'
@@ -31,6 +32,9 @@ import { noopLogger, type Logger } from '@/logger.js'
 
 const DEFAULT_METADATA_REFRESH_INTERVAL_MS = 300000
 const COORDINATOR_CACHE_TTL_MS = 300000
+// How long Cluster.disconnect() lets in-flight requests finish before rejecting them. Short, so
+// closing a client against an unresponsive broker does not hang on request timeouts.
+const CLUSTER_DISCONNECT_WAIT_MS = 1000
 
 function parseBrokerAddress(address: string): { host: string; port: number } {
 	const lastColonIndex = address.lastIndexOf(':')
@@ -55,6 +59,7 @@ function parseBrokerAddress(address: string): { host: string; port: number } {
 export class Cluster extends EventEmitter<ClusterEvents> {
 	private readonly config: ClusterConfig
 	private readonly brokers: Map<number, Broker> = new Map()
+	private readonly dedicatedBrokers: Set<Broker> = new Set()
 	private readonly bootstrapBrokers: Broker[] = []
 	private metadata: ClusterMetadata | null = null
 	private readonly coordinatorCache: Map<string, CoordinatorEntry> = new Map()
@@ -153,7 +158,7 @@ export class Cluster extends EventEmitter<ClusterEvents> {
 
 		for (const broker of this.brokers.values()) {
 			disconnectPromises.push(
-				broker.disconnect().catch((error: Error) => {
+				broker.disconnect(CLUSTER_DISCONNECT_WAIT_MS).catch((error: Error) => {
 					this.emitError(error)
 				})
 			)
@@ -161,7 +166,15 @@ export class Cluster extends EventEmitter<ClusterEvents> {
 
 		for (const broker of this.bootstrapBrokers) {
 			disconnectPromises.push(
-				broker.disconnect().catch((error: Error) => {
+				broker.disconnect(CLUSTER_DISCONNECT_WAIT_MS).catch((error: Error) => {
+					this.emitError(error)
+				})
+			)
+		}
+
+		for (const broker of this.dedicatedBrokers) {
+			disconnectPromises.push(
+				broker.disconnect(CLUSTER_DISCONNECT_WAIT_MS).catch((error: Error) => {
 					this.emitError(error)
 				})
 			)
@@ -170,6 +183,7 @@ export class Cluster extends EventEmitter<ClusterEvents> {
 		await Promise.all(disconnectPromises)
 
 		this.brokers.clear()
+		this.dedicatedBrokers.clear()
 		this.bootstrapBrokers.length = 0
 		this.metadata = null
 		this.coordinatorCache.clear()
@@ -260,6 +274,54 @@ export class Cluster extends EventEmitter<ClusterEvents> {
 		this.emit('brokerConnect', nodeId, brokerInfo.host, brokerInfo.port)
 
 		return broker
+	}
+
+	/**
+	 * Open a connection to the coordinator that is private to the caller.
+	 *
+	 * Group membership requests (JoinGroup, SyncGroup, Heartbeat) can be parked by the broker
+	 * for a long time, and a broker handles the requests of one connection strictly in order.
+	 * Members of the same group sharing a socket would therefore block each other (member B's
+	 * JoinGroup parked at the broker stops it reading member A's Heartbeat, which A needs to
+	 * learn about the rebalance, so the join only completes at the session timeout). Each
+	 * member must use its own connection. Release it with releaseDedicatedBroker().
+	 */
+	async getDedicatedCoordinator(type: CoordinatorType, key: string): Promise<Broker> {
+		const shared = await this.getCoordinator(type, key)
+		const broker = new Broker({
+			host: shared.host,
+			port: shared.port,
+			nodeId: shared.nodeId,
+			clientId: this.config.clientId,
+			connectionTimeoutMs: this.config.connectionTimeoutMs,
+			requestTimeoutMs: this.config.requestTimeoutMs,
+			maxInFlightRequests: this.config.maxInFlightRequests,
+			maxFrameSize: this.config.maxFrameSize,
+			tls: this.config.tls,
+			sasl: this.config.sasl,
+			logger: this.logger,
+			controlOnly: true,
+		})
+		this.dedicatedBrokers.add(broker)
+		try {
+			await broker.connect()
+		} catch (error) {
+			this.dedicatedBrokers.delete(broker)
+			await broker.disconnect(0).catch(() => {})
+			throw error
+		}
+		return broker
+	}
+
+	/**
+	 * Close a dedicated broker connection. In-flight requests get `waitForPendingMs` to finish
+	 * before being rejected (pass 0 to drop them at once, e.g. when the broker is unresponsive).
+	 */
+	async releaseDedicatedBroker(broker: Broker, waitForPendingMs?: number): Promise<void> {
+		this.dedicatedBrokers.delete(broker)
+		await broker.disconnect(waitForPendingMs).catch((error: Error) => {
+			this.emitError(error)
+		})
 	}
 
 	async getLeaderForPartition(topic: string, partition: number): Promise<Broker> {
@@ -446,7 +508,7 @@ export class Cluster extends EventEmitter<ClusterEvents> {
 			}
 		}
 
-		throw new Error('No brokers available')
+		throw new NoBrokersAvailableError()
 	}
 
 	async refreshMetadata(topics?: string[]): Promise<ClusterMetadata> {

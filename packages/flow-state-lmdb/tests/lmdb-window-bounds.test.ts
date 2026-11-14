@@ -4,19 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { lmdb } from '@/lmdb.js'
-
-const stringCodec = {
-	encode: (s: string) => Buffer.from(s, 'utf-8'),
-	decode: (b: Buffer) => b.toString('utf-8'),
-}
-const numberCodec = {
-	encode: (n: number) => {
-		const b = Buffer.alloc(8)
-		b.writeDoubleLE(n, 0)
-		return b
-	},
-	decode: (b: Buffer) => b.readDoubleLE(0),
-}
+import { numberCodec, stringCodec } from './codecs.js'
 
 describe('LMDBWindowStore time bounds', () => {
 	let stateDir: string

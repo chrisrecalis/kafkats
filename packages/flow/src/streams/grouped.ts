@@ -1,7 +1,7 @@
 import type { KTable, KGroupedStream, KGroupedTable, WindowedKGroupedStream, Materialized, Windowed } from '@/types.js'
-import type { KeyValueStore } from '@/state.js'
 import type { Codec } from '@/codec.js'
-import type { Processor, OutputProcessor, StreamFormat } from '@/processors/base.js'
+import type { KeyValueStore, SessionStore, WindowStore } from '@/state.js'
+import type { Processor, OutputProcessor, StoreRef, StreamFormat } from '@/processors/base.js'
 import {
 	AggregateNode,
 	ReduceNode,
@@ -11,103 +11,140 @@ import {
 	SessionReduceNode,
 	WINDOW_STORE_RETENTION_MULTIPLIER,
 } from '@/processors/aggregation.js'
-import {
-	TableDeltaCountNode,
-	TableDeltaReduceNode,
-	TableDeltaAggregateNode,
-	TableGroupedComputeCountNode,
-	TableGroupedComputeReduceNode,
-	TableGroupedComputeAggregateNode,
-	type GroupedTableMapping,
-} from '@/processors/table.js'
+import { TableDeltaCountNode, TableDeltaReduceNode, TableDeltaAggregateNode } from '@/processors/table.js'
 import { TimeWindows, SessionWindows, SlidingWindows } from '@/windows.js'
 import { parseWindowDuration, SLIDING_WINDOWS_NOT_IMPLEMENTED } from '@/helpers.js'
-import { KTableImpl, type FlowAppInterface } from '@/streams/ktable.js'
+import { KTableImpl } from '@/streams/ktable.js'
+import type { TopologyBuilder } from '@/streams/topology-builder.js'
+
+const numberCodec: Codec<number> = {
+	encode: (v: number) => {
+		const buf = Buffer.alloc(8)
+		buf.writeDoubleLE(v, 0)
+		return buf
+	},
+	decode: (b: Buffer) => b.readDoubleLE(0),
+}
+
+/** Encodes a windowed key as the key's bytes followed by the window start and end (int64 BE each). */
+function windowedKeyCodec<K>(keyCodec: Codec<K>): Codec<Windowed<K>> {
+	return {
+		encode: (wk: Windowed<K>) => {
+			const keyBytes = keyCodec.encode(wk.key)
+			const buf = Buffer.alloc(keyBytes.length + 16)
+			keyBytes.copy(buf, 0)
+			buf.writeBigInt64BE(BigInt(wk.window.start), keyBytes.length)
+			buf.writeBigInt64BE(BigInt(wk.window.end), keyBytes.length + 8)
+			return buf
+		},
+		decode: (b: Buffer) => ({
+			key: keyCodec.decode(b.subarray(0, b.length - 16)),
+			window: {
+				start: Number(b.readBigInt64BE(b.length - 16)),
+				end: Number(b.readBigInt64BE(b.length - 8)),
+			},
+		}),
+	}
+}
+
+function required<T>(value: T | undefined, message: string): T {
+	if (!value) {
+		throw new Error(message)
+	}
+	return value
+}
+
+/**
+ * Create a key-value store for an aggregation, connect the node that maintains it after `upstream`
+ * and return the resulting table.
+ */
+function materializeKeyValue<K, V, A>(
+	builder: TopologyBuilder,
+	upstream: OutputProcessor<K, V>,
+	sourceTopics: Set<string>,
+	defaultStorePrefix: string,
+	keyCodec: Codec<K>,
+	valueCodec: Codec<A>,
+	options: Materialized<K, A> | undefined,
+	createNode: (storeName: string, storeRef: StoreRef<KeyValueStore<K, A>>) => Processor<K, V, K, A>
+): KTable<K, A> {
+	const storeName = options?.storeName ?? `${defaultStorePrefix}-${builder.topology.nextStoreId()}`
+	const store = builder.stores.getOrCreateKeyValueStore<K, A>(storeName, {
+		keyCodec,
+		valueCodec,
+		changelog: options?.changelog,
+		sourceTopics,
+	})
+	const storeRef = { store }
+	const node = createNode(storeName, storeRef)
+	upstream.connect(node)
+	return new KTableImpl<K, A>(builder, node, { keyCodec, valueCodec }, storeRef, sourceTopics)
+}
 
 export class KGroupedStreamImpl<K, V> implements KGroupedStream<K, V> {
 	constructor(
-		private readonly app: FlowAppInterface,
+		private readonly builder: TopologyBuilder,
 		private readonly node: OutputProcessor<K, V>,
 		private readonly format: StreamFormat<K, V>,
 		/** Source topics that feed into this grouped stream. Used for changelog partition inference. */
-		private readonly sourceTopics: Set<string> = new Set(),
-		/** Whether to restrict changelog restoration to source topic partitions. False for re-keyed streams. */
-		private readonly restrictRestorationToSourcePartitions: boolean = true
+		private readonly sourceTopics: Set<string> = new Set()
 	) {}
 
-	count(options?: Materialized<K, number>): KTable<K, number> {
-		const keyCodec = options?.key ?? this.format.keyCodec
-		if (!keyCodec) {
-			throw new Error('count() requires a key codec. Provide one via groupBy/groupByKey options or Materialized.')
-		}
-
-		// Create a codec for number values
-		const valueCodec: Codec<number> = options?.value ?? {
-			encode: (v: number) => {
-				const buf = Buffer.alloc(8)
-				buf.writeDoubleLE(v, 0)
-				return buf
-			},
-			decode: (b: Buffer) => b.readDoubleLE(0),
-		}
-
-		const storeName = options?.storeName ?? `count-store-${this.app.nextStoreId()}`
-		const store = this.app.getOrCreateStore<K, number>(
-			storeName,
-			keyCodec,
-			valueCodec,
-			options?.changelog,
+	private materialize<A>(
+		defaultStorePrefix: string,
+		keyCodec: Codec<K>,
+		valueCodec: Codec<A>,
+		options: Materialized<K, A> | undefined,
+		createNode: (storeName: string, storeRef: StoreRef<KeyValueStore<K, A>>) => Processor<K, V, K, A>
+	): KTable<K, A> {
+		return materializeKeyValue(
+			this.builder,
+			this.node,
 			this.sourceTopics,
-			this.restrictRestorationToSourcePartitions
-		)
-		const storeRef = { store }
-
-		const aggregateNode = new AggregateNode<K, V, number>(
-			storeName,
-			storeRef,
-			() => 0,
-			(_key, _value, aggregate) => aggregate + 1
-		)
-
-		this.node.connect(aggregateNode)
-
-		return new KTableImpl<K, number>(this.app, aggregateNode, {
+			defaultStorePrefix,
 			keyCodec,
 			valueCodec,
-		})
+			options,
+			createNode
+		)
+	}
+
+	count(options?: Materialized<K, number>): KTable<K, number> {
+		const keyCodec = required(
+			options?.key ?? this.format.keyCodec,
+			'count() requires a key codec. Provide one via groupBy/groupByKey options or Materialized.'
+		)
+		return this.materialize(
+			'count-store',
+			keyCodec,
+			options?.value ?? numberCodec,
+			options,
+			(storeName, storeRef) =>
+				new AggregateNode<K, V, number>(
+					storeName,
+					storeRef,
+					() => 0,
+					(_k, _v, n) => n + 1
+				)
+		)
 	}
 
 	reduce(reducer: (aggregate: V, value: V) => V, options?: Materialized<K, V>): KTable<K, V> {
-		const keyCodec = options?.key ?? this.format.keyCodec
-		const valueCodec = options?.value ?? this.format.valueCodec
-
-		if (!keyCodec) {
-			throw new Error(
-				'reduce() requires a key codec. Provide one via groupBy/groupByKey options or Materialized.'
-			)
-		}
-		if (!valueCodec) {
-			throw new Error(
-				'reduce() requires a value codec. Provide one via groupBy/groupByKey options or Materialized.'
-			)
-		}
-
-		const storeName = options?.storeName ?? `reduce-store-${this.app.nextStoreId()}`
-		const store = this.app.getOrCreateStore<K, V>(
-			storeName,
+		const keyCodec = required(
+			options?.key ?? this.format.keyCodec,
+			'reduce() requires a key codec. Provide one via groupBy/groupByKey options or Materialized.'
+		)
+		const valueCodec = required(
+			options?.value ?? this.format.valueCodec,
+			'reduce() requires a value codec. Provide one via groupBy/groupByKey options or Materialized.'
+		)
+		return this.materialize(
+			'reduce-store',
 			keyCodec,
 			valueCodec,
-			options?.changelog,
-			this.sourceTopics,
-			this.restrictRestorationToSourcePartitions
+			options,
+			(storeName, storeRef) => new ReduceNode<K, V>(storeName, storeRef, reducer)
 		)
-		const storeRef = { store }
-
-		const aggregateNode = new ReduceNode<K, V>(storeName, storeRef, reducer)
-
-		this.node.connect(aggregateNode)
-
-		return new KTableImpl<K, V>(this.app, aggregateNode, { keyCodec, valueCodec })
 	}
 
 	aggregate<A>(
@@ -115,46 +152,28 @@ export class KGroupedStreamImpl<K, V> implements KGroupedStream<K, V> {
 		aggregator: (key: K, value: V, aggregate: A) => A,
 		options?: Materialized<K, A>
 	): KTable<K, A> {
-		const keyCodec = options?.key ?? this.format.keyCodec
-		const valueCodec = options?.value
-
-		if (!keyCodec) {
-			throw new Error(
-				'aggregate() requires a key codec. Provide one via groupBy/groupByKey options or Materialized.'
-			)
-		}
-		if (!valueCodec) {
-			throw new Error('aggregate() requires a value codec in Materialized options.')
-		}
-
-		const storeName = options?.storeName ?? `aggregate-store-${this.app.nextStoreId()}`
-		const store = this.app.getOrCreateStore<K, A>(
-			storeName,
+		const keyCodec = required(
+			options?.key ?? this.format.keyCodec,
+			'aggregate() requires a key codec. Provide one via groupBy/groupByKey options or Materialized.'
+		)
+		const valueCodec = required(options?.value, 'aggregate() requires a value codec in Materialized options.')
+		return this.materialize(
+			'aggregate-store',
 			keyCodec,
 			valueCodec,
-			options?.changelog,
-			this.sourceTopics,
-			this.restrictRestorationToSourcePartitions
+			options,
+			(storeName, storeRef) => new AggregateNode<K, V, A>(storeName, storeRef, initializer, aggregator)
 		)
-		const storeRef = { store }
-
-		const aggregateNode = new AggregateNode<K, V, A>(storeName, storeRef, initializer, aggregator)
-
-		this.node.connect(aggregateNode)
-
-		return new KTableImpl<K, A>(this.app, aggregateNode, { keyCodec, valueCodec })
 	}
 
 	windowedBy(windows: TimeWindows | SessionWindows | SlidingWindows): WindowedKGroupedStream<K, V> {
-		return new WindowedKGroupedStreamImpl<K, V>(
-			this.app,
-			this.node,
-			this.format,
-			windows,
-			this.sourceTopics,
-			this.restrictRestorationToSourcePartitions
-		)
+		return new WindowedKGroupedStreamImpl<K, V>(this.builder, this.node, this.format, windows, this.sourceTopics)
 	}
+}
+
+type WindowedNodes<K, V, A> = {
+	window: (storeName: string, storeRef: StoreRef<WindowStore<K, A>>) => Processor<K, V, Windowed<K>, A>
+	session: (storeName: string, storeRef: StoreRef<SessionStore<K, A>>) => Processor<K, V, Windowed<K>, A>
 }
 
 export class WindowedKGroupedStreamImpl<K, V> implements WindowedKGroupedStream<K, V> {
@@ -162,14 +181,12 @@ export class WindowedKGroupedStreamImpl<K, V> implements WindowedKGroupedStream<
 	private readonly advanceMs: number
 
 	constructor(
-		private readonly app: FlowAppInterface,
+		private readonly builder: TopologyBuilder,
 		private readonly node: OutputProcessor<K, V>,
 		private readonly format: StreamFormat<K, V>,
 		private readonly windows: TimeWindows | SessionWindows | SlidingWindows,
 		/** Source topics that feed into this windowed grouped stream. Used for changelog partition inference. */
-		private readonly sourceTopics: Set<string> = new Set(),
-		/** Whether to restrict changelog restoration to source topic partitions. False for re-keyed streams. */
-		private readonly restrictRestorationToSourcePartitions: boolean = true
+		private readonly sourceTopics: Set<string> = new Set()
 	) {
 		if (windows instanceof TimeWindows) {
 			this.windowSizeMs = parseWindowDuration(windows.size)
@@ -180,295 +197,167 @@ export class WindowedKGroupedStreamImpl<K, V> implements WindowedKGroupedStream<
 			// No dedicated processor yet; treating as tumbling silently produces wrong aggregates.
 			throw new Error(SLIDING_WINDOWS_NOT_IMPLEMENTED)
 		} else {
-			// SessionWindows - use gap as approximate window size
+			// For session windows the "window size" is the inactivity gap.
 			this.windowSizeMs = parseWindowDuration(windows.gap)
 			this.advanceMs = this.windowSizeMs
 		}
 	}
 
-	count(options?: Materialized<Windowed<K>, number>): KTable<Windowed<K>, number> {
-		const keyCodec = this.format.keyCodec
-		if (!keyCodec) {
-			throw new Error('windowed count() requires a key codec.')
+	/**
+	 * Create the window or session store for an aggregation, connect the node that maintains it and
+	 * return the resulting table. Stores keep windows/sessions for a multiple of the window size.
+	 */
+	private materialize<A>(
+		defaultStorePrefix: string,
+		keyCodec: Codec<K>,
+		valueCodec: Codec<A>,
+		options: Materialized<Windowed<K>, A> | undefined,
+		nodes: WindowedNodes<K, V, A>
+	): KTable<Windowed<K>, A> {
+		const { stores, topology } = this.builder
+		const storeName = options?.storeName ?? `${defaultStorePrefix}-${topology.nextStoreId()}`
+		const storeOptions = {
+			keyCodec,
+			valueCodec,
+			changelog: options?.changelog,
+			sourceTopics: this.sourceTopics,
+			retentionMs: this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER,
 		}
 
-		const valueCodec: Codec<number> = options?.value ?? {
-			encode: (v: number) => {
-				const buf = Buffer.alloc(8)
-				buf.writeDoubleLE(v, 0)
-				return buf
-			},
-			decode: (b: Buffer) => b.readDoubleLE(0),
-		}
-
-		const storeName = options?.storeName ?? `window-count-store-${this.app.nextStoreId()}`
-
-		let aggregateNode: Processor<K, V, Windowed<K>, number>
-
+		let node: Processor<K, V, Windowed<K>, A>
 		if (this.windows instanceof SessionWindows) {
-			// Use session store for session windows
-			const sessionStore = this.app.getOrCreateSessionStore<K, number>(
-				storeName,
-				keyCodec,
-				valueCodec,
-				{ retentionMs: this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER },
-				options?.changelog,
-				this.sourceTopics,
-				this.restrictRestorationToSourcePartitions
-			)
-			const storeRef = { store: sessionStore }
-
-			aggregateNode = new SessionAggregateNode<K, V, number>(
-				storeName,
-				storeRef,
-				() => 0,
-				(_key, _value, aggregate) => aggregate + 1,
-				(a, b) => a + b, // merger for counts
-				this.windowSizeMs
-			)
+			const store = stores.getOrCreateSessionStore<K, A>(storeName, storeOptions)
+			node = nodes.session(storeName, { store })
 		} else {
-			// Use window store for time windows
-			const store = this.app.getOrCreateWindowStore<K, number>(
-				storeName,
-				keyCodec,
-				valueCodec,
-				{ retentionMs: this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER, windowSizeMs: this.windowSizeMs }, // Keep windows for 24x the window size
-				options?.changelog,
-				this.sourceTopics,
-				this.restrictRestorationToSourcePartitions
-			)
-			const storeRef = { store }
-
-			aggregateNode = new WindowedAggregateNode<K, V, number>(
-				storeName,
-				storeRef,
-				() => 0,
-				(_key, _value, aggregate) => aggregate + 1,
-				this.windowSizeMs,
-				this.advanceMs
-			)
+			const store = stores.getOrCreateWindowStore<K, A>(storeName, {
+				...storeOptions,
+				windowSizeMs: this.windowSizeMs,
+			})
+			node = nodes.window(storeName, { store })
 		}
+		this.node.connect(node)
 
-		this.node.connect(aggregateNode)
+		return new KTableImpl<Windowed<K>, A>(this.builder, node, { keyCodec: windowedKeyCodec(keyCodec), valueCodec })
+	}
 
-		// Create a windowed key codec
-		const windowedKeyCodec: Codec<Windowed<K>> = {
-			encode: (wk: Windowed<K>) => {
-				const keyBytes = keyCodec.encode(wk.key)
-				const buf = Buffer.alloc(keyBytes.length + 16)
-				keyBytes.copy(buf, 0)
-				buf.writeBigInt64BE(BigInt(wk.window.start), keyBytes.length)
-				buf.writeBigInt64BE(BigInt(wk.window.end), keyBytes.length + 8)
-				return buf
-			},
-			decode: (b: Buffer) => {
-				const keyBytes = b.subarray(0, b.length - 16)
-				return {
-					key: keyCodec.decode(keyBytes),
-					window: {
-						start: Number(b.readBigInt64BE(b.length - 16)),
-						end: Number(b.readBigInt64BE(b.length - 8)),
-					},
-				}
-			},
-		}
-
-		return new KTableImpl<Windowed<K>, number>(this.app, aggregateNode, { keyCodec: windowedKeyCodec, valueCodec })
+	count(options?: Materialized<Windowed<K>, number>): KTable<Windowed<K>, number> {
+		const keyCodec = required(this.format.keyCodec, 'windowed count() requires a key codec.')
+		const initializer = () => 0
+		const increment = (_key: K, _value: V, count: number) => count + 1
+		return this.materialize('window-count-store', keyCodec, options?.value ?? numberCodec, options, {
+			window: (storeName, storeRef) =>
+				new WindowedAggregateNode<K, V, number>(
+					storeName,
+					storeRef,
+					initializer,
+					increment,
+					this.windowSizeMs,
+					this.advanceMs
+				),
+			session: (storeName, storeRef) =>
+				new SessionAggregateNode<K, V, number>(
+					storeName,
+					storeRef,
+					initializer,
+					increment,
+					(a, b) => a + b,
+					this.windowSizeMs
+				),
+		})
 	}
 
 	reduce(reducer: (aggregate: V, value: V) => V, options?: Materialized<Windowed<K>, V>): KTable<Windowed<K>, V> {
-		const keyCodec = this.format.keyCodec
-		const valueCodec = options?.value ?? this.format.valueCodec
-
-		if (!keyCodec) {
-			throw new Error('windowed reduce() requires a key codec.')
-		}
-		if (!valueCodec) {
-			throw new Error('windowed reduce() requires a value codec.')
-		}
-
-		const storeName = options?.storeName ?? `window-reduce-store-${this.app.nextStoreId()}`
-
-		let aggregateNode: Processor<K, V, Windowed<K>, V>
-
-		if (this.windows instanceof SessionWindows) {
-			// Use session store for session windows
-			const sessionStore = this.app.getOrCreateSessionStore<K, V>(
-				storeName,
-				keyCodec,
-				valueCodec,
-				{ retentionMs: this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER },
-				options?.changelog,
-				this.sourceTopics,
-				this.restrictRestorationToSourcePartitions
-			)
-			const storeRef = { store: sessionStore }
-
-			aggregateNode = new SessionReduceNode<K, V>(storeName, storeRef, reducer, this.windowSizeMs)
-		} else {
-			// Use window store for time windows
-			const store = this.app.getOrCreateWindowStore<K, V>(
-				storeName,
-				keyCodec,
-				valueCodec,
-				{ retentionMs: this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER, windowSizeMs: this.windowSizeMs },
-				options?.changelog,
-				this.sourceTopics,
-				this.restrictRestorationToSourcePartitions
-			)
-			const storeRef = { store }
-
-			aggregateNode = new WindowedReduceNode<K, V>(
-				storeName,
-				storeRef,
-				reducer,
-				this.windowSizeMs,
-				this.advanceMs
-			)
-		}
-
-		this.node.connect(aggregateNode)
-
-		const windowedKeyCodec: Codec<Windowed<K>> = {
-			encode: (wk: Windowed<K>) => {
-				const keyBytes = keyCodec.encode(wk.key)
-				const buf = Buffer.alloc(keyBytes.length + 16)
-				keyBytes.copy(buf, 0)
-				buf.writeBigInt64BE(BigInt(wk.window.start), keyBytes.length)
-				buf.writeBigInt64BE(BigInt(wk.window.end), keyBytes.length + 8)
-				return buf
-			},
-			decode: (b: Buffer) => {
-				const keyBytes = b.subarray(0, b.length - 16)
-				return {
-					key: keyCodec.decode(keyBytes),
-					window: {
-						start: Number(b.readBigInt64BE(b.length - 16)),
-						end: Number(b.readBigInt64BE(b.length - 8)),
-					},
-				}
-			},
-		}
-
-		return new KTableImpl<Windowed<K>, V>(this.app, aggregateNode, {
-			keyCodec: windowedKeyCodec,
-			valueCodec,
+		const keyCodec = required(this.format.keyCodec, 'windowed reduce() requires a key codec.')
+		const valueCodec = required(
+			options?.value ?? this.format.valueCodec,
+			'windowed reduce() requires a value codec.'
+		)
+		return this.materialize('window-reduce-store', keyCodec, valueCodec, options, {
+			window: (storeName, storeRef) =>
+				new WindowedReduceNode<K, V>(storeName, storeRef, reducer, this.windowSizeMs, this.advanceMs),
+			session: (storeName, storeRef) =>
+				new SessionReduceNode<K, V>(storeName, storeRef, reducer, this.windowSizeMs),
 		})
 	}
 
 	aggregate<A>(
 		initializer: () => A,
 		aggregator: (key: K, value: V, aggregate: A) => A,
-		options?: Materialized<Windowed<K>, A>
+		options?: Materialized<Windowed<K>, A> & { merger?: (aggregate1: A, aggregate2: A) => A }
 	): KTable<Windowed<K>, A> {
-		const keyCodec = this.format.keyCodec
-		const valueCodec = options?.value
-
-		if (!keyCodec) {
-			throw new Error('windowed aggregate() requires a key codec.')
-		}
-		if (!valueCodec) {
-			throw new Error('windowed aggregate() requires a value codec in Materialized options.')
-		}
-
-		const storeName = options?.storeName ?? `window-aggregate-store-${this.app.nextStoreId()}`
-
-		const store = this.app.getOrCreateWindowStore<K, A>(
-			storeName,
-			keyCodec,
-			valueCodec,
-			{ retentionMs: this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER, windowSizeMs: this.windowSizeMs },
-			options?.changelog,
-			this.sourceTopics,
-			this.restrictRestorationToSourcePartitions
+		const keyCodec = required(this.format.keyCodec, 'windowed aggregate() requires a key codec.')
+		const valueCodec = required(
+			options?.value,
+			'windowed aggregate() requires a value codec in Materialized options.'
 		)
-		const storeRef = { store }
-
-		const aggregateNode = new WindowedAggregateNode<K, V, A>(
-			storeName,
-			storeRef,
-			initializer,
-			aggregator,
-			this.windowSizeMs,
-			this.advanceMs
-		)
-
-		this.node.connect(aggregateNode)
-
-		const windowedKeyCodec: Codec<Windowed<K>> = {
-			encode: (wk: Windowed<K>) => {
-				const keyBytes = keyCodec.encode(wk.key)
-				const buf = Buffer.alloc(keyBytes.length + 16)
-				keyBytes.copy(buf, 0)
-				buf.writeBigInt64BE(BigInt(wk.window.start), keyBytes.length)
-				buf.writeBigInt64BE(BigInt(wk.window.end), keyBytes.length + 8)
-				return buf
-			},
-			decode: (b: Buffer) => {
-				const keyBytes = b.subarray(0, b.length - 16)
-				return {
-					key: keyCodec.decode(keyBytes),
-					window: {
-						start: Number(b.readBigInt64BE(b.length - 16)),
-						end: Number(b.readBigInt64BE(b.length - 8)),
-					},
-				}
-			},
+		// Sessions merge when a record bridges them, which needs to combine two aggregates.
+		const merger = options?.merger
+		if (this.windows instanceof SessionWindows && !merger) {
+			throw new Error(
+				'aggregate() on session windows requires a merger to combine the aggregates of sessions ' +
+					'that merge. Provide one via options: aggregate(init, agg, { value, merger: (a, b) => ... }).'
+			)
 		}
-
-		return new KTableImpl<Windowed<K>, A>(this.app, aggregateNode, {
-			keyCodec: windowedKeyCodec,
-			valueCodec,
+		return this.materialize('window-aggregate-store', keyCodec, valueCodec, options, {
+			window: (storeName, storeRef) =>
+				new WindowedAggregateNode<K, V, A>(
+					storeName,
+					storeRef,
+					initializer,
+					aggregator,
+					this.windowSizeMs,
+					this.advanceMs
+				),
+			session: (storeName, storeRef) =>
+				new SessionAggregateNode<K, V, A>(
+					storeName,
+					storeRef,
+					initializer,
+					aggregator,
+					merger!,
+					this.windowSizeMs
+				),
 		})
 	}
 }
 
 export class KGroupedTableImpl<K, V> implements KGroupedTable<K, V> {
 	constructor(
-		private readonly app: FlowAppInterface,
+		private readonly builder: TopologyBuilder,
 		private readonly node: OutputProcessor<K, V>,
 		private readonly format: StreamFormat<K, V>,
-		private readonly keyMappingStoreRef: { store: KeyValueStore<unknown, GroupedTableMapping<K, V>> | null },
-		private readonly groupedKeyCodec: Codec<K>
+		/** The repartition topic carrying the grouped rows; the aggregate state is co-partitioned with it. */
+		private readonly sourceTopics: Set<string>
 	) {}
 
-	count(options?: Materialized<K, number>): KTable<K, number> {
-		const keyCodec = options?.key ?? this.format.keyCodec
-		if (!keyCodec) {
-			throw new Error('KGroupedTable.count() requires a key codec.')
-		}
-
-		const valueCodec: Codec<number> = options?.value ?? {
-			encode: (v: number) => {
-				const buf = Buffer.alloc(8)
-				buf.writeDoubleLE(v, 0)
-				return buf
-			},
-			decode: (b: Buffer) => b.readDoubleLE(0),
-		}
-
-		const storeName = options?.storeName ?? `table-count-store-${this.app.nextStoreId()}`
-		const store = this.app.getOrCreateStore<K, number>(
-			storeName,
+	private materialize<A>(
+		defaultStorePrefix: string,
+		keyCodec: Codec<K>,
+		valueCodec: Codec<A>,
+		options: Materialized<K, A> | undefined,
+		createNode: (storeName: string, storeRef: StoreRef<KeyValueStore<K, A>>) => Processor<K, V, K, A>
+	): KTable<K, A> {
+		return materializeKeyValue(
+			this.builder,
+			this.node,
+			this.sourceTopics,
+			defaultStorePrefix,
 			keyCodec,
 			valueCodec,
-			options?.changelog,
-			undefined,
-			false
+			options,
+			createNode
 		)
-		const storeRef = { store }
+	}
 
-		const countNode = this.app.isExactlyOnce()
-			? new TableDeltaCountNode<K, V>(storeName, storeRef)
-			: new TableGroupedComputeCountNode<unknown, K, V>(
-					storeName,
-					storeRef,
-					this.keyMappingStoreRef,
-					this.groupedKeyCodec
-				)
-		this.node.connect(countNode)
-
-		return new KTableImpl<K, number>(this.app, countNode, { keyCodec, valueCodec }, storeRef)
+	count(options?: Materialized<K, number>): KTable<K, number> {
+		const keyCodec = required(options?.key ?? this.format.keyCodec, 'KGroupedTable.count() requires a key codec.')
+		return this.materialize(
+			'table-count-store',
+			keyCodec,
+			options?.value ?? numberCodec,
+			options,
+			(storeName, storeRef) => new TableDeltaCountNode<K, V>(storeName, storeRef)
+		)
 	}
 
 	reduce(
@@ -476,39 +365,18 @@ export class KGroupedTableImpl<K, V> implements KGroupedTable<K, V> {
 		subtractor: (aggregate: V, value: V) => V,
 		options?: Materialized<K, V>
 	): KTable<K, V> {
-		const keyCodec = options?.key ?? this.format.keyCodec
-		const valueCodec = options?.value ?? this.format.valueCodec
-
-		if (!keyCodec) {
-			throw new Error('KGroupedTable.reduce() requires a key codec.')
-		}
-		if (!valueCodec) {
-			throw new Error('KGroupedTable.reduce() requires a value codec.')
-		}
-
-		const storeName = options?.storeName ?? `table-reduce-store-${this.app.nextStoreId()}`
-		const store = this.app.getOrCreateStore<K, V>(
-			storeName,
+		const keyCodec = required(options?.key ?? this.format.keyCodec, 'KGroupedTable.reduce() requires a key codec.')
+		const valueCodec = required(
+			options?.value ?? this.format.valueCodec,
+			'KGroupedTable.reduce() requires a value codec.'
+		)
+		return this.materialize(
+			'table-reduce-store',
 			keyCodec,
 			valueCodec,
-			options?.changelog,
-			undefined,
-			false
+			options,
+			(storeName, storeRef) => new TableDeltaReduceNode<K, V>(storeName, storeRef, adder, subtractor)
 		)
-		const storeRef = { store }
-
-		const reduceNode = this.app.isExactlyOnce()
-			? new TableDeltaReduceNode<K, V>(storeName, storeRef, adder, subtractor)
-			: new TableGroupedComputeReduceNode<unknown, K, V>(
-					storeName,
-					storeRef,
-					this.keyMappingStoreRef,
-					this.groupedKeyCodec,
-					adder
-				)
-		this.node.connect(reduceNode)
-
-		return new KTableImpl<K, V>(this.app, reduceNode, { keyCodec, valueCodec }, storeRef)
 	}
 
 	aggregate<A>(
@@ -517,39 +385,26 @@ export class KGroupedTableImpl<K, V> implements KGroupedTable<K, V> {
 		subtractor: (key: K, value: V, aggregate: A) => A,
 		options?: Materialized<K, A>
 	): KTable<K, A> {
-		const keyCodec = options?.key ?? this.format.keyCodec
-		const valueCodec = options?.value
-
-		if (!keyCodec) {
-			throw new Error('KGroupedTable.aggregate() requires a key codec.')
-		}
-		if (!valueCodec) {
-			throw new Error('KGroupedTable.aggregate() requires a value codec in Materialized options.')
-		}
-
-		const storeName = options?.storeName ?? `table-aggregate-store-${this.app.nextStoreId()}`
-		const store = this.app.getOrCreateStore<K, A>(
-			storeName,
-			keyCodec,
-			valueCodec,
-			options?.changelog,
-			undefined,
-			false
+		const keyCodec = required(
+			options?.key ?? this.format.keyCodec,
+			'KGroupedTable.aggregate() requires a key codec.'
 		)
-		const storeRef = { store }
-
-		const aggregateNode = this.app.isExactlyOnce()
-			? new TableDeltaAggregateNode<K, V, A>(storeName, storeRef, initializer, adder, subtractor)
-			: new TableGroupedComputeAggregateNode<unknown, K, V, A>(
-					storeName,
-					storeRef,
-					this.keyMappingStoreRef,
-					this.groupedKeyCodec,
-					initializer,
-					adder
-				)
-		this.node.connect(aggregateNode)
-
-		return new KTableImpl<K, A>(this.app, aggregateNode, { keyCodec, valueCodec }, storeRef)
+		const valueCodec = required(
+			options?.value,
+			'KGroupedTable.aggregate() requires a value codec in Materialized options.'
+		)
+		return this.materialize('table-aggregate-store', keyCodec, valueCodec, options, (storeName, storeRef) => {
+			// Row count per group, so a group whose last row leaves is removed instead of lingering
+			// as whatever the subtractor returns for "nothing".
+			const members = this.builder.stores.getOrCreateKeyValueStore<K, number>(`${storeName}-members`, {
+				keyCodec,
+				valueCodec: numberCodec,
+				changelog: options?.changelog === false ? false : undefined,
+				sourceTopics: this.sourceTopics,
+			})
+			return new TableDeltaAggregateNode<K, V, A>(storeName, storeRef, initializer, adder, subtractor, {
+				store: members,
+			})
+		})
 	}
 }

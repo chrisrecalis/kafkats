@@ -29,6 +29,21 @@ export interface FlowConfig {
 	producer?: ProducerConfig
 	runEach?: RunEachOptions
 	/**
+	 * Whether a stream worker that fails with a recoverable error (broker outage, failed commit,
+	 * lost session, ...) restarts itself and resumes from the last committed offsets.
+	 * Errors thrown by user code and fatal errors (fencing, authorization) always stop the worker
+	 * and put the app in the ERROR state.
+	 * Default: true
+	 */
+	restartOnError?: boolean
+	/**
+	 * How long start() waits for each stream worker to join the consumer group.
+	 * Joining can take as long as the session timeout of a crashed member the group is still
+	 * waiting for.
+	 * Default: 120000
+	 */
+	startTimeoutMs?: number
+	/**
 	 * Default changelog topic configuration.
 	 */
 	changelog?: {
@@ -60,6 +75,8 @@ export interface Produced<K, V> {
 }
 
 export interface Grouped<K, V> {
+	/** Name used for the internal repartition topic (`<applicationId>-<name>-repartition`). */
+	name?: string
 	key?: Codec<K>
 	value?: Codec<V>
 }
@@ -107,6 +124,8 @@ export interface FlowApp {
 	start(): Promise<void>
 	close(): Promise<void>
 	state(): StreamState
+	/** The most recent error observed by the app (null if none). */
+	getError(): Error | null
 }
 
 export interface KStream<K, V> {
@@ -194,6 +213,7 @@ export interface WindowedKGroupedStream<K, V> {
 	aggregate<A>(
 		initializer: () => A,
 		aggregator: (key: K, value: V, aggregate: A) => A,
-		options?: Materialized<Windowed<K>, A>
+		/** `merger` is required for session windows: it combines the aggregates of two sessions that merge. */
+		options?: Materialized<Windowed<K>, A> & { merger?: (aggregate1: A, aggregate2: A) => A }
 	): KTable<Windowed<K>, A>
 }

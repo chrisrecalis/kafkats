@@ -24,6 +24,7 @@ import type { OffsetManager } from './offset-manager.js'
 import { noopLogger, type Logger } from '@/logger.js'
 import { tpKey, formatPartitions } from '@/utils/topic-partition.js'
 import { sleep } from '@/utils/sleep.js'
+import { ReconnectionStrategy } from '@/utils/reconnection-strategy.js'
 import type { PriorityStrategy, ScheduleDecision, SchedulerPartition, SchedulerState } from './priority.js'
 
 /**
@@ -449,7 +450,22 @@ export interface FetchManagerConfig {
 	maxBufferedBytes?: number
 	/** Called whenever a decoded batch range advances the fetch position. */
 	onFetchPosition?: (position: TopicPartitionOffset, recordCount: number) => void
+	/**
+	 * Called with failures of the background fetch loop (broker down, leader lookup failed, ...).
+	 * Throttled to one call per {@link FETCH_ERROR_REPORT_INTERVAL_MS}; the loop keeps retrying
+	 * with backoff regardless.
+	 */
+	onError?: (error: Error) => void
 	priority?: PriorityStrategy
+}
+
+/** Minimum spacing between reported background fetch failures (log line + onError). */
+export const FETCH_ERROR_REPORT_INTERVAL_MS = 5000
+/** Consecutive failed fetches against one broker before its cached leadership is re-resolved. */
+const FETCH_FAILURES_BEFORE_LEADER_REFRESH = 3
+
+function newFetchBackoff(): ReconnectionStrategy {
+	return new ReconnectionStrategy({ initialDelayMs: 100, maxDelayMs: 5000, jitter: 0.2 })
 }
 
 /**
@@ -502,6 +518,15 @@ export class FetchManager {
 	// Buffered poll mode fields
 	private fetchBuffer: FetchBuffer | null = null
 	private brokerInFlight: Map<number, boolean> = new Map()
+	// Per-broker retry gate after failed fetches (exponential backoff), so a down broker is polled
+	// at a bounded rate instead of in a hot loop. Cleared by the first successful fetch.
+	private readonly brokerBackoff: Map<number, { strategy: ReconnectionStrategy; until: number; failures: number }> =
+		new Map()
+	// Backoff for failed leader lookups (no broker reachable to resolve/connect the leader).
+	private readonly lookupBackoff = newFetchBackoff()
+	private lookupRetryAt = 0
+	private lastErrorReportAt = 0
+	private suppressedErrors = 0
 	// A fatal, non-retriable fetch error (e.g. CORRUPT_MESSAGE) surfaced to the next poll().
 	// The background fetch loop swallows rejected fetches (logs only), so fatal per-partition
 	// errors are stashed here and re-thrown from poll() rather than silently dropping data.
@@ -678,6 +703,11 @@ export class FetchManager {
 		}
 	}
 
+	/** The offset the next fetch of an assigned partition starts at, if the partition is assigned. */
+	getFetchPosition(topic: string, partition: number): bigint | undefined {
+		return this.partitionStates.get(tpKey(topic, partition))?.offset
+	}
+
 	/**
 	 * Seek to a specific offset for a partition
 	 *
@@ -837,6 +867,43 @@ export class FetchManager {
 		this.brokerInFlight.clear()
 	}
 
+	/** Log and surface a background failure, at most once per FETCH_ERROR_REPORT_INTERVAL_MS. */
+	private reportFailure(message: string, error: Error): void {
+		const now = Date.now()
+		if (now - this.lastErrorReportAt < FETCH_ERROR_REPORT_INTERVAL_MS) {
+			this.suppressedErrors++
+			return
+		}
+		this.lastErrorReportAt = now
+		this.logger.error(message, { error: error.message, suppressedSinceLastReport: this.suppressedErrors })
+		this.suppressedErrors = 0
+		this.config.onError?.(error)
+	}
+
+	/**
+	 * A fetch against `brokerId` failed (typically a dropped connection). Back that broker off
+	 * exponentially. The cached Broker reconnects by itself, so the leader is only re-resolved
+	 * (fresh metadata) after repeated failures, in case leadership moved to another node.
+	 */
+	private handleBrokerFetchFailure(brokerId: number, partitions: PartitionState[], error: Error): void {
+		const entry = this.brokerBackoff.get(brokerId) ?? { strategy: newFetchBackoff(), until: 0, failures: 0 }
+		entry.until = Date.now() + entry.strategy.nextDelay()
+		entry.strategy.recordFailure()
+		entry.failures++
+		this.brokerBackoff.set(brokerId, entry)
+
+		this.reportFailure('background fetch failed', error)
+
+		if (entry.failures >= FETCH_FAILURES_BEFORE_LEADER_REFRESH) {
+			const topics = new Set<string>()
+			for (const state of partitions) {
+				if (state.cachedLeader?.nodeId === brokerId) state.cachedLeader = null
+				topics.add(state.topic)
+			}
+			this.cluster.refreshMetadata([...topics]).catch(() => {})
+		}
+	}
+
 	/**
 	 * Background fetch loop for buffered poll mode
 	 * Continuously fetches from brokers and buffers results
@@ -897,16 +964,25 @@ export class FetchManager {
 				if (!this.running || signal?.aborted) break
 
 				if (partitionsByBroker.size === 0) {
-					await sleep(100, { signal }).catch(() => {})
+					// Leader lookup failed (or is backing off) for every ready partition: wait for the retry slot.
+					await sleep(Math.max(1, Math.min(this.lookupRetryAt - Date.now(), 100)), { signal }).catch(() => {})
 					continue
 				}
 				// Issue fetch to each broker that doesn't have an in-flight request. Split
 				// remaining capacity across those brokers so concurrent responses cannot each
 				// independently claim the entire buffer budget.
 				let fetchesIssued = 0
-				const availableBrokers = Array.from(partitionsByBroker.entries()).filter(
-					([brokerId]) => !this.brokerInFlight.get(brokerId)
-				)
+				const now = Date.now()
+				let backoffRemainingMs = Infinity
+				const availableBrokers = Array.from(partitionsByBroker.entries()).filter(([brokerId]) => {
+					if (this.brokerInFlight.get(brokerId)) return false
+					const until = this.brokerBackoff.get(brokerId)?.until ?? 0
+					if (until > now) {
+						backoffRemainingMs = Math.min(backoffRemainingMs, until - now)
+						return false
+					}
+					return true
+				})
 				for (let index = 0; index < availableBrokers.length; index++) {
 					const [brokerId, { broker, partitions }] = availableBrokers[index]!
 					const remainingBrokers = availableBrokers.length - index
@@ -920,11 +996,15 @@ export class FetchManager {
 
 					// Fire and forget - don't await, let it run in background
 					this.fetchFromBrokerToBuffer(broker, partitions, reservedBytes)
+						.then(() => {
+							this.brokerBackoff.delete(brokerId)
+						})
 						.catch(error => {
-							this.logger.error('background fetch failed', {
+							this.handleBrokerFetchFailure(
 								brokerId,
-								error: (error as Error).message,
-							})
+								partitions,
+								error instanceof Error ? error : new Error(String(error))
+							)
 						})
 						.finally(() => {
 							fetchBuffer.releaseCapacity(reservedBytes)
@@ -935,8 +1015,10 @@ export class FetchManager {
 				// Only sleep when necessary to prevent busy-loop. Capacity backpressure
 				// is handled at the top of the loop before any request is issued.
 				if (fetchesIssued === 0) {
-					// All brokers have in-flight requests, wait briefly
-					await sleep(1, { signal }).catch(() => {})
+					// All brokers have in-flight requests (or are backing off after failures), wait briefly
+					await sleep(Math.min(backoffRemainingMs, backoffRemainingMs === Infinity ? 1 : 10), {
+						signal,
+					}).catch(() => {})
 				}
 				// If fetches were issued and buffer is not full, continue immediately
 			} catch (error) {
@@ -970,7 +1052,7 @@ export class FetchManager {
 		}
 
 		// Parallel leader lookups for cache misses
-		if (needsLookup.length > 0) {
+		if (needsLookup.length > 0 && Date.now() >= this.lookupRetryAt) {
 			const lookups = await Promise.all(
 				needsLookup.map(async state => {
 					try {
@@ -978,15 +1060,22 @@ export class FetchManager {
 						state.cachedLeader = leader
 						return { state, leader }
 					} catch (error) {
-						this.logger.error('failed to get leader', {
-							topic: state.topic,
-							partition: state.partition,
-							error: (error as Error).message,
-						})
+						this.reportFailure(
+							'failed to get leader',
+							error instanceof Error ? error : new Error(String(error))
+						)
 						return null
 					}
 				})
 			)
+
+			if (lookups.some(result => result === null)) {
+				this.lookupRetryAt = Date.now() + this.lookupBackoff.nextDelay()
+				this.lookupBackoff.recordFailure()
+			} else {
+				this.lookupBackoff.reset()
+				this.lookupRetryAt = 0
+			}
 
 			for (const result of lookups) {
 				if (!result) continue

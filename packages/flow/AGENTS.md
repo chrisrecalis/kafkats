@@ -14,12 +14,42 @@ pnpm typecheck  # Type checking
 
 ```
 src/
-├── flow.ts     # Core streaming DSL (KStream, KTable, windowing)
-├── codec.ts    # Serialization codecs (string, json, buffer)
-├── state.ts    # State store interfaces
+├── flow.ts        # flow() / FlowAppImpl: DSL entry points, start/close lifecycle, wiring of runtime/
+├── types.ts       # Public types (FlowApp, KStream, KTable, FlowConfig, ...)
+├── changelog.ts   # Stable import path re-exporting changelog/
+├── changelog/
+│   ├── config.ts    # Changelog config, restoration options, topic naming
+│   ├── errors.ts    # ChangelogPartitionMismatchError, SourceTopicNotFoundError, CoPartitioningError
+│   ├── writer.ts    # ChangelogWriter, changelog key format for windowed stores
+│   └── restorer.ts  # ChangelogRestorer: checkpoint trust, replay to the log end, stall detection
+├── codec.ts       # Serialization codecs (string, json, buffer)
+├── state.ts       # State store interfaces
 ├── state/
-│   └── memory.ts  # In-memory state store implementation
-└── index.ts    # Public exports
+│   ├── memory.ts       # In-memory state store implementation
+│   ├── partitioned.ts  # Per-partition slices of a store (<applicationId>.<storeName>.p<partition>)
+│   ├── buffered.ts     # Transactional write buffer (exactly_once)
+│   └── changelog.ts    # Changelog-backed store wrappers
+├── streams/       # KStream / KTable / grouped stream implementations (the DSL)
+│   └── topology-builder.ts # TopologyBuilder: the only part of the app the DSL may use (stores, topology, output)
+├── processors/    # Processor nodes (aggregations, joins, table nodes)
+├── runtime/
+│   ├── context.ts         # Record context (worker + source partition) via AsyncLocalStorage
+│   ├── status.ts          # App state, last error, closing/started flags, shutdown signal
+│   ├── errors.ts          # Failure classification (fatal vs recoverable), restart backoff
+│   ├── topology.ts        # What the DSL registered (sources, internal topics, co-partition groups, global tables)
+│   ├── store-registry.ts  # State stores: per-partition stacks, provider names, changelog specs/writers
+│   ├── checkpoints.ts     # Changelog checkpoints (durable or in-process); pending checkpoints of an open transaction
+│   ├── internal-topics.ts # Co-partitioning checks, creation of changelog/repartition topics
+│   ├── restoration.ts     # Restore queue, app-/partition-scoped restore, release/prune of unowned state
+│   ├── start-positions.ts # Start position of partitions without a committed offset
+│   ├── transactions.ts    # Exactly-once batch of one worker (begin/commit/abort, commit timer)
+│   ├── worker-pool.ts     # WorkerPool: starts/stops the stream workers, commit on close
+│   ├── stream-worker.ts   # StreamWorker: run/restart loop, message handling, rebalance events
+│   ├── worker-config.ts   # Per-worker producer/consumer/runEach config (transactional id, group instance id, timeouts)
+│   ├── global-tables.ts   # Loading and following global tables
+│   └── output.ts          # RecordOutput: encoding, partitioner, transactional send
+├── testing.ts     # TestDriver, MockProducer/MockConsumer
+└── index.ts       # Public exports
 ```
 
 ### Key Abstractions
@@ -28,23 +58,39 @@ src/
 - **KStream**: Unbounded stream of key-value records
 - **KTable**: Changelog stream representing a table
 - **KGroupedStream**: Stream grouped by key for aggregations
-- **Windowing**: TimeWindows, SessionWindows, SlidingWindows
+- **Windowing**: TimeWindows, SessionWindows (SlidingWindows is not implemented and throws)
+
+### Runtime Model
+
+- **Partitioned state**: every source partition has its own slice of every state store. State partition N is logged to changelog partition N and restored from it. Provider-level store names are `<applicationId>.<storeName>.p<partition>` (default LMDB `maxDbs` is 4096 for that reason).
+- **Co-partitioning**: all topics feeding one stateful operation must have the same partition count, otherwise `start()` throws `CoPartitioningError`. Consumers always use the `range` assignor so partition N of every co-partitioned topic lands on the same worker.
+- **Repartitioning**: `groupBy()`, and `selectKey()`/`map()` followed by `groupByKey()`, a join or `toTable()`, write through an internal topic `<applicationId>-<name | repartition-N>-repartition` and read it back. `through(topic)` does the same with a user topic. Both are read from the beginning when the group has no committed offset. Needs key and value codecs.
+- **Global tables**: `globalTable()` is read in full by every instance outside the consumer group, loaded before processing starts, has no changelog and is only usable as the lookup side of a stream join.
+- **Exactly-once**: offsets, outputs and changelog records commit in one transaction. Store writes are buffered (`state/buffered.ts`) and applied only after the commit; an abort or crash never leaves uncommitted updates in a store.
+- **Fail-stop workers**: a worker that fails never continues past the failure. Recoverable failures (Kafka/infrastructure errors) abort the transaction, drop buffered state, rejoin and resume from committed offsets with backoff (0.5s to 30s), unless `restartOnError: false`. A broker-aborted transaction (fenced producer after `transactionTimeoutMs`) is recoverable too. User-code errors and fatal Kafka errors set `state()` to `'ERROR'`; see `app.getError()`.
+- **Restoration**: newly assigned partitions are paused, restored from the changelog, then resumed. A restore with no progress for `changelog.restoration.idleTimeoutMs` (default 30000) fails. Checkpoints are ignored (wipe + rebuild) when outside the changelog offset range or when the local store is empty.
+- **Stream time** is tracked per source partition (late-record dropping, window expiry). Clocks are in memory and are re-seeded from the restored window/session store after a restart, rebalance or abort.
+- **Start position**: source partitions read from `'latest'` with no committed offset are pinned to the position the process first started at until the first commit.
+- **Known limitations**: stream-stream left/outer joins emit the unmatched result eagerly; derived tables (`filter`/`mapValues`/joins/windowed results) are not materialized and cannot be a join lookup side.
+
+User-facing documentation: `packages/docs/flow/fault-tolerance.md`.
 
 ### Codecs
 
 ```typescript
-import { codec, string, json, buffer } from '@kafkats/flow'
+import { codec, string, json, buffer, type Codec } from '@kafkats/flow'
 
-// Built-in codecs
-string    // UTF-8 string
-json      // JSON serialization
-buffer    // Raw Buffer passthrough
+// Built-in codec factories (re-exported from @kafkats/client)
+string()      // UTF-8 string
+json<T>()     // JSON serialization
+buffer()      // Raw Buffer passthrough
+codec.json<T>() // `codec` is a namespace of the same factories
 
-// Custom codec
-const myCodec = codec<MyType>(
-  (value) => Buffer.from(...),  // encode
-  (buffer) => ...               // decode
-)
+// Custom codec: any object implementing Codec<T>
+const myCodec: Codec<MyType> = {
+  encode: (value) => Buffer.from(...),
+  decode: (buffer) => ...,
+}
 ```
 
 ## Example
@@ -52,15 +98,18 @@ const myCodec = codec<MyType>(
 ```typescript
 import { flow, topic, string, json } from '@kafkats/flow'
 
-const app = flow({ brokers: ['localhost:9092'] })
+const app = flow({
+	applicationId: 'my-app',
+	client: { clientId: 'my-app', brokers: ['localhost:9092'] },
+})
 
-const input = topic('input', string, json<Event>())
-const output = topic('output', string, json<Result>())
+const input = topic('input', { key: string(), value: json<Event>() })
+const output = topic('output', { key: string(), value: json<Result>() })
 
 app.stream(input)
 	.filter((k, v) => v.type === 'click')
 	.mapValues(v => ({ count: 1, ...v }))
-	.to(output)
+	.to(output.name, output) // to() takes the topic name; codecs via options
 
 await app.start()
 ```
@@ -79,7 +128,7 @@ Pluggable state stores for stateful stream processing (aggregations, joins, wind
 ### Built-in Provider
 
 ```typescript
-import { inMemory } from '@kafkats/flow'
+import { codec, inMemory } from '@kafkats/flow'
 
 const provider = inMemory()
 const store = provider.createKeyValueStore('my-store', {
@@ -109,7 +158,7 @@ Changelog topics are automatically created with the same partition count as sour
 app.stream('orders', { key: codec.string(), value: codec.json<Order>() }).groupByKey().count()
 ```
 
-For merged streams, uses the maximum partition count from all sources.
+Topics that feed the same stateful operation (merged streams, join sides) must have the same partition count; a mismatch throws `CoPartitioningError` from `start()`. Repartition topics are created with the largest partition count of the topics feeding them.
 
 ### Configuration
 
@@ -118,7 +167,7 @@ Global config in `FlowConfig`:
 ```typescript
 flow({
 	applicationId: 'my-app',
-	client: { brokers: ['localhost:9092'] },
+	client: { clientId: 'my-app', brokers: ['localhost:9092'] },
 	changelog: {
 		replicationFactor: 3,
 		topicConfigs: { 'min.insync.replicas': '2' },
@@ -145,8 +194,9 @@ stream.groupByKey().count({
 
 ### Key Files
 
-- `src/changelog.ts` - ChangelogConfig, error classes, ChangelogWriter/Restorer
-- `src/flow.ts` - validateAndCreateChangelogTopics(), source topic tracking
+- `src/changelog/` - ChangelogConfig, error classes, ChangelogWriter/Restorer
+- `src/runtime/internal-topics.ts` - validateAndCreateInternalTopics(); `src/runtime/restoration.ts` - restoration; `src/runtime/stream-worker.ts` - worker lifecycle
+- `src/state/partitioned.ts`, `src/state/buffered.ts` - per-partition stores and the transactional write buffer
 
 ## Testing Infrastructure
 
@@ -201,11 +251,15 @@ await driver.run(async ({ send }) => {
 
 ### Utilities
 
+- **Loopback**: records written to a topic the topology also reads (`through()`, repartition topics) are fed back into the topology automatically
+- **MockProducer** records `timestamp` and `headers` of produced messages
 - **testRecord(topic, key, value, options?)**: Create a test record for processor testing
-- **testRecordSequence(topic, items, options?)**: Create a sequence of records with incrementing timestamps
-- **createFactory(generator)**: Create test data factories
-- **timestamps(baseTime?)**: Create timestamp helpers for time-based testing
-- **quickTest(fn)**: Minimal setup for simple tests
+- **testRecordSequence(topic, items, options?)**: Create a sequence of records with incrementing timestamps (`{ startTimestamp, timestampIncrement, partition }`, bigint)
+- **createFactory(generator)**: Create test data factories (`create()`, `createMany()`, `reset()`)
+- **timestamps(baseTime?)**: Create timestamp helpers for time-based testing (`at()`, `after()`, `base`, `advance()`; bigint ms)
+- **quickTest(fn, config?)**: Minimal setup for simple tests
+
+`send()` takes `Buffer` keys (or `keyValue` + `keyCodec`) and `bigint` timestamps, and JSON-encodes values unless a `codec` is given.
 
 ### Example: Stream-Table Join
 

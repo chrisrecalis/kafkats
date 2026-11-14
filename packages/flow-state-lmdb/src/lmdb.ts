@@ -483,7 +483,7 @@ export interface LMDBProviderOptions {
 	stateDir: string
 	/** Maximum database size in bytes (default: 1GB) */
 	mapSize?: number
-	/** Maximum number of named databases (default: 100) */
+	/** Maximum number of named databases (default: 4096). One is used per state store partition. */
 	maxDbs?: number
 }
 
@@ -495,31 +495,44 @@ export interface LMDBProviderOptions {
  */
 export class LMDBStateStoreProvider implements StateStoreProvider {
 	readonly name = 'lmdb'
-	private readonly rootDb: RootDatabase<Buffer, Buffer>
+	private rootDb: RootDatabase<Buffer, Buffer> | null = null
 	private readonly stores = new Map<string, Database<Buffer, Buffer>>()
-	private readonly checkpointDb: Database<Buffer, Buffer>
+	private checkpointDb: Database<Buffer, Buffer> | null = null
 	private readonly checkpointStore: ChangelogCheckpointStore
 
-	constructor(options: LMDBProviderOptions) {
-		this.rootDb = open({
-			path: options.stateDir,
-			mapSize: options.mapSize ?? 1024 * 1024 * 1024, // 1GB default
-			maxDbs: options.maxDbs ?? 100,
-			keyEncoding: 'binary',
-			encoding: 'binary',
-		})
+	constructor(private readonly options: LMDBProviderOptions) {
+		this.root()
+		this.checkpointStore = new LMDBChangelogCheckpointStore(() => this.checkpoints())
+	}
 
-		this.checkpointDb = this.rootDb.openDB('__kafkats_flow_changelog_checkpoints__', {
-			keyEncoding: 'binary',
-			encoding: 'binary',
-		})
-		this.checkpointStore = new LMDBChangelogCheckpointStore(this.checkpointDb)
+	/** The environment, (re)opened on demand so a provider can be used again after close(). */
+	private root(): RootDatabase<Buffer, Buffer> {
+		if (!this.rootDb) {
+			this.rootDb = open({
+				path: this.options.stateDir,
+				mapSize: this.options.mapSize ?? 1024 * 1024 * 1024, // 1GB default
+				maxDbs: this.options.maxDbs ?? 4096,
+				keyEncoding: 'binary',
+				encoding: 'binary',
+			})
+		}
+		return this.rootDb
+	}
+
+	private checkpoints(): Database<Buffer, Buffer> {
+		if (!this.checkpointDb) {
+			this.checkpointDb = this.root().openDB('__kafkats_flow_changelog_checkpoints__', {
+				keyEncoding: 'binary',
+				encoding: 'binary',
+			})
+		}
+		return this.checkpointDb
 	}
 
 	private getOrCreateDb(name: string): Database<Buffer, Buffer> {
 		let db = this.stores.get(name)
 		if (!db) {
-			db = this.rootDb.openDB(name, {
+			db = this.root().openDB(name, {
 				keyEncoding: 'binary',
 				encoding: 'binary',
 			})
@@ -548,13 +561,20 @@ export class LMDBStateStoreProvider implements StateStoreProvider {
 	}
 
 	async close(): Promise<void> {
-		await this.rootDb.close()
+		const root = this.rootDb
+		this.rootDb = null
+		this.checkpointDb = null
 		this.stores.clear()
+		await root?.close()
 	}
 }
 
 class LMDBChangelogCheckpointStore implements ChangelogCheckpointStore {
-	constructor(private readonly db: Database<Buffer, Buffer>) {}
+	constructor(private readonly getDb: () => Database<Buffer, Buffer>) {}
+
+	private get db(): Database<Buffer, Buffer> {
+		return this.getDb()
+	}
 
 	get(topic: string, partition: number): Promise<bigint | undefined> {
 		const key = this.encodeKey(topic, partition)

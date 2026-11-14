@@ -12,7 +12,7 @@ import { EventEmitter } from 'node:events'
 import type { Cluster } from '@/client/cluster.js'
 import type { Broker } from '@/client/broker.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
-import { KafkaProtocolError, CoordinatorNotAvailableError } from '@/client/errors.js'
+import { KafkaProtocolError, CoordinatorNotAvailableError, isConnectionFailure } from '@/client/errors.js'
 import type {
 	TopicPartition,
 	ConsumerGroupEvents,
@@ -34,6 +34,7 @@ import { rangeAssignor, stickyAssignor, cooperativeStickyAssignor } from './assi
 import { noopLogger, type Logger } from '@/logger.js'
 import { sleep } from '@/utils/sleep.js'
 import { retry } from '@/utils/retry.js'
+import { SHUTDOWN_DEADLINE_MS, withTimeout } from '@/utils/timeout.js'
 
 /**
  * Result of join operation with partition change info
@@ -283,6 +284,10 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 		} catch (error) {
 			this.logger.error('join failed', { error: (error as Error).message })
 			this.state = ConsumerGroupState.UNJOINED
+			if (isConnectionFailure(error)) {
+				// The coordinator may have moved while it was unreachable.
+				await this.refreshCoordinatorIfMoved()
+			}
 			throw error
 		}
 	}
@@ -337,7 +342,7 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 	 * Dynamic members (no groupInstanceId) send LeaveGroup so the broker can immediately
 	 * rebalance rather than waiting for the session timeout.
 	 */
-	async leave(): Promise<void> {
+	async leave(budgetMs: number = SHUTDOWN_DEADLINE_MS): Promise<void> {
 		this.logger.info('leaving group', { memberId: this.memberId, static: !!this.config.groupInstanceId })
 		this.stopHeartbeat()
 		this.state = ConsumerGroupState.LEAVING
@@ -345,17 +350,23 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 		try {
 			// Static members must NOT send LeaveGroup — doing so triggers an immediate rebalance
 			// and defeats the purpose of static membership (KIP-345).
-			if (this.coordinator && this.memberId && !this.config.groupInstanceId) {
-				await this.coordinator.leaveGroup({
-					groupId: this.config.groupId,
-					members: [
-						{
-							memberId: this.memberId,
-							groupInstanceId: null,
-							reason: 'Consumer leaving group',
-						},
-					],
-				})
+			if (this.coordinator && this.memberId && !this.config.groupInstanceId && budgetMs > 0) {
+				// Best effort: against an unresponsive broker the wait is bounded, the session then
+				// simply expires broker-side.
+				await withTimeout(
+					this.coordinator.leaveGroup({
+						groupId: this.config.groupId,
+						members: [
+							{
+								memberId: this.memberId,
+								groupInstanceId: null,
+								reason: 'Consumer leaving group',
+							},
+						],
+					}),
+					budgetMs,
+					'LeaveGroup'
+				)
 				this.logger.debug('leave group response received')
 			} else if (this.config.groupInstanceId) {
 				this.logger.debug('static member: skipping LeaveGroup to avoid triggering rebalance (KIP-345)')
@@ -371,7 +382,7 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 			this.assignment = []
 			this.ownedPartitions = []
 			this.pendingRevocation = []
-			this.coordinator = null
+			await this.releaseCoordinator(0)
 			this.logger.info('left group')
 			this.emit('left')
 		}
@@ -380,9 +391,22 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 	/**
 	 * Stop the consumer group (abort heartbeat, leave group)
 	 */
-	async stop(): Promise<void> {
+	async stop(budgetMs?: number): Promise<void> {
 		this.abortController?.abort()
-		await this.leave()
+		await this.leave(budgetMs)
+	}
+
+	/**
+	 * Abandon requests parked at an unresponsive coordinator (a JoinGroup/SyncGroup can sit there
+	 * for the whole rebalance timeout) by force-closing this member's dedicated connection. They
+	 * reject at once; the connection is not re-dialed.
+	 */
+	interrupt(): void {
+		this.abortController?.abort()
+		const coordinator = this.coordinator
+		if (coordinator) {
+			void coordinator.disconnect(0).catch(() => {})
+		}
 	}
 
 	/**
@@ -395,7 +419,7 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 		}
 
 		const maxAttempts = 5
-		this.coordinator = await retry(() => this.cluster.getCoordinator('GROUP', this.config.groupId), {
+		this.coordinator = await retry(() => this.cluster.getDedicatedCoordinator('GROUP', this.config.groupId), {
 			maxAttempts,
 			initialDelayMs: 500,
 			maxDelayMs: 5_000,
@@ -414,11 +438,55 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 	}
 
 	/**
+	 * Close and forget this member's dedicated coordinator connection
+	 */
+	private async releaseCoordinator(waitForPendingMs?: number): Promise<void> {
+		const coordinator = this.coordinator
+		this.coordinator = null
+		if (coordinator) {
+			await this.cluster.releaseDedicatedBroker(coordinator, waitForPendingMs)
+		}
+	}
+
+	/**
+	 * After a connection failure: re-resolve the coordinator and, only if it is now a different
+	 * node, move to a fresh dedicated connection. The existing connection re-dials its own node by
+	 * itself, so an unchanged coordinator needs nothing. Best effort - errors are swallowed (the
+	 * cluster may still be unreachable; the caller retries).
+	 */
+	private async refreshCoordinatorIfMoved(): Promise<void> {
+		const current = this.coordinator
+		if (!current || this.abortController?.signal.aborted) {
+			return
+		}
+		try {
+			this.cluster.invalidateCoordinator('GROUP', this.config.groupId)
+			const resolved = await this.cluster.getCoordinator('GROUP', this.config.groupId)
+			if (
+				resolved.nodeId === current.nodeId &&
+				resolved.host === current.host &&
+				resolved.port === current.port
+			) {
+				return
+			}
+			const fresh = await this.cluster.getDedicatedCoordinator('GROUP', this.config.groupId)
+			if (this.coordinator !== current || this.abortController?.signal.aborted) {
+				await this.cluster.releaseDedicatedBroker(fresh, 0)
+				return
+			}
+			this.coordinator = fresh
+			await this.cluster.releaseDedicatedBroker(current, 0)
+		} catch (error) {
+			this.logger.debug('coordinator refresh failed', { error: (error as Error).message })
+		}
+	}
+
+	/**
 	 * Refresh coordinator connection (after NOT_COORDINATOR error)
 	 */
 	private async refreshCoordinator(): Promise<void> {
 		this.cluster.invalidateCoordinator('GROUP', this.config.groupId)
-		this.coordinator = null
+		await this.releaseCoordinator()
 		await this.ensureCoordinator()
 	}
 
@@ -803,9 +871,12 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 						await this.handleHeartbeatError(response.errorCode)
 					}
 				})
-				.catch(error => {
+				.catch(async error => {
 					this.logger.error('heartbeat failed', { error: (error as Error).message })
 					this.emitError(error as Error)
+					if (isConnectionFailure(error)) {
+						await this.refreshCoordinatorIfMoved()
+					}
 				})
 				.finally(() => {
 					if (this.state === ConsumerGroupState.STABLE && !this.abortController?.signal.aborted) {
@@ -875,7 +946,6 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 
 			case ErrorCode.NotCoordinator:
 			case ErrorCode.CoordinatorNotAvailable:
-				this.coordinator = null
 				await this.refreshCoordinator()
 				break
 

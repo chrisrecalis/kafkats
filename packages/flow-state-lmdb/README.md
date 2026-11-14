@@ -18,17 +18,18 @@ npm install @kafkats/flow @kafkats/flow-state-lmdb
 
 ```typescript
 import { KafkaClient } from '@kafkats/client'
-import { flow } from '@kafkats/flow'
+import { flow, string } from '@kafkats/flow'
 import { lmdb } from '@kafkats/flow-state-lmdb'
 
-const client = new KafkaClient({ brokers: ['localhost:9092'] })
+const client = new KafkaClient({ clientId: 'my-app', brokers: ['localhost:9092'] })
 
-const app = flow(client, {
+const app = flow({
 	applicationId: 'my-app',
+	client,
 	stateStoreProvider: lmdb({ stateDir: './state' }),
 })
 
-app.stream('events').groupByKey().count().toStream().to('counts')
+app.stream('events', { key: string(), value: string() }).groupByKey().count().toStream().to('counts')
 
 await app.start()
 ```
@@ -39,9 +40,11 @@ await app.start()
 lmdb({
 	stateDir: './state', // Directory for state files
 	mapSize: 1024 ** 3, // Max database size (default: 1GB)
-	maxDbs: 100, // Max number of stores (default: 100)
+	maxDbs: 4096, // Max number of named databases (default: 4096)
 })
 ```
+
+State is partitioned, so each partition of a store is its own LMDB database named `<applicationId>.<storeName>.p<partition>`. Size `maxDbs` for the number of stores times the number of partitions.
 
 ## Documentation
 

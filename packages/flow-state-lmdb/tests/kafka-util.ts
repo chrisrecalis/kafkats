@@ -1,0 +1,91 @@
+/**
+ * Helpers for the broker-backed LMDB tests: client/topic setup, a read_committed reader and the
+ * `hardening-worker.ts` child process. Requires a built @kafkats/client.
+ */
+import { spawn, type ChildProcess } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
+import path from 'node:path'
+// @kafkats/client is not a dependency of this package; load the workspace build directly.
+import { KafkaClient } from '../../client/dist/index.js'
+
+export const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms))
+export const uniq = (p: string) => `${p}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
+const here = path.dirname(fileURLToPath(import.meta.url))
+const TSX = path.resolve(here, '../../flow/node_modules/tsx/dist/loader.mjs')
+
+export class ChildWorker {
+	proc!: ChildProcess
+	lines: string[] = []
+	exited!: Promise<void>
+	pid = 0
+	constructor(readonly env: Record<string, string>) {}
+	start(): this {
+		this.proc = spawn(process.execPath, ['--import', TSX, path.join(here, 'hardening-worker.ts')], {
+			cwd: path.resolve(here, '..'),
+			env: { ...process.env, ...this.env },
+			stdio: ['ignore', 'pipe', 'pipe'],
+		})
+		this.pid = this.proc.pid ?? 0
+		this.proc.stdout!.on('data', d => this.lines.push(...d.toString().split('\n').filter(Boolean)))
+		this.proc.stderr!.on('data', d => this.lines.push(`STDERR ${d}`))
+		this.exited = new Promise(res => this.proc.on('exit', () => res()))
+		return this
+	}
+	get started() {
+		return this.lines.some(l => l.includes('"started"'))
+	}
+	async kill() {
+		this.proc.kill('SIGKILL')
+		await this.exited
+	}
+	async term() {
+		this.proc.kill('SIGTERM')
+		await this.exited
+	}
+}
+
+export async function makeClient(brokers: string[]) {
+	const c = new KafkaClient({ clientId: uniq('r3-harness'), brokers })
+	await c.connect()
+	return c
+}
+export async function createTopic(client: any, name: string, partitions: number) {
+	await client.createTopics([{ name, numPartitions: partitions, replicationFactor: 1 }])
+	const deadline = Date.now() + 20_000
+	while (Date.now() < deadline) {
+		const t = (await client.getMetadata([name])).topics.get(name)
+		if (t && t.partitions.size === partitions && [...t.partitions.values()].every((p: any) => p.leaderId >= 0))
+			return
+		await sleep(100)
+	}
+	throw new Error('topic not ready')
+}
+export async function readCommitted(
+	client: any,
+	topic: string,
+	quietMs = 2_000
+): Promise<Array<{ key: string; value: number | null; partition: number; offset: bigint }>> {
+	const consumer = client.consumer({
+		groupId: uniq('r3-reader'),
+		autoOffsetReset: 'earliest',
+		isolationLevel: 'read_committed',
+		maxWaitMs: 100,
+	})
+	const out: any[] = []
+	let last = Date.now()
+	const run = consumer.runEach(topic, async (m: any) => {
+		out.push({
+			key: m.key.toString(),
+			value: m.value === null ? null : JSON.parse(m.value.toString()),
+			partition: m.partition,
+			offset: m.offset,
+		})
+		last = Date.now()
+	})
+	run.catch(() => {})
+	await sleep(800)
+	while (Date.now() - last < quietMs) await sleep(100)
+	consumer.stop()
+	await run.catch(() => {})
+	return out
+}

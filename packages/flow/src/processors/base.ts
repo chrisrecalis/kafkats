@@ -1,5 +1,8 @@
 import type { ConsumeContext, Consumer, Producer, SendResult } from '@kafkats/client'
 import type { Codec } from '@/codec.js'
+import type { PendingCheckpoints } from '@/runtime/checkpoints.js'
+import type { TransactionalBuffer } from '@/runtime/context.js'
+import type { SourceNode } from '@/processors/source-sink.js'
 
 // Internal types (not exported from public API)
 
@@ -30,13 +33,21 @@ export type ActiveTransaction = {
 	readonly signal: AbortSignal
 	send(
 		topic: string,
-		messages: { key?: Buffer | null; value: Buffer | null; headers?: Record<string, Buffer>; partition?: number }
+		messages: {
+			key?: Buffer | null
+			value: Buffer | null
+			headers?: Record<string, Buffer>
+			partition?: number
+			timestamp?: Date
+		}
 	): Promise<SendResult>
 	sendOffsets(
 		context: ConsumeContext,
 		offsets: Array<{ topic: string; partition: number; offset: bigint }>
 	): Promise<void>
 }
+
+export type StreamClock = { streamTimeMs: number; lastCleanupMs: number }
 
 export type TopicPartitionKey = `${string}:${number}`
 
@@ -45,21 +56,32 @@ export type WorkerContext = {
 	producer: Producer
 	consumer: Consumer
 	activeTransaction: ActiveTransaction | null
-	activeTransactionPromise: Promise<void> | null
-	offsetCommitContext: ConsumeContext | null
 	sourcesByTopic: Map<string, SourceNode<unknown, unknown>[]>
 	assignedPartitions: Map<TopicPartitionKey, { topic: string; partition: number }>
-	// Transaction batching state for EOS
-	pendingOffsets: Map<TopicPartitionKey, { topic: string; partition: number; offset: bigint }>
-	pendingChangelogOffsets: Map<TopicPartitionKey, { topic: string; partition: number; offset: bigint }>
-	eosQueue: Promise<void>
-	transactionActive: boolean
-	commitTimer: ReturnType<typeof setTimeout> | null
-	lastCommitTime: number
+	/** Changelog positions of the open transaction, checkpointed once it commits. */
+	pendingCheckpoints: PendingCheckpoints
+	/**
+	 * Stream-time clocks of this worker, keyed `<trackerId>|<topic>:<partition>`. Reset whenever the
+	 * worker's uncommitted progress is discarded or a partition is (re)assigned.
+	 */
+	streamClocks: Map<string, StreamClock>
+	/** Stores holding writes buffered by the open transaction. */
+	dirtyStores: Set<TransactionalBuffer>
+	/** Set once the worker has failed; it processes nothing more until restarted. */
+	failure: { error: Error; recoverable: boolean } | null
+	/** Whether the worker made progress since it last (re)started; resets the restart backoff. */
+	processedSinceRestart: boolean
 }
 
-// Forward declaration for WorkerContext type
-import type { SourceNode } from '@/processors/source-sink.js'
+/** Holder of a state store, shared by every worker clone of the node that uses it. */
+export type StoreRef<S> = { store: S | null }
+
+export function requireStore<S>(ref: StoreRef<S>, name: string): S {
+	if (!ref.store) {
+		throw new Error(`State store '${name}' not initialized`)
+	}
+	return ref.store
+}
 
 export type AnyProcessor = Processor<unknown, unknown, unknown, unknown>
 export type OutputProcessor<K, V> = Processor<unknown, unknown, K, V>
@@ -110,8 +132,7 @@ export abstract class Processor<IK, IV, OK = IK, OV = IV> {
 }
 
 export class PassThroughNode<K, V> extends Processor<K, V, K, V> {
-	clone(worker: WorkerContext): Processor<K, V, K, V> {
-		void worker
+	clone(): Processor<K, V, K, V> {
 		return new PassThroughNode<K, V>()
 	}
 

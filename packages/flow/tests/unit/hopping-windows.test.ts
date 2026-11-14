@@ -12,7 +12,7 @@ function makeStubStore<K, A>() {
 			data.set(JSON.stringify(key), value)
 		}),
 		delete: vi.fn(async () => {}),
-		all: vi.fn(),
+		all: vi.fn(() => (async function* () {})()),
 		range: vi.fn(),
 		fetch: vi.fn(),
 		fetchAll: vi.fn(),

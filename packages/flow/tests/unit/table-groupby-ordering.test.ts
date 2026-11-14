@@ -13,7 +13,7 @@ interface MappingEntry<K, V> {
 }
 
 describe('TableGroupByNode mapping ordering', () => {
-	it('persists new mapping BEFORE forwarding SUB/ADD deltas', async () => {
+	it('forwards SUB/ADD deltas BEFORE persisting the new mapping (replay re-emits them instead of losing them)', async () => {
 		const order: string[] = []
 
 		const data = new Map<string, MappingEntry<string, number>>()
@@ -39,15 +39,10 @@ describe('TableGroupByNode mapping ordering', () => {
 		} as any
 
 		const storeRef = { store }
-		const codec = {
-			encode: (k: string) => Buffer.from(k),
-			decode: (b: Buffer) => b.toString(),
-		}
 
 		const node = new TableGroupByNode<string, number, string>(
 			(_k, v) => ['new-group', v],
-			storeRef as unknown as { store: KeyValueStore<string, MappingEntry<string, number>> | null },
-			codec
+			storeRef as unknown as { store: KeyValueStore<string, MappingEntry<string, number>> | null }
 		)
 		const forwards: Array<{ key: string | null; value: number | null; headers: Record<string, Buffer> }> = []
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -72,9 +67,9 @@ describe('TableGroupByNode mapping ordering', () => {
 		const putIdx = order.findIndex(s => s.startsWith('put('))
 		const addIdx = order.findIndex(s => s.startsWith(`forward(${DELTA_ADD_VALUE}`))
 
-		expect(putIdx).toBeGreaterThanOrEqual(0)
-		expect(subIdx).toBeGreaterThan(putIdx)
+		expect(subIdx).toBeGreaterThanOrEqual(0)
 		expect(addIdx).toBeGreaterThan(subIdx)
+		expect(putIdx).toBeGreaterThan(addIdx)
 
 		const subForward = forwards.find(f => {
 			const op = f.headers[DELTA_OP_HEADER]

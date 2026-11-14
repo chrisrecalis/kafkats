@@ -14,7 +14,7 @@ import type {
 import { InMemoryStateStoreProvider } from '../../src/state/memory.js'
 
 // Wrap InMemoryStateStoreProvider but inject a failing CheckpointStore so tests drive
-// the real flushChangelogCheckpoints path through FlowAppImpl.
+// the real checkpoint flush path (Checkpoints.flush) of the app.
 function makeProviderWithFailingCheckpointStore(checkpointStore: ChangelogCheckpointStore): StateStoreProvider {
 	const inner = new InMemoryStateStoreProvider()
 	return {
@@ -48,7 +48,7 @@ describe('checkpoint persistence errors surface, not swallow', () => {
 		// Force topology compilation but don't actually start the consumer/producer loop.
 		void driver.flow
 
-		// Reach into the private impl to drive flushChangelogCheckpoints directly with a
+		// Reach into the private impl to drive the checkpoint flush directly with a
 		// synthetic worker. This actually calls the production method (regression-proof:
 		// reverting to .catch(() => {}) would silently break this test's lastError check).
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -60,13 +60,13 @@ describe('checkpoint persistence errors surface, not swallow', () => {
 			]),
 		}
 
-		await flowAny.flushChangelogCheckpoints(worker)
+		await flowAny.checkpoints.flush([...worker.pendingChangelogOffsets.values()])
 
-		// set() called with offset+1 for both partitions.
+		// set() called one past the pending offset (the commit marker) for both partitions.
 		expect(checkpointStore.set).toHaveBeenCalledWith('t', 0, 42n)
 		expect(checkpointStore.set).toHaveBeenCalledWith('t', 1, 100n)
 		// lastError reflects the failure even though we didn't halt.
-		expect(flowAny.lastError).toBe(setError)
+		expect(flowAny.getError()).toBe(setError)
 	})
 
 	it('logs flush() rejections too', async () => {
@@ -84,12 +84,10 @@ describe('checkpoint persistence errors surface, not swallow', () => {
 
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const flowAny = driver.flow as any
-		await flowAny.flushChangelogCheckpoints({
-			pendingChangelogOffsets: new Map([['t:0', { topic: 't', partition: 0, offset: 0n }]]),
-		})
+		await flowAny.checkpoints.flush([{ topic: 't', partition: 0, offset: 1n }])
 
 		expect(checkpointStore.flush).toHaveBeenCalled()
-		expect(flowAny.lastError).toBe(flushError)
+		expect(flowAny.getError()).toBe(flushError)
 	})
 
 	it('dedupes log lines for repeated identical errors and recovers on success', async () => {
@@ -111,17 +109,17 @@ describe('checkpoint persistence errors surface, not swallow', () => {
 		const worker = { pendingChangelogOffsets: new Map([['t:0', { topic: 't', partition: 0, offset: 0n }]]) }
 
 		// First failure → message recorded.
-		await flowAny.flushChangelogCheckpoints(worker)
-		const firstMsg = flowAny.lastCheckpointErrorMessage
+		await flowAny.checkpoints.flush([...worker.pendingChangelogOffsets.values()])
+		const firstMsg = flowAny.checkpoints.lastErrorMessage
 		expect(firstMsg).toBe('disk full')
 
 		// Repeat failure → no log re-emit; lastCheckpointErrorMessage stays the same.
-		await flowAny.flushChangelogCheckpoints(worker)
-		expect(flowAny.lastCheckpointErrorMessage).toBe(firstMsg)
+		await flowAny.checkpoints.flush([...worker.pendingChangelogOffsets.values()])
+		expect(flowAny.checkpoints.lastErrorMessage).toBe(firstMsg)
 
 		// Subsequent success → recovery, message cleared.
 		setShouldFail = false
-		await flowAny.flushChangelogCheckpoints(worker)
-		expect(flowAny.lastCheckpointErrorMessage).toBeNull()
+		await flowAny.checkpoints.flush([...worker.pendingChangelogOffsets.values()])
+		expect(flowAny.checkpoints.lastErrorMessage).toBeNull()
 	})
 })

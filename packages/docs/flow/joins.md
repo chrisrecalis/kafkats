@@ -14,12 +14,15 @@ Joins combine data from multiple streams or tables based on matching keys.
 
 Joins accept an optional `options` object (type `Joined<K, V1, V2>`):
 
-| Option       | Type                                              | Description                                    |
-| ------------ | ------------------------------------------------- | ---------------------------------------------- |
-| `within`     | `TimeWindows \| SessionWindows \| SlidingWindows` | Join window (required for stream-stream joins) |
-| `key`        | `Codec<K>`                                        | Key codec override                             |
-| `value`      | `Codec<V1>`                                       | Left-side value codec override                 |
-| `otherValue` | `Codec<V2>`                                       | Right-side value codec override                |
+| Option       | Type                                              | Description                                                             |
+| ------------ | ------------------------------------------------- | ----------------------------------------------------------------------- |
+| `within`     | `TimeWindows \| SessionWindows \| SlidingWindows` | Join window (required for stream-stream joins; `SlidingWindows` throws) |
+| `key`        | `Codec<K>`                                        | Key codec override                                                      |
+| `value`      | `Codec<V1>`                                       | Left-side value codec override                                          |
+| `otherValue` | `Codec<V2>`                                       | Right-side value codec override                                         |
+| `changelog`  | `boolean \| ChangelogConfig`                      | Changelog for the join window stores (default: enabled)                 |
+
+If a stream was re-keyed with `selectKey()` or `map()`, the join repartitions it first, which needs its key and value codecs. Pass them here when they cannot be inferred. See [Repartitioning](/flow/streams#repartitioning).
 
 ## Stream-Stream Joins
 
@@ -41,6 +44,12 @@ const clicksWithImpressions = clicks.join(
 	{ within: TimeWindows.of('5m') } // Events must be within 5 minutes
 )
 ```
+
+Several records with the same key and the same timestamp on one side are all kept, and each of them can match.
+
+::: warning Left and outer joins emit eagerly
+A stream-stream `leftJoin()` or `outerJoin()` emits the unmatched result (`null` for the other side) as soon as a record arrives without a match. If a matching record arrives later within the window, a **second** record is emitted with the match. Downstream consumers should expect both.
+:::
 
 ### Window Requirement
 
@@ -102,9 +111,11 @@ Both sides must have the same key for joining:
 // Orders keyed by orderId, users keyed by userId
 // Need to rekey orders first
 orders
-	.selectKey((_, order) => order.userId) // Rekey by userId
-	.join(users, joiner)
+	.selectKey(order => order.userId) // Rekey by userId
+	.join(users, joiner, { key: string() })
 ```
+
+The re-keyed stream is written to an internal repartition topic and read back, so every order for a user is processed in the same partition as that user's row. The `key` codec is needed because `selectKey()` does not carry one over. See [Repartitioning](/flow/streams#repartitioning).
 
 ### Left Join
 
@@ -153,36 +164,54 @@ app.stream(eventsTopic)
 		...event,
 		setting: configValue.setting,
 	}))
-	.to(enrichedEventsTopic)
+	.to('enriched-events', { value: json() })
 ```
+
+Every instance reads all partitions of the topic itself and loads the table fully before processing starts, so there is no co-partitioning requirement. A global table can only be the lookup side of a stream `join()` or `leftJoin()`.
 
 Global tables are useful for:
 
 - Small, reference data
 - Lookup tables needed everywhere
 - Configuration data
+- Joining with topics that have a different partition count
+
+::: tip
+A stream that was re-keyed with `selectKey()` or `map()` is repartitioned before a join with another stream or a table; pass the `key` and `value` codecs in the join options for it. Joins with a global table never repartition.
+:::
 
 ## Co-partitioning Requirement
 
-For joins to work correctly, both sides must be **co-partitioned**:
+State is kept per partition, so for a join to find its match, both sides must be **co-partitioned**:
 
-- Same number of partitions
-- Same partitioning logic
+- the same number of partitions
+- the same partitioning logic: records with the same key are in the same partition index
+
+This applies to both sides of a stream-stream or table-table join, and to the stream and the table of a stream-table join. If the partition counts differ, `start()` throws `CoPartitioningError`:
 
 ```typescript
-// Both topics must have same partition count and key type
-const orders = topic('orders', { key: string(), ... })
-const users = topic('users', { key: string(), ... })  // Same key type
+import { CoPartitioningError } from '@kafkats/flow'
+
+try {
+	await app.start()
+} catch (err) {
+	if (err instanceof CoPartitioningError) {
+		console.error(err.partitionCounts) // Map { 'orders' => 6, 'users' => 3 }
+	}
+}
 ```
 
-If not co-partitioned, rekey through an intermediate topic:
+Flow can only check partition counts. It cannot check that both topics were written with the same partitioner.
+
+To fix a mismatch, repartition one side with `through()` into a topic that has the right partition count (it must exist), or use a [global table](#global-table-joins):
 
 ```typescript
 orders
-	.selectKey((_, o) => o.userId)
-	.through(rekeyedOrdersTopic) // Repartition
+	.through(ordersByUserTopic, { key: string(), value: json<Order>() }) // same partition count as users
 	.join(users, joiner)
 ```
+
+Streams that were re-keyed with `selectKey()` or `map()` are repartitioned automatically, so you only need `through()` when the partition counts differ.
 
 ## Example: Order Enrichment Pipeline
 
@@ -224,12 +253,12 @@ const products = app.globalTable<string, Product>(productsTopic)
 
 // Process orders
 app.stream<string, Order>(ordersTopic)
-	// First join with users (by userId)
-	.selectKey((_, order) => order.userId)
-	.join(users, (order, user) => ({ order, user }))
+	// First join with users (by userId). The re-keyed stream is repartitioned, so give it codecs
+	.selectKey(order => order.userId)
+	.join(users, (order, user) => ({ order, user }), { key: string() })
 
-	// Then join with products (by productId)
-	.selectKey((_, { order }) => order.productId)
+	// Then join with products (by productId, from a global table)
+	.selectKey(({ order }) => order.productId)
 	.join(
 		products,
 		({ order, user }, product) =>
@@ -242,10 +271,11 @@ app.stream<string, Order>(ordersTopic)
 				quantity: order.quantity,
 				price: order.price,
 				discount: user.tier === 'gold' ? 0.15 : user.tier === 'silver' ? 0.1 : 0.05,
-			}) as EnrichedOrder
+			}) as EnrichedOrder,
+		{ key: string(), value: json<{ order: Order; user: User }>() }
 	)
 
-	.to(enrichedOrdersTopic)
+	.to('enriched-orders', { value: json<EnrichedOrder>() })
 ```
 
 ## Example: Session Attribution
@@ -283,7 +313,8 @@ pageViews
 		() => ({ pages: [] as string[] }),
 		(sessionId, pv, agg) => ({
 			pages: [...agg.pages, pv.page],
-		})
+		}),
+		{ value: json<{ pages: string[] }>() }
 	)
 	.toStream()
 	.join(
@@ -297,13 +328,13 @@ pageViews
 			}) as Attribution,
 		{ within: TimeWindows.of('30m') }
 	)
-	.to(attributionsTopic)
+	.to('attributions', { value: json<Attribution>() })
 ```
 
 ## Performance Tips
 
 1. **Order matters** - Join smaller table to larger stream
 2. **Use global tables** - For small lookup data
-3. **Rekey sparingly** - Repartitioning is expensive
+3. **Rekey sparingly** - Repartitioning writes every record to an internal topic and reads it back
 4. **Window size** - Smaller windows = less state
-5. **Materialization** - Name stores for queryability
+5. **Materialization** - Name stores so their changelog topics keep stable names

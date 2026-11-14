@@ -7,6 +7,7 @@
 import { ErrorCode, getErrorMessage, getErrorName, isRetriableError } from '@/protocol/messages/error-codes.js'
 import type { ApiKey } from '@/protocol/messages/api-keys.js'
 import type { CoordinatorType } from './types.js'
+import { NetworkError } from '@/network/errors.js'
 
 /**
  * Base class for all Kafka client errors
@@ -167,6 +168,16 @@ export class BrokerNotAvailableError extends KafkaError {
 		super(`Broker ${nodeId} is not available`, ErrorCode.BrokerNotAvailable)
 		this.name = 'BrokerNotAvailableError'
 		this.nodeId = nodeId
+	}
+}
+
+/**
+ * No broker of the cluster could be reached
+ */
+export class NoBrokersAvailableError extends KafkaError {
+	constructor() {
+		super('No brokers available', ErrorCode.BrokerNotAvailable)
+		this.name = 'NoBrokersAvailableError'
 	}
 }
 
@@ -470,4 +481,18 @@ export function isRetriable(error: unknown): boolean {
 		return error.retriable
 	}
 	return false
+}
+
+/**
+ * Whether an error means "the broker could not be reached right now" (dropped/refused/timed-out
+ * connection, or no broker reachable) rather than a protocol-level answer. These are the failures
+ * a broker restart produces, and are always worth retrying with backoff.
+ */
+export function isConnectionFailure(error: unknown): boolean {
+	return (
+		error instanceof NetworkError ||
+		error instanceof ConnectionError ||
+		error instanceof NoBrokersAvailableError ||
+		error instanceof BrokerNotAvailableError
+	)
 }

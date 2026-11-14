@@ -62,6 +62,7 @@ export {
 	ChangelogWriter,
 	ChangelogRestorer,
 	ChangelogPartitionMismatchError,
+	CoPartitioningError,
 	SourceTopicNotFoundError,
 } from '@/changelog.js'
 export type { ChangelogConfig, ChangelogTopicSpec } from '@/changelog.js'

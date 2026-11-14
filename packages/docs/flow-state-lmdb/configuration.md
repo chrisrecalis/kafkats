@@ -25,8 +25,8 @@ lmdb({
 	// Optional: Maximum database size (default: 1GB)
 	mapSize: 1024 * 1024 * 1024,
 
-	// Optional: Maximum number of named databases (default: 100)
-	maxDbs: 100,
+	// Optional: Maximum number of named databases (default: 4096; one is used per state store partition)
+	maxDbs: 4096,
 })
 ```
 
@@ -34,7 +34,7 @@ lmdb({
 | ---------- | -------- | -------------------- | --------------------------------- |
 | `stateDir` | `string` | -                    | Directory for LMDB database files |
 | `mapSize`  | `number` | `1024 * 1024 * 1024` | Maximum database size in bytes    |
-| `maxDbs`   | `number` | `100`                | Maximum number of named databases |
+| `maxDbs`   | `number` | `4096`               | Maximum number of named databases |
 
 ### stateDir
 

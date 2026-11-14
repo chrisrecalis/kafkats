@@ -130,6 +130,7 @@ export default defineConfig({
 						{ text: 'Aggregations', link: '/flow/aggregations' },
 						{ text: 'Joins', link: '/flow/joins' },
 						{ text: 'State Stores', link: '/flow/state-stores' },
+						{ text: 'Fault Tolerance', link: '/flow/fault-tolerance' },
 					],
 				},
 				{

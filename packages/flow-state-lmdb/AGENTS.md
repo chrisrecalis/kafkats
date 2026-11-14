@@ -42,9 +42,15 @@ Session stores use `[key][windowStart][windowEnd]` ordering for efficient key-ba
 lmdb({
 	stateDir: './state', // Required: directory for LMDB files
 	mapSize: 1024 * 1024 * 1024, // Optional: max DB size (default 1GB)
-	maxDbs: 100, // Optional: max named databases (default 100)
+	maxDbs: 4096, // Optional: max named databases (default 4096)
 })
 ```
+
+## Partitioned State
+
+`@kafkats/flow` keeps one slice of every state store per source partition, so each slice is its own named LMDB database: `<applicationId>.<storeName>.p<partition>` (hence the `maxDbs` default of 4096). Changelog checkpoints are kept in a separate database (`__kafkats_flow_changelog_checkpoints__`) and let a restart resume restoration incrementally. Flow ignores a checkpoint (wipes the store and rebuilds it from the changelog) when it is outside the changelog's offset range or the local store is empty.
+
+`close()` closes the LMDB environment; it is reopened on demand, so an app using the provider can be started again after `close()`.
 
 ## Native Dependency
 
