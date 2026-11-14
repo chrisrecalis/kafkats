@@ -27,6 +27,7 @@ import type {
 	KeyOf,
 	Message,
 	ConsumeContext,
+	BatchContext,
 	MessageHandler,
 	BatchHandler,
 	RunEachOptions,
@@ -668,15 +669,22 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 
 				const messages = records.map(r => decodeRecord(topic, partition, r, decoders))
 				const lastRecord = records[records.length - 1]!
-				const consumeCtx = this.createConsumeContext(ctx.signal, topic, partition, lastRecord.offset)
-
-				await handler(messages as Message<MsgOf<S>, KeyOf<S>>[], consumeCtx)
-
-				if (ctx.commitOffsets) {
-					for (const record of records) {
-						ctx.offsetManager.markConsumed(topic, partition, record.offset)
+				let resolved = 0
+				const resolveOffset = (offset: bigint): void => {
+					if (!ctx.commitOffsets) return
+					while (resolved < records.length && records[resolved]!.offset <= offset) {
+						ctx.offsetManager.markConsumed(topic, partition, records[resolved]!.offset)
+						resolved++
 					}
 				}
+				const batchCtx: BatchContext = {
+					...this.createConsumeContext(ctx.signal, topic, partition, lastRecord.offset),
+					resolveOffset,
+				}
+
+				await handler(messages as Message<MsgOf<S>, KeyOf<S>>[], batchCtx)
+
+				resolveOffset(lastRecord.offset)
 			},
 			opts.autoCommitIntervalMs ?? DEFAULT_RUN_BATCH_OPTIONS.autoCommitIntervalMs,
 			opts.autoCommit !== false

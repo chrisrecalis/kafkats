@@ -19,7 +19,7 @@ const app = flow({
 
 No record is lost. After a crash or a redelivery, records since the last committed offset are processed again, so their **outputs and state updates may be applied again**. A `count()` can over-count, and a record can be written to the output topic twice.
 
-Records are processed in the batches the consumer delivers. Output and changelog records are sent without waiting for each acknowledgement; before the offsets of a batch are committed, every one of them must have been acknowledged. If a send fails, the worker fails without committing and the batch is processed again. An output record can therefore be written before the changelog record of the same input is acknowledged, and is written again after such a failure. This is the same contract as Kafka Streams: flush everything, then commit.
+Records are processed in the batches the consumer delivers. Output and changelog records are sent without waiting for each acknowledgement; before offsets are committed, every one of them must have been acknowledged. This happens at the end of a batch and, within a long batch, every `commitIntervalMs`. If a send fails, the worker fails without committing and the batch is processed again. An output record can therefore be written before the changelog record of the same input is acknowledged, and is written again after such a failure. This is the same contract as Kafka Streams: flush everything, then commit.
 
 ### Exactly-Once
 

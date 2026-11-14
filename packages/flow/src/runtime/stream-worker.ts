@@ -1,4 +1,4 @@
-import type { ConsumeContext, KafkaClient, Logger, Message } from '@kafkats/client'
+import type { BatchContext, ConsumeContext, KafkaClient, Logger, Message } from '@kafkats/client'
 import type { AnyProcessor, SourceNode, WorkerContext } from '@/processors/index.js'
 import type { FlowConfig } from '@/types.js'
 import { PendingCheckpoints, type Checkpoints } from '@/runtime/checkpoints.js'
@@ -49,6 +49,7 @@ export type WorkerDeps = {
 export class StreamWorker {
 	readonly context: WorkerContext
 	private readonly transactions: WorkerTransactions
+	private readonly commitIntervalMs: number
 	private readonly eosEnabled: boolean
 
 	constructor(
@@ -80,9 +81,10 @@ export class StreamWorker {
 			failure: null,
 			processedSinceRestart: false,
 		}
+		this.commitIntervalMs = config.commitIntervalMs ?? DEFAULT_COMMIT_INTERVAL_MS
 		this.transactions = new WorkerTransactions(
 			this.context,
-			config.commitIntervalMs ?? DEFAULT_COMMIT_INTERVAL_MS,
+			this.commitIntervalMs,
 			deps.checkpoints,
 			(err, recoverable) => this.fail(err, recoverable)
 		)
@@ -262,7 +264,7 @@ export class StreamWorker {
 	 * returns only after everything the batch produced has been acknowledged.
 	 * Exactly-once: every record joins the worker's transaction batch, which commits offsets itself.
 	 */
-	private async handleBatch(batch: Message<Buffer>[], ctx: ConsumeContext): Promise<void> {
+	private async handleBatch(batch: Message<Buffer>[], ctx: BatchContext): Promise<void> {
 		const worker = this.context
 		// Fail-stop: once a worker has failed, nothing more may be processed (and thereby
 		// acknowledged) until it has restarted from the last committed offsets.
@@ -281,8 +283,17 @@ export class StreamWorker {
 		}
 
 		try {
+			// A batch can take long to work through (many records, a slow processor). Its progress
+			// is made committable every commit interval, so a failure repeats at most that much.
+			let flushedAt = Date.now()
 			for (const message of batch) {
 				await this.processorFor(message, ctx)?.()
+				if (Date.now() - flushedAt >= this.commitIntervalMs) {
+					await worker.sends.flush()
+					ctx.resolveOffset(message.offset)
+					worker.processedSinceRestart = true
+					flushedAt = Date.now()
+				}
 			}
 			await worker.sends.flush()
 			worker.processedSinceRestart = true

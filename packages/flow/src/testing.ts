@@ -25,7 +25,13 @@
 
 import { EventEmitter } from 'node:events'
 import { vi } from 'vitest'
-import { KafkaClient, type ConsumeContext, type Message, type RunBatchOptions } from '@kafkats/client'
+import {
+	KafkaClient,
+	type BatchContext,
+	type ConsumeContext,
+	type Message,
+	type RunBatchOptions,
+} from '@kafkats/client'
 import type { Codec } from '@/codec.js'
 import { flow, type FlowApp, type FlowConfig, type Consumed } from '@/flow.js'
 
@@ -69,7 +75,7 @@ export class MockConsumer extends EventEmitter {
 	/** Topics this consumer subscribed to. */
 	subscription: string[] = []
 
-	private handler: ((batch: Message<Buffer>[], ctx: ConsumeContext) => Promise<void>) | null = null
+	private handler: ((batch: Message<Buffer>[], ctx: BatchContext) => Promise<void>) | null = null
 	private stopResolve: (() => void) | null = null
 	private nextOffset = 0n
 	/** Records produced to a subscribed topic while another record is being processed. */
@@ -78,7 +84,7 @@ export class MockConsumer extends EventEmitter {
 
 	async runBatch(
 		subscription: string[],
-		handler: (batch: Message<Buffer>[], ctx: ConsumeContext) => Promise<void>,
+		handler: (batch: Message<Buffer>[], ctx: BatchContext) => Promise<void>,
 		_options?: RunBatchOptions
 	): Promise<void> {
 		this.subscription = subscription
@@ -143,7 +149,14 @@ export class MockConsumer extends EventEmitter {
 					headers: options.headers ?? {},
 				},
 			],
-			{ signal: new AbortController().signal, topic, partition, offset, groupId: 'test-group' }
+			{
+				signal: new AbortController().signal,
+				topic,
+				partition,
+				offset,
+				groupId: 'test-group',
+				resolveOffset: () => {},
+			}
 		)
 	}
 }

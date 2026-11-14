@@ -20,6 +20,7 @@ export type {
 	// Message
 	Message,
 	ConsumeContext,
+	BatchContext,
 	ConsumerGroupMetadata,
 	// Handlers
 	MessageHandler,
