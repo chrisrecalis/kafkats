@@ -50,10 +50,7 @@ await createTopics(client, [input, output], 4)
 const inputs = genInput(keys, perKey)
 console.log(`== ${label}: ${inputs.length} records, ${kills} kills; in=${input} out=${output}`)
 
-let produced = false
-const producing = produceBatches(client, input, inputs, batch, delayMs).then(() => {
-	produced = true
-})
+const producing = produceBatches(client, input, inputs, batch, delayMs)
 
 const env = workerEnv({ appId, input, output, mode, guarantee, threads })
 const all: Worker[] = []

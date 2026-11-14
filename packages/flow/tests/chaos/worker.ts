@@ -6,7 +6,6 @@
  *   CHAOS_BROKERS=127.0.0.1:29092 CHAOS_APP_ID=x CHAOS_IN=in CHAOS_OUT=out \
  *   CHAOS_MODE=count CHAOS_GUARANTEE=exactly_once pnpm exec tsx tests/chaos/worker.ts
  *
-NOTE: CHAOS_TRACE_RESTORE monkeypatch targets the OLD ChangelogRestorer.restore signature and is broken on new code; do not set it.
  * Env: CHAOS_BROKERS, CHAOS_APP_ID, CHAOS_IN, CHAOS_OUT, CHAOS_MODE=stateless|count|regroup,
  *      CHAOS_GUARANTEE=at_least_once|exactly_once, CHAOS_THREADS (default 1),
  *      CHAOS_SESSION_MS (default 6000), CHAOS_TXN_TIMEOUT_MS (default 10000),
@@ -19,7 +18,6 @@ NOTE: CHAOS_TRACE_RESTORE monkeypatch targets the OLD ChangelogRestorer.restore 
  * Logs every unhandledRejection / uncaughtException (scenario E) but does NOT exit on them.
  */
 import { codec, flow } from '../../src/index.js'
-import { ChangelogRestorer } from '../../src/changelog.js'
 
 const env = (k: string, d?: string): string => {
 	const v = process.env[k] ?? d
@@ -41,42 +39,6 @@ process.on('uncaughtException', (err: Error) => {
 	log('UNCAUGHT_EXCEPTION', { message: err.message, stack: err.stack?.split('\n').slice(0, 6).join(' | ') })
 })
 
-// CHAOS_TRACE_RESTORE=1: wrap ChangelogRestorer.restore (runtime monkeypatch, src untouched) to log what each restoration did.
-if (process.env.CHAOS_TRACE_RESTORE) {
-	const orig = (ChangelogRestorer.prototype as any).restore
-	;(ChangelogRestorer.prototype as any).restore = async function (
-		this: any,
-		client: any,
-		opts: any,
-		partitions: any,
-		cp: any
-	) {
-		const st = Date.now()
-		const admin = client.admin()
-		const lso = await admin.fetchTopicOffsets(this.topicName, partitions, 'latest', {
-			isolationLevel: 'read_committed',
-		})
-		const hw = await admin.fetchTopicOffsets(this.topicName, partitions, 'latest', {
-			isolationLevel: 'read_uncommitted',
-		})
-		log('restore_begin', {
-			topic: this.topicName,
-			partitions,
-			lso: [...lso].map(([p, o]) => `${p}:${o}`),
-			hw: [...hw].map(([p, o]) => `${p}:${o}`),
-		})
-		try {
-			const n = await orig.call(this, client, opts, partitions, cp)
-			const vals: unknown[] = []
-			for (let i = 0; i < 12; i++) vals.push(await this.store.get(`k${i}`).catch(() => '?'))
-			log('restore_end', { restored: n, ms: Date.now() - st, restoredValues: vals.join(',') })
-			return n
-		} catch (e) {
-			log('restore_error', { message: (e as Error).message, ms: Date.now() - st })
-			throw e
-		}
-	}
-}
 
 const guarantee = env('CHAOS_GUARANTEE', 'at_least_once') as 'at_least_once' | 'exactly_once'
 const mode = env('CHAOS_MODE', 'stateless')

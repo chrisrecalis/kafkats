@@ -244,11 +244,11 @@ export function summarizeCount(
 		const a = byKey.get(`${keyPrefix}${k}`) ?? []
 		const perKey = expectedByKey?.get(`k${k}`) ?? perKeyDefault
 		const max = a.length ? Math.max(...a) : 0
-		const last = a.length ? a[a.length - 1] : 0
+		const last = a[a.length - 1] ?? 0
 		const exact = a.length === perKey && a.every((v, i) => v === i + 1)
 		if (exact) exactKeys++
 		if (last < perKey) lastBelowKeys++
-		if (a.some((v, i) => i > 0 && v < a[i - 1])) nonMonotonicKeys++
+		if (a.some((v, i) => i > 0 && v < a[i - 1]!)) nonMonotonicKeys++
 		if (max < perKey) {
 			belowKeys++
 			maxBelow = Math.max(maxBelow, perKey - max)
