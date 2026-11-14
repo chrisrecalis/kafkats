@@ -123,6 +123,8 @@ export class WorkerTransactions {
 		const dirtyStores = [...worker.dirtyStores]
 
 		try {
+			// Everything the batch produced must be acknowledged before the transaction commits.
+			await worker.sends.flush()
 			if (offsets.length > 0) {
 				if (!this.offsetCommitContext) {
 					throw new Error('exactly_once requires a consume context for transactional offset commits')
@@ -164,6 +166,7 @@ export class WorkerTransactions {
 		const open = this.open
 
 		for (const store of worker.dirtyStores) store.discardBuffer(worker.dirtyStores)
+		worker.sends.discard()
 		this.clearState()
 		// Stream time advanced by the aborted records must not make their replay look late.
 		worker.streamClocks.clear()

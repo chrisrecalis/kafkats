@@ -202,6 +202,8 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	// settles, so at most one batch per partition is ever in flight (preserves
 	// per-partition ordering for the idempotent producer).
 	private mutedPartitions = new Set<string>()
+	// AddPartitionsToTxn requests in flight, by `topic:partition`.
+	private readonly partitionRegistrations = new Map<string, Promise<void>>()
 
 	// Transaction state (only used when transactionalId is set)
 	private transactionState: TransactionState = 'idle'
@@ -233,7 +235,12 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		this.accumulator.on('batchReady', batch => {
 			// Collect batches and schedule drain to group by broker
 			this.pendingBatches.push(batch)
-			this.scheduleDrain()
+			// A batch for a partition with an in-flight send cannot go out yet, and the drain that
+			// runs when that send settles will pick it up. Draining now would only re-scan the
+			// queue once per send() call, which is quadratic while a busy partition backs up.
+			if (!this.mutedPartitions.has(`${batch.topic}:${batch.partition}`)) {
+				this.scheduleDrain()
+			}
 		})
 
 		if (this.config.transactionConcurrency > 1) {
@@ -292,23 +299,38 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		// OutOfOrderSequenceNumber. Deferred batches stay queued and are drained when
 		// their partition's in-flight send settles (see the finally below) — every
 		// deferred batch's partition is muted, so a re-drain is always pending.
-		const pickedPartitions = new Set<string>()
-		const toSend: PartitionBatch[] = []
+		//
+		// Batches of one partition that queued up behind an in-flight send are merged into a
+		// single batch (in order, up to maxBatchBytes). Every send() call seals its own batch
+		// right away, so without this, concurrent sends to a busy partition would each cost a
+		// round trip; with it, a busy partition batches whatever arrived while it was sending.
+		const picked = new Map<string, PartitionBatch>()
 
 		for (const batch of batches) {
 			const key = `${batch.topic}:${batch.partition}`
-			if (this.mutedPartitions.has(key) || pickedPartitions.has(key)) {
+			if (this.mutedPartitions.has(key)) {
 				this.pendingBatches.push(batch)
+				continue
+			}
+			const first = picked.get(key)
+			if (!first) {
+				picked.set(key, batch)
+			} else if (first.sizeBytes + batch.sizeBytes <= this.config.maxBatchBytes) {
+				for (const message of batch.messages) first.messages.push(message)
+				first.sizeBytes += batch.sizeBytes
+				// The merged batch is sent (and accounted for) as part of `first`.
+				this.accumulator.batchCompleted()
 			} else {
-				pickedPartitions.add(key)
-				toSend.push(batch)
+				this.pendingBatches.push(batch)
 			}
 		}
 
-		if (toSend.length === 0) return
+		if (picked.size === 0) return
+
+		const toSend = [...picked.values()]
 
 		// Mute the partitions we are about to send so subsequent drains skip them.
-		for (const key of pickedPartitions) {
+		for (const key of picked.keys()) {
 			this.mutedPartitions.add(key)
 		}
 
@@ -316,7 +338,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		this.inflight.add(promise)
 		promise.finally(() => {
 			this.inflight.delete(promise)
-			for (const key of pickedPartitions) {
+			for (const key of picked.keys()) {
 				this.mutedPartitions.delete(key)
 			}
 			// Now-unmuted partitions may have deferred batches waiting.
@@ -1481,6 +1503,8 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		// the counter, so addPartitionsToTxn and the actual writes would diverge.
 		const partitionCount = await this.getPartitionCount(topicDef.topic)
 		const partitionsToAdd = new Set<number>()
+		// Registrations of this send's partitions already requested by a concurrent send.
+		const registering = new Set<Promise<void>>()
 		const resolvedMessages: Array<ProducerMessage<V, K> & { partition: number }> = msgArray.map(msg => {
 			let partition = msg.partition
 			if (partition === undefined) {
@@ -1494,13 +1518,32 @@ export class Producer extends EventEmitter<ProducerEvents> {
 			}
 			const key = `${topicDef.topic}:${partition}`
 			if (!this.partitionsInTransaction.has(key)) {
-				partitionsToAdd.add(partition)
+				const inFlight = this.partitionRegistrations.get(key)
+				if (inFlight) {
+					registering.add(inFlight)
+				} else {
+					partitionsToAdd.add(partition)
+				}
 			}
 			return { ...msg, partition }
 		})
 
 		if (partitionsToAdd.size > 0) {
-			await this.addPartitionsToTransaction(topicDef.topic, Array.from(partitionsToAdd))
+			// Sends issued before this request returns wait for it instead of each sending their
+			// own AddPartitionsToTxn for the same partition.
+			const registration = this.addPartitionsToTransaction(topicDef.topic, Array.from(partitionsToAdd))
+			const keys = Array.from(partitionsToAdd, partition => `${topicDef.topic}:${partition}`)
+			for (const key of keys) this.partitionRegistrations.set(key, registration)
+			const forget = () => {
+				for (const key of keys) {
+					if (this.partitionRegistrations.get(key) === registration) this.partitionRegistrations.delete(key)
+				}
+			}
+			registration.then(forget, forget)
+			registering.add(registration)
+		}
+		if (registering.size > 0) {
+			await Promise.all(registering)
 		}
 
 		return this.internalSend(topicDef, isSingle ? resolvedMessages[0]! : resolvedMessages)

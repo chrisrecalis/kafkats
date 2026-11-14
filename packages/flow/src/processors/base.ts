@@ -1,6 +1,7 @@
 import type { ConsumeContext, Consumer, Producer, SendResult } from '@kafkats/client'
 import type { Codec } from '@/codec.js'
 import type { PendingCheckpoints } from '@/runtime/checkpoints.js'
+import type { PendingSends } from '@/runtime/pending-sends.js'
 import type { TransactionalBuffer } from '@/runtime/context.js'
 import type { SourceNode } from '@/processors/source-sink.js'
 
@@ -60,6 +61,8 @@ export type WorkerContext = {
 	assignedPartitions: Map<TopicPartitionKey, { topic: string; partition: number }>
 	/** Changelog positions of the open transaction, checkpointed once it commits. */
 	pendingCheckpoints: PendingCheckpoints
+	/** Produce requests awaited at the next commit point instead of per record. */
+	sends: PendingSends
 	/**
 	 * Stream-time clocks of this worker, keyed `<trackerId>|<topic>:<partition>`. Reset whenever the
 	 * worker's uncommitted progress is discarded or a partition is (re)assigned.

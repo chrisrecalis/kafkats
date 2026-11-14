@@ -317,7 +317,13 @@ export class StoreRegistry implements StoreFactory {
 				await this.checkpoints.recordWrite(result.topic, result.partition, result.offset)
 			},
 			// State partition N is logged to changelog partition N (see ChangelogWriter).
-			scope === 'partition' ? () => recordContextStorage.getStore()?.partition : undefined
+			scope === 'partition' ? () => recordContextStorage.getStore()?.partition : undefined,
+			// Acknowledgements are awaited at the worker's next commit point, not per write.
+			ack => {
+				const worker = recordContextStorage.getStore()?.worker
+				worker?.sends.track(ack)
+				return worker !== undefined
+			}
 		)
 	}
 }

@@ -6,7 +6,7 @@ import { PartitionedWindowStore, PartitionedSessionStore } from '../../src/state
 
 type TestMessage = Omit<Message<Buffer>, 'value'> & { value: Buffer | null }
 type TestContext = ConsumeContext
-type TestHandler = (message: TestMessage, ctx: TestContext) => Promise<void>
+type TestHandler = (batch: TestMessage[], ctx: TestContext) => Promise<void>
 
 class TestConsumer extends EventEmitter {
 	private handler: TestHandler | null = null
@@ -20,7 +20,7 @@ class TestConsumer extends EventEmitter {
 		key?: Buffer | null
 		headers?: Record<string, Buffer>
 	}> = []
-	async runEach(subscription: string[], handler: TestHandler): Promise<void> {
+	async runBatch(subscription: string[], handler: TestHandler): Promise<void> {
 		this.subscription = subscription
 		this.handler = handler
 		this.emit('running')
@@ -74,7 +74,7 @@ class TestConsumer extends EventEmitter {
 			offset: 0n,
 			groupId: 'test-app',
 		}
-		await this.handler(message, ctx)
+		await this.handler([message], ctx)
 		const next = this.loopback.shift()
 		if (next) {
 			await this.emitMessage(next.topic, next.value, next.key, timestamp, next.headers)

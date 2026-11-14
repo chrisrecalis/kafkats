@@ -2,6 +2,7 @@ import type { ConsumeContext, KafkaClient, Logger, Message } from '@kafkats/clie
 import type { AnyProcessor, SourceNode, WorkerContext } from '@/processors/index.js'
 import type { FlowConfig } from '@/types.js'
 import { PendingCheckpoints, type Checkpoints } from '@/runtime/checkpoints.js'
+import { PendingSends } from '@/runtime/pending-sends.js'
 import { recordContextStorage, type RecordContext } from '@/runtime/context.js'
 import {
 	RESTART_INITIAL_BACKOFF_MS,
@@ -73,6 +74,7 @@ export class StreamWorker {
 			sourcesByTopic: new Map(),
 			assignedPartitions: new Map(),
 			pendingCheckpoints: new PendingCheckpoints(),
+			sends: new PendingSends(),
 			dirtyStores: new Set(),
 			streamClocks: new Map(),
 			failure: null,
@@ -143,9 +145,9 @@ export class StreamWorker {
 		for (;;) {
 			let runError: unknown = null
 			try {
-				await worker.consumer.runEach(
+				await worker.consumer.runBatch(
 					topics,
-					(message, ctx) => this.handleMessage(message, ctx),
+					(batch, ctx) => this.handleBatch(batch, ctx),
 					workerRunEachOptions(config, this.eosEnabled)
 				)
 			} catch (err) {
@@ -253,40 +255,56 @@ export class StreamWorker {
 		worker.failure = null
 	}
 
-	private async handleMessage(message: Message<Buffer>, ctx: ConsumeContext): Promise<void> {
+	/**
+	 * Process one consumed batch (records of one partition, in order).
+	 *
+	 * At-least-once: the batch's offsets are committed by the consumer once this returns, so it
+	 * returns only after everything the batch produced has been acknowledged.
+	 * Exactly-once: every record joins the worker's transaction batch, which commits offsets itself.
+	 */
+	private async handleBatch(batch: Message<Buffer>[], ctx: ConsumeContext): Promise<void> {
 		const worker = this.context
 		// Fail-stop: once a worker has failed, nothing more may be processed (and thereby
 		// acknowledged) until it has restarted from the last committed offsets.
 		if (worker.failure) throw worker.failure.error
 
-		// close() first seals message delivery, then commits everything already queued.
-		// Records that were fetched but not started remain uncommitted for the next owner.
-		if (this.deps.status.closing && this.eosEnabled) return
-
-		const sources = worker.sourcesByTopic.get(message.topic)
-		if (!sources) return
-
-		const recordContext: RecordContext = { worker, topic: message.topic, partition: message.partition }
-		const handle = async () => {
-			for (const source of sources) {
-				await source.handleMessage(message, ctx)
-			}
-		}
-
-		if (!this.eosEnabled) {
-			try {
-				await recordContextStorage.run(recordContext, handle)
-				worker.processedSinceRestart = true
-			} catch (err) {
-				this.fail(err, isRecoverable(err))
-				throw err
+		if (this.eosEnabled) {
+			for (const message of batch) {
+				// close() first seals message delivery, then commits everything already queued.
+				// Records that were fetched but not started remain uncommitted for the next owner.
+				if (this.deps.status.closing) return
+				const process = this.processorFor(message, ctx)
+				if (!process) continue
+				await this.transactions.enqueue(() => this.transactions.process(message, ctx, process))
 			}
 			return
 		}
 
-		await this.transactions.enqueue(() =>
-			recordContextStorage.run(recordContext, () => this.transactions.process(message, ctx, handle))
-		)
+		try {
+			for (const message of batch) {
+				await this.processorFor(message, ctx)?.()
+			}
+			await worker.sends.flush()
+			worker.processedSinceRestart = true
+		} catch (err) {
+			worker.sends.discard()
+			this.fail(err, isRecoverable(err))
+			throw err
+		}
+	}
+
+	/** Runs a record through its source nodes, in the record's context. Undefined if nothing consumes it. */
+	private processorFor(message: Message<Buffer>, ctx: ConsumeContext): (() => Promise<void>) | undefined {
+		const worker = this.context
+		const sources = worker.sourcesByTopic.get(message.topic)
+		if (!sources) return undefined
+		const recordContext: RecordContext = { worker, topic: message.topic, partition: message.partition }
+		return () =>
+			recordContextStorage.run(recordContext, async () => {
+				for (const source of sources) {
+					await source.handleMessage(message, ctx)
+				}
+			})
 	}
 
 	private attachConsumerEvents(): void {
