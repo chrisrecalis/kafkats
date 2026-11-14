@@ -1,6 +1,6 @@
 # Windowing
 
-Windowing groups stream records by time for aggregations. kafkats/flow supports three window types.
+Windowing groups stream records by time for aggregations. kafkats/flow supports time windows (tumbling and hopping) and session windows. Sliding windows are not implemented yet.
 
 ## Time Windows
 
@@ -85,16 +85,17 @@ const windowed = stream.groupByKey().windowedBy(TimeWindows.of('1h'))
 // Count per window
 windowed.count()
 
-// Sum per window
-windowed.reduce((sum, value) => sum + value.amount)
+// Combine values per window (the aggregate has the value type)
+windowed.reduce((latest, value) => (value.amount > latest.amount ? value : latest))
 
-// Custom aggregation
+// Custom aggregation (needs a value codec for the aggregate)
 windowed.aggregate(
 	() => ({ count: 0, total: 0 }),
 	(key, value, agg) => ({
 		count: agg.count + 1,
 		total: agg.total + value.amount,
-	})
+	}),
+	{ value: json<{ count: number; total: number }>() }
 )
 ```
 
@@ -131,31 +132,23 @@ stream
 	.windowedBy(TimeWindows.of('5m'))
 	.count()
 	.toStream()
-	.map((windowedKey, count) => ({
-		key: windowedKey.key,
-		value: {
-			key: windowedKey.key,
-			windowStart: new Date(windowedKey.window.start),
-			windowEnd: new Date(windowedKey.window.end),
-			count,
-		},
-	}))
+	.map(
+		(windowedKey, count) =>
+			[
+				windowedKey.key,
+				{
+					key: windowedKey.key,
+					windowStart: new Date(windowedKey.window.start),
+					windowEnd: new Date(windowedKey.window.end),
+					count,
+				},
+			] as const
+	)
 ```
 
 ## Grace Periods
 
-Handle late-arriving data:
-
-```typescript
-// Accept events up to 10 minutes late
-TimeWindows.of('5m').gracePeriod('10m')
-```
-
-Without grace period, late events are dropped. With grace period:
-
-- Window remains open longer
-- Late events are included in aggregation
-- Higher memory usage
+`TimeWindows` and `SessionWindows` have no configurable grace period. A late record is still applied as long as its window (or session) is retained, which is 24 times the window size (or session gap) behind stream time; see [Stream Time and Late Records](#stream-time-and-late-records).
 
 ## Window Comparison
 
@@ -164,7 +157,7 @@ Without grace period, late events are dropped. With grace period:
 | Time (Tumbling) | Fixed   | No         | Regular metrics, hourly counts   |
 | Time (Hopping)  | Fixed   | Yes        | Smoothed averages, sliding stats |
 | Session         | Dynamic | No         | User sessions, activity tracking |
-| Sliding         | Fixed   | Continuous | Event-relative windows           |
+| Sliding         | Fixed   | Continuous | Not implemented yet              |
 
 ## Example: Hourly Metrics
 
@@ -192,21 +185,25 @@ app.stream<string, MetricEvent>(metricsTopic)
 		(key, value, agg) => ({
 			sum: agg.sum + value.value,
 			count: agg.count + 1,
-		})
+		}),
+		{ value: json<{ sum: number; count: number }>() }
 	)
 	.toStream()
-	.map((windowedKey, agg) => ({
-		key: windowedKey.key,
-		value: {
-			metricName: windowedKey.key,
-			windowStart: new Date(windowedKey.window.start),
-			windowEnd: new Date(windowedKey.window.end),
-			sum: agg.sum,
-			count: agg.count,
-			average: agg.sum / agg.count,
-		} as HourlyMetric,
-	}))
-	.to(hourlyMetricsTopic)
+	.map(
+		(windowedKey, agg) =>
+			[
+				windowedKey.key,
+				{
+					metricName: windowedKey.key,
+					windowStart: new Date(windowedKey.window.start),
+					windowEnd: new Date(windowedKey.window.end),
+					sum: agg.sum,
+					count: agg.count,
+					average: agg.sum / agg.count,
+				} as HourlyMetric,
+			] as const
+	)
+	.to('hourly-metrics', { key: string(), value: json<HourlyMetric>() })
 ```
 
 ## Example: User Sessions
@@ -233,20 +230,30 @@ app.stream<string, UserAction>(actionsTopic)
 		() => ({ actions: [] as string[] }),
 		(key, action, agg) => ({
 			actions: [...agg.actions, action.action],
-		})
+		}),
+		{
+			value: json<{ actions: string[] }>(),
+			// Required for session windows: combines two sessions that merge
+			merger: (a, b) => ({ actions: [...a.actions, ...b.actions] }),
+		}
 	)
 	.toStream()
-	.map((windowedKey, agg) => ({
-		key: windowedKey.key,
-		value: {
-			userId: windowedKey.key,
-			sessionStart: new Date(windowedKey.window.start),
-			sessionEnd: new Date(windowedKey.window.end),
-			actionCount: agg.actions.length,
-			actions: agg.actions,
-		} as SessionSummary,
-	}))
-	.to(sessionsTopic)
+	// A session that grows or merges replaces the old one, which is emitted with a null value
+	.filter((_, agg) => agg !== null)
+	.map(
+		(windowedKey, agg) =>
+			[
+				windowedKey.key,
+				{
+					userId: windowedKey.key,
+					sessionStart: new Date(windowedKey.window.start),
+					sessionEnd: new Date(windowedKey.window.end),
+					actionCount: agg.actions.length,
+					actions: agg.actions,
+				} as SessionSummary,
+			] as const
+	)
+	.to('user-sessions', { key: string(), value: json<SessionSummary>() })
 ```
 
 ## State Management

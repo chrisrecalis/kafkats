@@ -46,7 +46,7 @@ If you pass a config object as `client`, it uses the same options as `new KafkaC
 | Option     | Type         | Notes                                               |
 | ---------- | ------------ | --------------------------------------------------- |
 | `brokers`  | `string[]`   | Required                                            |
-| `clientId` | `string`     | Optional (Flow may set a default)                   |
+| `clientId` | `string`     | Required                                            |
 | `tls`      | `TlsConfig`  | Omit for plaintext; use `{ enabled: true }` for TLS |
 | `sasl`     | `SaslConfig` | SASL authentication                                 |
 
@@ -61,7 +61,7 @@ No record is lost. After a crash or redelivery, some records are processed again
 ```typescript
 const app = flow({
 	applicationId: 'my-app',
-	client: { brokers: ['localhost:9092'] },
+	client: { clientId: 'my-app', brokers: ['localhost:9092'] },
 	processingGuarantee: 'at_least_once', // default
 })
 ```
@@ -75,7 +75,7 @@ Messages are processed exactly once using Kafka transactions. Input offsets, out
 ```typescript
 const app = flow({
 	applicationId: 'my-app',
-	client: { brokers: ['localhost:9092'] },
+	client: { clientId: 'my-app', brokers: ['localhost:9092'] },
 	processingGuarantee: 'exactly_once',
 	commitIntervalMs: 100, // optional, default 100ms
 })
@@ -159,7 +159,7 @@ const events = topic('user-events', {
 app.stream(events)
 	.filter((key, value) => value.action === 'purchase')
 	.mapValues(value => ({ ...value, processed: true }))
-	.to(outputTopic)
+	.to('processed-events', { value: json<UserEvent & { processed: boolean }>() })
 ```
 
 ### Table Processing
@@ -172,13 +172,13 @@ const usersTable = app.table(usersTopic)
 usersTable
 	.mapValues(user => ({ name: user.name, email: user.email }))
 	.toStream()
-	.to(userProfilesTopic)
+	.to('user-profiles', { value: json() })
 ```
 
 ### Aggregations
 
 ```typescript
-app.stream(events).groupByKey().count().toStream().to(countsTopic)
+app.stream(events).groupByKey().count().toStream().to('user-event-counts')
 ```
 
 ## Starting and Stopping
@@ -261,16 +261,20 @@ app.stream(pageViews)
 	.count()
 	// Transform output
 	.toStream()
-	.map((windowedKey, count) => ({
-		key: windowedKey.key,
-		value: {
-			page: windowedKey.key,
-			count,
-			windowStart: windowedKey.window.start,
-			windowEnd: windowedKey.window.end,
-		},
-	}))
-	.to(pageViewCounts)
+	.map(
+		(windowedKey, count) =>
+			[
+				windowedKey.key,
+				{
+					page: windowedKey.key,
+					count,
+					windowStart: windowedKey.window.start,
+					windowEnd: windowedKey.window.end,
+				},
+			] as const
+	)
+	// to() takes the topic name; the topic definition supplies the codecs
+	.to(pageViewCounts.name, pageViewCounts)
 
 // Handle shutdown
 process.on('SIGTERM', async () => {

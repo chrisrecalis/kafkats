@@ -70,18 +70,19 @@ User-facing documentation: `packages/docs/flow/fault-tolerance.md`.
 ### Codecs
 
 ```typescript
-import { codec, string, json, buffer } from '@kafkats/flow'
+import { codec, string, json, buffer, type Codec } from '@kafkats/flow'
 
-// Built-in codecs
-string    // UTF-8 string
-json      // JSON serialization
-buffer    // Raw Buffer passthrough
+// Built-in codec factories (re-exported from @kafkats/client)
+string()      // UTF-8 string
+json<T>()     // JSON serialization
+buffer()      // Raw Buffer passthrough
+codec.json<T>() // `codec` is a namespace of the same factories
 
-// Custom codec
-const myCodec = codec<MyType>(
-  (value) => Buffer.from(...),  // encode
-  (buffer) => ...               // decode
-)
+// Custom codec: any object implementing Codec<T>
+const myCodec: Codec<MyType> = {
+  encode: (value) => Buffer.from(...),
+  decode: (buffer) => ...,
+}
 ```
 
 ## Example
@@ -89,15 +90,18 @@ const myCodec = codec<MyType>(
 ```typescript
 import { flow, topic, string, json } from '@kafkats/flow'
 
-const app = flow({ brokers: ['localhost:9092'] })
+const app = flow({
+	applicationId: 'my-app',
+	client: { clientId: 'my-app', brokers: ['localhost:9092'] },
+})
 
-const input = topic('input', string, json<Event>())
-const output = topic('output', string, json<Result>())
+const input = topic('input', { key: string(), value: json<Event>() })
+const output = topic('output', { key: string(), value: json<Result>() })
 
 app.stream(input)
 	.filter((k, v) => v.type === 'click')
 	.mapValues(v => ({ count: 1, ...v }))
-	.to(output)
+	.to(output.name, output) // to() takes the topic name; codecs via options
 
 await app.start()
 ```
@@ -116,7 +120,7 @@ Pluggable state stores for stateful stream processing (aggregations, joins, wind
 ### Built-in Provider
 
 ```typescript
-import { inMemory } from '@kafkats/flow'
+import { codec, inMemory } from '@kafkats/flow'
 
 const provider = inMemory()
 const store = provider.createKeyValueStore('my-store', {
@@ -155,7 +159,7 @@ Global config in `FlowConfig`:
 ```typescript
 flow({
 	applicationId: 'my-app',
-	client: { brokers: ['localhost:9092'] },
+	client: { clientId: 'my-app', brokers: ['localhost:9092'] },
 	changelog: {
 		replicationFactor: 3,
 		topicConfigs: { 'min.insync.replicas': '2' },
@@ -242,10 +246,12 @@ await driver.run(async ({ send }) => {
 - **Loopback**: records written to a topic the topology also reads (`through()`, repartition topics) are fed back into the topology automatically
 - **MockProducer** records `timestamp` and `headers` of produced messages
 - **testRecord(topic, key, value, options?)**: Create a test record for processor testing
-- **testRecordSequence(topic, items, options?)**: Create a sequence of records with incrementing timestamps
-- **createFactory(generator)**: Create test data factories
-- **timestamps(baseTime?)**: Create timestamp helpers for time-based testing
-- **quickTest(fn)**: Minimal setup for simple tests
+- **testRecordSequence(topic, items, options?)**: Create a sequence of records with incrementing timestamps (`{ startTimestamp, timestampIncrement, partition }`, bigint)
+- **createFactory(generator)**: Create test data factories (`create()`, `createMany()`, `reset()`)
+- **timestamps(baseTime?)**: Create timestamp helpers for time-based testing (`at()`, `after()`, `base`, `advance()`; bigint ms)
+- **quickTest(fn, config?)**: Minimal setup for simple tests
+
+`send()` takes `Buffer` keys (or `keyValue` + `keyCodec`) and `bigint` timestamps, and JSON-encodes values unless a `codec` is given.
 
 ### Example: Stream-Table Join
 

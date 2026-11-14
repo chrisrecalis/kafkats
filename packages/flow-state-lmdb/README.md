@@ -18,17 +18,18 @@ npm install @kafkats/flow @kafkats/flow-state-lmdb
 
 ```typescript
 import { KafkaClient } from '@kafkats/client'
-import { flow } from '@kafkats/flow'
+import { flow, string } from '@kafkats/flow'
 import { lmdb } from '@kafkats/flow-state-lmdb'
 
-const client = new KafkaClient({ brokers: ['localhost:9092'] })
+const client = new KafkaClient({ clientId: 'my-app', brokers: ['localhost:9092'] })
 
-const app = flow(client, {
+const app = flow({
 	applicationId: 'my-app',
+	client,
 	stateStoreProvider: lmdb({ stateDir: './state' }),
 })
 
-app.stream('events').groupByKey().count().toStream().to('counts')
+app.stream('events', { key: string(), value: string() }).groupByKey().count().toStream().to('counts')
 
 await app.start()
 ```

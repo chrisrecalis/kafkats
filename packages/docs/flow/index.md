@@ -9,7 +9,7 @@ Kafka Streams-like flow APIs for building stream processing applications in Type
 - **Fault Tolerant** - Partitioned, changelog-backed state; workers restart after recoverable failures
 - **Type-Safe** - Full TypeScript support with strong typing
 - **Pluggable State** - In-memory and LMDB state stores
-- **Windowing** - Time, session, and sliding windows
+- **Windowing** - Tumbling, hopping, and session windows
 - **Joins** - Stream-stream and stream-table joins
 - **Testing** - Built-in test utilities
 
@@ -57,8 +57,8 @@ app.stream(clicks)
 	.groupByKey()
 	.count()
 	.toStream()
-	.mapValues((count, key) => ({ userId: key, count }))
-	.to(counts)
+	.map((userId, count) => [userId, { userId, count }] as const)
+	.to(counts.name, counts)
 
 // Start processing
 await app.start()
@@ -74,7 +74,7 @@ An unbounded stream of key-value records. Each record is an independent event.
 app.stream(inputTopic)
 	.filter((key, value) => value.amount > 100)
 	.mapValues(value => ({ ...value, processed: true }))
-	.to(outputTopic)
+	.to('output-topic', { value: json() })
 ```
 
 ### KTable
@@ -105,14 +105,14 @@ app.stream(clicks).groupByKey().windowedBy(TimeWindows.of('5m')).count()
 ├── KStream          # Unbounded record stream
 ├── KTable           # Changelog table
 ├── KGroupedStream   # Grouped stream for aggregations
-├── Windowing        # Time, session, sliding windows
+├── Windowing        # Time and session windows (sliding: not implemented)
 └── State Stores     # In-memory and persistent
 
 @kafkats/client (codecs)
 ├── string()         # UTF-8 string codec
 ├── json<T>()        # JSON codec with types
 ├── buffer()         # Raw buffer codec
-└── codec()          # Custom codec factory
+└── codec            # Namespace: codec.string(), codec.json(), codec.buffer()
 ```
 
 ## Next Steps

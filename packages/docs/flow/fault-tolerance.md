@@ -9,7 +9,7 @@ Set `processingGuarantee` in the app config:
 ```typescript
 const app = flow({
 	applicationId: 'my-app',
-	client: { brokers: ['localhost:9092'] },
+	client: { clientId: 'my-app', brokers: ['localhost:9092'] },
 	processingGuarantee: 'exactly_once', // or 'at_least_once' (default)
 	commitIntervalMs: 100, // exactly_once only
 })
@@ -52,7 +52,7 @@ Recoverable failures are retried with exponential backoff, starting at 0.5 secon
 ```typescript
 const app = flow({
 	applicationId: 'my-app',
-	client: { brokers: ['localhost:9092'] },
+	client: { clientId: 'my-app', brokers: ['localhost:9092'] },
 	restartOnError: false,
 })
 ```
@@ -108,7 +108,7 @@ On every assignment, the newly assigned partitions are **paused**, their state i
 ```typescript
 const app = flow({
 	applicationId: 'my-app',
-	client: { brokers: ['localhost:9092'] },
+	client: { clientId: 'my-app', brokers: ['localhost:9092'] },
 	changelog: {
 		restoration: {
 			idleTimeoutMs: 60_000, // give slow brokers more time

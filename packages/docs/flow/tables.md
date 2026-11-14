@@ -53,14 +53,6 @@ When a row stops matching (for example the user becomes inactive), `filter()` em
 
 The results of `filter()` and `mapValues()` are not materialized, so they cannot be used as the lookup side of a join. See [Known Limitations](/flow/fault-tolerance#known-limitations).
 
-### filterNot
-
-Remove matching entries:
-
-```typescript
-usersTable.filterNot((key, user) => user.deleted)
-```
-
 ## Conversion
 
 ### toStream
@@ -71,7 +63,7 @@ Convert table to stream:
 const stream = usersTable.toStream()
 
 // Now you can use stream operations
-stream.mapValues(user => ({ event: 'user_updated', user })).to(userEventsTopic)
+stream.mapValues(user => ({ event: 'user_updated', user })).to('user-events', { value: json() })
 ```
 
 ## Grouping
@@ -153,7 +145,7 @@ app.stream(eventsTopic)
 		...event,
 		settings: config,
 	}))
-	.to(enrichedEventsTopic)
+	.to('enriched-events', { value: json() })
 ```
 
 A global table can **only** be used as the lookup side of a stream join (`join()` or `leftJoin()`). Any other operation (`toStream()`, `mapValues()`, `filter()`, `groupBy()`, table-table joins) throws.
@@ -201,7 +193,7 @@ const usersTable = app.table<string, User>(usersTopic)
 // Orders stream
 app.stream<string, Order>(ordersTopic)
 	// Rekey by userId for join
-	.selectKey((_, order) => order.userId)
+	.selectKey(order => order.userId)
 	// Join with users. The re-keyed stream is repartitioned first, which needs the key codec
 	.join(
 		usersTable,
@@ -217,23 +209,21 @@ app.stream<string, Order>(ordersTopic)
 			}) as EnrichedOrder,
 		{ key: string() }
 	)
-	.to(enrichedOrdersTopic)
+	.to('enriched-orders', { value: json<EnrichedOrder>() })
 ```
 
 ## Table State
 
-Tables maintain state internally. Access the underlying store:
+Tables maintain state internally. Give the store a stable name (its changelog topic is `<applicationId>-<storeName>-changelog`):
 
 ```typescript
 // Materialize table to a named store
 const users = app.table(usersTopic, {
 	materialized: { storeName: 'users-store' },
 })
-
-// Query the store (after app is running)
-const store = app.getStore<string, User>('users-store')
-const user = await store.get('user-123')
 ```
+
+`FlowApp` does not expose its state stores for querying.
 
 ## Tombstones (Deletions)
 

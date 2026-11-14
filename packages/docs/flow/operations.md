@@ -16,11 +16,13 @@ Many operations accept an `options` object. These are the common ones:
 
 ### Produced (for `to(...)`, `through(...)`)
 
-| Option | Type | Description |
-| ------------- | ---------- | -------------------------------------------------- | --------------------------------------- |
-| `key` | `Codec<K>` | Encode keys |
-| `value` | `Codec<V>` | Encode values |
-| `partitioner` | `(key: K   | null, value: V, partitionCount: number) => number` | Choose a partition for produced records |
+| Option        | Type                                                                   | Description                             |
+| ------------- | ---------------------------------------------------------------------- | --------------------------------------- |
+| `key`         | `Codec<K>`                                                             | Encode keys                             |
+| `value`       | `Codec<V>`                                                             | Encode values                           |
+| `partitioner` | `(key: K \| null, value: V \| null, partitionCount: number) => number` | Choose a partition for produced records |
+
+Without `key`/`value`, the codecs the stream carries are used. `mapValues()`, `flatMapValues()` and `map()` drop the value codec, and `map()` and `selectKey()` drop the key codec.
 
 Records written with `to()` or `through()` keep the timestamp of the input record.
 
@@ -34,20 +36,22 @@ Records written with `to()` or `through()` keep the timestamp of the input recor
 
 ### Materialized (for `toTable(...)` and stateful ops)
 
-| Option      | Type       | Description                                  |
-| ----------- | ---------- | -------------------------------------------- |
-| `storeName` | `string`   | Store name (and changelog topic name prefix) |
-| `key`       | `Codec<K>` | Key codec for the state store                |
-| `value`     | `Codec<V>` | Value codec for the state store              |
+| Option      | Type                         | Description                                                  |
+| ----------- | ---------------------------- | ------------------------------------------------------------ |
+| `storeName` | `string`                     | Store name (and changelog topic name prefix)                 |
+| `key`       | `Codec<K>`                   | Key codec for the state store                                |
+| `value`     | `Codec<V>`                   | Value codec for the state store (required for `aggregate()`) |
+| `changelog` | `boolean \| ChangelogConfig` | Changelog for the store (default: enabled)                   |
 
 ### Joined (for `join(...)`, `leftJoin(...)`, `outerJoin(...)`)
 
-| Option       | Type                                              | Description                                    |
-| ------------ | ------------------------------------------------- | ---------------------------------------------- |
-| `key`        | `Codec<K>`                                        | Key codec                                      |
-| `value`      | `Codec<V1>`                                       | Left-side value codec                          |
-| `otherValue` | `Codec<V2>`                                       | Right-side value codec                         |
-| `within`     | `TimeWindows \| SessionWindows \| SlidingWindows` | Join window (required for stream-stream joins) |
+| Option       | Type                                              | Description                                                             |
+| ------------ | ------------------------------------------------- | ----------------------------------------------------------------------- |
+| `key`        | `Codec<K>`                                        | Key codec                                                               |
+| `value`      | `Codec<V1>`                                       | Left-side value codec                                                   |
+| `otherValue` | `Codec<V2>`                                       | Right-side value codec                                                  |
+| `within`     | `TimeWindows \| SessionWindows \| SlidingWindows` | Join window (required for stream-stream joins; `SlidingWindows` throws) |
+| `changelog`  | `boolean \| ChangelogConfig`                      | Changelog for the join window stores (default: enabled)                 |
 
 ## Stateless Operations
 
@@ -58,10 +62,7 @@ These operations don't require state storage:
 Transform key and value:
 
 ```typescript
-stream.map((key, value) => ({
-	key: newKey,
-	value: newValue,
-}))
+stream.map((key, value) => [newKey, newValue] as const)
 ```
 
 ### mapValues
@@ -70,9 +71,6 @@ Transform only value:
 
 ```typescript
 stream.mapValues(value => transformedValue)
-
-// With key access
-stream.mapValues((value, key) => ({ ...value, originalKey: key }))
 ```
 
 ### selectKey
@@ -80,7 +78,7 @@ stream.mapValues((value, key) => ({ ...value, originalKey: key }))
 Change the key:
 
 ```typescript
-stream.selectKey((key, value) => value.userId)
+stream.selectKey((value, key) => value.userId)
 ```
 
 `selectKey()` and `map()` mark the stream as re-keyed. If it is followed by `groupByKey()`, a join or `toTable()`, it is [repartitioned](/flow/streams#repartitioning) through an internal topic, which needs key and value codecs.
@@ -91,25 +89,6 @@ Keep matching records:
 
 ```typescript
 stream.filter((key, value) => condition)
-```
-
-### filterNot
-
-Remove matching records:
-
-```typescript
-stream.filterNot((key, value) => condition)
-```
-
-### flatMap
-
-One-to-many transformation:
-
-```typescript
-stream.flatMap((key, value) => [
-	{ key: k1, value: v1 },
-	{ key: k2, value: v2 },
-])
 ```
 
 ### flatMapValues
@@ -167,15 +146,15 @@ grouped.count()
 
 ### reduce
 
-Reduce to single value:
+Reduce to single value (the aggregate has the value type; `KGroupedTable.reduce()` also takes a subtractor):
 
 ```typescript
-grouped.reduce((agg, value) => agg + value.amount)
+grouped.reduce((agg, value) => agg + value)
 ```
 
 ### aggregate
 
-Custom aggregation:
+Custom aggregation (`KGroupedTable.aggregate()` also takes a subtractor):
 
 ```typescript
 grouped.aggregate(
@@ -184,7 +163,8 @@ grouped.aggregate(
 		// aggregator
 		sum: agg.sum + value.amount,
 		count: agg.count + 1,
-	})
+	}),
+	{ value: json<{ sum: number; count: number }>() } // codec for the aggregate (required)
 )
 ```
 
@@ -201,14 +181,12 @@ grouped.windowedBy(TimeWindows.of('5m'))
 // Returns WindowedKGroupedStream
 ```
 
-### sessionWindowedBy
-
-Apply session window:
+Session windows also use `windowedBy()`:
 
 ```typescript
 import { SessionWindows } from '@kafkats/flow'
 
-grouped.sessionWindowedBy(SessionWindows.withInactivityGap('30m'))
+grouped.windowedBy(SessionWindows.withInactivityGap('30m'))
 ```
 
 ## Join Operations
@@ -278,7 +256,7 @@ const [premium, standard] = stream.branch(
 Combine streams:
 
 ```typescript
-const merged = stream1.merge(stream2, stream3)
+const merged = stream1.merge(stream2).merge(stream3)
 ```
 
 ## Output Operations
@@ -288,7 +266,7 @@ const merged = stream1.merge(stream2, stream3)
 Terminal - write to topic:
 
 ```typescript
-stream.to(outputTopic)
+stream.to('output-topic')
 
 // With options
 const customPartitioner = (key, _value, partitionCount) => {
@@ -296,7 +274,7 @@ const customPartitioner = (key, _value, partitionCount) => {
 	return String(key).length % partitionCount
 }
 
-stream.to(outputTopic, { partitioner: customPartitioner })
+stream.to('output-topic', { partitioner: customPartitioner })
 ```
 
 ### through
@@ -336,29 +314,29 @@ Operations can be chained fluently:
 app.stream(inputTopic)
 	.filter((_, v) => v.valid)
 	.mapValues(v => transform(v))
-	.selectKey((_, v) => v.userId)
+	.selectKey(v => v.userId)
 	.groupByKey({ key: string(), value: json<Valid>(), name: 'valid-by-user' })
 	.windowedBy(TimeWindows.of('1h'))
 	.count()
 	.toStream()
-	.map((windowedKey, count) => ({
-		key: windowedKey.key,
-		value: { userId: windowedKey.key, count, window: windowedKey.window },
-	}))
-	.to(outputTopic)
+	.map(
+		(windowedKey, count) =>
+			[windowedKey.key, { userId: windowedKey.key, count, window: windowedKey.window }] as const
+	)
+	.to('user-counts', { key: string(), value: json() })
 ```
 
 ## Operation Categories
 
-| Category    | Operations                         | State Required                               |
-| ----------- | ---------------------------------- | -------------------------------------------- |
-| Transform   | map, mapValues, selectKey, flatMap | No                                           |
-| Filter      | filter, filterNot                  | No                                           |
-| Side Effect | peek                               | No                                           |
-| Group       | groupByKey, groupBy                | Repartition topic after a re-key / `groupBy` |
-| Aggregate   | count, reduce, aggregate           | Yes                                          |
-| Window      | windowedBy, sessionWindowedBy      | Yes                                          |
-| Join        | join, leftJoin, outerJoin          | Yes                                          |
-| Branch      | branch, merge                      | No                                           |
-| Output      | to, through                        | No                                           |
-| Convert     | toTable, toStream                  | Maybe                                        |
+| Category    | Operations                               | State Required                               |
+| ----------- | ---------------------------------------- | -------------------------------------------- |
+| Transform   | map, mapValues, selectKey, flatMapValues | No                                           |
+| Filter      | filter                                   | No                                           |
+| Side Effect | peek                                     | No                                           |
+| Group       | groupByKey, groupBy                      | Repartition topic after a re-key / `groupBy` |
+| Aggregate   | count, reduce, aggregate                 | Yes                                          |
+| Window      | windowedBy                               | Yes                                          |
+| Join        | join, leftJoin, outerJoin                | Yes                                          |
+| Branch      | branch, merge                            | No                                           |
+| Output      | to, through                              | No                                           |
+| Convert     | toTable, toStream                        | Maybe                                        |

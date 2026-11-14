@@ -37,11 +37,14 @@ const hourlyCounts = stream.groupByKey().windowedBy(TimeWindows.of('1h')).count(
 
 ## Reduce
 
-Combine values into one using a reducer:
+Combine values into one using a reducer. The aggregate has the same type as the values:
 
 ```typescript
 // Sum amounts per key
-const totals = stream.groupByKey().reduce((sum, value) => sum + value.amount)
+const totals = stream
+	.mapValues(value => value.amount)
+	.groupByKey({ value: json<number>() })
+	.reduce((sum, amount) => sum + amount)
 ```
 
 The reducer receives:
@@ -54,7 +57,7 @@ For session windows, existing sessions are merged in time order, and the reducer
 
 ## Aggregate
 
-Custom aggregation with initializer:
+Custom aggregation with initializer. `aggregate()` needs a `value` codec for the aggregate in its options:
 
 ```typescript
 interface Stats {
@@ -74,7 +77,10 @@ const stats = stream.groupByKey().aggregate<Stats>(
 		sum: agg.sum + value.amount,
 		min: Math.min(agg.min, value.amount),
 		max: Math.max(agg.max, value.amount),
-	})
+	}),
+
+	// Materialized options - codec for the aggregate
+	{ value: json<Stats>() }
 )
 ```
 
@@ -87,31 +93,29 @@ KGroupedTable has different aggregation semantics.
 :::
 
 ```typescript
-const grouped = table.groupBy((key, value) => value.category)
+// Return the new [key, value]; the new key needs a codec
+const grouped = table.groupBy((key, value) => [value.category, value], { key: string() })
 
 // Must provide both adder and subtractor
 const counts = grouped.aggregate(
 	() => 0,
 	(key, value, agg) => agg + 1, // add
-	(key, value, agg) => agg - 1 // subtract (when key changes/deleted)
+	(key, value, agg) => agg - 1, // subtract (when key changes/deleted)
+	{ value: json<number>() }
 )
 ```
 
 ## Materialization
 
-Store aggregation results in a named store:
+Store aggregation results in a named store (its changelog topic is `<applicationId>-my-counts-store-changelog`):
 
 ```typescript
 const counts = stream.groupByKey().count({
-	materialized: {
-		storeName: 'my-counts-store',
-	},
+	storeName: 'my-counts-store',
 })
-
-// Query the store later
-const store = app.getStore<string, number>('my-counts-store')
-const count = await store.get('some-key')
 ```
+
+`FlowApp` does not expose its state stores for querying. Write the results to a topic with `toStream().to()` instead.
 
 ## Delivery Guarantees
 
@@ -122,7 +126,7 @@ With the default `at_least_once`, a record can be processed again after a crash,
 Aggregations return KTable. Convert to stream for output:
 
 ```typescript
-stream.groupByKey().count().toStream().to(countsTopic)
+stream.groupByKey().count().toStream().to('counts')
 ```
 
 ## Example: Real-time Analytics
@@ -152,17 +156,24 @@ app.stream<string, PageView>(pageViewsTopic)
 			views: agg.views + 1,
 			users: agg.users.includes(view.userId) ? agg.users : [...agg.users, view.userId],
 			totalDuration: agg.totalDuration + view.duration,
-		})
+		}),
+		{ value: json<{ views: number; users: string[]; totalDuration: number }>() }
 	)
 	.toStream()
-	.mapValues((agg, windowedKey) => ({
-		page: windowedKey.key,
-		views: agg.views,
-		uniqueUsers: agg.users.length,
-		totalDuration: agg.totalDuration,
-		avgDuration: agg.totalDuration / agg.views,
-	}))
-	.to(pageStatsTopic)
+	.map(
+		(windowedKey, agg) =>
+			[
+				windowedKey.key,
+				{
+					page: windowedKey.key,
+					views: agg.views,
+					uniqueUsers: agg.users.length,
+					totalDuration: agg.totalDuration,
+					avgDuration: agg.totalDuration / agg.views,
+				},
+			] as const
+	)
+	.to('page-stats', { key: string(), value: json() })
 ```
 
 ## Example: Running Totals
@@ -188,10 +199,11 @@ app.stream<string, Transaction>(transactionsTopic)
 			accountId,
 			balance: agg.balance + (txn.type === 'credit' ? txn.amount : -txn.amount),
 			transactionCount: agg.transactionCount + 1,
-		})
+		}),
+		{ value: json<AccountBalance>() }
 	)
 	.toStream()
-	.to(balancesTopic)
+	.to('balances')
 ```
 
 ## Performance Considerations
@@ -202,12 +214,14 @@ app.stream<string, Transaction>(transactionsTopic)
 4. **Serialization** - Use efficient codecs for aggregate values
 
 ```typescript
-// Configure state store for better performance
-const counts = stream.groupByKey().count({
-	materialized: {
-		storeName: 'counts',
-		// Use LMDB for persistence
-		storeProvider: lmdb({ stateDir: './state' }),
-	},
+// Name the store
+const counts = stream.groupByKey().count({ storeName: 'counts' })
+
+// The store backend is configured for the whole app
+const app = flow({
+	applicationId: 'my-app',
+	client: { clientId: 'my-app', brokers: ['localhost:9092'] },
+	// Use LMDB for persistence
+	stateStoreProvider: lmdb({ stateDir: './state' }),
 })
 ```

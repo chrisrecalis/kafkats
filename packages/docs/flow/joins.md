@@ -14,12 +14,13 @@ Joins combine data from multiple streams or tables based on matching keys.
 
 Joins accept an optional `options` object (type `Joined<K, V1, V2>`):
 
-| Option       | Type                                              | Description                                    |
-| ------------ | ------------------------------------------------- | ---------------------------------------------- |
-| `within`     | `TimeWindows \| SessionWindows \| SlidingWindows` | Join window (required for stream-stream joins) |
-| `key`        | `Codec<K>`                                        | Key codec override                             |
-| `value`      | `Codec<V1>`                                       | Left-side value codec override                 |
-| `otherValue` | `Codec<V2>`                                       | Right-side value codec override                |
+| Option       | Type                                              | Description                                                             |
+| ------------ | ------------------------------------------------- | ----------------------------------------------------------------------- |
+| `within`     | `TimeWindows \| SessionWindows \| SlidingWindows` | Join window (required for stream-stream joins; `SlidingWindows` throws) |
+| `key`        | `Codec<K>`                                        | Key codec override                                                      |
+| `value`      | `Codec<V1>`                                       | Left-side value codec override                                          |
+| `otherValue` | `Codec<V2>`                                       | Right-side value codec override                                         |
+| `changelog`  | `boolean \| ChangelogConfig`                      | Changelog for the join window stores (default: enabled)                 |
 
 If a stream was re-keyed with `selectKey()` or `map()`, the join repartitions it first, which needs its key and value codecs. Pass them here when they cannot be inferred. See [Repartitioning](/flow/streams#repartitioning).
 
@@ -110,7 +111,7 @@ Both sides must have the same key for joining:
 // Orders keyed by orderId, users keyed by userId
 // Need to rekey orders first
 orders
-	.selectKey((_, order) => order.userId) // Rekey by userId
+	.selectKey(order => order.userId) // Rekey by userId
 	.join(users, joiner, { key: string() })
 ```
 
@@ -163,7 +164,7 @@ app.stream(eventsTopic)
 		...event,
 		setting: configValue.setting,
 	}))
-	.to(enrichedEventsTopic)
+	.to('enriched-events', { value: json() })
 ```
 
 Every instance reads all partitions of the topic itself and loads the table fully before processing starts, so there is no co-partitioning requirement. A global table can only be the lookup side of a stream `join()` or `leftJoin()`.
@@ -253,11 +254,11 @@ const products = app.globalTable<string, Product>(productsTopic)
 // Process orders
 app.stream<string, Order>(ordersTopic)
 	// First join with users (by userId). The re-keyed stream is repartitioned, so give it codecs
-	.selectKey((_, order) => order.userId)
+	.selectKey(order => order.userId)
 	.join(users, (order, user) => ({ order, user }), { key: string() })
 
 	// Then join with products (by productId, from a global table)
-	.selectKey((_, { order }) => order.productId)
+	.selectKey(({ order }) => order.productId)
 	.join(
 		products,
 		({ order, user }, product) =>
@@ -274,7 +275,7 @@ app.stream<string, Order>(ordersTopic)
 		{ key: string(), value: json<{ order: Order; user: User }>() }
 	)
 
-	.to(enrichedOrdersTopic)
+	.to('enriched-orders', { value: json<EnrichedOrder>() })
 ```
 
 ## Example: Session Attribution
@@ -312,7 +313,8 @@ pageViews
 		() => ({ pages: [] as string[] }),
 		(sessionId, pv, agg) => ({
 			pages: [...agg.pages, pv.page],
-		})
+		}),
+		{ value: json<{ pages: string[] }>() }
 	)
 	.toStream()
 	.join(
@@ -326,7 +328,7 @@ pageViews
 			}) as Attribution,
 		{ within: TimeWindows.of('30m') }
 	)
-	.to(attributionsTopic)
+	.to('attributions', { value: json<Attribution>() })
 ```
 
 ## Performance Tips
@@ -335,4 +337,4 @@ pageViews
 2. **Use global tables** - For small lookup data
 3. **Rekey sparingly** - Repartitioning writes every record to an internal topic and reads it back
 4. **Window size** - Smaller windows = less state
-5. **Materialization** - Name stores for queryability
+5. **Materialization** - Name stores so their changelog topics keep stable names

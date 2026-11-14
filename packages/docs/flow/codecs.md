@@ -1,6 +1,6 @@
 # Codecs
 
-Codecs handle serialization and deserialization. They're provided by `@kafkats/client` and used throughout both client and flow packages.
+Codecs handle serialization and deserialization. They're provided by `@kafkats/client` (and re-exported by `@kafkats/flow`) and used throughout both client and flow packages.
 
 ## Built-in Codecs
 
@@ -53,19 +53,19 @@ const userEvents = topic('user-events', {
 
 ## Custom Codecs
 
-Create custom codecs with the `codec` function:
+A custom codec is any object that implements the `Codec` interface below. (`codec` itself is a namespace of the built-in codecs: `codec.string()`, `codec.json<T>()`, `codec.buffer()`.)
 
 ```typescript
-import { codec } from '@kafkats/client'
+import type { Codec } from '@kafkats/client'
 
-const intCodec = codec<number>(
-	n => {
+const intCodec: Codec<number> = {
+	encode: n => {
 		const buf = Buffer.alloc(4)
 		buf.writeInt32BE(n)
 		return buf
 	},
-	buf => buf.readInt32BE()
-)
+	decode: buf => buf.readInt32BE(),
+}
 ```
 
 ### Codec Interface
@@ -92,7 +92,7 @@ const orders = topic('orders', {
 
 app.stream(orders)
 	.filter((key, order) => order.total > 100)
-	.to(outputTopic)
+	.to('large-orders')
 ```
 
 ### In TestDriver
@@ -123,13 +123,14 @@ const store = provider.createKeyValueStore('my-store', {
 ## Protocol Buffers
 
 ```typescript
-import { codec } from '@kafkats/client'
+import { topic } from '@kafkats/flow'
+import { string, type Codec } from '@kafkats/client'
 import { User } from './generated/user_pb.js'
 
-const userCodec = codec<User>(
-	user => Buffer.from(user.serializeBinary()),
-	buf => User.deserializeBinary(buf)
-)
+const userCodec: Codec<User> = {
+	encode: user => Buffer.from(user.serializeBinary()),
+	decode: buf => User.deserializeBinary(buf),
+}
 
 const usersTopic = topic('users', {
 	key: string(),
@@ -140,7 +141,7 @@ const usersTopic = topic('users', {
 ## Avro
 
 ```typescript
-import { codec } from '@kafkats/client'
+import type { Codec } from '@kafkats/client'
 import avro from 'avsc'
 
 const userType = avro.Type.forSchema({
@@ -152,18 +153,18 @@ const userType = avro.Type.forSchema({
 	],
 })
 
-const avroCodec = codec<{ id: string; name: string }>(
-	user => userType.toBuffer(user),
-	buf => userType.fromBuffer(buf)
-)
+const avroCodec: Codec<{ id: string; name: string }> = {
+	encode: user => userType.toBuffer(user),
+	decode: buf => userType.fromBuffer(buf),
+}
 ```
 
 ## Zod Validation
 
-Use [@kafkats/flow-codec-zod](/flow-codec-zod/) for runtime validation:
+Use [@kafkats/codec-zod](/flow-codec-zod/) for runtime validation:
 
 ```typescript
-import { zodCodec } from '@kafkats/flow-codec-zod'
+import { zodCodec } from '@kafkats/codec-zod'
 import { z } from 'zod'
 
 const UserSchema = z.object({
@@ -173,7 +174,7 @@ const UserSchema = z.object({
 })
 
 const userCodec = zodCodec(UserSchema)
-// Validates on encode and decode
+// Validates on decode (encode serializes the value as JSON without validating)
 ```
 
 ## Nullable Values
@@ -181,12 +182,12 @@ const userCodec = zodCodec(UserSchema)
 Handle null values in your codec:
 
 ```typescript
-import { codec } from '@kafkats/client'
+import type { Codec } from '@kafkats/client'
 
-const nullableStringCodec = codec<string | null>(
-	value => (value === null ? Buffer.alloc(0) : Buffer.from(value)),
-	buf => (buf.length === 0 ? null : buf.toString())
-)
+const nullableStringCodec: Codec<string | null> = {
+	encode: value => (value === null ? Buffer.alloc(0) : Buffer.from(value)),
+	decode: buf => (buf.length === 0 ? null : buf.toString()),
+}
 ```
 
 ## Composite Codecs
@@ -194,24 +195,24 @@ const nullableStringCodec = codec<string | null>(
 Combine multiple codecs:
 
 ```typescript
-import { codec } from '@kafkats/client'
+import type { Codec } from '@kafkats/client'
 
 interface KeyValue {
 	timestamp: number
 	value: string
 }
 
-const kvCodec = codec<KeyValue>(
-	kv => {
+const kvCodec: Codec<KeyValue> = {
+	encode: kv => {
 		const valueBuf = Buffer.from(kv.value)
 		const buf = Buffer.alloc(8 + valueBuf.length)
 		buf.writeBigInt64BE(BigInt(kv.timestamp))
 		valueBuf.copy(buf, 8)
 		return buf
 	},
-	buf => ({
+	decode: buf => ({
 		timestamp: Number(buf.readBigInt64BE()),
 		value: buf.subarray(8).toString(),
-	})
-)
+	}),
+}
 ```

@@ -27,10 +27,8 @@ const stream = app.stream<string, MyEvent>(myTopic)
 Transform both key and value:
 
 ```typescript
-stream.map((key, value) => ({
-	key: value.userId,
-	value: { ...value, processed: true },
-}))
+// Return a [key, value] tuple
+stream.map((key, value) => [value.userId, { ...value, processed: true }] as const)
 ```
 
 ### mapValues
@@ -49,7 +47,8 @@ stream.mapValues(value => ({
 Change the key:
 
 ```typescript
-stream.selectKey((key, value) => value.userId)
+// The function receives (value, key)
+stream.selectKey(value => value.userId)
 ```
 
 `map()` and `selectKey()` can change which partition a key belongs to. If the re-keyed stream is followed by `groupByKey()`, a join or `toTable()`, Flow [repartitions](#repartitioning) it automatically.
@@ -60,25 +59,6 @@ Keep only matching records:
 
 ```typescript
 stream.filter((key, value) => value.amount > 100)
-```
-
-### filterNot
-
-Remove matching records:
-
-```typescript
-stream.filterNot((key, value) => value.deleted)
-```
-
-### flatMap
-
-Emit multiple records per input:
-
-```typescript
-stream.flatMap((key, value) => [
-	{ key: `${key}-1`, value: value.part1 },
-	{ key: `${key}-2`, value: value.part2 },
-])
 ```
 
 ### flatMapValues
@@ -128,7 +108,7 @@ Combine multiple streams:
 const merged = stream1.merge(stream2)
 
 // Or merge multiple
-const merged = stream1.merge(stream2, stream3, stream4)
+const merged = stream1.merge(stream2).merge(stream3).merge(stream4)
 ```
 
 If a merged stream feeds a stateful operation, all merged topics must have the same partition count, otherwise `start()` throws `CoPartitioningError`. See [Co-partitioning](/flow/state-stores#co-partitioning).
@@ -140,16 +120,18 @@ If a merged stream feeds a stateful operation, all merged topics must have the s
 Write to a topic (terminal operation):
 
 ```typescript
-stream.to(outputTopic)
+stream.to('output-topic')
 
 // With options
-stream.to(outputTopic, {
+stream.to('output-topic', {
 	partitioner: (key, _value, partitionCount) => {
 		if (key === null) return 0
 		return String(key).length % partitionCount
 	},
 })
 ```
+
+`to()` and `through()` take the topic name. Records are encoded with the `key` and `value` codecs from the options, or else with the codecs the stream carries. `mapValues()`, `flatMapValues()` and `map()` drop the value codec, and `map()` and `selectKey()` drop the key codec, so pass the codecs when writing such a stream; a record that is not a `Buffer` and has no codec fails to encode.
 
 Records written with `to()` or `through()` keep the timestamp of the input record, so windowing and joins downstream see the original event time.
 
@@ -161,7 +143,7 @@ Write to a topic and continue from what is read back from it:
 stream
 	.through(intermediateTopic)
 	.mapValues(value => transform(value))
-	.to(finalTopic)
+	.to(finalTopic, { value: json() })
 ```
 
 `through()` is a real repartition point. Records are written to the topic, and the rest of the topology processes them from the partition they were written to. Use it to repartition with your own partitioner or partition count:
@@ -225,7 +207,7 @@ State is kept per partition, so all records of a key must be processed in the sa
 
 ```typescript
 app.stream(events)
-	.selectKey((_, event) => event.userId)
+	.selectKey(event => event.userId)
 	.groupByKey({ key: string(), value: json<Event>(), name: 'events-by-user' })
 	.count()
 ```
@@ -283,7 +265,7 @@ app.stream<string, RawEvent>(rawEvents)
 	)
 	.forEach((branch, index) => {
 		const topics = [purchasesTopic, pageviewsTopic, otherEventsTopic]
-		branch.to(topics[index])
+		branch.to(topics[index], { value: json<ProcessedEvent>() })
 	})
 ```
 
@@ -298,6 +280,6 @@ const stream = app.stream(userEvents)
 // KStream<string, { count: number }> - value type changed
 const mapped = stream.mapValues(e => ({ count: 1 }))
 
-// KStream<string, { count: number }> - key type changed to userId
-const rekeyed = mapped.selectKey((_, v) => v.userId)
+// KStream<string, UserEvent> - key changed to userId
+const rekeyed = stream.selectKey(e => e.userId)
 ```
