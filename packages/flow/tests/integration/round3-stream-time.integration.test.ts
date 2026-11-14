@@ -48,12 +48,11 @@ describe('round3: stream time survives a restart', () => {
 		return app
 	}
 
-	async function run(restart: boolean, lateTs: (base: number) => number[]): Promise<string[]> {
+	async function run(restart: boolean, lateTs: (base: number) => number[], base: number): Promise<string[]> {
 		const input = uniqueTopicName('r3-st-in')
 		const output = uniqueTopicName('r3-st-out')
 		const applicationId = uniqueTopicName('r3-st-app')
 		await createTopics(admin, [{ name: input }, { name: output }])
-		const base = Math.floor(Date.now() / 1000) * 1000
 		let app = build(applicationId, input, output)
 		try {
 			await app.start()
@@ -81,15 +80,17 @@ describe('round3: stream time survives a restart', () => {
 
 	it('late record beyond retention (window long expired): restart run == failure-free run', async () => {
 		const lateTs = (base: number) => [base + 300] // 99.7s behind stream time: dropped by the failure-free run
-		const free = await run(false, lateTs)
-		const restarted = await run(true, lateTs)
+		const base = Math.floor(Date.now() / 1000) * 1000
+		const free = await run(false, lateTs, base)
+		const restarted = await run(true, lateTs, base)
 		expect(restarted).toEqual(free)
 	}, 80_000)
 
 	it('late record within retention: restart run == failure-free run (guard)', async () => {
 		const lateTs = (base: number) => [base + 100_000 - 5_000]
-		const free = await run(false, lateTs)
-		const restarted = await run(true, lateTs)
+		const base = Math.floor(Date.now() / 1000) * 1000
+		const free = await run(false, lateTs, base)
+		const restarted = await run(true, lateTs, base)
 		expect(restarted).toEqual(free)
 	}, 80_000)
 })
