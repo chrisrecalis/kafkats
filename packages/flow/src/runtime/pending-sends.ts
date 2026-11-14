@@ -10,13 +10,16 @@
 export class PendingSends {
 	private pending: Promise<void>[] = []
 	private failure: { error: unknown } | null = null
+	/** Incremented by discard(), so that sends discarded while in flight cannot fail later work. */
+	private generation = 0
 
 	track(send: Promise<unknown>): void {
+		const generation = this.generation
 		this.pending.push(
 			send.then(
 				() => {},
 				error => {
-					this.failure ??= { error }
+					if (generation === this.generation) this.failure ??= { error }
 				}
 			)
 		)
@@ -37,6 +40,7 @@ export class PendingSends {
 
 	/** Forget the tracked sends (their outcome no longer matters: the work is being discarded). */
 	discard(): void {
+		this.generation += 1
 		this.pending = []
 		this.failure = null
 	}

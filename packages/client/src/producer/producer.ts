@@ -305,10 +305,13 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		// right away, so without this, concurrent sends to a busy partition would each cost a
 		// round trip; with it, a busy partition batches whatever arrived while it was sending.
 		const picked = new Map<string, PartitionBatch>()
+		// Partitions whose picked batch is complete: a later batch did not fit, so everything
+		// after it must wait as well (merging past it would reorder the partition).
+		const full = new Set<string>()
 
 		for (const batch of batches) {
 			const key = `${batch.topic}:${batch.partition}`
-			if (this.mutedPartitions.has(key)) {
+			if (this.mutedPartitions.has(key) || full.has(key)) {
 				this.pendingBatches.push(batch)
 				continue
 			}
@@ -321,6 +324,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 				// The merged batch is sent (and accounted for) as part of `first`.
 				this.accumulator.batchCompleted()
 			} else {
+				full.add(key)
 				this.pendingBatches.push(batch)
 			}
 		}

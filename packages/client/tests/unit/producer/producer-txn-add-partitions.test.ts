@@ -75,3 +75,68 @@ describe('Producer.addPartitionsToTransaction top-level error handling', () => {
 		expect(p.partitionsInTransaction.has(`${TOPIC}:0`)).toBe(true)
 	})
 })
+
+describe('Producer: concurrent transactional sends share one partition registration', () => {
+	let mockCluster: ReturnType<typeof createMockCluster>
+	let txnCoordinator: MockBroker
+
+	beforeEach(() => {
+		mockCluster = createMockCluster()
+		txnCoordinator = createMockBroker(1)
+		mockCluster.getCoordinator.mockResolvedValue(txnCoordinator)
+	})
+
+	afterEach(() => {
+		vi.restoreAllMocks()
+	})
+
+	/** A transactional producer whose actual produce step is stubbed out. */
+	function makeProducer() {
+		const producer = new Producer(mockCluster, { retries: 1, retryBackoffMs: 1, transactionalId: 'tx-1' })
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const p = producer as any
+		vi.spyOn(p, 'getPartitionCount').mockResolvedValue(1)
+		vi.spyOn(p, 'internalSend').mockResolvedValue({ topic: TOPIC, partition: 0, offset: 0n, timestamp: 0n })
+		return p
+	}
+
+	const send = (p: { transactionalSend: (topic: unknown, message: unknown) => Promise<unknown> }) =>
+		p.transactionalSend({ topic: TOPIC }, { value: Buffer.from('v'), partition: 0 })
+
+	it('issues a single AddPartitionsToTxn for sends started before it returns', async () => {
+		txnCoordinator.addPartitionsToTxn.mockImplementation(async () => {
+			await new Promise(resolve => setTimeout(resolve, 10))
+			return {
+				throttleTimeMs: 0,
+				errorCode: ErrorCode.None,
+				results: [{ name: TOPIC, resultsByPartition: [{ partitionIndex: 0, errorCode: ErrorCode.None }] }],
+			}
+		})
+		const p = makeProducer()
+
+		await Promise.all(Array.from({ length: 50 }, () => send(p)))
+
+		expect(txnCoordinator.addPartitionsToTxn).toHaveBeenCalledTimes(1)
+		// None of the sends produced before the partition was part of the transaction.
+		expect(p.partitionsInTransaction.has(`${TOPIC}:0`)).toBe(true)
+		expect(p.internalSend).toHaveBeenCalledTimes(50)
+	})
+
+	it('fails every waiting send when the registration fails, and the next send tries again', async () => {
+		txnCoordinator.addPartitionsToTxn.mockImplementation(async () => {
+			await new Promise(resolve => setTimeout(resolve, 10))
+			return { throttleTimeMs: 0, errorCode: ErrorCode.InvalidTxnState, results: [] }
+		})
+		const p = makeProducer()
+
+		const outcomes = await Promise.allSettled(Array.from({ length: 20 }, () => send(p)))
+
+		expect(outcomes.every(o => o.status === 'rejected')).toBe(true)
+		// Nothing was produced to a partition the transaction does not contain.
+		expect(p.internalSend).not.toHaveBeenCalled()
+		expect(p.partitionRegistrations.size).toBe(0)
+
+		await expect(send(p)).rejects.toThrow()
+		expect(txnCoordinator.addPartitionsToTxn).toHaveBeenCalledTimes(2)
+	})
+})
