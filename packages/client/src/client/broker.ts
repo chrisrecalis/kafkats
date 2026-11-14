@@ -185,6 +185,9 @@ import {
 } from '@/protocol/messages/responses/share-acknowledge.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import { DEFAULT_REQUEST_TIMEOUT_MS } from '@/network/types.js'
+import { ConnectionClosedError } from '@/network/errors.js'
+import { ReconnectionStrategy } from '@/utils/reconnection-strategy.js'
+import { sleep } from '@/utils/sleep.js'
 import { UnsupportedVersionError, KafkaProtocolError } from './errors.js'
 import type { BrokerConfig, VersionRange } from './types.js'
 
@@ -239,6 +242,15 @@ export class Broker {
 	private readonly logger: Logger
 	private readonly requestTimeoutMs: number
 
+	// Transparent reconnection. Once connect() has succeeded the broker heals its own connections:
+	// a request on a connection that was dropped (broker restart, TCP reset) re-dials it first, so
+	// every holder of a cached Broker (fetch leader cache, group coordinator, transaction
+	// coordinator, ...) recovers without re-resolving it. Disabled by disconnect().
+	private autoReconnect = false
+	private readonly reconnects = new Map<Connection, Promise<void>>()
+	private readonly reconnectBackoff = new ReconnectionStrategy({ initialDelayMs: 100, maxDelayMs: 5000, jitter: 0.2 })
+	private nextReconnectAt = 0
+
 	constructor(config: BrokerConfig) {
 		this.host = config.host
 		this.port = config.port
@@ -289,15 +301,92 @@ export class Broker {
 			await Promise.allSettled([this.connection.close(false), this.fetchConnection.close(false)])
 			throw error
 		}
+		this.autoReconnect = true
+		this.reconnectBackoff.reset()
+		this.nextReconnectAt = 0
 		this.logger.debug('connected', { host: this.host, port: this.port })
 	}
 
-	async disconnect(): Promise<void> {
+	/**
+	 * Close the connections and stop reconnecting.
+	 *
+	 * @param waitForPendingMs - how long to let in-flight requests finish before they are rejected
+	 * (0 rejects them immediately).
+	 */
+	async disconnect(waitForPendingMs = 5000): Promise<void> {
 		this.logger.debug('disconnecting', { host: this.host, port: this.port })
-		await Promise.all([this.connection.close(), this.fetchConnection.close()])
+		this.autoReconnect = false
+		const wait = waitForPendingMs > 0
+		await Promise.all([
+			this.connection.close(wait, waitForPendingMs),
+			this.fetchConnection.close(wait, waitForPendingMs),
+		])
 		this.apiVersions.clear()
 		this.versionsFetchedAt = 0
 		this.logger.debug('disconnected', { host: this.host, port: this.port })
+	}
+
+	/**
+	 * Re-dial `conn` if it was dropped. Concurrent callers share one attempt, and consecutive
+	 * failed attempts are spaced by a bounded exponential backoff (100ms -> 5s) so a down broker is
+	 * not hammered. A no-op (the send then fails with ConnectionClosedError as before) when the
+	 * broker was never connected or was deliberately disconnected.
+	 */
+	private async ensureConnected(conn: Connection): Promise<void> {
+		if (conn.isConnected || !this.autoReconnect) {
+			return
+		}
+		let attempt = this.reconnects.get(conn)
+		if (!attempt) {
+			attempt = this.reconnect(conn).finally(() => {
+				this.reconnects.delete(conn)
+			})
+			this.reconnects.set(conn, attempt)
+		}
+		await attempt
+	}
+
+	private async reconnect(conn: Connection): Promise<void> {
+		const waitMs = this.nextReconnectAt - Date.now()
+		if (waitMs > 0) {
+			await sleep(waitMs)
+		}
+		if (!this.autoReconnect) {
+			throw new ConnectionClosedError('Broker disconnected')
+		}
+		this.logger.debug('reconnecting', { host: this.host, port: this.port })
+		try {
+			await conn.connect()
+			if (conn === this.connection) {
+				// The broker may have been restarted with different capabilities.
+				await this.negotiateApiVersions()
+			}
+			this.reconnectBackoff.reset()
+			this.nextReconnectAt = 0
+			this.logger.debug('reconnected', { host: this.host, port: this.port })
+		} catch (error) {
+			this.nextReconnectAt = Date.now() + this.reconnectBackoff.nextDelay()
+			this.reconnectBackoff.recordFailure()
+			if (conn.isConnected) {
+				await conn.close(false).catch(() => {})
+			}
+			throw error
+		}
+	}
+
+	private async controlSend(...args: Parameters<Connection['send']>): Promise<Buffer> {
+		await this.ensureConnected(this.connection)
+		return this.connection.send(...args)
+	}
+
+	private async controlSendNoResponse(...args: Parameters<Connection['sendNoResponse']>): Promise<void> {
+		await this.ensureConnected(this.connection)
+		return this.connection.sendNoResponse(...args)
+	}
+
+	private async fetchSend(...args: Parameters<Connection['send']>): Promise<Buffer> {
+		await this.ensureConnected(this.fetchConnection)
+		return this.fetchConnection.send(...args)
 	}
 
 	/**
@@ -370,7 +459,7 @@ export class Broker {
 		const startTime = Date.now()
 		this.logger.debug('sending request', { api: 'Metadata', version })
 
-		const responseBuffer = await this.connection.send(ApiKey.Metadata, version, encoder => {
+		const responseBuffer = await this.controlSend(ApiKey.Metadata, version, encoder => {
 			encodeMetadataRequest(encoder, version, request)
 		})
 
@@ -392,7 +481,7 @@ export class Broker {
 		// await connection.send (which expects a correlated response), or the
 		// promise hangs until request timeout.
 		if (request.acks === 0) {
-			await this.connection.sendNoResponse(ApiKey.Produce, version, encoder => {
+			await this.controlSendNoResponse(ApiKey.Produce, version, encoder => {
 				encodeProduceRequest(encoder, version, request)
 			})
 			const synthesized: ProduceResponse = {
@@ -415,7 +504,7 @@ export class Broker {
 			return synthesized
 		}
 
-		const responseBuffer = await this.connection.send(
+		const responseBuffer = await this.controlSend(
 			ApiKey.Produce,
 			version,
 			encoder => {
@@ -438,7 +527,7 @@ export class Broker {
 		const startTime = Date.now()
 		this.logger.debug('sending request', { api: 'Fetch', version, maxWaitMs: request.maxWaitMs })
 
-		const responseBuffer = await this.fetchConnection.send(
+		const responseBuffer = await this.fetchSend(
 			ApiKey.Fetch,
 			version,
 			encoder => {
@@ -461,7 +550,7 @@ export class Broker {
 		const startTime = Date.now()
 		this.logger.debug('sending request', { api: 'ListOffsets', version })
 
-		const responseBuffer = await this.connection.send(ApiKey.ListOffsets, version, encoder => {
+		const responseBuffer = await this.controlSend(ApiKey.ListOffsets, version, encoder => {
 			encodeListOffsetsRequest(encoder, version, request)
 		})
 
@@ -479,7 +568,7 @@ export class Broker {
 		const startTime = Date.now()
 		this.logger.debug('sending request', { api: 'FindCoordinator', version, key: request.key })
 
-		const responseBuffer = await this.connection.send(ApiKey.FindCoordinator, version, encoder => {
+		const responseBuffer = await this.controlSend(ApiKey.FindCoordinator, version, encoder => {
 			encodeFindCoordinatorRequest(encoder, version, request)
 		})
 
@@ -502,7 +591,7 @@ export class Broker {
 			memberId: request.memberId,
 		})
 
-		const responseBuffer = await this.connection.send(
+		const responseBuffer = await this.controlSend(
 			ApiKey.JoinGroup,
 			version,
 			encoder => {
@@ -530,7 +619,7 @@ export class Broker {
 			generationId: request.generationId,
 		})
 
-		const responseBuffer = await this.connection.send(
+		const responseBuffer = await this.controlSend(
 			ApiKey.SyncGroup,
 			version,
 			encoder => {
@@ -558,7 +647,7 @@ export class Broker {
 			generationId: request.generationId,
 		})
 
-		const responseBuffer = await this.connection.send(ApiKey.Heartbeat, version, encoder => {
+		const responseBuffer = await this.controlSend(ApiKey.Heartbeat, version, encoder => {
 			encodeHeartbeatRequest(encoder, version, request)
 		})
 
@@ -576,7 +665,7 @@ export class Broker {
 		const startTime = Date.now()
 		this.logger.debug('sending request', { api: 'LeaveGroup', version, groupId: request.groupId })
 
-		const responseBuffer = await this.connection.send(ApiKey.LeaveGroup, version, encoder => {
+		const responseBuffer = await this.controlSend(ApiKey.LeaveGroup, version, encoder => {
 			encodeLeaveGroupRequest(encoder, version, request)
 		})
 
@@ -599,7 +688,7 @@ export class Broker {
 		const startTime = Date.now()
 		this.logger.debug('sending request', { api: 'OffsetCommit', version, groupId: request.groupId })
 
-		const responseBuffer = await this.connection.send(ApiKey.OffsetCommit, version, encoder => {
+		const responseBuffer = await this.controlSend(ApiKey.OffsetCommit, version, encoder => {
 			encodeOffsetCommitRequest(encoder, version, request)
 		})
 
@@ -617,7 +706,7 @@ export class Broker {
 		const startTime = Date.now()
 		this.logger.debug('sending request', { api: 'OffsetFetch', version, groupId: request.groupId })
 
-		const responseBuffer = await this.connection.send(ApiKey.OffsetFetch, version, encoder => {
+		const responseBuffer = await this.controlSend(ApiKey.OffsetFetch, version, encoder => {
 			encodeOffsetFetchRequest(encoder, version, request)
 		})
 
@@ -639,7 +728,7 @@ export class Broker {
 			topicCount: request.topics.length,
 		})
 
-		const responseBuffer = await this.connection.send(ApiKey.CreateTopics, version, encoder => {
+		const responseBuffer = await this.controlSend(ApiKey.CreateTopics, version, encoder => {
 			encodeCreateTopicsRequest(encoder, version, request)
 		})
 
@@ -661,7 +750,7 @@ export class Broker {
 			transactionalId: request.transactionalId,
 		})
 
-		const responseBuffer = await this.connection.send(ApiKey.InitProducerId, version, encoder => {
+		const responseBuffer = await this.controlSend(ApiKey.InitProducerId, version, encoder => {
 			encodeInitProducerIdRequest(encoder, version, request)
 		})
 
@@ -690,7 +779,7 @@ export class Broker {
 			transactionalId: request.transactionalId,
 		})
 
-		const responseBuffer = await this.connection.send(ApiKey.AddPartitionsToTxn, version, encoder => {
+		const responseBuffer = await this.controlSend(ApiKey.AddPartitionsToTxn, version, encoder => {
 			encodeAddPartitionsToTxnRequest(encoder, version, request)
 		})
 
@@ -713,7 +802,7 @@ export class Broker {
 			groupId: request.groupId,
 		})
 
-		const responseBuffer = await this.connection.send(ApiKey.AddOffsetsToTxn, version, encoder => {
+		const responseBuffer = await this.controlSend(ApiKey.AddOffsetsToTxn, version, encoder => {
 			encodeAddOffsetsToTxnRequest(encoder, version, request)
 		})
 
@@ -741,7 +830,7 @@ export class Broker {
 			committed: request.committed,
 		})
 
-		const responseBuffer = await this.connection.send(ApiKey.EndTxn, version, encoder => {
+		const responseBuffer = await this.controlSend(ApiKey.EndTxn, version, encoder => {
 			encodeEndTxnRequest(encoder, version, request)
 		})
 
@@ -769,7 +858,7 @@ export class Broker {
 			groupId: request.groupId,
 		})
 
-		const responseBuffer = await this.connection.send(ApiKey.TxnOffsetCommit, version, encoder => {
+		const responseBuffer = await this.controlSend(ApiKey.TxnOffsetCommit, version, encoder => {
 			encodeTxnOffsetCommitRequest(encoder, version, request)
 		})
 
@@ -791,7 +880,7 @@ export class Broker {
 			topicCount: request.topics.length,
 		})
 
-		const responseBuffer = await this.connection.send(ApiKey.DeleteTopics, version, encoder => {
+		const responseBuffer = await this.controlSend(ApiKey.DeleteTopics, version, encoder => {
 			encodeDeleteTopicsRequest(encoder, version, request)
 		})
 
@@ -809,7 +898,7 @@ export class Broker {
 		const startTime = Date.now()
 		this.logger.debug('sending request', { api: 'DescribeAcls', version })
 
-		const responseBuffer = await this.connection.send(ApiKey.DescribeAcls, version, encoder => {
+		const responseBuffer = await this.controlSend(ApiKey.DescribeAcls, version, encoder => {
 			encodeDescribeAclsRequest(encoder, version, request)
 		})
 
@@ -836,7 +925,7 @@ export class Broker {
 			aclCount: request.creations.length,
 		})
 
-		const responseBuffer = await this.connection.send(ApiKey.CreateAcls, version, encoder => {
+		const responseBuffer = await this.controlSend(ApiKey.CreateAcls, version, encoder => {
 			encodeCreateAclsRequest(encoder, version, request)
 		})
 
@@ -858,7 +947,7 @@ export class Broker {
 			filterCount: request.filters.length,
 		})
 
-		const responseBuffer = await this.connection.send(ApiKey.DeleteAcls, version, encoder => {
+		const responseBuffer = await this.controlSend(ApiKey.DeleteAcls, version, encoder => {
 			encodeDeleteAclsRequest(encoder, version, request)
 		})
 
@@ -881,7 +970,7 @@ export class Broker {
 		const startTime = Date.now()
 		this.logger.debug('sending request', { api: 'ListGroups', version })
 
-		const responseBuffer = await this.connection.send(ApiKey.ListGroups, version, encoder => {
+		const responseBuffer = await this.controlSend(ApiKey.ListGroups, version, encoder => {
 			encodeListGroupsRequest(encoder, version, request)
 		})
 
@@ -908,7 +997,7 @@ export class Broker {
 			groupCount: request.groups.length,
 		})
 
-		const responseBuffer = await this.connection.send(ApiKey.DescribeGroups, version, encoder => {
+		const responseBuffer = await this.controlSend(ApiKey.DescribeGroups, version, encoder => {
 			encodeDescribeGroupsRequest(encoder, version, request)
 		})
 
@@ -930,7 +1019,7 @@ export class Broker {
 			groupCount: request.groupsNames.length,
 		})
 
-		const responseBuffer = await this.connection.send(ApiKey.DeleteGroups, version, encoder => {
+		const responseBuffer = await this.controlSend(ApiKey.DeleteGroups, version, encoder => {
 			encodeDeleteGroupsRequest(encoder, version, request)
 		})
 
@@ -948,7 +1037,7 @@ export class Broker {
 		const startTime = Date.now()
 		this.logger.debug('sending request', { api: 'ShareGroupHeartbeat', version, groupId: request.groupId })
 
-		const responseBuffer = await this.connection.send(ApiKey.ShareGroupHeartbeat, version, encoder => {
+		const responseBuffer = await this.controlSend(ApiKey.ShareGroupHeartbeat, version, encoder => {
 			encodeShareGroupHeartbeatRequest(encoder, version, request)
 		})
 
@@ -979,7 +1068,7 @@ export class Broker {
 		const startTime = Date.now()
 		this.logger.debug('sending request', { api: 'ShareFetch', version })
 
-		const responseBuffer = await this.fetchConnection.send(
+		const responseBuffer = await this.fetchSend(
 			ApiKey.ShareFetch,
 			version,
 			encoder => {
@@ -1002,7 +1091,7 @@ export class Broker {
 		const startTime = Date.now()
 		this.logger.debug('sending request', { api: 'ShareAcknowledge', version })
 
-		const responseBuffer = await this.connection.send(ApiKey.ShareAcknowledge, version, encoder => {
+		const responseBuffer = await this.controlSend(ApiKey.ShareAcknowledge, version, encoder => {
 			encodeShareAcknowledgeRequest(encoder, version, request)
 		})
 

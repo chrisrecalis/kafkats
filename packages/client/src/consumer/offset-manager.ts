@@ -11,7 +11,7 @@
 import type { Cluster } from '@/client/cluster.js'
 import type { Broker } from '@/client/broker.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
-import { isKafkaError, KafkaProtocolError, shouldRefreshMetadata } from '@/client/errors.js'
+import { isConnectionFailure, isKafkaError, KafkaProtocolError, shouldRefreshMetadata } from '@/client/errors.js'
 import { OFFSET_TIMESTAMP } from '@/protocol/messages/requests/list-offsets.js'
 import type { TopicPartition, AutoOffsetReset } from './types.js'
 import { noopLogger, type Logger } from '@/logger.js'
@@ -259,13 +259,26 @@ export class OffsetManager {
 			})),
 		}))
 
-		const response = await this.coordinator.offsetCommit({
-			groupId: this.groupId,
-			generationId: this.generationId,
-			memberId: this.memberId,
-			groupInstanceId: this.groupInstanceId ?? null,
-			topics,
-		})
+		let response: Awaited<ReturnType<Broker['offsetCommit']>>
+		try {
+			response = await this.coordinator.offsetCommit({
+				groupId: this.groupId,
+				generationId: this.generationId,
+				memberId: this.memberId,
+				groupInstanceId: this.groupInstanceId ?? null,
+				topics,
+			})
+		} catch (error) {
+			if (isConnectionFailure(error)) {
+				// The connection re-dials by itself; additionally re-resolve the coordinator in case it
+				// moved to another node. Offsets stay pending for the next attempt.
+				this.cluster.invalidateCoordinator('GROUP', this.groupId)
+				this.coordinator = await this.cluster
+					.getCoordinator('GROUP', this.groupId)
+					.catch(() => this.coordinator)
+			}
+			throw error
+		}
 
 		// Clear successes before throwing so a failed sibling doesn't poison healthy
 		// partitions on the next retry (stale generation → forever-failing commits).

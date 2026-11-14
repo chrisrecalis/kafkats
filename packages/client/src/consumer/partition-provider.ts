@@ -13,7 +13,11 @@ import type { OffsetManager } from './offset-manager.js'
 import type { TopicPartition, ManualAssignment, AutoOffsetReset } from './types.js'
 import { retry } from '@/utils/retry.js'
 import { sleep } from '@/utils/sleep.js'
-import { CoordinatorNotAvailableError, NotCoordinatorError } from '@/client/errors.js'
+import { CoordinatorNotAvailableError, NotCoordinatorError, isConnectionFailure } from '@/client/errors.js'
+import { ReconnectionStrategy } from '@/utils/reconnection-strategy.js'
+
+/** Minimum spacing between 'error' events reported while waiting for an unreachable cluster. */
+const UNREACHABLE_REPORT_INTERVAL_MS = 5000
 
 /**
  * Partition with resolved offset (internal type)
@@ -32,7 +36,10 @@ export interface PartitionProviderCallbacks {
 
 export interface PartitionProvider {
 	start(topics: string[], callbacks: PartitionProviderCallbacks): Promise<TopicPartition[]>
-	stop(): Promise<void>
+	/** Leave/clean up; `budgetMs` bounds best-effort network work (LeaveGroup). */
+	stop(budgetMs?: number): Promise<void>
+	/** Abandon requests parked at an unresponsive broker (shutdown deadline exceeded). */
+	interrupt?(): void
 	hasPendingRebalance(): boolean
 	/**
 	 * Check for and handle any pending rebalance synchronously.
@@ -164,6 +171,7 @@ export class GroupPartitionProvider implements PartitionProvider {
 	private callbacks: PartitionProviderCallbacks | null = null
 	private topics: string[] = []
 	private rebalancePending = false
+	private lastUnreachableReportAt = 0
 
 	constructor(config: GroupPartitionProviderConfig) {
 		this.consumerGroup = config.consumerGroup
@@ -193,8 +201,41 @@ export class GroupPartitionProvider implements PartitionProvider {
 		return joinResult.assignment
 	}
 
-	async stop(): Promise<void> {
-		await this.consumerGroup.stop()
+	async stop(budgetMs?: number): Promise<void> {
+		await this.consumerGroup.stop(budgetMs)
+	}
+
+	interrupt(): void {
+		this.consumerGroup.interrupt()
+	}
+
+	/**
+	 * Run a step of the rebalance protocol, retrying with bounded exponential backoff while the
+	 * cluster is unreachable (e.g. the broker is restarting). Dying here would strand the consumer
+	 * outside the group; instead it keeps trying until the cluster is back or the consumer stops.
+	 * Protocol-level errors are not retried. Failures are surfaced as throttled 'error' events.
+	 */
+	private async whileReachable<T>(step: () => Promise<T>): Promise<T> {
+		const backoff = new ReconnectionStrategy({ initialDelayMs: 100, maxDelayMs: 5000, jitter: 0.2 })
+		for (;;) {
+			try {
+				return await step()
+			} catch (error) {
+				if (!isConnectionFailure(error) || this.signal?.aborted || !this.isRunning()) {
+					throw error
+				}
+				const now = Date.now()
+				if (now - this.lastUnreachableReportAt >= UNREACHABLE_REPORT_INTERVAL_MS) {
+					this.lastUnreachableReportAt = now
+					this.logger.warn('cluster unreachable during rebalance, retrying', {
+						error: (error as Error).message,
+					})
+					this.callbacks?.onError(error as Error)
+				}
+				await sleep(backoff.nextDelay(), { signal: this.signal, resolveOnAbort: true })
+				backoff.recordFailure()
+			}
+		}
 	}
 
 	private onRebalanceEvent(): void {
@@ -228,7 +269,7 @@ export class GroupPartitionProvider implements PartitionProvider {
 				await this.callbacks.onPartitionsRevoked(previousAssignment)
 			}
 
-			const rejoinResult = await this.consumerGroup.rejoin(this.topics)
+			const rejoinResult = await this.whileReachable(() => this.consumerGroup.rejoin(this.topics))
 			if (!this.isRunning()) return
 
 			await this.updateGroupState()
@@ -243,6 +284,10 @@ export class GroupPartitionProvider implements PartitionProvider {
 				await this.handleCooperativeRebalance(rejoinResult, wasEager)
 			}
 		} catch (error) {
+			// Stopping while the cluster was unreachable: nothing left to rebalance.
+			if (!this.isRunning() && isConnectionFailure(error)) {
+				return
+			}
 			const err = error instanceof Error ? error : new Error(String(error))
 			this.logger.error('rebalance handler failed', { error: err.message })
 			// Stop the group: if the rebalance failed (e.g. EOS commit in onRebalance),
@@ -303,7 +348,8 @@ export class GroupPartitionProvider implements PartitionProvider {
 				await sleep(backoffMs, { signal: this.signal, resolveOnAbort: true })
 				if (!this.isRunning()) return
 
-				rejoinResult = await this.consumerGroup.rejoin(this.topics, rejoinResult.revoked)
+				const revokedBefore = rejoinResult.revoked
+				rejoinResult = await this.whileReachable(() => this.consumerGroup.rejoin(this.topics, revokedBefore))
 				await this.updateGroupState()
 
 				if (rejoinResult.needsRejoin && rejoinResult.revoked.length > 0) {
@@ -325,7 +371,7 @@ export class GroupPartitionProvider implements PartitionProvider {
 	}
 
 	private async updateGroupState(): Promise<void> {
-		const coordinator = await this.cluster.getCoordinator('GROUP', this.groupId)
+		const coordinator = await this.whileReachable(() => this.cluster.getCoordinator('GROUP', this.groupId))
 		this.offsetManager.updateGroupState(
 			this.consumerGroup.currentMemberId,
 			this.consumerGroup.currentGenerationId,
@@ -334,7 +380,7 @@ export class GroupPartitionProvider implements PartitionProvider {
 	}
 
 	private async resolveOffsets(partitions: TopicPartition[]): Promise<TopicPartitionOffset[]> {
-		const committedOffsets = await this.offsetManager.fetchCommittedOffsets(partitions)
+		const committedOffsets = await this.whileReachable(() => this.offsetManager.fetchCommittedOffsets(partitions))
 
 		const result: TopicPartitionOffset[] = []
 		for (const tp of partitions) {

@@ -47,6 +47,7 @@ import {
 import { ConsumerGroup } from './consumer-group.js'
 import { OffsetManager } from './offset-manager.js'
 import { FetchManager } from './fetch-manager.js'
+import { SHUTDOWN_DEADLINE_MS, withTimeout, DeadlineExceededError } from '@/utils/timeout.js'
 import { PartitionTracker } from './partition-tracker.js'
 import { noopLogger, type Logger } from '@/logger.js'
 import { validatePriorityStrategy, type PriorityStrategy } from './priority.js'
@@ -78,6 +79,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	private abortController: AbortController | null = null
 	private runPromiseResolve: (() => void) | null = null
 	private runPromiseReject: ((error: Error) => void) | null = null
+	private shutdownTimer: ReturnType<typeof setTimeout> | null = null
 
 	constructor(cluster: Cluster, config: ConsumerConfig) {
 		super()
@@ -223,6 +225,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 				isolationLevel: this.config.isolationLevel,
 				checkCrcs: this.config.checkCrcs,
 				priority,
+				onError: error => this.emitError(error),
 				onFetchPosition: (position, recordCount) => {
 					this.emit('fetchPosition', position, recordCount)
 				},
@@ -800,6 +803,12 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		this.state = 'stopping'
 		this.abortController?.abort()
 
+		// If the run loop does not wind down in time (e.g. parked in a JoinGroup at an unresponsive
+		// coordinator), force-close the coordinator connection so shutdown stays bounded.
+		this.clearShutdownTimer()
+		this.shutdownTimer = setTimeout(() => this.partitionProvider?.interrupt?.(), SHUTDOWN_DEADLINE_MS)
+		this.shutdownTimer.unref?.()
+
 		if (this.runPromiseResolve) {
 			this.runPromiseResolve()
 			this.runPromiseResolve = null
@@ -826,10 +835,20 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		return [...byKey.values()]
 	}
 
+	private clearShutdownTimer(): void {
+		if (this.shutdownTimer) {
+			clearTimeout(this.shutdownTimer)
+			this.shutdownTimer = null
+		}
+	}
+
 	private async cleanup(): Promise<void> {
+		this.clearShutdownTimer()
 		if (this.fetchManager) {
 			this.fetchManager.stop()
 		}
+
+		let commitTimedOut = false
 
 		// Wait for fetch loop to exit before committing - ensures last message was marked consumed
 		const fetchLoopPromise = this.fetchLoopPromise
@@ -846,17 +865,24 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			this.offsetManager.stopAutoCommit()
 			if (this.commitOffsets && !this.sessionLost) {
 				try {
-					await this.offsetManager.commitPendingOffsets()
+					// Best effort within the shutdown budget (healthy broker: returns immediately).
+					await withTimeout(
+						this.offsetManager.commitPendingOffsets(),
+						SHUTDOWN_DEADLINE_MS,
+						'final offset commit'
+					)
 				} catch (error) {
 					this.emitError(error)
+					commitTimedOut = error instanceof DeadlineExceededError
 				}
 			}
 		}
 
-		// Handles leaving consumer group
+		// Handles leaving consumer group. If the final commit timed out the broker is unresponsive:
+		// skip LeaveGroup (the session expires broker-side) and just close the connection.
 		if (this.partitionProvider) {
 			try {
-				await this.partitionProvider.stop()
+				await this.partitionProvider.stop(commitTimedOut ? 0 : SHUTDOWN_DEADLINE_MS)
 			} catch (error) {
 				this.emitError(error)
 			}

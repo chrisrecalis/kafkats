@@ -6,6 +6,7 @@ import { EventEmitter } from 'node:events'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import type { Cluster } from '@/client/cluster.js'
 import type { Broker } from '@/client/broker.js'
+import { SHUTDOWN_DEADLINE_MS, withTimeout } from '@/utils/timeout.js'
 import type { ProduceRequest } from '@/protocol/messages/requests/produce.js'
 import { ErrorCode, isRetriableError } from '@/protocol/messages/error-codes.js'
 import {
@@ -194,6 +195,9 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	// messages are acked (including retries), so flush() can wait for in-progress sends
 	// by awaiting these directly — no need to inspect internal batch/drain state.
 	private activeSends = new Set<Promise<unknown>>()
+	// Batches currently being produced (also for non-idempotent producers, unlike inflightBatches),
+	// so disconnect() can reject their callers when the broker does not answer.
+	private sendingBatches = new Set<PreparedProduceBatch[]>()
 	// Partitions with an in-flight send. A partition stays muted until its send
 	// settles, so at most one batch per partition is ever in flight (preserves
 	// per-partition ordering for the idempotent producer).
@@ -449,6 +453,15 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	}
 
 	private async sendPreparedBatches(preparedBatches: PreparedProduceBatch[]): Promise<void> {
+		this.sendingBatches.add(preparedBatches)
+		try {
+			await this.sendPreparedBatchesWithRetry(preparedBatches)
+		} finally {
+			this.sendingBatches.delete(preparedBatches)
+		}
+	}
+
+	private async sendPreparedBatchesWithRetry(preparedBatches: PreparedProduceBatch[]): Promise<void> {
 		const strategy = new ReconnectionStrategy(createRetryStrategyOptions(this.config))
 		let pendingBatches = preparedBatches
 
@@ -1194,7 +1207,9 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		}
 
 		try {
-			await this.flush()
+			// Bounded: against an unresponsive broker the remaining batches are rejected below
+			// instead of waiting out the request timeouts.
+			await withTimeout(this.flush(), SHUTDOWN_DEADLINE_MS, 'flush')
 		} catch (error) {
 			this.logger.warn('flush() failed during disconnect', {
 				error: error instanceof Error ? error.message : String(error),
@@ -1206,6 +1221,13 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		const disconnectError = new Error('Producer disconnected')
 		this.rejectAndClearPendingBatches(disconnectError)
 		this.failAllInflightBatches(disconnectError)
+		for (const prepared of this.sendingBatches) {
+			for (const { messagesToSend } of prepared) {
+				for (const msg of messagesToSend) {
+					msg.reject(disconnectError)
+				}
+			}
+		}
 		this.accumulator.clearWithRejection(disconnectError)
 
 		this.state = 'idle'
