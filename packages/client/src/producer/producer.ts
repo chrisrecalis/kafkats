@@ -104,6 +104,11 @@ function isCoordinatorErrorCode(errorCode: ErrorCode): boolean {
 	return errorCode === ErrorCode.NotCoordinator || errorCode === ErrorCode.CoordinatorNotAvailable
 }
 
+/** The result of a send() call, from the promises of its messages. */
+function settleSend(promises: Promise<SendResult>[], isSingle: boolean): Promise<SendResult | SendResult[]> {
+	return isSingle ? promises[0]! : Promise.all(promises)
+}
+
 /** Poll interval for CONCURRENT_TRANSACTIONS — matches the Java client's ADD_PARTITIONS_RETRY_BACKOFF_MS. */
 const CONCURRENT_TRANSACTIONS_POLL_MS = 20
 
@@ -203,8 +208,10 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	// settles, so at most one batch per partition is ever in flight (preserves
 	// per-partition ordering for the idempotent producer).
 	private mutedPartitions = new Set<string>()
-	// Tail of the chain that keeps the asynchronous part of send() in call order (see inSendOrder).
+	// Tail of the chain that keeps the asynchronous part of send() in call order (see inSendOrder),
+	// and the number of sends in it that have not appended yet.
 	private sendOrder: Promise<unknown> = Promise.resolve()
+	private sendsInOrder = 0
 
 	// Transaction state (only used when transactionalId is set)
 	private transactionState: TransactionState = 'idle'
@@ -1172,17 +1179,18 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	/**
 	 * Internal send implementation (bypasses transactional check)
 	 */
-	private async internalSend<V, K>(
+	private internalSend<V, K>(
 		topicDef: TopicDefinition<V, K>,
 		messages: ProducerMessage<V, K> | ProducerMessage<V, K>[]
 	): Promise<SendResult | SendResult[]> {
 		const msgArray = Array.isArray(messages) ? messages : [messages]
 		const isSingle = !Array.isArray(messages)
 
-		const promises = await this.inSendOrder(() => this.append(topicDef, msgArray))
-
-		const results = await Promise.all(promises)
-		return isSingle ? results[0]! : results
+		const partitionCount = this.partitionCountToAppendNow(topicDef.topic)
+		if (partitionCount !== undefined) {
+			return settleSend(this.enqueueMessages(topicDef, msgArray, partitionCount), isSingle)
+		}
+		return this.inSendOrder(() => this.append(topicDef, msgArray)).then(promises => settleSend(promises, isSingle))
 	}
 
 	/**
@@ -1194,14 +1202,31 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	 * issued back to back could append in the wrong order. Appending in call order is what makes
 	 * "records of a partition are written in the order they were sent" hold for sends that are
 	 * not awaited one by one.
+	 *
+	 * A send that has nothing to wait for skips this and appends synchronously, but only while no
+	 * send is in here (see partitionCountToAppendNow), so it cannot overtake one.
 	 */
 	private inSendOrder<T>(prepareAndAppend: () => Promise<T>): Promise<T> {
+		this.sendsInOrder++
 		const run = this.sendOrder.then(prepareAndAppend, prepareAndAppend)
-		this.sendOrder = run.then(
-			() => {},
-			() => {}
-		)
+		// Counted down only once the send has appended (or failed), never before.
+		const done = () => {
+			this.sendsInOrder--
+		}
+		this.sendOrder = run.then(done, done)
 		return run
+	}
+
+	/**
+	 * The partition count to append a send with right away, or undefined when the send must go
+	 * through {@link inSendOrder}: an earlier send is still waiting there (appending now would
+	 * overtake it), the idempotent producer is not initialized, or the partition count is not
+	 * cached.
+	 */
+	private partitionCountToAppendNow(topic: string): number | undefined {
+		if (this.sendsInOrder > 0) return undefined
+		if (this.config.idempotent && this.idempotentState !== 'running') return undefined
+		return this.cachedPartitionCount(topic)
 	}
 
 	/** Append messages to the accumulator. Must run inside {@link inSendOrder}. */
@@ -1533,33 +1558,53 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		const isSingle = !Array.isArray(messages)
 		const msgArray = Array.isArray(messages) ? messages : [messages]
 
+		// No send waiting before this one: resolve the partitions now, and if they are all part of
+		// the transaction already, append right away.
+		const partitionCount = this.partitionCountToAppendNow(topicDef.topic)
+		const resolvedNow =
+			partitionCount === undefined ? undefined : this.resolveMessagePartitions(topicDef, msgArray, partitionCount)
+		if (resolvedNow && this.partitionsNotInTransaction(topicDef.topic, resolvedNow).length === 0) {
+			return settleSend(this.enqueueMessages(topicDef, resolvedNow, partitionCount!), isSingle)
+		}
+
 		// In send order: a partition is registered by the first send that needs it, and every
-		// later send finds it registered instead of issuing its own AddPartitionsToTxn.
+		// later send finds it registered instead of issuing its own AddPartitionsToTxn. Nothing
+		// is appended to a partition before it is part of the transaction.
 		const promises = await this.inSendOrder(async () => {
-			const resolved = await this.resolveTransactionPartitions(topicDef, msgArray)
+			const resolved =
+				resolvedNow ??
+				this.resolveMessagePartitions(topicDef, msgArray, await this.getPartitionCount(topicDef.topic))
+			const partitionsToAdd = this.partitionsNotInTransaction(topicDef.topic, resolved)
+			if (partitionsToAdd.length > 0) {
+				await this.addPartitionsToTransaction(topicDef.topic, partitionsToAdd)
+			}
 			return this.append(topicDef, resolved)
 		})
 
-		const results = await Promise.all(promises)
-		return isSingle ? results[0]! : results
+		return settleSend(promises, isSingle)
+	}
+
+	/** The partitions of these messages that are not part of the open transaction yet. */
+	private partitionsNotInTransaction(topic: string, messages: Array<{ partition: number }>): number[] {
+		const partitions = new Set<number>()
+		for (const { partition } of messages) {
+			if (!this.partitionsInTransaction.has(`${topic}:${partition}`)) partitions.add(partition)
+		}
+		return Array.from(partitions)
 	}
 
 	/**
-	 * Fix the partition of each message and make sure those partitions are part of the open
-	 * transaction before anything is produced to them.
+	 * Resolve the partition of each message once and freeze it on the message. Re-invoking a
+	 * stateful partitioner (e.g. round-robin) in append would advance the counter, so
+	 * addPartitionsToTxn and the actual writes would diverge.
 	 */
-	private async resolveTransactionPartitions<V, K>(
+	private resolveMessagePartitions<V, K>(
 		topicDef: TopicDefinition<V, K>,
-		msgArray: ProducerMessage<V, K>[]
-	): Promise<Array<ProducerMessage<V, K> & { partition: number }>> {
+		msgArray: ProducerMessage<V, K>[],
+		partitionCount: number
+	): Array<ProducerMessage<V, K> & { partition: number }> {
 		const { encodeKey, encodeValue } = this.resolveEncoders(topicDef)
-
-		// Resolve partitions once and freeze them on the message. Re-invoking a
-		// stateful partitioner (e.g. round-robin) in append would advance
-		// the counter, so addPartitionsToTxn and the actual writes would diverge.
-		const partitionCount = await this.getPartitionCount(topicDef.topic)
-		const partitionsToAdd = new Set<number>()
-		const resolvedMessages: Array<ProducerMessage<V, K> & { partition: number }> = msgArray.map(msg => {
+		return msgArray.map(msg => {
 			let partition = msg.partition
 			if (partition === undefined) {
 				const valueBuffer = msg.value === null ? null : encodeValue(msg.value)
@@ -1570,16 +1615,8 @@ export class Producer extends EventEmitter<ProducerEvents> {
 					partition = this.getStickyPartition(topicDef.topic, partitionCount)
 				}
 			}
-			if (!this.partitionsInTransaction.has(`${topicDef.topic}:${partition}`)) {
-				partitionsToAdd.add(partition)
-			}
 			return { ...msg, partition }
 		})
-
-		if (partitionsToAdd.size > 0) {
-			await this.addPartitionsToTransaction(topicDef.topic, Array.from(partitionsToAdd))
-		}
-		return resolvedMessages
 	}
 
 	/**
@@ -1986,12 +2023,9 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	 * Get partition count for a topic (cached with TTL)
 	 */
 	private async getPartitionCount(topic: string): Promise<number> {
-		const cached = this.partitionCache.get(topic)
-		const now = Date.now()
-
-		// Return cached value if fresh
-		if (cached && now - cached.fetchedAt < Producer.PARTITION_CACHE_TTL_MS) {
-			return cached.count
+		const cached = this.cachedPartitionCount(topic)
+		if (cached !== undefined) {
+			return cached
 		}
 
 		// Topic creation is asynchronous; even after CreateTopics returns successfully, the topic may not be
@@ -2012,6 +2046,15 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		}
 
 		throw new Error(`Topic ${topic} not found`)
+	}
+
+	/** The cached partition count of a topic, if it is still fresh. */
+	private cachedPartitionCount(topic: string): number | undefined {
+		const cached = this.partitionCache.get(topic)
+		if (cached && Date.now() - cached.fetchedAt < Producer.PARTITION_CACHE_TTL_MS) {
+			return cached.count
+		}
+		return undefined
 	}
 
 	/**

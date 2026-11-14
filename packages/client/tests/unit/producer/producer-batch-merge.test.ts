@@ -193,3 +193,109 @@ describe('Producer: batches queued behind an in-flight request are merged', () =
 		await producer.disconnect()
 	})
 })
+
+describe('Producer: a send with nothing to wait for does not overtake one that waits', () => {
+	const TOPIC = 'test-topic'
+	let mockCluster: ReturnType<typeof createMockCluster>
+	let mockBroker: ReturnType<typeof createMockBroker>
+	/** Values received by the broker, per partition, in order. */
+	let received: Map<number, string[]>
+
+	beforeEach(() => {
+		mockCluster = createMockCluster({ partitionCount: 2 })
+		mockBroker = createMockBroker(1)
+		mockCluster.getLeaderForPartition.mockResolvedValue(mockBroker)
+		mockCluster.getCoordinator.mockResolvedValue(mockBroker)
+		mockCluster.getAnyBroker.mockResolvedValue(mockBroker)
+		mockBroker.initProducerId.mockResolvedValue({
+			throttleTimeMs: 0,
+			errorCode: ErrorCode.None,
+			producerId: 1n,
+			producerEpoch: 0,
+		})
+		mockBroker.endTxn.mockResolvedValue({ throttleTimeMs: 0, errorCode: ErrorCode.None })
+		received = new Map()
+		mockBroker.produce.mockImplementation(async (request: ProduceRequest) => {
+			const partitions = []
+			for (const { partitionIndex, records } of request.topics[0]!.partitions) {
+				const batch = await decodeRecordBatch(records)
+				const values = received.get(partitionIndex) ?? []
+				for (const record of batch.records) values.push(record.value!.toString())
+				received.set(partitionIndex, values)
+				partitions.push({ partitionIndex, errorCode: ErrorCode.None, baseOffset: 0n })
+			}
+			return buildProduceResponse([{ name: TOPIC, partitions }])
+		})
+	})
+
+	afterEach(() => {
+		vi.restoreAllMocks()
+	})
+
+	it('waits behind a send whose partition count lookup is finishing', async () => {
+		const producer = new Producer(mockCluster, { retries: 1 })
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const p = producer as any
+		const sends: Array<Promise<unknown>> = []
+		const send = (value: string) => {
+			sends.push(producer.send(TOPIC, { value: Buffer.from(value), partition: 0 }))
+		}
+		// The moment the first lookup fills the cache, before the send that asked for it has
+		// appended, issue another send: it finds the count cached, but must still go after.
+		const cacheSet = p.partitionCache.set.bind(p.partitionCache)
+		vi.spyOn(p.partitionCache, 'set').mockImplementationOnce((...args: unknown[]) => {
+			cacheSet(...args)
+			queueMicrotask(() => send('second'))
+		})
+
+		send('first')
+		while (sends.length < 2) await new Promise(resolve => setTimeout(resolve, 1))
+		await Promise.all(sends)
+		send('third')
+		await Promise.all(sends)
+
+		expect(received.get(0)).toEqual(['first', 'second', 'third'])
+		await producer.disconnect()
+	})
+
+	it('waits behind a transactional send whose other partition is being registered', async () => {
+		mockBroker.addPartitionsToTxn.mockImplementation(async request => {
+			const partitions = request.topics[0]!.partitions
+			// Registering partition 0 is slow.
+			if (partitions.includes(0)) await new Promise(resolve => setTimeout(resolve, 20))
+			return {
+				throttleTimeMs: 0,
+				errorCode: ErrorCode.None,
+				results: [
+					{
+						name: TOPIC,
+						resultsByPartition: partitions.map(partitionIndex => ({
+							partitionIndex,
+							errorCode: ErrorCode.None,
+						})),
+					},
+				],
+			}
+		})
+		const producer = new Producer(mockCluster, { retries: 1, transactionalId: 'tx-1' })
+
+		await producer.transaction(async tx => {
+			// Partition 1 is part of the transaction (and the partition count cached) after this.
+			await tx.send(TOPIC, { value: Buffer.from('a'), partition: 1 })
+			// Waits for partition 0 to be registered...
+			const waiting = tx.send(TOPIC, [
+				{ value: Buffer.from('b'), partition: 1 },
+				{ value: Buffer.from('x'), partition: 0 },
+			])
+			// ...and this one, which needs nothing, must not get to partition 1 before it.
+			const ready = tx.send(TOPIC, { value: Buffer.from('c'), partition: 1 })
+			await Promise.all([waiting, ready])
+			// Once nothing waits, sends append right away again.
+			await tx.send(TOPIC, { value: Buffer.from('d'), partition: 1 })
+		})
+
+		expect(received.get(1)).toEqual(['a', 'b', 'c', 'd'])
+		expect(received.get(0)).toEqual(['x'])
+		expect(mockBroker.addPartitionsToTxn).toHaveBeenCalledTimes(2)
+	})
+})
