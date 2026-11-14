@@ -371,7 +371,7 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 			this.assignment = []
 			this.ownedPartitions = []
 			this.pendingRevocation = []
-			this.coordinator = null
+			await this.releaseCoordinator()
 			this.logger.info('left group')
 			this.emit('left')
 		}
@@ -395,7 +395,7 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 		}
 
 		const maxAttempts = 5
-		this.coordinator = await retry(() => this.cluster.getCoordinator('GROUP', this.config.groupId), {
+		this.coordinator = await retry(() => this.cluster.getDedicatedCoordinator('GROUP', this.config.groupId), {
 			maxAttempts,
 			initialDelayMs: 500,
 			maxDelayMs: 5_000,
@@ -414,11 +414,22 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 	}
 
 	/**
+	 * Close and forget this member's dedicated coordinator connection
+	 */
+	private async releaseCoordinator(): Promise<void> {
+		const coordinator = this.coordinator
+		this.coordinator = null
+		if (coordinator) {
+			await this.cluster.releaseDedicatedBroker(coordinator)
+		}
+	}
+
+	/**
 	 * Refresh coordinator connection (after NOT_COORDINATOR error)
 	 */
 	private async refreshCoordinator(): Promise<void> {
 		this.cluster.invalidateCoordinator('GROUP', this.config.groupId)
-		this.coordinator = null
+		await this.releaseCoordinator()
 		await this.ensureCoordinator()
 	}
 
@@ -875,7 +886,6 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 
 			case ErrorCode.NotCoordinator:
 			case ErrorCode.CoordinatorNotAvailable:
-				this.coordinator = null
 				await this.refreshCoordinator()
 				break
 

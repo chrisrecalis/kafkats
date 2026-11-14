@@ -55,6 +55,7 @@ function parseBrokerAddress(address: string): { host: string; port: number } {
 export class Cluster extends EventEmitter<ClusterEvents> {
 	private readonly config: ClusterConfig
 	private readonly brokers: Map<number, Broker> = new Map()
+	private readonly dedicatedBrokers: Set<Broker> = new Set()
 	private readonly bootstrapBrokers: Broker[] = []
 	private metadata: ClusterMetadata | null = null
 	private readonly coordinatorCache: Map<string, CoordinatorEntry> = new Map()
@@ -167,9 +168,18 @@ export class Cluster extends EventEmitter<ClusterEvents> {
 			)
 		}
 
+		for (const broker of this.dedicatedBrokers) {
+			disconnectPromises.push(
+				broker.disconnect().catch((error: Error) => {
+					this.emitError(error)
+				})
+			)
+		}
+
 		await Promise.all(disconnectPromises)
 
 		this.brokers.clear()
+		this.dedicatedBrokers.clear()
 		this.bootstrapBrokers.length = 0
 		this.metadata = null
 		this.coordinatorCache.clear()
@@ -260,6 +270,50 @@ export class Cluster extends EventEmitter<ClusterEvents> {
 		this.emit('brokerConnect', nodeId, brokerInfo.host, brokerInfo.port)
 
 		return broker
+	}
+
+	/**
+	 * Open a connection to the coordinator that is private to the caller.
+	 *
+	 * Group membership requests (JoinGroup, SyncGroup, Heartbeat) can be parked by the broker
+	 * for a long time, and a broker handles the requests of one connection strictly in order.
+	 * Members of the same group sharing a socket would therefore block each other (member B's
+	 * JoinGroup parked at the broker stops it reading member A's Heartbeat, which A needs to
+	 * learn about the rebalance, so the join only completes at the session timeout). Each
+	 * member must use its own connection. Release it with releaseDedicatedBroker().
+	 */
+	async getDedicatedCoordinator(type: CoordinatorType, key: string): Promise<Broker> {
+		const shared = await this.getCoordinator(type, key)
+		const broker = new Broker({
+			host: shared.host,
+			port: shared.port,
+			nodeId: shared.nodeId,
+			clientId: this.config.clientId,
+			connectionTimeoutMs: this.config.connectionTimeoutMs,
+			requestTimeoutMs: this.config.requestTimeoutMs,
+			maxInFlightRequests: this.config.maxInFlightRequests,
+			maxFrameSize: this.config.maxFrameSize,
+			tls: this.config.tls,
+			sasl: this.config.sasl,
+			logger: this.logger,
+			controlOnly: true,
+		})
+		this.dedicatedBrokers.add(broker)
+		try {
+			await broker.connect()
+		} catch (error) {
+			this.dedicatedBrokers.delete(broker)
+			await broker.disconnect().catch(() => {})
+			throw error
+		}
+		return broker
+	}
+
+	async releaseDedicatedBroker(broker: Broker): Promise<void> {
+		this.dedicatedBrokers.delete(broker)
+		await broker.disconnect().catch((error: Error) => {
+			this.emitError(error)
+		})
 	}
 
 	async getLeaderForPartition(topic: string, partition: number): Promise<Broker> {

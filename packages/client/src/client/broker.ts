@@ -233,6 +233,7 @@ export class Broker {
 
 	private readonly connection: Connection
 	private readonly fetchConnection: Connection
+	private readonly controlOnly: boolean
 	private apiVersions: Map<ApiKey, VersionRange> = new Map()
 	private versionsFetchedAt: number = 0
 	private readonly logger: Logger
@@ -244,6 +245,7 @@ export class Broker {
 		this.nodeId = config.nodeId
 		this.logger = config.logger?.child({ component: 'broker', nodeId: config.nodeId }) ?? noopLogger
 		this.requestTimeoutMs = config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
+		this.controlOnly = config.controlOnly ?? false
 
 		const connectionOptions: ConnectionOptions = {
 			host: config.host,
@@ -267,7 +269,7 @@ export class Broker {
 	}
 
 	get isConnected(): boolean {
-		return this.connection.isConnected && this.fetchConnection.isConnected
+		return this.connection.isConnected && (this.controlOnly || this.fetchConnection.isConnected)
 	}
 
 	async connect(): Promise<void> {
@@ -276,7 +278,7 @@ export class Broker {
 		}
 
 		this.logger.debug('connecting', { host: this.host, port: this.port })
-		await Promise.all([this.connection.connect(), this.fetchConnection.connect()])
+		await Promise.all([this.connection.connect(), this.controlOnly ? undefined : this.fetchConnection.connect()])
 		try {
 			await this.negotiateApiVersions()
 		} catch (error) {
