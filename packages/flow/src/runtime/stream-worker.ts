@@ -58,11 +58,11 @@ export class StreamWorker {
 		this.eosEnabled = deps.eosEnabled
 		const producer = client.producer(this.producerConfig())
 		const consumer = client.consumer(
-			workerConsumerConfig(config, this.eosEnabled, deps.topology.resolveOffsetReset(), slot, async () => {
-				if (this.transactions.active) {
-					await this.commit()
-				}
-			})
+			// Always goes through the transaction queue, even when no transaction is open yet: a
+			// record whose processing was dispatched but has not opened its transaction is queued
+			// ahead of this commit, so its transaction is committed too instead of staying open
+			// across the revoke.
+			workerConsumerConfig(config, this.eosEnabled, deps.topology.resolveOffsetReset(), slot, () => this.commit())
 		)
 
 		this.context = {

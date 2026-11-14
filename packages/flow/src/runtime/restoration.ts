@@ -84,31 +84,18 @@ export class Restoration {
 	}
 
 	/**
-	 * Partitions were revoked or lost: drop anything buffered for them and schedule a cleanup.
+	 * Partitions were revoked or lost: schedule the cleanup of state this instance no longer owns.
 	 *
 	 * The local copy is kept for now, because the partition often comes straight back (every
 	 * rebalance revokes before it re-assigns) and can then be caught up from its checkpoint instead
 	 * of being rebuilt from the start of the changelog.
+	 *
+	 * Writes buffered by an open transaction are deliberately left alone: they belong to that
+	 * transaction, which applies them when it commits and drops them when it aborts. Dropping them
+	 * here would let the transaction commit in Kafka without its update reaching the local store.
 	 */
 	release(released: TopicPartition[]): void {
 		if (released.length === 0) return
-		const task = this.queue.then(async () => {
-			for (const def of this.deps.stores.definitions) {
-				if (def.scope !== 'partition') continue
-				const partitions = new Set(
-					released.filter(tp => def.sourceTopics.has(tp.topic)).map(tp => tp.partition)
-				)
-				for (const partition of partitions) {
-					if (this.deps.isStatePartitionOwned(def.sourceTopics, partition)) continue
-					if (!def.partitions.materializedPartitions().includes(partition)) continue
-					const stack = await def.partitions.forPartition(partition)
-					stack.buffer.discardBuffer()
-				}
-			}
-		})
-		this.queue = task.catch(err => {
-			this.deps.logger.warn('failed to release state of revoked partitions', { error: toError(err).message })
-		})
 		this.schedulePrune()
 	}
 
@@ -138,9 +125,9 @@ export class Restoration {
 						spec.keyCodec,
 						spec.valueCodec,
 						async partition => {
+							// Restoration writes committed state straight to the provider's store, below
+							// the transactional buffer.
 							const stack = await def.partitions.forPartition(partition)
-							// Anything still buffered belongs to a transaction that no longer exists.
-							stack.buffer.discardBuffer()
 							return stack.raw as unknown as KeyValueStore<unknown, unknown>
 						}
 					)
