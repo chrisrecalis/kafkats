@@ -197,7 +197,6 @@ export class WorkerTransactions {
 	}
 
 	private scheduleCommit(): void {
-		const worker = this.worker
 		if (this.commitTimer) {
 			return
 		}
