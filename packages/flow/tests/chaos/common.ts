@@ -9,6 +9,10 @@ import { KafkaClient } from '@kafkats/client'
 
 export const BROKERS = (process.env.CHAOS_BROKERS ?? '127.0.0.1:29092').split(',')
 export const CONTAINER = process.env.CHAOS_CONTAINER ?? 'kafka-chaos'
+/** Replication factor for harness and application topics (set to 3 on a multi-broker cluster). */
+export const REPLICATION_FACTOR = Number(process.env.CHAOS_RF ?? '1')
+/** All broker containers of the cluster, for rolling restarts (CHAOS_CONTAINERS=a,b,c). */
+export const CONTAINERS = (process.env.CHAOS_CONTAINERS ?? CONTAINER).split(',')
 const here = path.dirname(fileURLToPath(import.meta.url))
 export const WORKER = path.join(here, 'worker.ts')
 export const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms))
@@ -25,7 +29,9 @@ export async function makeClient(): Promise<KafkaClient> {
 }
 
 export async function createTopics(client: KafkaClient, names: string[], partitions = 4) {
-	await client.createTopics(names.map(name => ({ name, numPartitions: partitions, replicationFactor: 1 })))
+	await client.createTopics(
+		names.map(name => ({ name, numPartitions: partitions, replicationFactor: REPLICATION_FACTOR }))
+	)
 	const deadline = Date.now() + 20000
 	while (Date.now() < deadline) {
 		const meta = await client.getMetadata(names)
@@ -160,6 +166,7 @@ export function workerEnv(p: {
 }): Record<string, string> {
 	return {
 		CHAOS_BROKERS: BROKERS.join(','),
+		CHAOS_RF: String(REPLICATION_FACTOR),
 		CHAOS_APP_ID: p.appId,
 		CHAOS_IN: p.input,
 		CHAOS_OUT: p.output,

@@ -132,5 +132,6 @@ export {
 	createKafkaError,
 	throwIfError,
 	isKafkaError,
+	isConnectionFailure,
 	isRetriable,
 } from './errors.js'

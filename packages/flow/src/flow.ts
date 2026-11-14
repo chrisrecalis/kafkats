@@ -3,6 +3,7 @@ import {
 	KafkaClient,
 	KafkaError,
 	ErrorCode,
+	isConnectionFailure,
 	type Consumer,
 	type Message,
 	type ConsumeContext,
@@ -104,6 +105,8 @@ const DEFAULT_TRANSACTION_TIMEOUT_MS = 10_000
  * the session timeout of a member that crashed (the group waits for it before rebalancing).
  */
 const DEFAULT_START_TIMEOUT_MS = 120_000
+/** How long start() waits for a missing source topic to show up in metadata before failing. */
+const SOURCE_TOPIC_VISIBILITY_WAIT_MS = 5_000
 const RESTART_INITIAL_BACKOFF_MS = 500
 const RESTART_MAX_BACKOFF_MS = 30_000
 /** How long after a revocation unowned in-memory state partitions are kept before being dropped. */
@@ -180,11 +183,12 @@ function isFatalKafkaError(error: unknown): boolean {
 
 /**
  * Whether a worker can recover from an error raised while running the topology by restarting
- * (rejoining the group and resuming from the last committed offsets). Only Kafka errors qualify:
+ * (rejoining the group and resuming from the last committed offsets). Only Kafka and connection errors qualify:
  * an error thrown by user code would fail the same way on the same record again.
  */
 function isRecoverable(error: unknown): boolean {
-	return error instanceof KafkaError && !isFatalKafkaError(error)
+	// A dropped or unreachable broker connection surfaces as a network error, not a KafkaError.
+	return isConnectionFailure(error) || (error instanceof KafkaError && !isFatalKafkaError(error))
 }
 
 /**
@@ -718,7 +722,7 @@ class FlowAppImpl implements FlowApp {
 
 			// Validate topology against the cluster and create internal topics
 			// (returns false if skipped because no cluster is reachable, e.g. mocked clients).
-			this.clusterAvailable = await this.validateAndCreateInternalTopics()
+			this.clusterAvailable = await this.validateTopicsOnceVisible()
 			this.assertNotClosing()
 
 			if (this.clusterAvailable) {
@@ -1250,6 +1254,24 @@ class FlowAppImpl implements FlowApp {
 	 * @throws CoPartitioningError if topics that must be co-partitioned have different partition counts
 	 * @throws ChangelogPartitionMismatchError if an existing internal topic has the wrong partition count
 	 */
+	/**
+	 * Validate the topology against the cluster, tolerating metadata that has not caught up yet.
+	 * On a multi-broker cluster a topic created moments ago may be unknown to the broker that
+	 * answers the metadata request, so a missing source topic is re-checked for a short while
+	 * before it is reported.
+	 */
+	private async validateTopicsOnceVisible(): Promise<boolean> {
+		const deadline = Date.now() + SOURCE_TOPIC_VISIBILITY_WAIT_MS
+		for (;;) {
+			try {
+				return await this.validateAndCreateInternalTopics()
+			} catch (err) {
+				if (!(err instanceof SourceTopicNotFoundError) || Date.now() >= deadline || this.closing) throw err
+				await this.sleepUnlessClosing(500)
+			}
+		}
+	}
+
 	private async validateAndCreateInternalTopics(): Promise<boolean> {
 		const userTopics = new Set<string>()
 		for (const topic of this.sourcesByTopic.keys()) {

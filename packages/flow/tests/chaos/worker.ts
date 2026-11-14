@@ -63,6 +63,7 @@ const app = flow({
 	},
 	producer: { lingerMs: 0, retries: 10, transactionTimeoutMs: Number(env('CHAOS_TXN_TIMEOUT_MS', '10000')) },
 	changelog: {
+		replicationFactor: Number(env('CHAOS_RF', '1')),
 		restoration: process.env.CHAOS_RESTORE_DEFAULT
 			? undefined
 			: {

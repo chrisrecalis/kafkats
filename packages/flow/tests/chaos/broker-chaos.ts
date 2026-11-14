@@ -5,7 +5,7 @@
  * Run (from packages/flow):
  *   pnpm exec tsx tests/chaos/broker-chaos.ts --guarantee eos --mode stateless --fault restart
  *   pnpm exec tsx tests/chaos/broker-chaos.ts --guarantee alo --mode count --fault pause --pause-s 25
- * Flags: --guarantee alo|eos --mode stateless|count --fault restart|pause --pause-s 25 --keys 12 --per-key 100
+ * Flags: --guarantee alo|eos --mode stateless|count --fault restart|pause|kill|rolling (multi-broker: CHAOS_RF=3 CHAOS_CONTAINER=<one> CHAOS_CONTAINERS=<all>) --pause-s 25 --keys 12 --per-key 100
  *        --recover-ms 120000 (how long to wait for self-recovery before declaring HANG)
  * Timeline: produce; once worker is processing inject fault while producer keeps going; then watch the worker:
  *   state, processed counter progress, errors. Reports precise phases: stall start, broker back, resume (or never).
@@ -23,6 +23,7 @@ import {
 	uid,
 	sleep,
 	CONTAINER,
+	CONTAINERS,
 	summarizeStateless,
 	summarizeCount,
 	type Rec,
@@ -107,6 +108,20 @@ if (fault === 'restart') {
 	ev('docker restart ...')
 	sh(`docker restart ${CONTAINER}`)
 	ev('docker restart returned')
+} else if (fault === 'kill') {
+	// Hard-kill one broker and keep it down: leaders and coordinators must fail over.
+	sh(`docker kill ${CONTAINER}`)
+	ev(`docker killed ${CONTAINER}, down for ${pauseS}s`)
+	await sleep(pauseS * 1000)
+	sh(`docker start ${CONTAINER}`)
+	ev('docker started')
+} else if (fault === 'rolling') {
+	// Restart every broker of the cluster, one after the other.
+	for (const container of CONTAINERS) {
+		sh(`docker restart ${container}`)
+		ev(`docker restarted ${container}`)
+		await sleep(pauseS * 1000)
+	}
 } else {
 	sh(`docker pause ${CONTAINER}`)
 	ev(`docker paused for ${pauseS}s`)
