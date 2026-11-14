@@ -361,18 +361,25 @@ export class StreamWorker {
 				if (position !== undefined) positions.set(`${tp.topic}:${tp.partition}`, position)
 			}
 
+			// Whether a partition is still held under *this* assignment. A partition that was revoked
+			// and assigned again in the meantime has its own preparation queued behind this one and
+			// must stay paused until that one finishes: resuming it here would let records be
+			// processed while the later restore still rewrites (and resets the buffers of) its state.
+			const current = new Map(partitions.map(tp => [`${tp.topic}:${tp.partition}`, tp]))
+			const heldSinceThisAssignment = (topic: string, partition: number) => {
+				const key = `${topic}:${partition}` as const
+				return worker.assignedPartitions.get(key) === current.get(key)
+			}
+
 			void restoration
 				.enqueue(partitions)
 				.then(() =>
 					startPositions.settle(partitions, positions, (topic, partition, offset) => {
-						if (worker.assignedPartitions.has(`${topic}:${partition}`))
-							consumer.seek(topic, partition, offset)
+						if (heldSinceThisAssignment(topic, partition)) consumer.seek(topic, partition, offset)
 					})
 				)
 				.then(() => {
-					const stillAssigned = partitions.filter(tp =>
-						worker.assignedPartitions.has(`${tp.topic}:${tp.partition}`)
-					)
+					const stillAssigned = partitions.filter(tp => heldSinceThisAssignment(tp.topic, tp.partition))
 					if (stillAssigned.length === 0 || worker.failure || status.closing) return
 					try {
 						consumer.resume(stillAssigned)

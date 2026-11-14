@@ -159,7 +159,9 @@ describe('hardening: session windows under EOS', () => {
 				if (fail)
 					injectCommitFailures(c, () => {
 						commits += 1
-						return commits % 6 === 0 && commits <= 60
+						// From the 2nd commit on, so a failure is injected even when a slow machine
+						// batches everything into a handful of transactions.
+						return commits % 3 === 2 && commits <= 60
 					})
 				return build(applicationId, input, outs, c)
 			}
@@ -196,7 +198,8 @@ describe('hardening: session windows under EOS', () => {
 					await sleep(800)
 					;[c, r, a] = [await view(outs.count), await view(outs.reduce), await view(outs.agg)]
 				}
-				if (variant.startsWith('commit')) expect(commits).toBeGreaterThan(6)
+				if (variant.startsWith('commit'))
+					expect(commits, 'a commit failure was injected').toBeGreaterThanOrEqual(2)
 				expect(c.tombstones, 'merged-away sessions must be retracted').toBeGreaterThan(0)
 				expect(c.live).toEqual(wantCount)
 				expect(r.live).toEqual(wantSum)

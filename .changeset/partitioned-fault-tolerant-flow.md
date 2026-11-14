@@ -31,6 +31,7 @@ Redesign the `@kafkats/flow` runtime for correctness: partitioned state, reparti
 - A worker that restarts or gets a partition back before its first commit no longer re-resolves `'latest'` and skips the records it had read; the start position is kept until the first commit.
 - Stream time survives restarts and rebalances: it is rebuilt from the restored window or session store, so a late record that was dropped as past retention is not accepted after a restart.
 - Applications sharing one state store provider (for example one LMDB `stateDir`) no longer overwrite each other's state; provider-level store names include the application id.
+- Exactly-once: a partition that is revoked and assigned again while an earlier restore is still running stays paused until its own restore has finished. Resuming it early let a committed update be dropped from the local store.
 - `@kafkats/client`: consumers and producers recover after a broker restart or a dropped connection. Brokers re-dial dropped connections with backoff, the fetch loop backs off instead of spinning and reports failures through the `error` event, and group rebalance steps retry while the cluster is unreachable.
 - `@kafkats/client`: `consumer.stop()`, `producer.disconnect()` and `client.disconnect()` are bounded (about 5 seconds each) when a broker does not respond. Sends still in flight at that point are rejected.
 - `@kafkats/client`: multiple consumers on one `KafkaClient` no longer deadlock. Each consumer group member now uses a dedicated coordinator connection.
