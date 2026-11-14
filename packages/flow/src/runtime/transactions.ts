@@ -119,12 +119,14 @@ export class WorkerTransactions {
 		if (!open) return
 
 		const offsets = Array.from(this.pendingOffsets.values())
-		const changelogPositions = worker.pendingCheckpoints.list()
 		const dirtyStores = [...worker.dirtyStores]
+		let changelogPositions: ReturnType<typeof worker.pendingCheckpoints.list>
 
 		try {
 			// Everything the batch produced must be acknowledged before the transaction commits.
+			// The acknowledgements also report the changelog positions to checkpoint.
 			await worker.sends.flush()
+			changelogPositions = worker.pendingCheckpoints.list()
 			if (offsets.length > 0) {
 				if (!this.offsetCommitContext) {
 					throw new Error('exactly_once requires a consume context for transactional offset commits')
