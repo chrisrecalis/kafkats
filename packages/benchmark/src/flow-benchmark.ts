@@ -8,10 +8,12 @@ import { uniqueName } from './utils.js'
  *
  * Each scenario preloads its input topic, starts one application and measures the time from
  * `start()` until the last record has passed through the whole topology (records per second of
- * input). The broker is taken from KAFKA_BROKERS.
+ * input). The `restore` scenario instead times how fast a fresh instance restores the state of
+ * `count` from its changelog. The broker is taken from KAFKA_BROKERS.
  *
  *   KAFKA_BROKERS=localhost:9092 pnpm -C packages/benchmark bench:flow
- *   ... bench:flow -- --records 200000 --scenario count --guarantee exactly_once --runs 3
+ *   ... bench:flow -- --records 200000 --scenario count,restore --guarantee exactly_once --runs 3
+ *   ... bench:flow -- --scenario stateless --threads 2
  */
 
 type Guarantee = NonNullable<FlowConfig['processingGuarantee']>
@@ -20,6 +22,7 @@ interface Options {
 	records: number
 	keys: number
 	partitions: number
+	threads: number
 	valueBytes: number
 	runs: number
 	scenarios: string[]
@@ -115,6 +118,19 @@ const SCENARIOS: Scenario[] = [
 		},
 	},
 	{
+		name: 'global-table-join',
+		usesTable: true,
+		build(app, t, done) {
+			const users = app.globalTable(t.table, { key: str, value: str })
+			sink(
+				app.stream(t.input, { key: str, value: event }).join(users, (e, name) => `${name}:${e.amount}`),
+				t.output,
+				str,
+				done
+			)
+		},
+	},
+	{
 		name: 'repartition-count',
 		build(app, t, done) {
 			sink(
@@ -149,9 +165,10 @@ function parseArgs(argv: string[]): Options {
 		records: Number(arg('records') ?? 200_000),
 		keys: Number(arg('keys') ?? 1_000),
 		partitions: Number(arg('partitions') ?? 4),
+		threads: Number(arg('threads') ?? 1),
 		valueBytes: Number(arg('value-bytes') ?? 100),
 		runs: Number(arg('runs') ?? 3),
-		scenarios: arg('scenario')?.split(',') ?? SCENARIOS.map(s => s.name),
+		scenarios: arg('scenario')?.split(',') ?? [...SCENARIOS.map(s => s.name), 'restore'],
 		guarantees: (arg('guarantee')?.split(',') as Guarantee[] | undefined) ?? ['at_least_once', 'exactly_once'],
 	}
 }
@@ -191,7 +208,7 @@ async function preload(client: KafkaClient, topics: Topics, options: Options, us
 	await producer.disconnect()
 }
 
-async function runOnce(brokers: string[], scenario: Scenario, guarantee: Guarantee, options: Options): Promise<number> {
+async function setUp(brokers: string[], scenario: Scenario, options: Options): Promise<Topics> {
 	const admin = new KafkaClient({ brokers, clientId: 'flow-bench-setup', logLevel: 'silent' })
 	await admin.connect()
 	const topics: Topics = {
@@ -202,14 +219,27 @@ async function runOnce(brokers: string[], scenario: Scenario, guarantee: Guarant
 	await createTopics(admin, Object.values(topics), options.partitions)
 	await preload(admin, topics, options, scenario.usesTable === true)
 	await admin.disconnect()
+	return topics
+}
 
-	const app = flow({
-		applicationId: uniqueName(`flow-bench-${scenario.name}`),
+function createApp(brokers: string[], applicationId: string, guarantee: Guarantee, options: Options): FlowApp {
+	return flow({
+		applicationId,
 		client: { brokers, clientId: 'flow-bench', logLevel: 'silent' },
 		processingGuarantee: guarantee,
+		numStreamThreads: options.threads,
 		consumer: { autoOffsetReset: 'earliest' },
 	})
+}
 
+async function runOnce(brokers: string[], scenario: Scenario, guarantee: Guarantee, options: Options): Promise<number> {
+	const topics = await setUp(brokers, scenario, options)
+	const app = createApp(brokers, uniqueName(`flow-bench-${scenario.name}`), guarantee, options)
+	return processAll(app, scenario, topics, options)
+}
+
+/** Starts `app` and resolves with records/s once every input record has passed through it; closes it. */
+async function processAll(app: FlowApp, scenario: Scenario, topics: Topics, options: Options): Promise<number> {
 	let processed = 0
 	let finished!: () => void
 	const allProcessed = new Promise<void>(resolve => {
@@ -227,6 +257,39 @@ async function runOnce(brokers: string[], scenario: Scenario, guarantee: Guarant
 	return (options.records / elapsedMs) * 1000
 }
 
+/**
+ * Restoration throughput: builds the `count` state (one changelog record per input record), closes
+ * the app, then starts a fresh instance with empty in-memory state and times `start()`, which
+ * returns once the state is restored from the changelog. Changelog records per second.
+ */
+async function restoreOnce(brokers: string[], guarantee: Guarantee, options: Options): Promise<number> {
+	const count = SCENARIOS.find(s => s.name === 'count')!
+	const topics = await setUp(brokers, count, options)
+	const applicationId = uniqueName('flow-bench-restore')
+	await processAll(createApp(brokers, applicationId, guarantee, options), count, topics, options)
+
+	const app = createApp(brokers, applicationId, guarantee, options)
+	count.build(app, topics, () => {})
+	const startedAt = performance.now()
+	await app.start()
+	const elapsedMs = performance.now() - startedAt
+	await app.close()
+
+	const admin = new KafkaClient({ brokers, clientId: 'flow-bench-setup', logLevel: 'silent' })
+	await admin.connect()
+	const partitions = Array.from({ length: options.partitions }, (_, p) => p)
+	const changelog = `${applicationId}-counts-changelog`
+	const [earliest, latest] = await Promise.all([
+		admin.admin().fetchTopicOffsets(changelog, partitions, 'earliest'),
+		admin.admin().fetchTopicOffsets(changelog, partitions, 'latest'),
+	])
+	await admin.disconnect()
+	// Includes the transaction markers of an exactly_once changelog (one per commit, a small share).
+	let records = 0
+	for (const p of partitions) records += Number(latest.get(p)! - earliest.get(p)!)
+	return (records / elapsedMs) * 1000
+}
+
 async function main(): Promise<void> {
 	const brokers = process.env.KAFKA_BROKERS?.split(',').map(b => b.trim())
 	if (!brokers) throw new Error('Set KAFKA_BROKERS (for example localhost:9092)')
@@ -234,14 +297,22 @@ async function main(): Promise<void> {
 
 	console.log(
 		`flow benchmark: ${options.records} records, ${options.keys} keys, ${options.partitions} partitions, ` +
+			`${options.threads} stream thread(s), ` +
 			`~${options.valueBytes} byte values, best of ${options.runs} runs\n`
 	)
 	const rows: Array<{ scenario: string; guarantee: string; 'records/s': string; runs: string }> = []
-	for (const scenario of SCENARIOS.filter(s => options.scenarios.includes(s.name))) {
+	const measurements = SCENARIOS.filter(s => options.scenarios.includes(s.name)).map(scenario => ({
+		name: scenario.name,
+		once: (guarantee: Guarantee) => runOnce(brokers, scenario, guarantee, options),
+	}))
+	if (options.scenarios.includes('restore')) {
+		measurements.push({ name: 'restore', once: guarantee => restoreOnce(brokers, guarantee, options) })
+	}
+	for (const scenario of measurements) {
 		for (const guarantee of options.guarantees) {
 			const rates: number[] = []
 			for (let run = 0; run < options.runs; run++) {
-				rates.push(await runOnce(brokers, scenario, guarantee, options))
+				rates.push(await scenario.once(guarantee))
 			}
 			rows.push({
 				scenario: scenario.name,
