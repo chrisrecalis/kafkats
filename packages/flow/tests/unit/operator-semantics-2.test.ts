@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest'
 
 import { TestDriver } from '../../src/testing.js'
 import { codec } from '../../src/index.js'
-import { TimeWindows } from '../../src/windows.js'
+import { TimeWindows, SessionWindows } from '../../src/windows.js'
 import { InMemoryKeyValueStore, InMemoryWindowStore } from '../../src/state/memory.js'
 
 const str = codec.string()
@@ -211,5 +211,51 @@ describe('hunt2: stores', () => {
 		const out: string[] = []
 		for await (const [, v] of s.fetch('a', 0, 10)) out.push(v)
 		expect(out).toEqual(['1'])
+	})
+})
+
+describe('session window aggregate via DSL', () => {
+	it('merges sessions with the provided merger instead of using fixed windows', async () => {
+		const driver = new TestDriver()
+		const out: Array<{ start: number; end: number; value: string | null }> = []
+		driver
+			.input('events', { key: codec.string(), value: codec.string() })
+			.groupByKey()
+			.windowedBy(SessionWindows.withInactivityGap('100ms'))
+			.aggregate<string>(
+				() => '',
+				(_key, value, aggregate) => aggregate + value,
+				{ value: codec.string(), merger: (a, b) => a + b }
+			)
+			.toStream()
+			.peek((key, value) => {
+				if (key) out.push({ start: key.window.start, end: key.window.end, value })
+			})
+
+		await driver.run(async ({ consumer }) => {
+			const send = (value: string, timestamp: number) =>
+				consumer.sendMessage('events', Buffer.from(value), { key: Buffer.from('k'), timestamp: BigInt(timestamp) })
+			await send('a', 1000)
+			await send('c', 1200)
+			// Bridges both sessions: one session [1000, 1200] remains.
+			await send('b', 1100)
+		})
+
+		expect(out[out.length - 1]).toEqual({ start: 1000, end: 1200, value: 'acb' })
+	})
+
+	it('requires a merger for session windows', () => {
+		const driver = new TestDriver()
+		expect(() =>
+			driver
+				.input('events', { key: codec.string(), value: codec.string() })
+				.groupByKey()
+				.windowedBy(SessionWindows.withInactivityGap('100ms'))
+				.aggregate<string>(
+					() => '',
+					(_key, value, aggregate) => aggregate + value,
+					{ value: codec.string() }
+				)
+		).toThrow(/merger/)
 	})
 })

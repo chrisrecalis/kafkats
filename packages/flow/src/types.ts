@@ -206,6 +206,7 @@ export interface WindowedKGroupedStream<K, V> {
 	aggregate<A>(
 		initializer: () => A,
 		aggregator: (key: K, value: V, aggregate: A) => A,
-		options?: Materialized<Windowed<K>, A>
+		/** `merger` is required for session windows: it combines the aggregates of two sessions that merge. */
+		options?: Materialized<Windowed<K>, A> & { merger?: (aggregate1: A, aggregate2: A) => A }
 	): KTable<Windowed<K>, A>
 }

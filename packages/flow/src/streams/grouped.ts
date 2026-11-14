@@ -356,7 +356,7 @@ export class WindowedKGroupedStreamImpl<K, V> implements WindowedKGroupedStream<
 	aggregate<A>(
 		initializer: () => A,
 		aggregator: (key: K, value: V, aggregate: A) => A,
-		options?: Materialized<Windowed<K>, A>
+		options?: Materialized<Windowed<K>, A> & { merger?: (aggregate1: A, aggregate2: A) => A }
 	): KTable<Windowed<K>, A> {
 		const keyCodec = this.format.keyCodec
 		const valueCodec = options?.value
@@ -370,25 +370,56 @@ export class WindowedKGroupedStreamImpl<K, V> implements WindowedKGroupedStream<
 
 		const storeName = options?.storeName ?? `window-aggregate-store-${this.app.nextStoreId()}`
 
-		const store = this.app.getOrCreateWindowStore<K, A>(
-			storeName,
-			keyCodec,
-			valueCodec,
-			{ retentionMs: this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER, windowSizeMs: this.windowSizeMs },
-			options?.changelog,
-			this.sourceTopics,
-			this.restrictRestorationToSourcePartitions
-		)
-		const storeRef = { store }
+		let aggregateNode: Processor<K, V, Windowed<K>, A>
 
-		const aggregateNode = new WindowedAggregateNode<K, V, A>(
-			storeName,
-			storeRef,
-			initializer,
-			aggregator,
-			this.windowSizeMs,
-			this.advanceMs
-		)
+		if (this.windows instanceof SessionWindows) {
+			// Sessions merge when a record bridges them, which needs to combine two aggregates.
+			const merger = options?.merger
+			if (!merger) {
+				throw new Error(
+					'aggregate() on session windows requires a merger to combine the aggregates of sessions ' +
+						'that merge. Provide one via options: aggregate(init, agg, { value, merger: (a, b) => ... }).'
+				)
+			}
+			const sessionStore = this.app.getOrCreateSessionStore<K, A>(
+				storeName,
+				keyCodec,
+				valueCodec,
+				{ retentionMs: this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER },
+				options?.changelog,
+				this.sourceTopics,
+				this.restrictRestorationToSourcePartitions
+			)
+			aggregateNode = new SessionAggregateNode<K, V, A>(
+				storeName,
+				{ store: sessionStore },
+				initializer,
+				aggregator,
+				merger,
+				this.windowSizeMs
+			)
+		} else {
+			const store = this.app.getOrCreateWindowStore<K, A>(
+				storeName,
+				keyCodec,
+				valueCodec,
+				{
+					retentionMs: this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER,
+					windowSizeMs: this.windowSizeMs,
+				},
+				options?.changelog,
+				this.sourceTopics,
+				this.restrictRestorationToSourcePartitions
+			)
+			aggregateNode = new WindowedAggregateNode<K, V, A>(
+				storeName,
+				{ store },
+				initializer,
+				aggregator,
+				this.windowSizeMs,
+				this.advanceMs
+			)
+		}
 
 		this.node.connect(aggregateNode)
 

@@ -217,7 +217,11 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 		options?: Joined<K, V, V2>
 	): KStream<K, VR> {
 		// Check if joining with a KTable (Stream-Table join)
-		const self = this.copartitioned(undefined, options?.key, options?.value)
+		// A global table holds every key on every instance, so its lookups need no repartitioning.
+		const self =
+			other instanceof KTableImpl && other.global
+				? this
+				: this.copartitioned(undefined, options?.key, options?.value)
 
 		if (other instanceof KTableImpl) {
 			const tableImpl = other as KTableImpl<K, V2>
@@ -320,7 +324,11 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 		options?: Joined<K, V, V2>
 	): KStream<K, VR> {
 		// Check if joining with a KTable (Stream-Table left join)
-		const self = this.copartitioned(undefined, options?.key, options?.value)
+		// A global table holds every key on every instance, so its lookups need no repartitioning.
+		const self =
+			other instanceof KTableImpl && other.global
+				? this
+				: this.copartitioned(undefined, options?.key, options?.value)
 
 		if (other instanceof KTableImpl) {
 			const tableImpl = other as KTableImpl<K, V2>

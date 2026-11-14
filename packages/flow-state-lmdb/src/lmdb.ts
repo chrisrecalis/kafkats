@@ -483,7 +483,7 @@ export interface LMDBProviderOptions {
 	stateDir: string
 	/** Maximum database size in bytes (default: 1GB) */
 	mapSize?: number
-	/** Maximum number of named databases (default: 100) */
+	/** Maximum number of named databases (default: 4096). One is used per state store partition. */
 	maxDbs?: number
 }
 
