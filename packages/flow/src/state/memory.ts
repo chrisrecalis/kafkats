@@ -30,7 +30,7 @@ export class InMemoryKeyValueStore<K, V> implements KeyValueStore<K, V> {
 	}
 
 	get(key: K): Promise<V | undefined> {
-		const keyBytes = this.serializeKey(key)
+		const keyBytes = this.keyCodec.encode(key)
 		const entry = this.store.get(this.keyId(keyBytes))
 		if (!entry) {
 			return Promise.resolve(undefined)
@@ -39,14 +39,14 @@ export class InMemoryKeyValueStore<K, V> implements KeyValueStore<K, V> {
 	}
 
 	put(key: K, value: V): Promise<void> {
-		const keyBytes = this.serializeKey(key)
+		const keyBytes = this.keyCodec.encode(key)
 		const valueBytes = this.valueCodec.encode(value)
 		this.store.set(this.keyId(keyBytes), { keyBytes, valueBytes })
 		return Promise.resolve()
 	}
 
 	delete(key: K): Promise<void> {
-		const keyBytes = this.serializeKey(key)
+		const keyBytes = this.keyCodec.encode(key)
 		this.store.delete(this.keyId(keyBytes))
 		return Promise.resolve()
 	}
@@ -54,7 +54,7 @@ export class InMemoryKeyValueStore<K, V> implements KeyValueStore<K, V> {
 	async *all(): AsyncIterable<[K, V]> {
 		await Promise.resolve()
 		for (const entry of this.store.values()) {
-			const key = this.deserializeKey(entry.keyBytes)
+			const key = this.keyCodec.decode(entry.keyBytes)
 			const value = this.valueCodec.decode(entry.valueBytes)
 			yield [key, value]
 		}
@@ -62,15 +62,15 @@ export class InMemoryKeyValueStore<K, V> implements KeyValueStore<K, V> {
 
 	async *range(from: K, to: K): AsyncIterable<[K, V]> {
 		await Promise.resolve()
-		const fromBytes = this.serializeKey(from)
-		const toBytes = this.serializeKey(to)
+		const fromBytes = this.keyCodec.encode(from)
+		const toBytes = this.keyCodec.encode(to)
 
 		// Sort by raw key bytes to match serialized key ordering
 		const sortedEntries = [...this.store.values()].sort((a, b) => Buffer.compare(a.keyBytes, b.keyBytes))
 
 		for (const entry of sortedEntries) {
 			if (Buffer.compare(entry.keyBytes, fromBytes) >= 0 && Buffer.compare(entry.keyBytes, toBytes) <= 0) {
-				const key = this.deserializeKey(entry.keyBytes)
+				const key = this.keyCodec.decode(entry.keyBytes)
 				const value = this.valueCodec.decode(entry.valueBytes)
 				yield [key, value]
 			}
@@ -82,12 +82,10 @@ export class InMemoryKeyValueStore<K, V> implements KeyValueStore<K, V> {
 	}
 
 	init(): Promise<void> {
-		// No initialization needed for in-memory store
 		return Promise.resolve()
 	}
 
 	flush(): Promise<void> {
-		// No flushing needed for in-memory store
 		return Promise.resolve()
 	}
 
@@ -96,16 +94,8 @@ export class InMemoryKeyValueStore<K, V> implements KeyValueStore<K, V> {
 		return Promise.resolve()
 	}
 
-	private serializeKey(key: K): Buffer {
-		return this.keyCodec.encode(key)
-	}
-
 	private keyId(keyBytes: Buffer): string {
 		return keyBytes.toString('base64')
-	}
-
-	private deserializeKey(keyBytes: Buffer): K {
-		return this.keyCodec.decode(keyBytes)
 	}
 }
 
@@ -115,56 +105,39 @@ export class InMemoryKeyValueStore<K, V> implements KeyValueStore<K, V> {
 // ones and break ranges that span the sign boundary. Matches the LMDB store's encoding.
 const SIGNED_TIME_BIAS = 0x8000000000000000n
 
-/**
- * Encodes a windowed key to a buffer for storage.
- * Format: [keyBytes][windowStart:8bytes][windowEnd:8bytes]
- */
-function encodeWindowedKey<K>(key: WindowedKey<K>, keyCodec: Codec<K>): Buffer {
-	const keyBytes = keyCodec.encode(key.key)
-	const buf = Buffer.alloc(keyBytes.length + 16)
-	keyBytes.copy(buf, 0)
-	buf.writeBigUInt64BE(BigInt(key.windowStart) + SIGNED_TIME_BIAS, keyBytes.length)
-	buf.writeBigUInt64BE(BigInt(key.windowEnd) + SIGNED_TIME_BIAS, keyBytes.length + 8)
-	return buf
-}
-
-/**
- * Decodes a windowed key from a buffer.
- */
-function decodeWindowedKey<K>(buf: Buffer, keyCodec: Codec<K>): WindowedKey<K> {
-	const keyBytes = buf.subarray(0, buf.length - 16)
-	const windowStart = Number(buf.readBigUInt64BE(buf.length - 16) - SIGNED_TIME_BIAS)
-	const windowEnd = Number(buf.readBigUInt64BE(buf.length - 8) - SIGNED_TIME_BIAS)
-	return {
-		key: keyCodec.decode(keyBytes),
-		windowStart,
-		windowEnd,
-	}
-}
-
-/**
- * Creates a codec for windowed keys.
- */
+/** Store key of window and session stores: [keyBytes][windowStart: 8 bytes][windowEnd: 8 bytes]. */
 function windowedKeyCodec<K>(keyCodec: Codec<K>): Codec<WindowedKey<K>> {
 	return {
-		encode: (key: WindowedKey<K>) => encodeWindowedKey(key, keyCodec),
-		decode: (buf: Buffer) => decodeWindowedKey(buf, keyCodec),
+		encode(key: WindowedKey<K>): Buffer {
+			const keyBytes = keyCodec.encode(key.key)
+			const buf = Buffer.alloc(keyBytes.length + 16)
+			keyBytes.copy(buf, 0)
+			buf.writeBigUInt64BE(BigInt(key.windowStart) + SIGNED_TIME_BIAS, keyBytes.length)
+			buf.writeBigUInt64BE(BigInt(key.windowEnd) + SIGNED_TIME_BIAS, keyBytes.length + 8)
+			return buf
+		},
+		decode(buf: Buffer): WindowedKey<K> {
+			return {
+				key: keyCodec.decode(buf.subarray(0, buf.length - 16)),
+				windowStart: Number(buf.readBigUInt64BE(buf.length - 16) - SIGNED_TIME_BIAS),
+				windowEnd: Number(buf.readBigUInt64BE(buf.length - 8) - SIGNED_TIME_BIAS),
+			}
+		},
 	}
 }
 
-/**
- * In-memory implementation of WindowStore.
- *
- * Stores windowed key-value pairs with time-based querying support.
- */
-export class InMemoryWindowStore<K, V> implements WindowStore<K, V> {
-	private readonly store: InMemoryKeyValueStore<WindowedKey<K>, V>
-	private readonly keyCodec: Codec<K>
-	private readonly retentionMs: number
+/** Shared part of the in-memory window and session stores: a key-value store of windowed keys. */
+abstract class InMemoryWindowedStore<K, V, O extends SessionStoreOptions<K, V>> implements KeyValueStore<
+	WindowedKey<K>,
+	V
+> {
+	protected readonly store: InMemoryKeyValueStore<WindowedKey<K>, V>
+	protected readonly keyCodec: Codec<K>
+	protected readonly retentionMs: number
 
 	constructor(
 		readonly name: string,
-		options: WindowStoreOptions<K, V>
+		options: O
 	) {
 		this.keyCodec = options.keyCodec
 		this.retentionMs = options.retentionMs
@@ -194,184 +167,102 @@ export class InMemoryWindowStore<K, V> implements WindowStore<K, V> {
 		yield* this.store.range(from, to)
 	}
 
-	async *fetch(key: K, timeFrom: number, timeTo: number): AsyncIterable<[WindowedKey<K>, V]> {
-		const keyBytes = this.keyCodec.encode(key)
-		for await (const [windowedKey, value] of this.store.all()) {
-			const entryKeyBytes = this.keyCodec.encode(windowedKey.key)
-			if (
-				keyBytes.equals(entryKeyBytes) &&
-				windowedKey.windowStart >= timeFrom &&
-				windowedKey.windowStart <= timeTo
-			) {
-				yield [windowedKey, value]
-			}
+	async approximateNumEntries(): Promise<number> {
+		return this.store.approximateNumEntries()
+	}
+
+	async init(): Promise<void> {
+		await this.store.init()
+	}
+
+	async flush(): Promise<void> {
+		await this.store.flush()
+	}
+
+	async close(): Promise<void> {
+		await this.store.close()
+	}
+
+	/** Entries whose windowed key matches. */
+	protected async *where(matches: (key: WindowedKey<K>) => boolean): AsyncIterable<[WindowedKey<K>, V]> {
+		for await (const entry of this.store.all()) {
+			if (matches(entry[0])) yield entry
 		}
 	}
 
-	async *fetchAll(timeFrom: number, timeTo: number): AsyncIterable<[WindowedKey<K>, V]> {
-		for await (const [windowedKey, value] of this.store.all()) {
-			if (windowedKey.windowStart >= timeFrom && windowedKey.windowStart <= timeTo) {
-				yield [windowedKey, value]
-			}
+	/** Delete every entry whose windowed key matches; returns the deleted keys. */
+	protected async deleteWhere(matches: (key: WindowedKey<K>) => boolean): Promise<WindowedKey<K>[]> {
+		const keys: WindowedKey<K>[] = []
+		for await (const [key] of this.where(matches)) {
+			keys.push(key)
 		}
+		for (const key of keys) {
+			await this.store.delete(key)
+		}
+		return keys
+	}
+
+	protected deleteExpired(currentTime: number): Promise<WindowedKey<K>[]> {
+		const cutoff = currentTime - this.retentionMs
+		return this.deleteWhere(key => key.windowEnd < cutoff)
+	}
+
+	/** Matches windowed keys of the user key with the given serialized form. */
+	protected hasKey(keyBytes: Buffer): (key: WindowedKey<K>) => boolean {
+		return windowedKey => this.keyCodec.encode(windowedKey.key).equals(keyBytes)
+	}
+}
+
+/** In-memory implementation of WindowStore. */
+export class InMemoryWindowStore<K, V>
+	extends InMemoryWindowedStore<K, V, WindowStoreOptions<K, V>>
+	implements WindowStore<K, V>
+{
+	async *fetch(key: K, timeFrom: number, timeTo: number): AsyncIterable<[WindowedKey<K>, V]> {
+		const hasKey = this.hasKey(this.keyCodec.encode(key))
+		yield* this.where(k => hasKey(k) && k.windowStart >= timeFrom && k.windowStart <= timeTo)
+	}
+
+	fetchAll(timeFrom: number, timeTo: number): AsyncIterable<[WindowedKey<K>, V]> {
+		return this.where(k => k.windowStart >= timeFrom && k.windowStart <= timeTo)
 	}
 
 	async *fetchRange(keyFrom: K, keyTo: K, timeFrom: number, timeTo: number): AsyncIterable<[WindowedKey<K>, V]> {
 		const keyFromBytes = this.keyCodec.encode(keyFrom)
 		const keyToBytes = this.keyCodec.encode(keyTo)
-
-		for await (const [windowedKey, value] of this.store.all()) {
-			const entryKeyBytes = this.keyCodec.encode(windowedKey.key)
-			if (
-				Buffer.compare(entryKeyBytes, keyFromBytes) >= 0 &&
-				Buffer.compare(entryKeyBytes, keyToBytes) <= 0 &&
-				windowedKey.windowStart >= timeFrom &&
-				windowedKey.windowStart <= timeTo
-			) {
-				yield [windowedKey, value]
-			}
-		}
-	}
-
-	async approximateNumEntries(): Promise<number> {
-		return this.store.approximateNumEntries()
-	}
-
-	async init(): Promise<void> {
-		await this.store.init()
-	}
-
-	async flush(): Promise<void> {
-		await this.store.flush()
-	}
-
-	async close(): Promise<void> {
-		await this.store.close()
-	}
-
-	/**
-	 * Remove expired windows based on retention period.
-	 */
-	async expireOldWindows(currentTime: number): Promise<number> {
-		const cutoff = currentTime - this.retentionMs
-		const toDelete: WindowedKey<K>[] = []
-
-		for await (const [windowedKey] of this.store.all()) {
-			if (windowedKey.windowEnd < cutoff) {
-				toDelete.push(windowedKey)
-			}
-		}
-
-		for (const key of toDelete) {
-			await this.store.delete(key)
-		}
-
-		return toDelete.length
-	}
-}
-
-/**
- * In-memory implementation of SessionStore.
- *
- * Stores session windows that can be merged when activity resumes.
- */
-export class InMemorySessionStore<K, V> implements SessionStore<K, V> {
-	private readonly store: InMemoryKeyValueStore<WindowedKey<K>, V>
-	private readonly keyCodec: Codec<K>
-	private readonly retentionMs: number
-
-	constructor(
-		readonly name: string,
-		options: SessionStoreOptions<K, V>
-	) {
-		this.keyCodec = options.keyCodec
-		this.retentionMs = options.retentionMs
-		this.store = new InMemoryKeyValueStore(name, {
-			keyCodec: windowedKeyCodec(options.keyCodec),
-			valueCodec: options.valueCodec,
+		yield* this.where(k => {
+			const keyBytes = this.keyCodec.encode(k.key)
+			return (
+				Buffer.compare(keyBytes, keyFromBytes) >= 0 &&
+				Buffer.compare(keyBytes, keyToBytes) <= 0 &&
+				k.windowStart >= timeFrom &&
+				k.windowStart <= timeTo
+			)
 		})
 	}
 
-	async get(key: WindowedKey<K>): Promise<V | undefined> {
-		return this.store.get(key)
+	async expireOldWindows(currentTime: number): Promise<number> {
+		return (await this.deleteExpired(currentTime)).length
 	}
+}
 
-	async put(key: WindowedKey<K>, value: V): Promise<void> {
-		await this.store.put(key, value)
-	}
-
-	async delete(key: WindowedKey<K>): Promise<void> {
-		await this.store.delete(key)
-	}
-
-	async *all(): AsyncIterable<[WindowedKey<K>, V]> {
-		yield* this.store.all()
-	}
-
-	async *range(from: WindowedKey<K>, to: WindowedKey<K>): AsyncIterable<[WindowedKey<K>, V]> {
-		yield* this.store.range(from, to)
-	}
-
+/** In-memory implementation of SessionStore. */
+export class InMemorySessionStore<K, V>
+	extends InMemoryWindowedStore<K, V, SessionStoreOptions<K, V>>
+	implements SessionStore<K, V>
+{
 	async *findSessions(key: K, earliestStart: number, latestEnd: number): AsyncIterable<[WindowedKey<K>, V]> {
-		const keyBytes = this.keyCodec.encode(key)
-
-		for await (const [windowedKey, value] of this.store.all()) {
-			const entryKeyBytes = this.keyCodec.encode(windowedKey.key)
-			// Session overlaps if it starts before latestEnd and ends after earliestStart
-			if (
-				keyBytes.equals(entryKeyBytes) &&
-				windowedKey.windowStart <= latestEnd &&
-				windowedKey.windowEnd >= earliestStart
-			) {
-				yield [windowedKey, value]
-			}
-		}
+		const hasKey = this.hasKey(this.keyCodec.encode(key))
+		// A session overlaps if it starts before latestEnd and ends after earliestStart.
+		yield* this.where(k => hasKey(k) && k.windowStart <= latestEnd && k.windowEnd >= earliestStart)
 	}
 
 	async remove(key: K): Promise<void> {
-		const keyBytes = this.keyCodec.encode(key)
-		const toDelete: WindowedKey<K>[] = []
-
-		for await (const [windowedKey] of this.store.all()) {
-			const entryKeyBytes = this.keyCodec.encode(windowedKey.key)
-			if (keyBytes.equals(entryKeyBytes)) {
-				toDelete.push(windowedKey)
-			}
-		}
-
-		for (const k of toDelete) {
-			await this.store.delete(k)
-		}
+		await this.deleteWhere(this.hasKey(this.keyCodec.encode(key)))
 	}
 
-	async approximateNumEntries(): Promise<number> {
-		return this.store.approximateNumEntries()
-	}
-
-	async expireOldSessions(currentTime: number): Promise<WindowedKey<K>[]> {
-		const cutoff = currentTime - this.retentionMs
-		const toDelete: WindowedKey<K>[] = []
-		for await (const [windowedKey] of this.store.all()) {
-			if (windowedKey.windowEnd < cutoff) {
-				toDelete.push(windowedKey)
-			}
-		}
-		for (const k of toDelete) {
-			await this.store.delete(k)
-		}
-		return toDelete
-	}
-
-	async init(): Promise<void> {
-		await this.store.init()
-	}
-
-	async flush(): Promise<void> {
-		await this.store.flush()
-	}
-
-	async close(): Promise<void> {
-		await this.store.close()
+	expireOldSessions(currentTime: number): Promise<WindowedKey<K>[]> {
+		return this.deleteExpired(currentTime)
 	}
 }
 
@@ -391,7 +282,7 @@ export interface InMemoryProviderOptions {
  */
 export class InMemoryStateStoreProvider implements StateStoreProvider {
 	readonly name = 'in-memory'
-	private readonly stores: Array<KeyValueStore<unknown, unknown>> = []
+	private readonly stores: Array<{ close(): Promise<void> }> = []
 
 	constructor(options?: InMemoryProviderOptions) {
 		// Options reserved for future use
@@ -400,19 +291,19 @@ export class InMemoryStateStoreProvider implements StateStoreProvider {
 
 	createKeyValueStore<K, V>(name: string, options: KeyValueStoreOptions<K, V>): KeyValueStore<K, V> {
 		const store = new InMemoryKeyValueStore(name, options)
-		this.stores.push(store as KeyValueStore<unknown, unknown>)
+		this.stores.push(store)
 		return store
 	}
 
 	createWindowStore<K, V>(name: string, options: WindowStoreOptions<K, V>): WindowStore<K, V> {
 		const store = new InMemoryWindowStore(name, options)
-		this.stores.push(store as KeyValueStore<unknown, unknown>)
+		this.stores.push(store)
 		return store
 	}
 
 	createSessionStore<K, V>(name: string, options: SessionStoreOptions<K, V>): SessionStore<K, V> {
 		const store = new InMemorySessionStore(name, options)
-		this.stores.push(store as KeyValueStore<unknown, unknown>)
+		this.stores.push(store)
 		return store
 	}
 

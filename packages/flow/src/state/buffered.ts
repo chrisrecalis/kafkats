@@ -48,7 +48,7 @@ abstract class BufferedStoreBase<SK, V, S extends KeyValueStore<SK, V>> implemen
 	}
 
 	constructor(
-		readonly inner: S,
+		protected readonly inner: S,
 		protected readonly storeKeyCodec: Codec<SK>,
 		protected readonly valueCodec: Codec<V>
 	) {}
@@ -177,36 +177,53 @@ abstract class BufferedStoreBase<SK, V, S extends KeyValueStore<SK, V>> implemen
 	}
 }
 
-/** Keys (as seen through the buffer) whose window ended before the cutoff. */
-async function expiredWindowedKeys<K, V>(
-	store: { all(): AsyncIterable<[WindowedKey<K>, V]> },
-	cutoff: number
-): Promise<WindowedKey<K>[]> {
-	const expired: WindowedKey<K>[] = []
-	for await (const [key] of store.all()) {
-		if (key.windowEnd < cutoff) expired.push(key)
-	}
-	return expired
-}
-
 export class BufferedKeyValueStore<K, V>
 	extends BufferedStoreBase<K, V, KeyValueStore<K, V>>
 	implements KeyValueStore<K, V> {}
 
-export class BufferedWindowStore<K, V>
-	extends BufferedStoreBase<WindowedKey<K>, V, WindowStore<K, V>>
-	implements WindowStore<K, V>
-{
+/** Buffer of a window or session store: keys are windowed, entries expire after `retentionMs`. */
+abstract class BufferedWindowedStore<K, V, S extends KeyValueStore<WindowedKey<K>, V>> extends BufferedStoreBase<
+	WindowedKey<K>,
+	V,
+	S
+> {
 	constructor(
-		inner: WindowStore<K, V>,
+		inner: S,
 		storeKeyCodec: Codec<WindowedKey<K>>,
 		valueCodec: Codec<V>,
-		private readonly userKeyCodec: Codec<K>,
-		private readonly retentionMs: number
+		protected readonly userKeyCodec: Codec<K>,
+		protected readonly retentionMs: number
 	) {
 		super(inner, storeKeyCodec, valueCodec)
 	}
 
+	/**
+	 * Delete, through the buffer, every entry (as seen through the buffer) whose key matches.
+	 *
+	 * Inside a transaction expiry and removal must be buffered like any other delete: applied
+	 * directly, an abort would have removed committed entries that the replay still needs.
+	 */
+	protected async deleteWhere(matches: (key: WindowedKey<K>) => boolean): Promise<WindowedKey<K>[]> {
+		const keys: WindowedKey<K>[] = []
+		for await (const [key] of this.all()) {
+			if (matches(key)) keys.push(key)
+		}
+		for (const key of keys) {
+			await this.delete(key)
+		}
+		return keys
+	}
+
+	protected deleteExpired(currentTime: number): Promise<WindowedKey<K>[]> {
+		const cutoff = currentTime - this.retentionMs
+		return this.deleteWhere(key => key.windowEnd < cutoff)
+	}
+}
+
+export class BufferedWindowStore<K, V>
+	extends BufferedWindowedStore<K, V, WindowStore<K, V>>
+	implements WindowStore<K, V>
+{
 	fetch(key: K, timeFrom: number, timeTo: number): AsyncIterable<[WindowedKey<K>, V]> {
 		const keyBytes = this.userKeyCodec.encode(key)
 		return this.merged(
@@ -239,30 +256,14 @@ export class BufferedWindowStore<K, V>
 		if (!currentTransactionScope()) {
 			return this.inner.expireOldWindows(currentTime)
 		}
-		// Inside a transaction expiry must be buffered like any other delete: applied directly,
-		// an abort would have removed committed windows that the replay still needs.
-		const expired = await expiredWindowedKeys(this, currentTime - this.retentionMs)
-		for (const key of expired) {
-			await this.delete(key)
-		}
-		return expired.length
+		return (await this.deleteExpired(currentTime)).length
 	}
 }
 
 export class BufferedSessionStore<K, V>
-	extends BufferedStoreBase<WindowedKey<K>, V, SessionStore<K, V>>
+	extends BufferedWindowedStore<K, V, SessionStore<K, V>>
 	implements SessionStore<K, V>
 {
-	constructor(
-		inner: SessionStore<K, V>,
-		storeKeyCodec: Codec<WindowedKey<K>>,
-		valueCodec: Codec<V>,
-		private readonly userKeyCodec: Codec<K>,
-		private readonly retentionMs: number
-	) {
-		super(inner, storeKeyCodec, valueCodec)
-	}
-
 	findSessions(key: K, earliestStart: number, latestEnd: number): AsyncIterable<[WindowedKey<K>, V]> {
 		const keyBytes = this.userKeyCodec.encode(key)
 		return this.merged(
@@ -280,26 +281,13 @@ export class BufferedSessionStore<K, V>
 			return
 		}
 		const keyBytes = this.userKeyCodec.encode(key)
-		const toDelete: WindowedKey<K>[] = []
-		for await (const [windowedKey] of this.all()) {
-			if (this.userKeyCodec.encode(windowedKey.key).equals(keyBytes)) {
-				toDelete.push(windowedKey)
-			}
-		}
-		for (const windowedKey of toDelete) {
-			await this.delete(windowedKey)
-		}
+		await this.deleteWhere(windowedKey => this.userKeyCodec.encode(windowedKey.key).equals(keyBytes))
 	}
 
 	async expireOldSessions(currentTime: number): Promise<WindowedKey<K>[]> {
 		if (!currentTransactionScope()) {
 			return this.inner.expireOldSessions(currentTime)
 		}
-		// See BufferedWindowStore.expireOldWindows.
-		const expired = await expiredWindowedKeys(this, currentTime - this.retentionMs)
-		for (const key of expired) {
-			await this.delete(key)
-		}
-		return expired
+		return this.deleteExpired(currentTime)
 	}
 }

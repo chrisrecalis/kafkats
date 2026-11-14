@@ -2,78 +2,16 @@ import type { KeyValueStore, WindowStore, SessionStore, WindowedKey } from '@/st
 import type { ChangelogWriter } from '@/changelog.js'
 
 /**
- * A KeyValueStore wrapper that writes mutations to a changelog topic.
- *
- * All put/delete operations are written to Kafka for durability and recovery.
- * Read operations delegate directly to the inner store.
+ * Store wrapper that logs every mutation to a changelog topic. Reads delegate to the inner store.
  */
-export class ChangelogBackedKeyValueStore<K, V> implements KeyValueStore<K, V> {
-	/** The underlying store (exposed for restoration purposes) */
-	readonly innerStore: KeyValueStore<K, V>
-
+abstract class ChangelogBackedStore<K, V, S extends KeyValueStore<K, V>> implements KeyValueStore<K, V> {
 	constructor(
-		inner: KeyValueStore<K, V>,
-		private readonly writer: ChangelogWriter<K, V>
-	) {
-		this.innerStore = inner
-	}
-
-	get name(): string {
-		return this.innerStore.name
-	}
-
-	async get(key: K): Promise<V | undefined> {
-		return this.innerStore.get(key)
-	}
-
-	async put(key: K, value: V): Promise<void> {
-		// Local-first: a crash between the two must leave local stale (replayed on restart),
-		// not the changelog ahead (downstream forwards aggregates that disagree with the durable log).
-		await this.innerStore.put(key, value)
-		await this.writer.write(key, value)
-	}
-
-	async delete(key: K): Promise<void> {
-		await this.innerStore.delete(key)
-		await this.writer.writeTombstone(key)
-	}
-
-	all(): AsyncIterable<[K, V]> {
-		return this.innerStore.all()
-	}
-
-	range(from: K, to: K): AsyncIterable<[K, V]> {
-		return this.innerStore.range(from, to)
-	}
-
-	async approximateNumEntries(): Promise<number> {
-		return this.innerStore.approximateNumEntries()
-	}
-
-	async init(): Promise<void> {
-		return this.innerStore.init()
-	}
-
-	async flush(): Promise<void> {
-		return this.innerStore.flush()
-	}
-
-	async close(): Promise<void> {
-		return this.innerStore.close()
-	}
-}
-
-/**
- * A WindowStore wrapper that writes mutations to a changelog topic.
- */
-export class ChangelogBackedWindowStore<K, V> implements WindowStore<K, V> {
-	constructor(
-		private readonly inner: WindowStore<K, V>,
-		private readonly writer: ChangelogWriter<WindowedKey<K>, V>
+		protected readonly inner: S,
+		protected readonly writer: ChangelogWriter<K, V>
 	) {}
 
-	/** The underlying store (exposed so restoration can replay changelog records into it). */
-	get innerStore(): WindowStore<K, V> {
+	/** The wrapped store. */
+	get innerStore(): S {
 		return this.inner
 	}
 
@@ -81,29 +19,53 @@ export class ChangelogBackedWindowStore<K, V> implements WindowStore<K, V> {
 		return this.inner.name
 	}
 
-	async get(key: WindowedKey<K>): Promise<V | undefined> {
+	async get(key: K): Promise<V | undefined> {
 		return this.inner.get(key)
 	}
 
-	async put(key: WindowedKey<K>, value: V): Promise<void> {
-		// Local-first; see ChangelogBackedKeyValueStore.put for rationale.
+	async put(key: K, value: V): Promise<void> {
+		// Local-first: a crash between the two must leave local stale (replayed on restart),
+		// not the changelog ahead (downstream forwards aggregates that disagree with the durable log).
 		await this.inner.put(key, value)
 		await this.writer.write(key, value)
 	}
 
-	async delete(key: WindowedKey<K>): Promise<void> {
+	async delete(key: K): Promise<void> {
 		await this.inner.delete(key)
 		await this.writer.writeTombstone(key)
 	}
 
-	all(): AsyncIterable<[WindowedKey<K>, V]> {
+	all(): AsyncIterable<[K, V]> {
 		return this.inner.all()
 	}
 
-	range(from: WindowedKey<K>, to: WindowedKey<K>): AsyncIterable<[WindowedKey<K>, V]> {
+	range(from: K, to: K): AsyncIterable<[K, V]> {
 		return this.inner.range(from, to)
 	}
 
+	async approximateNumEntries(): Promise<number> {
+		return this.inner.approximateNumEntries()
+	}
+
+	async init(): Promise<void> {
+		return this.inner.init()
+	}
+
+	async flush(): Promise<void> {
+		return this.inner.flush()
+	}
+
+	async close(): Promise<void> {
+		return this.inner.close()
+	}
+}
+
+export class ChangelogBackedKeyValueStore<K, V> extends ChangelogBackedStore<K, V, KeyValueStore<K, V>> {}
+
+export class ChangelogBackedWindowStore<K, V>
+	extends ChangelogBackedStore<WindowedKey<K>, V, WindowStore<K, V>>
+	implements WindowStore<K, V>
+{
 	fetch(key: K, timeFrom: number, timeTo: number): AsyncIterable<[WindowedKey<K>, V]> {
 		return this.inner.fetch(key, timeFrom, timeTo)
 	}
@@ -118,87 +80,31 @@ export class ChangelogBackedWindowStore<K, V> implements WindowStore<K, V> {
 
 	async expireOldWindows(currentTime: number): Promise<number> {
 		// No per-window tombstones: the window changelog topic is configured with delete+compact and
-		// a finite retention.ms tied to the store's retention (see FlowAppImpl.setupChangelog), so the
+		// a finite retention.ms tied to the store's retention (see StoreRegistry.setupChangelog), so the
 		// broker prunes records for expired windows — the same approximate, time-based cleanup Kafka
 		// Streams uses for windowed changelogs. It is broker wall-clock based, not stream-time exact,
 		// so restore can briefly replay a window the local store had already expired; such a window is
 		// re-expired once stream time advances far enough after restore.
 		return this.inner.expireOldWindows(currentTime)
 	}
-
-	async approximateNumEntries(): Promise<number> {
-		return this.inner.approximateNumEntries()
-	}
-
-	async init(): Promise<void> {
-		return this.inner.init()
-	}
-
-	async flush(): Promise<void> {
-		return this.inner.flush()
-	}
-
-	async close(): Promise<void> {
-		return this.inner.close()
-	}
 }
 
-/**
- * A SessionStore wrapper that writes mutations to a changelog topic.
- */
-export class ChangelogBackedSessionStore<K, V> implements SessionStore<K, V> {
-	constructor(
-		private readonly inner: SessionStore<K, V>,
-		private readonly writer: ChangelogWriter<WindowedKey<K>, V>
-	) {}
-
-	/** The underlying store (exposed so restoration can replay changelog records into it). */
-	get innerStore(): SessionStore<K, V> {
-		return this.inner
-	}
-
-	get name(): string {
-		return this.inner.name
-	}
-
-	async get(key: WindowedKey<K>): Promise<V | undefined> {
-		return this.inner.get(key)
-	}
-
-	async put(key: WindowedKey<K>, value: V): Promise<void> {
-		// Local-first; see ChangelogBackedKeyValueStore.put for rationale.
-		await this.inner.put(key, value)
-		await this.writer.write(key, value)
-	}
-
-	async delete(key: WindowedKey<K>): Promise<void> {
-		await this.inner.delete(key)
-		await this.writer.writeTombstone(key)
-	}
-
-	all(): AsyncIterable<[WindowedKey<K>, V]> {
-		return this.inner.all()
-	}
-
-	range(from: WindowedKey<K>, to: WindowedKey<K>): AsyncIterable<[WindowedKey<K>, V]> {
-		return this.inner.range(from, to)
-	}
-
+export class ChangelogBackedSessionStore<K, V>
+	extends ChangelogBackedStore<WindowedKey<K>, V, SessionStore<K, V>>
+	implements SessionStore<K, V>
+{
 	findSessions(key: K, earliestStart: number, latestEnd: number): AsyncIterable<[WindowedKey<K>, V]> {
 		return this.inner.findSessions(key, earliestStart, latestEnd)
 	}
 
 	async remove(key: K): Promise<void> {
-		// Find all sessions for this key and write tombstones
 		const toDelete: WindowedKey<K>[] = []
 		for await (const [windowedKey] of this.inner.findSessions(key, 0, Number.MAX_SAFE_INTEGER)) {
 			toDelete.push(windowedKey)
 		}
-
 		await this.inner.remove(key)
-
-		for (const k of toDelete) {
-			await this.writer.writeTombstone(k)
+		for (const windowedKey of toDelete) {
+			await this.writer.writeTombstone(windowedKey)
 		}
 	}
 
@@ -207,25 +113,9 @@ export class ChangelogBackedSessionStore<K, V> implements SessionStore<K, V> {
 		// expired sessions (changelog's last value per key wins). Mirror remove(): inner deletes
 		// first (local-first), then emit a tombstone for each so the durable log stays consistent.
 		const expired = await this.inner.expireOldSessions(currentTime)
-		for (const k of expired) {
-			await this.writer.writeTombstone(k)
+		for (const key of expired) {
+			await this.writer.writeTombstone(key)
 		}
 		return expired
-	}
-
-	async approximateNumEntries(): Promise<number> {
-		return this.inner.approximateNumEntries()
-	}
-
-	async init(): Promise<void> {
-		return this.inner.init()
-	}
-
-	async flush(): Promise<void> {
-		return this.inner.flush()
-	}
-
-	async close(): Promise<void> {
-		return this.inner.close()
 	}
 }

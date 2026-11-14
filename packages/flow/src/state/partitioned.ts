@@ -11,9 +11,6 @@ export interface StoreStack<S, R> {
 	buffer: TransactionalBuffer
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type AnyKV = KeyValueStore<any, any>
-
 /** Name of the provider-level store backing one partition of a logical store. */
 export function partitionStoreName(storeName: string, partition: number): string {
 	return `${storeName}.p${partition}`
@@ -27,7 +24,7 @@ export function partitionStoreName(storeName: string, partition: number): string
  * rebuilds, it can be wiped and restored without touching other partitions, and it can be dropped
  * when the partition is revoked instead of lingering as stale data.
  */
-export class StorePartitions<S extends AnyKV, R extends AnyKV> {
+export class StorePartitions<S, R extends { init(): Promise<void> }> {
 	private readonly stacks = new Map<number, { stack: StoreStack<S, R>; ready: Promise<void> }>()
 
 	constructor(
@@ -52,17 +49,14 @@ export class StorePartitions<S extends AnyKV, R extends AnyKV> {
 
 	/** The store for the partition of the record currently being processed. */
 	async current(): Promise<S> {
-		const ctx = recordContextStorage.getStore()
-		if (this.shared) {
-			return (await this.forPartition(0)).store
-		}
-		if (!ctx) {
+		const store = await this.currentOrNull()
+		if (!store) {
 			throw new Error(
 				`State store '${this.name}' was written outside of record processing; ` +
 					'writes need a record context to select the state partition'
 			)
 		}
-		return (await this.forPartition(ctx.partition)).store
+		return store
 	}
 
 	/** The current record's store, or null when called outside of record processing. */
@@ -103,26 +97,12 @@ export async function clearStore<K, V>(store: KeyValueStore<K, V>): Promise<void
 	}
 }
 
-async function* concat<T>(
-	partitions: StorePartitions<never, never>,
-	scan: (store: never) => AsyncIterable<T>
-): AsyncIterable<T> {
-	const current = await partitions.currentOrNull()
-	if (current) {
-		yield* scan(current)
-		return
-	}
-	for (const store of await partitions.allStores()) {
-		yield* scan(store)
-	}
-}
-
 /**
- * KeyValueStore facade that routes every call to the state partition of the record currently
- * being processed. Reads made outside of record processing see all local partitions.
+ * Store facade that routes every call to the state partition of the record currently being
+ * processed. Reads made outside of record processing see all local partitions.
  */
-export class PartitionedKeyValueStore<K, V> implements KeyValueStore<K, V> {
-	constructor(readonly partitions: StorePartitions<KeyValueStore<K, V>, KeyValueStore<K, V>>) {}
+abstract class PartitionedStore<K, V, S extends KeyValueStore<K, V>> implements KeyValueStore<K, V> {
+	constructor(protected readonly partitions: StorePartitions<S, S>) {}
 
 	get name(): string {
 		return this.partitions.name
@@ -147,11 +127,11 @@ export class PartitionedKeyValueStore<K, V> implements KeyValueStore<K, V> {
 	}
 
 	all(): AsyncIterable<[K, V]> {
-		return concat(this.partitions as never, (store: KeyValueStore<K, V>) => store.all())
+		return this.scan(store => store.all())
 	}
 
 	range(from: K, to: K): AsyncIterable<[K, V]> {
-		return concat(this.partitions as never, (store: KeyValueStore<K, V>) => store.range(from, to))
+		return this.scan(store => store.range(from, to))
 	}
 
 	async approximateNumEntries(): Promise<number> {
@@ -175,116 +155,50 @@ export class PartitionedKeyValueStore<K, V> implements KeyValueStore<K, V> {
 	async close(): Promise<void> {
 		// The provider owns and closes the underlying stores.
 	}
+
+	/** Scan the current record's partition, or every local partition outside of record processing. */
+	protected async *scan<T>(fn: (store: S) => AsyncIterable<T>): AsyncIterable<T> {
+		const current = await this.partitions.currentOrNull()
+		if (current) {
+			yield* fn(current)
+			return
+		}
+		for (const store of await this.partitions.allStores()) {
+			yield* fn(store)
+		}
+	}
 }
 
-export class PartitionedWindowStore<K, V> implements WindowStore<K, V> {
-	constructor(readonly partitions: StorePartitions<WindowStore<K, V>, WindowStore<K, V>>) {}
+export class PartitionedKeyValueStore<K, V> extends PartitionedStore<K, V, KeyValueStore<K, V>> {}
 
-	get name(): string {
-		return this.partitions.name
-	}
-
-	async get(key: WindowedKey<K>): Promise<V | undefined> {
-		const current = await this.partitions.currentOrNull()
-		if (current) return current.get(key)
-		for (const store of await this.partitions.allStores()) {
-			const value = await store.get(key)
-			if (value !== undefined) return value
-		}
-		return undefined
-	}
-
-	async put(key: WindowedKey<K>, value: V): Promise<void> {
-		await (await this.partitions.current()).put(key, value)
-	}
-
-	async delete(key: WindowedKey<K>): Promise<void> {
-		await (await this.partitions.current()).delete(key)
-	}
-
-	all(): AsyncIterable<[WindowedKey<K>, V]> {
-		return concat(this.partitions as never, (store: WindowStore<K, V>) => store.all())
-	}
-
-	range(from: WindowedKey<K>, to: WindowedKey<K>): AsyncIterable<[WindowedKey<K>, V]> {
-		return concat(this.partitions as never, (store: WindowStore<K, V>) => store.range(from, to))
-	}
-
+export class PartitionedWindowStore<K, V>
+	extends PartitionedStore<WindowedKey<K>, V, WindowStore<K, V>>
+	implements WindowStore<K, V>
+{
 	fetch(key: K, timeFrom: number, timeTo: number): AsyncIterable<[WindowedKey<K>, V]> {
-		return concat(this.partitions as never, (store: WindowStore<K, V>) => store.fetch(key, timeFrom, timeTo))
+		return this.scan(store => store.fetch(key, timeFrom, timeTo))
 	}
 
 	fetchAll(timeFrom: number, timeTo: number): AsyncIterable<[WindowedKey<K>, V]> {
-		return concat(this.partitions as never, (store: WindowStore<K, V>) => store.fetchAll(timeFrom, timeTo))
+		return this.scan(store => store.fetchAll(timeFrom, timeTo))
 	}
 
 	fetchRange(keyFrom: K, keyTo: K, timeFrom: number, timeTo: number): AsyncIterable<[WindowedKey<K>, V]> {
-		return concat(this.partitions as never, (store: WindowStore<K, V>) =>
-			store.fetchRange(keyFrom, keyTo, timeFrom, timeTo)
-		)
+		return this.scan(store => store.fetchRange(keyFrom, keyTo, timeFrom, timeTo))
 	}
 
 	async expireOldWindows(currentTime: number): Promise<number> {
 		// Stream time is per partition, so expiry only ever applies to the current partition.
 		return (await this.partitions.current()).expireOldWindows(currentTime)
 	}
-
-	async approximateNumEntries(): Promise<number> {
-		let total = 0
-		for (const store of await this.partitions.allStores()) {
-			total += await store.approximateNumEntries()
-		}
-		return total
-	}
-
-	async init(): Promise<void> {}
-
-	async flush(): Promise<void> {
-		for (const store of await this.partitions.allStores()) {
-			await store.flush()
-		}
-	}
-
-	async close(): Promise<void> {}
 }
 
-export class PartitionedSessionStore<K, V> implements SessionStore<K, V> {
-	constructor(readonly partitions: StorePartitions<SessionStore<K, V>, SessionStore<K, V>>) {}
-
-	get name(): string {
-		return this.partitions.name
-	}
-
-	async get(key: WindowedKey<K>): Promise<V | undefined> {
-		const current = await this.partitions.currentOrNull()
-		if (current) return current.get(key)
-		for (const store of await this.partitions.allStores()) {
-			const value = await store.get(key)
-			if (value !== undefined) return value
-		}
-		return undefined
-	}
-
-	async put(key: WindowedKey<K>, value: V): Promise<void> {
-		await (await this.partitions.current()).put(key, value)
-	}
-
-	async delete(key: WindowedKey<K>): Promise<void> {
-		await (await this.partitions.current()).delete(key)
-	}
-
-	all(): AsyncIterable<[WindowedKey<K>, V]> {
-		return concat(this.partitions as never, (store: SessionStore<K, V>) => store.all())
-	}
-
-	range(from: WindowedKey<K>, to: WindowedKey<K>): AsyncIterable<[WindowedKey<K>, V]> {
-		return concat(this.partitions as never, (store: SessionStore<K, V>) => store.range(from, to))
-	}
-
+export class PartitionedSessionStore<K, V>
+	extends PartitionedStore<WindowedKey<K>, V, SessionStore<K, V>>
+	implements SessionStore<K, V>
+{
 	findSessions(key: K, earliestStart: number, latestEnd: number): AsyncIterable<[WindowedKey<K>, V]> {
-		return concat(this.partitions as never, (store: SessionStore<K, V>) =>
-			store.findSessions(key, earliestStart, latestEnd)
-		)
+		return this.scan(store => store.findSessions(key, earliestStart, latestEnd))
 	}
 
 	async remove(key: K): Promise<void> {
@@ -292,24 +206,7 @@ export class PartitionedSessionStore<K, V> implements SessionStore<K, V> {
 	}
 
 	async expireOldSessions(currentTime: number): Promise<WindowedKey<K>[]> {
+		// Stream time is per partition, so expiry only ever applies to the current partition.
 		return (await this.partitions.current()).expireOldSessions(currentTime)
 	}
-
-	async approximateNumEntries(): Promise<number> {
-		let total = 0
-		for (const store of await this.partitions.allStores()) {
-			total += await store.approximateNumEntries()
-		}
-		return total
-	}
-
-	async init(): Promise<void> {}
-
-	async flush(): Promise<void> {
-		for (const store of await this.partitions.allStores()) {
-			await store.flush()
-		}
-	}
-
-	async close(): Promise<void> {}
 }
