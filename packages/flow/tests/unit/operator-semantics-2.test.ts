@@ -21,7 +21,7 @@ const send = (ctx: any, topic: string, key: string, value: string | null, ts: nu
 		? ctx.consumer.sendMessage(topic, null, { key: Buffer.from(key), timestamp: BigInt(ts) })
 		: ctx.send(topic, Buffer.from(value), { key: Buffer.from(key), timestamp: BigInt(ts) })
 
-describe('hunt2: windows', () => {
+describe('operator semantics 2: windows', () => {
 	it('hopping size 10 advance 3 assigns ts=10 to [3,13) [6,16) [9,19)', async () => {
 		const d = new TestDriver()
 		const wins: number[] = []
@@ -81,7 +81,7 @@ describe('hunt2: windows', () => {
 	})
 })
 
-describe('hunt2: tables', () => {
+describe('operator semantics 2: tables', () => {
 	it('inner table-table join retracts on right tombstone and on update', async () => {
 		const d = new TestDriver()
 		d.table('a', S)
@@ -170,7 +170,7 @@ describe('hunt2: tables', () => {
 	})
 })
 
-describe('hunt2: aggregations', () => {
+describe('operator semantics 2: aggregations', () => {
 	it('aggregate returning falsy values (0, empty string, false) is stored and continues', async () => {
 		const d = new TestDriver()
 		d.input('in', S)
@@ -190,7 +190,7 @@ describe('hunt2: aggregations', () => {
 	})
 })
 
-describe('hunt2: stores', () => {
+describe('operator semantics 2: stores', () => {
 	it('KV range is inclusive and ordered; prefix keys fine', async () => {
 		const s = new InMemoryKeyValueStore<string, string>('s', { keyCodec: str, valueCodec: str })
 		for (const k of ['b', 'a', 'ab', 'c']) await s.put(k, k)

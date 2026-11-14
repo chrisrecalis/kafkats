@@ -41,7 +41,7 @@ const send = (
 	partition = 0
 ) => ctx.send(topic, Buffer.from(value), { key: Buffer.from(key), timestamp: BigInt(ts), partition })
 
-describe('hunt: stream-stream join', () => {
+describe('operator semantics: stream-stream join', () => {
 	it('two records with same key + same timestamp on one side both join (no overwrite in window store)', async () => {
 		const mk = (name: string) =>
 			new InMemoryWindowStore<string, string>(name, {
@@ -121,7 +121,7 @@ describe('hunt: stream-stream join', () => {
 	})
 })
 
-describe('hunt: session windows', () => {
+describe('operator semantics: session windows', () => {
 	async function newStore() {
 		const s = new InMemorySessionStore<string, string>('s', {
 			keyCodec: str,
@@ -198,7 +198,7 @@ describe('hunt: session windows', () => {
 	})
 })
 
-describe('hunt: KTable', () => {
+describe('operator semantics: KTable', () => {
 	it('KTable.filter emits a tombstone when a previously-passing key stops passing', async () => {
 		const driver = new TestDriver()
 		driver
@@ -294,7 +294,7 @@ describe('hunt: KTable', () => {
 	})
 })
 
-describe('hunt: stream time / partitions', () => {
+describe('operator semantics: stream time / partitions', () => {
 	it('a far-future record on one partition must not make late-ish records on another partition be dropped', async () => {
 		// Kafka Streams tracks stream time per task (partition); here the cleanup state is shared by all clones.
 		const driver = new TestDriver()
@@ -314,7 +314,7 @@ describe('hunt: stream time / partitions', () => {
 	})
 })
 
-describe('hunt: sanity', () => {
+describe('operator semantics: sanity', () => {
 	it('sanity: partition-1 record alone is counted', async () => {
 		const driver = new TestDriver()
 		const results: Array<{ s: number; v: number | null }> = []
@@ -332,7 +332,7 @@ describe('hunt: sanity', () => {
 	})
 })
 
-describe('hunt: output record timestamps', () => {
+describe('operator semantics: output record timestamps', () => {
 	it('to() forwards the event timestamp of the record to the producer', async () => {
 		const driver = new TestDriver()
 		driver

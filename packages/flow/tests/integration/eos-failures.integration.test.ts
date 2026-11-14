@@ -567,6 +567,7 @@ describe('EOS failure paths', () => {
 			await sleep(1_500) // processed, txn still open (20s commit interval)
 			arm = true
 			await b.start() // rebalance => A's onBeforeRebalance commit fails
+			expect(failures).toBeGreaterThan(0)
 			await producer.send(
 				input,
 				[5, 6, 7, 8, 9].map(i => ({ key: `k${i}`, value: numberCodec.encode(i) }))
