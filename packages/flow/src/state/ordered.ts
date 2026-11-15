@@ -9,14 +9,15 @@ import type {
 	WindowStore,
 	WindowStoreOptions,
 } from '@/state.js'
+import { sessionKeys, windowKeys } from '@/state/ordered-keys.js'
 
 /**
  * What a storage engine has to offer to back flow's state stores: a map of byte keys to byte
  * values that iterates in unsigned byte order (LMDB, RocksDB, ...).
  *
- * The stores in this file implement flow's store interfaces on top of it (key layout of window
- * and session stores, range and expiry queries, changelog checkpoints), so a state store provider
- * for a new engine only has to adapt its database to this interface.
+ * The stores in this file implement flow's store interfaces on top of it, so a state store
+ * provider for a new engine only has to adapt its database to this interface. The engine opens
+ * and closes its database; the stores never do.
  */
 export interface OrderedByteStore {
 	/** The value of `key`. May answer synchronously when the engine has it in memory. */
@@ -35,86 +36,45 @@ export interface OrderedByteStore {
 	flush(): Promise<void>
 }
 
-function readValue<V>(
-	bytes: Buffer | undefined | Promise<Buffer | undefined>,
-	valueCodec: Codec<V>
-): Promise<V | undefined> {
-	if (bytes instanceof Promise) return bytes.then(b => (b === undefined ? undefined : valueCodec.decode(b)))
-	return Promise.resolve(bytes === undefined ? undefined : valueCodec.decode(bytes))
-}
+type Bounds = Parameters<OrderedByteStore['range']>[0]
 
-// range()'s end is exclusive; the public range() contract of the stores is inclusive.
-const KEY_TERMINATOR = Buffer.from([0])
-const inclusiveEnd = (b: Buffer): Buffer => Buffer.concat([b, KEY_TERMINATOR])
+/** The smallest key after `key`: turns an inclusive upper bound into range()'s exclusive one. */
+const justAfter = (key: Buffer): Buffer => Buffer.concat([key, Buffer.from([0])])
 
-// Bias signed times by 2^63 so unsigned-byte lex order matches signed numeric order.
-// Buffer.alloc's zero-fill represents bias(-2^63) = lex-smallest; LEX_MAX_TIME = bias(+2^63-1).
-const SIGNED_BIAS = 0x8000000000000000n
-const LEX_MAX_TIME = 0xff
-
-export function writeSignedTime(buf: Buffer, value: number, offset: number): void {
-	buf.writeBigUInt64BE(BigInt(value) + SIGNED_BIAS, offset)
-}
-
-export function readSignedTime(buf: Buffer, offset: number): number {
-	return Number(buf.readBigUInt64BE(offset) - SIGNED_BIAS)
-}
-
-// WindowStore key prefix [biasedStart][biasedEnd]; second half is implicit LEX_MIN_TIME (= -2^63)
-// so half-open [timeBound(from), timeBound(to+1)) selects every windowStart in [from, to].
-const timeBound = (t: number): Buffer => {
-	const b = Buffer.alloc(16)
-	writeSignedTime(b, t, 0)
-	return b
-}
-
-/** KeyValueStore over an {@link OrderedByteStore}. */
-export class OrderedKeyValueStore<K, V> implements KeyValueStore<K, V> {
-	private readonly db: OrderedByteStore
-	private readonly keyCodec: Codec<K>
-	private readonly valueCodec: Codec<V>
-
-	constructor(
+/**
+ * A key-value store over an {@link OrderedByteStore}, for store keys `SK` that a codec maps to
+ * bytes whose order is the order the store iterates in.
+ */
+abstract class OrderedStore<SK, V> implements KeyValueStore<SK, V> {
+	protected constructor(
 		readonly name: string,
-		db: OrderedByteStore,
-		options: KeyValueStoreOptions<K, V>
-	) {
-		this.db = db
-		this.keyCodec = options.keyCodec
-		this.valueCodec = options.valueCodec
+		protected readonly db: OrderedByteStore,
+		protected readonly storeKeyCodec: Codec<SK>,
+		protected readonly valueCodec: Codec<V>
+	) {}
+
+	get(key: SK): Promise<V | undefined> {
+		const decode = (bytes: Buffer | undefined): V | undefined =>
+			bytes === undefined ? undefined : this.valueCodec.decode(bytes)
+		const bytes = this.db.get(this.storeKeyCodec.encode(key))
+		return bytes instanceof Promise ? bytes.then(decode) : Promise.resolve(decode(bytes))
 	}
 
-	get(key: K): Promise<V | undefined> {
-		const keyBytes = this.keyCodec.encode(key)
-		return readValue(this.db.get(keyBytes), this.valueCodec)
+	put(key: SK, value: V): Promise<void> {
+		return this.db.put(this.storeKeyCodec.encode(key), this.valueCodec.encode(value))
 	}
 
-	async put(key: K, value: V): Promise<void> {
-		const keyBytes = this.keyCodec.encode(key)
-		const valueBytes = this.valueCodec.encode(value)
-		await this.db.put(keyBytes, valueBytes)
+	delete(key: SK): Promise<void> {
+		return this.db.remove(this.storeKeyCodec.encode(key))
 	}
 
-	async delete(key: K): Promise<void> {
-		const keyBytes = this.keyCodec.encode(key)
-		await this.db.remove(keyBytes)
+	all(): AsyncIterable<[SK, V]> {
+		return this.scan({})
 	}
 
-	async *all(): AsyncIterable<[K, V]> {
-		await Promise.resolve()
-		for (const { key, value } of this.db.range({})) {
-			yield [this.keyCodec.decode(key), this.valueCodec.decode(value)]
-		}
-	}
-
-	async *range(from: K, to: K): AsyncIterable<[K, V]> {
-		await Promise.resolve()
-		const fromBytes = this.keyCodec.encode(from)
-		const toBytes = this.keyCodec.encode(to)
-
-		for (const { key, value } of this.db.range({ start: fromBytes, end: inclusiveEnd(toBytes) })) {
-			yield [this.keyCodec.decode(key), this.valueCodec.decode(value)]
-		}
+	/** Entries from `from` to `to`, both inclusive. */
+	range(from: SK, to: SK): AsyncIterable<[SK, V]> {
+		return this.scan({ start: this.storeKeyCodec.encode(from), end: justAfter(this.storeKeyCodec.encode(to)) })
 	}
 
 	approximateNumEntries(): Promise<number> {
@@ -122,106 +82,56 @@ export class OrderedKeyValueStore<K, V> implements KeyValueStore<K, V> {
 	}
 
 	init(): Promise<void> {
-		// Opened by the provider
 		return Promise.resolve()
 	}
 
-	async flush(): Promise<void> {
-		await this.db.flush()
+	flush(): Promise<void> {
+		return this.db.flush()
 	}
 
 	close(): Promise<void> {
-		// Closed by the provider
 		return Promise.resolve()
 	}
+
+	/** The entries in `bounds` whose stored key passes `matches`, decoded. */
+	protected async *scan(bounds: Bounds, matches?: (storedKey: Buffer) => boolean): AsyncIterable<[SK, V]> {
+		await Promise.resolve()
+		for (const { key, value } of this.db.range(bounds)) {
+			if (matches && !matches(key)) continue
+			yield [this.storeKeyCodec.decode(key), this.valueCodec.decode(value)]
+		}
+	}
+
+	/** Remove the entries in `bounds` whose decoded key passes `matches`; returns their keys. */
+	protected async removeWhere(bounds: Bounds, matches: (key: SK, storedKey: Buffer) => boolean): Promise<SK[]> {
+		const removed: SK[] = []
+		const removals: Promise<void>[] = []
+		for (const { key: storedKey } of this.db.range(bounds)) {
+			const key = this.storeKeyCodec.decode(storedKey)
+			if (!matches(key, storedKey)) continue
+			removed.push(key)
+			// Issued together: an engine that commits per event-loop turn then commits them at once.
+			removals.push(this.db.remove(storedKey))
+		}
+		await Promise.all(removals)
+		return removed
+	}
 }
 
-/**
- * Encodes a windowed key to a buffer for storage.
- * Format: [windowStart:8bytes][windowEnd:8bytes][keyBytes]
- *
- * This format allows efficient range queries by time.
- */
-function encodeWindowedKey<K>(key: WindowedKey<K>, keyCodec: Codec<K>): Buffer {
-	const keyBytes = keyCodec.encode(key.key)
-	const buf = Buffer.alloc(16 + keyBytes.length)
-	writeSignedTime(buf, key.windowStart, 0)
-	writeSignedTime(buf, key.windowEnd, 8)
-	keyBytes.copy(buf, 16)
-	return buf
-}
-
-/**
- * Decodes a windowed key from a buffer.
- */
-function decodeWindowedKey<K>(buf: Buffer, keyCodec: Codec<K>): WindowedKey<K> {
-	const windowStart = readSignedTime(buf, 0)
-	const windowEnd = readSignedTime(buf, 8)
-	const keyBytes = buf.subarray(16)
-	return {
-		key: keyCodec.decode(keyBytes),
-		windowStart,
-		windowEnd,
+/** KeyValueStore over an {@link OrderedByteStore}. */
+export class OrderedKeyValueStore<K, V> extends OrderedStore<K, V> {
+	constructor(name: string, db: OrderedByteStore, options: KeyValueStoreOptions<K, V>) {
+		super(name, db, options.keyCodec, options.valueCodec)
 	}
 }
 
 /**
- * Creates a codec for windowed keys with time-prefix ordering.
+ * WindowStore over an {@link OrderedByteStore}. Keys are ordered by window start (see
+ * {@link windowKeys}), which makes time-range queries and expiry cheap.
  */
-function windowedKeyCodec<K>(keyCodec: Codec<K>): Codec<WindowedKey<K>> {
-	return {
-		encode: (key: WindowedKey<K>) => encodeWindowedKey(key, keyCodec),
-		decode: (buf: Buffer) => decodeWindowedKey(buf, keyCodec),
-	}
-}
-
-/**
- * Encodes a windowed key for key-first ordering (used in session stores).
- * Format: [keyBytes][windowStart:8bytes][windowEnd:8bytes]
- */
-function encodeSessionKey<K>(key: WindowedKey<K>, keyCodec: Codec<K>): Buffer {
-	const keyBytes = keyCodec.encode(key.key)
-	const buf = Buffer.alloc(keyBytes.length + 16)
-	keyBytes.copy(buf, 0)
-	writeSignedTime(buf, key.windowStart, keyBytes.length)
-	writeSignedTime(buf, key.windowEnd, keyBytes.length + 8)
-	return buf
-}
-
-/**
- * Decodes a session key from a buffer.
- */
-function decodeSessionKey<K>(buf: Buffer, keyCodec: Codec<K>): WindowedKey<K> {
-	const keyBytes = buf.subarray(0, buf.length - 16)
-	const windowStart = readSignedTime(buf, buf.length - 16)
-	const windowEnd = readSignedTime(buf, buf.length - 8)
-	return {
-		key: keyCodec.decode(keyBytes),
-		windowStart,
-		windowEnd,
-	}
-}
-
-/**
- * Creates a codec for session keys with key-prefix ordering.
- */
-function sessionKeyCodec<K>(keyCodec: Codec<K>): Codec<WindowedKey<K>> {
-	return {
-		encode: (key: WindowedKey<K>) => encodeSessionKey(key, keyCodec),
-		decode: (buf: Buffer) => decodeSessionKey(buf, keyCodec),
-	}
-}
-
-/**
- * WindowStore over an {@link OrderedByteStore}.
- *
- * Keys are ordered by [windowStart, windowEnd, key] for efficient time-range queries.
- */
-export class OrderedWindowStore<K, V> implements WindowStore<K, V> {
-	private readonly db: OrderedByteStore
+export class OrderedWindowStore<K, V> extends OrderedStore<WindowedKey<K>, V> implements WindowStore<K, V> {
 	private readonly keyCodec: Codec<K>
-	private readonly windowedCodec: Codec<WindowedKey<K>>
-	private readonly valueCodec: Codec<V>
+	private readonly keys: ReturnType<typeof windowKeys<K>>
 	private readonly retentionMs: number
 	/**
 	 * No window starting before this is in the store: where an expiry pass starts scanning. A
@@ -230,299 +140,119 @@ export class OrderedWindowStore<K, V> implements WindowStore<K, V> {
 	 */
 	private expiredBefore = Number.MIN_SAFE_INTEGER
 
-	constructor(
-		readonly name: string,
-		db: OrderedByteStore,
-		options: WindowStoreOptions<K, V>
-	) {
-		this.db = db
+	constructor(name: string, db: OrderedByteStore, options: WindowStoreOptions<K, V>) {
+		const keys = windowKeys(options.keyCodec)
+		super(name, db, keys.codec, options.valueCodec)
+		this.keys = keys
 		this.keyCodec = options.keyCodec
-		this.windowedCodec = windowedKeyCodec(options.keyCodec)
-		this.valueCodec = options.valueCodec
 		this.retentionMs = options.retentionMs
 	}
 
-	get(key: WindowedKey<K>): Promise<V | undefined> {
-		const keyBytes = this.windowedCodec.encode(key)
-		return readValue(this.db.get(keyBytes), this.valueCodec)
-	}
-
-	async put(key: WindowedKey<K>, value: V): Promise<void> {
-		const keyBytes = this.windowedCodec.encode(key)
+	override put(key: WindowedKey<K>, value: V): Promise<void> {
 		if (key.windowStart < this.expiredBefore) this.expiredBefore = key.windowStart
-		const valueBytes = this.valueCodec.encode(value)
-		await this.db.put(keyBytes, valueBytes)
+		return super.put(key, value)
 	}
 
-	async delete(key: WindowedKey<K>): Promise<void> {
-		const keyBytes = this.windowedCodec.encode(key)
-		await this.db.remove(keyBytes)
-	}
-
-	async *all(): AsyncIterable<[WindowedKey<K>, V]> {
-		await Promise.resolve()
-		for (const { key, value } of this.db.range({})) {
-			yield [this.windowedCodec.decode(key), this.valueCodec.decode(value)]
-		}
-	}
-
-	async *range(from: WindowedKey<K>, to: WindowedKey<K>): AsyncIterable<[WindowedKey<K>, V]> {
-		await Promise.resolve()
-		const fromBytes = this.windowedCodec.encode(from)
-		const toBytes = this.windowedCodec.encode(to)
-
-		for (const { key, value } of this.db.range({ start: fromBytes, end: inclusiveEnd(toBytes) })) {
-			yield [this.windowedCodec.decode(key), this.valueCodec.decode(value)]
-		}
-	}
-
-	async *fetch(key: K, timeFrom: number, timeTo: number): AsyncIterable<[WindowedKey<K>, V]> {
-		await Promise.resolve()
+	fetch(key: K, timeFrom: number, timeTo: number): AsyncIterable<[WindowedKey<K>, V]> {
+		// Compared as bytes, so the windows of other keys in the time range are never decoded.
 		const keyBytes = this.keyCodec.encode(key)
-
-		for (const { key: storedKey, value } of this.db.range({
-			start: timeBound(timeFrom),
-			end: timeBound(timeTo + 1),
-		})) {
-			// Compare raw key-suffix bytes (after the 16-byte windowStart/End prefix) instead of
-			// decoding then re-encoding — saves a full codec round-trip per row on the join hot path.
-			if (storedKey.length === 16 + keyBytes.length && storedKey.subarray(16).equals(keyBytes)) {
-				yield [this.windowedCodec.decode(storedKey), this.valueCodec.decode(value)]
-			}
-		}
+		return this.scan(this.keys.startingIn(timeFrom, timeTo), stored => this.keys.userKey(stored).equals(keyBytes))
 	}
 
-	async *fetchAll(timeFrom: number, timeTo: number): AsyncIterable<[WindowedKey<K>, V]> {
-		await Promise.resolve()
-
-		for (const { key, value } of this.db.range({
-			start: timeBound(timeFrom),
-			end: timeBound(timeTo + 1),
-		})) {
-			yield [this.windowedCodec.decode(key), this.valueCodec.decode(value)]
-		}
+	fetchAll(timeFrom: number, timeTo: number): AsyncIterable<[WindowedKey<K>, V]> {
+		return this.scan(this.keys.startingIn(timeFrom, timeTo))
 	}
 
-	async *fetchRange(keyFrom: K, keyTo: K, timeFrom: number, timeTo: number): AsyncIterable<[WindowedKey<K>, V]> {
-		const keyFromBytes = this.keyCodec.encode(keyFrom)
-		const keyToBytes = this.keyCodec.encode(keyTo)
-
-		for await (const [windowedKey, value] of this.fetchAll(timeFrom, timeTo)) {
-			const entryKeyBytes = this.keyCodec.encode(windowedKey.key)
-			if (entryKeyBytes.compare(keyFromBytes) >= 0 && entryKeyBytes.compare(keyToBytes) <= 0) {
-				yield [windowedKey, value]
-			}
-		}
+	fetchRange(keyFrom: K, keyTo: K, timeFrom: number, timeTo: number): AsyncIterable<[WindowedKey<K>, V]> {
+		const from = this.keyCodec.encode(keyFrom)
+		const to = this.keyCodec.encode(keyTo)
+		return this.scan(this.keys.startingIn(timeFrom, timeTo), stored => {
+			const userKey = this.keys.userKey(stored)
+			return userKey.compare(from) >= 0 && userKey.compare(to) <= 0
+		})
 	}
 
-	approximateNumEntries(): Promise<number> {
-		return Promise.resolve(this.db.approximateCount())
-	}
-
-	init(): Promise<void> {
-		// Already initialized
-		return Promise.resolve()
-	}
-
-	async flush(): Promise<void> {
-		await this.db.flush()
-	}
-
-	close(): Promise<void> {
-		// Handled by provider
-		return Promise.resolve()
-	}
-
-	/**
-	 * Remove expired windows based on retention period.
-	 */
+	/** Remove the windows that ended before the retention period; returns how many. */
 	async expireOldWindows(currentTime: number): Promise<number> {
 		const cutoff = currentTime - this.retentionMs
-		const toDelete: Buffer[] = []
-		// The earliest windowStart this pass leaves in the store, where the next pass begins.
+		// The earliest window this pass leaves in the store: where the next pass begins.
 		let earliestKept = cutoff
-
-		// Scan windowStart < cutoff, then drop only those whose windowEnd < cutoff (still-overlapping windows stay).
-		for (const { key } of this.db.range({ start: timeBound(this.expiredBefore), end: timeBound(cutoff) })) {
-			const windowedKey = this.windowedCodec.decode(key)
-			if (windowedKey.windowEnd < cutoff) {
-				toDelete.push(key)
-			} else {
-				earliestKept = Math.min(earliestKept, windowedKey.windowStart)
-			}
-		}
-
-		await Promise.all(toDelete.map(key => this.db.remove(key)))
+		// Windows that started before the cutoff but have not ended yet stay.
+		const startedBeforeCutoff = this.keys.startingIn(this.expiredBefore, cutoff - 1)
+		const removed = await this.removeWhere(startedBeforeCutoff, window => {
+			if (window.windowEnd < cutoff) return true
+			earliestKept = Math.min(earliestKept, window.windowStart)
+			return false
+		})
 		this.expiredBefore = Math.max(this.expiredBefore, earliestKept)
-
-		return toDelete.length
+		return removed.length
 	}
 }
 
 /**
- * SessionStore over an {@link OrderedByteStore}.
- *
- * Keys are ordered by [key, windowStart, windowEnd] for efficient key-based queries.
+ * SessionStore over an {@link OrderedByteStore}. Keys are ordered by user key (see
+ * {@link sessionKeys}), which makes the sessions of one key cheap to find.
  */
-export class OrderedSessionStore<K, V> implements SessionStore<K, V> {
-	private readonly db: OrderedByteStore
+export class OrderedSessionStore<K, V> extends OrderedStore<WindowedKey<K>, V> implements SessionStore<K, V> {
 	private readonly keyCodec: Codec<K>
-	private readonly sessionCodec: Codec<WindowedKey<K>>
-	private readonly valueCodec: Codec<V>
+	private readonly keys: ReturnType<typeof sessionKeys<K>>
 	private readonly retentionMs: number
 
-	constructor(
-		readonly name: string,
-		db: OrderedByteStore,
-		options: SessionStoreOptions<K, V>
-	) {
-		this.db = db
+	constructor(name: string, db: OrderedByteStore, options: SessionStoreOptions<K, V>) {
+		const keys = sessionKeys(options.keyCodec)
+		super(name, db, keys.codec, options.valueCodec)
+		this.keys = keys
 		this.keyCodec = options.keyCodec
-		this.sessionCodec = sessionKeyCodec(options.keyCodec)
-		this.valueCodec = options.valueCodec
 		this.retentionMs = options.retentionMs
 	}
 
-	get(key: WindowedKey<K>): Promise<V | undefined> {
-		const keyBytes = this.sessionCodec.encode(key)
-		return readValue(this.db.get(keyBytes), this.valueCodec)
-	}
-
-	async put(key: WindowedKey<K>, value: V): Promise<void> {
-		const keyBytes = this.sessionCodec.encode(key)
-		const valueBytes = this.valueCodec.encode(value)
-		await this.db.put(keyBytes, valueBytes)
-	}
-
-	async delete(key: WindowedKey<K>): Promise<void> {
-		const keyBytes = this.sessionCodec.encode(key)
-		await this.db.remove(keyBytes)
-	}
-
-	async *all(): AsyncIterable<[WindowedKey<K>, V]> {
-		await Promise.resolve()
-		for (const { key, value } of this.db.range({})) {
-			yield [this.sessionCodec.decode(key), this.valueCodec.decode(value)]
-		}
-	}
-
-	async *range(from: WindowedKey<K>, to: WindowedKey<K>): AsyncIterable<[WindowedKey<K>, V]> {
-		await Promise.resolve()
-		const fromBytes = this.sessionCodec.encode(from)
-		const toBytes = this.sessionCodec.encode(to)
-
-		for (const { key, value } of this.db.range({ start: fromBytes, end: inclusiveEnd(toBytes) })) {
-			yield [this.sessionCodec.decode(key), this.valueCodec.decode(value)]
-		}
-	}
-
+	/** The sessions of `key` that overlap `[earliestStart, latestEnd]`. */
 	async *findSessions(key: K, earliestStart: number, latestEnd: number): AsyncIterable<[WindowedKey<K>, V]> {
-		await Promise.resolve()
 		const keyBytes = this.keyCodec.encode(key)
-		const { from, to } = this.sessionPrefixRange(keyBytes)
-
-		for (const { key: storedKey, value } of this.db.range({ start: from, end: to })) {
-			// Variable-length keys with shared prefixes can sort inside [from, to) — e.g. stored "ka"
-			// inside a "k" range. Filter to exact key match (length + prefix) before yielding.
-			if (!this.matchesKeyPrefix(storedKey, keyBytes)) continue
-			const sessionKey = this.sessionCodec.decode(storedKey)
-			if (sessionKey.windowStart <= latestEnd && sessionKey.windowEnd >= earliestStart) {
-				yield [sessionKey, this.valueCodec.decode(value)]
-			}
+		for await (const entry of this.scan(this.keys.of(keyBytes), stored => this.keys.isOf(stored, keyBytes))) {
+			const [session] = entry
+			if (session.windowStart <= latestEnd && session.windowEnd >= earliestStart) yield entry
 		}
 	}
 
+	/** Remove every session of `key`. */
 	async remove(key: K): Promise<void> {
 		const keyBytes = this.keyCodec.encode(key)
-		const { from, to } = this.sessionPrefixRange(keyBytes)
-		const toDelete: Buffer[] = []
-
-		for (const { key: storedKey } of this.db.range({ start: from, end: to })) {
-			// See findSessions: prefix-scan can include longer keys that share the prefix.
-			if (!this.matchesKeyPrefix(storedKey, keyBytes)) continue
-			toDelete.push(storedKey)
-		}
-
-		await Promise.all(toDelete.map(k => this.db.remove(k)))
+		await this.removeWhere(this.keys.of(keyBytes), (_, stored) => this.keys.isOf(stored, keyBytes))
 	}
 
-	private sessionPrefixRange(keyBytes: Buffer): { from: Buffer; to: Buffer } {
-		// Sessions are stored as [keyBytes][biasedStart:8][biasedEnd:8]. Range covers all
-		// time pairs for this key prefix: lex-min biased time = 0x00, lex-max = 0xff.
-		const from = Buffer.alloc(keyBytes.length + 16) // zero-filled = LEX_MIN_TIME
-		keyBytes.copy(from, 0)
-		const to = Buffer.alloc(keyBytes.length + 16)
-		keyBytes.copy(to, 0)
-		to.fill(LEX_MAX_TIME, keyBytes.length)
-		return { from, to }
-	}
-
-	private matchesKeyPrefix(storedKey: Buffer, keyBytes: Buffer): boolean {
-		return storedKey.length === keyBytes.length + 16 && storedKey.subarray(0, keyBytes.length).equals(keyBytes)
-	}
-
-	approximateNumEntries(): Promise<number> {
-		return Promise.resolve(this.db.approximateCount())
-	}
-
-	async expireOldSessions(currentTime: number): Promise<WindowedKey<K>[]> {
-		// Sessions are key-prefix-ordered, not time-ordered, so we can't scan a time prefix —
-		// have to walk the whole store and filter. Cleanup is a cold path (per N records, not per record).
+	/**
+	 * Remove the sessions that ended before the retention period; returns their keys. Sessions are
+	 * ordered by key, not by time, so this walks the whole store (it runs once per cleanup interval
+	 * of stream time, not per record).
+	 */
+	expireOldSessions(currentTime: number): Promise<WindowedKey<K>[]> {
 		const cutoff = currentTime - this.retentionMs
-		const toDelete: Array<{ raw: Buffer; decoded: WindowedKey<K> }> = []
-		for (const { key } of this.db.range({})) {
-			const sessionKey = this.sessionCodec.decode(key)
-			if (sessionKey.windowEnd < cutoff) {
-				toDelete.push({ raw: key, decoded: sessionKey })
-			}
-		}
-		await Promise.all(toDelete.map(({ raw }) => this.db.remove(raw)))
-		return toDelete.map(e => e.decoded)
-	}
-
-	init(): Promise<void> {
-		// Already initialized
-		return Promise.resolve()
-	}
-
-	async flush(): Promise<void> {
-		await this.db.flush()
-	}
-
-	close(): Promise<void> {
-		// Handled by provider
-		return Promise.resolve()
+		return this.removeWhere({}, session => session.windowEnd < cutoff)
 	}
 }
 
 /** Changelog checkpoints (topic, partition -> offset) in an {@link OrderedByteStore}. */
 export class OrderedChangelogCheckpointStore implements ChangelogCheckpointStore {
-	/** `getDb` is called per operation, so the provider may reopen the database in between. */
-	constructor(private readonly getDb: () => OrderedByteStore) {}
+	constructor(private readonly db: OrderedByteStore) {}
 
-	private get db(): OrderedByteStore {
-		return this.getDb()
+	async get(topic: string, partition: number): Promise<bigint | undefined> {
+		return (await this.db.get(checkpointKey(topic, partition)))?.readBigInt64BE(0)
 	}
 
-	get(topic: string, partition: number): Promise<bigint | undefined> {
-		const key = this.encodeKey(topic, partition)
-		return Promise.resolve(this.db.get(key)).then(value => value?.readBigInt64BE(0))
-	}
-
-	async set(topic: string, partition: number, offset: bigint): Promise<void> {
-		const key = this.encodeKey(topic, partition)
+	set(topic: string, partition: number, offset: bigint): Promise<void> {
 		const value = Buffer.alloc(8)
 		value.writeBigInt64BE(offset, 0)
-		await this.db.put(key, value)
+		return this.db.put(checkpointKey(topic, partition), value)
 	}
 
-	// Made durable after the put-loop, not per write: an engine may resolve put() at visibility, and
-	// a checkpoint must not survive a crash that loses the store data it stands for.
-	async flush(): Promise<void> {
-		await this.db.flush()
-	}
-
-	private encodeKey(topic: string, partition: number): Buffer {
-		return Buffer.from(`${topic}\u0000${partition}`, 'utf8')
+	/**
+	 * Flow calls this after writing a round of checkpoints, not per write: a checkpoint must not
+	 * survive a crash that loses the store data it stands for.
+	 */
+	flush(): Promise<void> {
+		return this.db.flush()
 	}
 }
+
+const checkpointKey = (topic: string, partition: number): Buffer => Buffer.from(`${topic}\u0000${partition}`, 'utf8')

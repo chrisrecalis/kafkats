@@ -46,10 +46,9 @@ export {
 	OrderedWindowStore,
 	OrderedSessionStore,
 	OrderedChangelogCheckpointStore,
-	writeSignedTime,
-	readSignedTime,
 	type OrderedByteStore,
 } from '@/state/ordered.js'
+export { writeSignedTime, readSignedTime } from '@/state/ordered-keys.js'
 export type {
 	StateStoreProvider,
 	ChangelogCheckpointStore,

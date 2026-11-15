@@ -15,23 +15,24 @@ import {
 	type WindowStoreOptions,
 } from '@kafkats/flow'
 
-export { readSignedTime, writeSignedTime } from '@kafkats/flow'
-
-/** An LMDB database as the ordered byte store flow's state stores are built on. */
-function lmdbBytes(db: Database<Buffer, Buffer>): OrderedByteStore {
+/**
+ * An LMDB database as the ordered byte store flow's state stores are built on. `database` is
+ * asked on every operation, so the provider can reopen it.
+ */
+function lmdbBytes(database: () => Database<Buffer, Buffer>): OrderedByteStore {
 	return {
-		get: key => db.get(key),
+		get: key => database().get(key),
 		put: async (key, value) => {
-			await db.put(key, value)
+			await database().put(key, value)
 		},
 		remove: async key => {
-			await db.remove(key)
+			await database().remove(key)
 		},
-		range: bounds => db.getRange(bounds),
-		approximateCount: () => db.getKeysCount(),
+		range: bounds => database().getRange(bounds),
+		approximateCount: () => database().getKeysCount(),
 		// lmdb-js resolves put() at visibility; `flushed` resolves once those writes are synced.
 		flush: async () => {
-			await db.flushed
+			await database().flushed
 		},
 	}
 }
@@ -44,21 +45,33 @@ function lmdbBytes(db: Database<Buffer, Buffer>): OrderedByteStore {
  */
 export class LMDBKeyValueStore<K, V> extends OrderedKeyValueStore<K, V> {
 	constructor(name: string, db: Database<Buffer, Buffer>, options: KeyValueStoreOptions<K, V>) {
-		super(name, lmdbBytes(db), options)
+		super(
+			name,
+			lmdbBytes(() => db),
+			options
+		)
 	}
 }
 
 /** LMDB implementation of WindowStore. Keys are ordered by [windowStart, windowEnd, key]. */
 export class LMDBWindowStore<K, V> extends OrderedWindowStore<K, V> {
 	constructor(name: string, db: Database<Buffer, Buffer>, options: WindowStoreOptions<K, V>) {
-		super(name, lmdbBytes(db), options)
+		super(
+			name,
+			lmdbBytes(() => db),
+			options
+		)
 	}
 }
 
 /** LMDB implementation of SessionStore. Keys are ordered by [key, windowStart, windowEnd]. */
 export class LMDBSessionStore<K, V> extends OrderedSessionStore<K, V> {
 	constructor(name: string, db: Database<Buffer, Buffer>, options: SessionStoreOptions<K, V>) {
-		super(name, lmdbBytes(db), options)
+		super(
+			name,
+			lmdbBytes(() => db),
+			options
+		)
 	}
 }
 
@@ -84,12 +97,12 @@ export class LMDBStateStoreProvider implements StateStoreProvider {
 	readonly name = 'lmdb'
 	private rootDb: RootDatabase<Buffer, Buffer> | null = null
 	private readonly stores = new Map<string, Database<Buffer, Buffer>>()
-	private checkpointDb: OrderedByteStore | null = null
+	private checkpointDb: Database<Buffer, Buffer> | null = null
 	private readonly checkpointStore: ChangelogCheckpointStore
 
 	constructor(private readonly options: LMDBProviderOptions) {
 		this.root()
-		this.checkpointStore = new OrderedChangelogCheckpointStore(() => this.checkpoints())
+		this.checkpointStore = new OrderedChangelogCheckpointStore(lmdbBytes(() => this.checkpoints()))
 	}
 
 	/** The environment, (re)opened on demand so a provider can be used again after close(). */
@@ -106,15 +119,11 @@ export class LMDBStateStoreProvider implements StateStoreProvider {
 		return this.rootDb
 	}
 
-	private checkpoints(): OrderedByteStore {
-		if (!this.checkpointDb) {
-			this.checkpointDb = lmdbBytes(
-				this.root().openDB('__kafkats_flow_changelog_checkpoints__', {
-					keyEncoding: 'binary',
-					encoding: 'binary',
-				})
-			)
-		}
+	private checkpoints(): Database<Buffer, Buffer> {
+		this.checkpointDb ??= this.root().openDB('__kafkats_flow_changelog_checkpoints__', {
+			keyEncoding: 'binary',
+			encoding: 'binary',
+		})
 		return this.checkpointDb
 	}
 

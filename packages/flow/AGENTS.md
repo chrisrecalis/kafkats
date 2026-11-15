@@ -28,6 +28,7 @@ src/
 │   ├── memory.ts       # In-memory state store implementation
 │   ├── partitioned.ts  # Per-partition slices of a store (<applicationId>.<storeName>.p<partition>)
 │   ├── ordered.ts      # Stores over any byte-ordered engine (OrderedByteStore); used by the LMDB and RocksDB providers
+│   ├── ordered-keys.ts # Key layouts of window and session stores in such an engine, and the ranges their queries scan
 │   ├── buffered.ts     # Transactional write buffer (exactly_once)
 │   └── changelog.ts    # Changelog-backed store wrappers
 ├── streams/       # KStream / KTable / grouped stream implementations (the DSL)
