@@ -84,12 +84,12 @@ export class LMDBStateStoreProvider implements StateStoreProvider {
 	readonly name = 'lmdb'
 	private rootDb: RootDatabase<Buffer, Buffer> | null = null
 	private readonly stores = new Map<string, Database<Buffer, Buffer>>()
-	private checkpointDb: Database<Buffer, Buffer> | null = null
+	private checkpointDb: OrderedByteStore | null = null
 	private readonly checkpointStore: ChangelogCheckpointStore
 
 	constructor(private readonly options: LMDBProviderOptions) {
 		this.root()
-		this.checkpointStore = new OrderedChangelogCheckpointStore(() => lmdbBytes(this.checkpoints()))
+		this.checkpointStore = new OrderedChangelogCheckpointStore(() => this.checkpoints())
 	}
 
 	/** The environment, (re)opened on demand so a provider can be used again after close(). */
@@ -106,12 +106,14 @@ export class LMDBStateStoreProvider implements StateStoreProvider {
 		return this.rootDb
 	}
 
-	private checkpoints(): Database<Buffer, Buffer> {
+	private checkpoints(): OrderedByteStore {
 		if (!this.checkpointDb) {
-			this.checkpointDb = this.root().openDB('__kafkats_flow_changelog_checkpoints__', {
-				keyEncoding: 'binary',
-				encoding: 'binary',
-			})
+			this.checkpointDb = lmdbBytes(
+				this.root().openDB('__kafkats_flow_changelog_checkpoints__', {
+					keyEncoding: 'binary',
+					encoding: 'binary',
+				})
+			)
 		}
 		return this.checkpointDb
 	}

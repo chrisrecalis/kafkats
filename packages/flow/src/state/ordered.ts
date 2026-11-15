@@ -223,6 +223,12 @@ export class OrderedWindowStore<K, V> implements WindowStore<K, V> {
 	private readonly windowedCodec: Codec<WindowedKey<K>>
 	private readonly valueCodec: Codec<V>
 	private readonly retentionMs: number
+	/**
+	 * No window starting before this is in the store: where an expiry pass starts scanning. A
+	 * log-structured engine would otherwise walk the deletion markers of all earlier passes again.
+	 * In memory only: the first pass after a start scans from the beginning.
+	 */
+	private expiredBefore = Number.MIN_SAFE_INTEGER
 
 	constructor(
 		readonly name: string,
@@ -243,6 +249,7 @@ export class OrderedWindowStore<K, V> implements WindowStore<K, V> {
 
 	async put(key: WindowedKey<K>, value: V): Promise<void> {
 		const keyBytes = this.windowedCodec.encode(key)
+		if (key.windowStart < this.expiredBefore) this.expiredBefore = key.windowStart
 		const valueBytes = this.valueCodec.encode(value)
 		await this.db.put(keyBytes, valueBytes)
 	}
@@ -332,16 +339,21 @@ export class OrderedWindowStore<K, V> implements WindowStore<K, V> {
 	async expireOldWindows(currentTime: number): Promise<number> {
 		const cutoff = currentTime - this.retentionMs
 		const toDelete: Buffer[] = []
+		// The earliest windowStart this pass leaves in the store, where the next pass begins.
+		let earliestKept = cutoff
 
 		// Scan windowStart < cutoff, then drop only those whose windowEnd < cutoff (still-overlapping windows stay).
-		for (const { key } of this.db.range({ end: timeBound(cutoff) })) {
+		for (const { key } of this.db.range({ start: timeBound(this.expiredBefore), end: timeBound(cutoff) })) {
 			const windowedKey = this.windowedCodec.decode(key)
 			if (windowedKey.windowEnd < cutoff) {
 				toDelete.push(key)
+			} else {
+				earliestKept = Math.min(earliestKept, windowedKey.windowStart)
 			}
 		}
 
 		await Promise.all(toDelete.map(key => this.db.remove(key)))
+		this.expiredBefore = Math.max(this.expiredBefore, earliestKept)
 
 		return toDelete.length
 	}

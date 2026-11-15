@@ -19,7 +19,7 @@
 		"test:unit": {
 			"dependsOn": ["^build"],
 			"outputs": [],
-			"inputs": ["src/**", "tests/**", "vitest*.config.ts"],
+			"inputs": ["src/**", "tests/unit/**", "vitest*.config.ts"],
 			"env": ["KAFKA_TS_LOG_LEVEL"]
 		},
 		"test": {

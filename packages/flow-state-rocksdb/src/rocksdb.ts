@@ -25,7 +25,11 @@ export interface RocksDBProviderOptions {
 	 * Options passed to RocksDB when the database is opened (memtable size, compression, ...).
 	 * Key and value encoding are fixed by the provider.
 	 */
-	rocksdb?: Omit<RocksDatabaseOptions, 'name' | 'keyEncoding' | 'encoding' | 'readOnly' | 'secondaryPath' | 'store'>
+	rocksdb?: Omit<
+		RocksDatabaseOptions,
+		// The write-ahead log is what makes flushed state and checkpoints durable.
+		'name' | 'keyEncoding' | 'encoding' | 'readOnly' | 'secondaryPath' | 'store' | 'disableWAL'
+	>
 }
 
 /**
@@ -58,7 +62,8 @@ const keyspace = (id: number): Buffer => {
 export class RocksDBStateStoreProvider implements StateStoreProvider {
 	readonly name = 'rocksdb'
 	private db: RocksDatabase | null = null
-	private syncing: Promise<void> | null = null
+	private syncRunning: Promise<void> | null = null
+	private syncQueued: Promise<void> | null = null
 	private readonly checkpointStore: ChangelogCheckpointStore
 
 	constructor(private readonly options: RocksDBProviderOptions) {
@@ -75,6 +80,7 @@ export class RocksDBStateStoreProvider implements StateStoreProvider {
 				...this.options.rocksdb,
 				keyEncoding: 'binary',
 				encoding: 'binary',
+				disableWAL: false,
 			})
 		}
 		return this.db
@@ -82,21 +88,23 @@ export class RocksDBStateStoreProvider implements StateStoreProvider {
 
 	/**
 	 * The keyspace of a store, assigned when the store is first created. The assignment lives in
-	 * the database, not in this object: several providers of one process may share a directory, and
-	 * everything here is synchronous, so two of them can never hand out the same id.
+	 * the database and is made in a transaction, so providers that share a directory (several in
+	 * one process, or in worker threads) never hand out the same id: of two concurrent assignments
+	 * one fails to commit and is retried.
 	 */
 	private storeKeyspace(name: string): Buffer {
 		const db = this.database()
 		const meta = keyspace(META_KEYSPACE)
 		const nameKey = Buffer.concat([meta, STORE_ID_PREFIX, Buffer.from(name, 'utf8')])
-		const assigned = db.getSync(nameKey) as Buffer | undefined
-		if (assigned) return assigned
-
 		const counterKey = Buffer.concat([meta, NEXT_STORE_ID])
-		const next = (db.getSync(counterKey) as Buffer | undefined) ?? keyspace(META_KEYSPACE + 1)
-		db.putSync(counterKey, keyspace(next.readUInt32BE() + 1))
-		db.putSync(nameKey, next)
-		return next
+		return db.transactionSync(txn => {
+			const assigned = txn.getSync(nameKey) as Buffer | undefined
+			if (assigned) return assigned
+			const next = (txn.getSync(counterKey) as Buffer | undefined) ?? keyspace(META_KEYSPACE + 1)
+			txn.putSync(counterKey, keyspace(next.readUInt32BE() + 1))
+			txn.putSync(nameKey, next)
+			return next
+		}) as Buffer
 	}
 
 	/** The keys starting with `prefix`, as the ordered byte store flow's state stores are built on. */
@@ -134,18 +142,29 @@ export class RocksDBStateStoreProvider implements StateStoreProvider {
 	 * Make every write so far durable. All stores and the checkpoints share one write-ahead log, so
 	 * one sync covers them all, and a crash never keeps a checkpoint without the store data written
 	 * before it.
+	 *
+	 * A commit flushes every store partition and the checkpoints. At most one sync runs at a time;
+	 * everyone who asks while it runs shares the single sync that follows it.
 	 */
 	private sync(): Promise<void> {
-		// RocksDB serializes syncs of one log: callers that arrive during a sync share the next one.
-		const db = this.database()
-		const previous = this.syncing
-		const next: Promise<void> = (previous ? previous.catch(() => {}) : Promise.resolve())
-			.then(() => (this.db === db ? db.syncWal() : undefined))
-			.finally(() => {
-				if (this.syncing === next) this.syncing = null
+		// Nothing to make durable (and nothing to reopen) once the database is closed.
+		if (!this.db) return Promise.resolve()
+		if (!this.syncRunning) return (this.syncRunning = this.runSync())
+		this.syncQueued ??= this.syncRunning
+			.catch(() => {})
+			.then(() => {
+				this.syncQueued = null
+				return (this.syncRunning = this.runSync())
 			})
-		this.syncing = next
-		return next
+		return this.syncQueued
+	}
+
+	private runSync(): Promise<void> {
+		const done = (): void => {
+			if (this.syncRunning === running) this.syncRunning = null
+		}
+		const running: Promise<void> = (this.db?.syncWal() ?? Promise.resolve()).finally(done)
+		return running
 	}
 
 	createKeyValueStore<K, V>(name: string, options: KeyValueStoreOptions<K, V>): KeyValueStore<K, V> {

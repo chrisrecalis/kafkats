@@ -1,0 +1,7 @@
+{
+	"extends": "../flow-state-lmdb/tsconfig.base.json",
+	"compilerOptions": {
+		"noEmit": true
+	},
+	"include": ["src"]
+}

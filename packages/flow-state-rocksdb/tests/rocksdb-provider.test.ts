@@ -1,8 +1,10 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { spawnSync } from 'node:child_process'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { codec } from '@kafkats/flow'
+import { RocksDatabase } from '@harperfast/rocksdb-js'
 import { rocksdb } from '@/rocksdb.js'
 
 const str = codec.string()
@@ -86,5 +88,57 @@ describe('RocksDB provider', () => {
 		await store.delete('k')
 		expect(await store.approximateNumEntries()).toBe(0)
 		await provider.close()
+	})
+
+	it('one disk sync serves every flush that arrives while another is running', async () => {
+		const provider = rocksdb({ stateDir })
+		const stores = Array.from({ length: 40 }, (_, i) => provider.createKeyValueStore(`s${i}`, options))
+		await Promise.all(stores.map(store => store.put('k', 'v')))
+		const syncWal = vi.spyOn(RocksDatabase.prototype, 'syncWal')
+		try {
+			// What a commit does: flush every store partition and the checkpoints.
+			await Promise.all([
+				...stores.map(store => store.flush()),
+				provider.getChangelogCheckpointStore!()!.flush?.(),
+			])
+			expect(syncWal.mock.calls.length).toBeLessThanOrEqual(2)
+		} finally {
+			syncWal.mockRestore()
+		}
+		await provider.close()
+	})
+
+	it('a flush after close neither fails nor reopens the database', async () => {
+		const provider = rocksdb({ stateDir })
+		const store = provider.createKeyValueStore('a', options)
+		await store.put('k', 'v')
+		await provider.close()
+		await store.flush()
+
+		// Only one process can have the directory open: another one can, so this one let go of it.
+		const child = spawnSync(
+			process.execPath,
+			[
+				'--input-type=module',
+				'-e',
+				`import { RocksDatabase } from '@harperfast/rocksdb-js'; RocksDatabase.open(${JSON.stringify(stateDir)}).close()`,
+			],
+			{ cwd: process.cwd(), encoding: 'utf8' }
+		)
+		expect(child.stderr).toBe('')
+		expect(child.status).toBe(0)
+	})
+
+	it('close() lets writes that are in flight finish', async () => {
+		const provider = rocksdb({ stateDir })
+		const store = provider.createKeyValueStore('a', options)
+		const writes = Array.from({ length: 500 }, (_, i) => store.put(`k${i}`, 'v'))
+		await provider.close()
+		const results = await Promise.allSettled(writes)
+		expect(results.filter(r => r.status === 'rejected')).toEqual([])
+
+		const reopened = rocksdb({ stateDir })
+		expect(await reopened.createKeyValueStore('a', options).get('k499')).toBe('v')
+		await reopened.close()
 	})
 })

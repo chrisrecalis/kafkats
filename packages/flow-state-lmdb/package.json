@@ -56,10 +56,11 @@
 		"lmdb": "^3.2.6"
 	},
 	"peerDependencies": {
-		"@kafkats/flow": "workspace:>=0.13.0"
+		"@kafkats/flow": "workspace:^"
 	},
 	"devDependencies": {
 		"@kafkats/flow": "workspace:^",
+		"@kafkats/flow-state-testkit": "workspace:*",
 		"@types/node": "^24.10.1",
 		"tsdown": "^0.22.14",
 		"typescript": "^7.0.2",

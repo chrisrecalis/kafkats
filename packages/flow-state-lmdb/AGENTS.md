@@ -58,3 +58,7 @@ lmdb({
 
 This package requires the `lmdb` npm package which includes native bindings.
 Prebuilt binaries are available for most platforms.
+
+## Tests
+
+`tests/provider-contract.test.ts` runs the shared suites of `@kafkats/flow-state-testkit`, the same ones the RocksDB provider runs. Broker-backed suites are skipped without `KAFKA_BROKERS`.

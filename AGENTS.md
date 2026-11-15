@@ -14,6 +14,7 @@ This is a pnpm monorepo containing a pure-protocol TypeScript Kafka client and s
 | `@kafkats/flow` | Kafka Streams-like DSL for stream processing |
 | `@kafkats/flow-state-lmdb` | Persistent LMDB state stores for flow |
 | `@kafkats/flow-state-rocksdb` | Persistent RocksDB state stores for flow |
+| `@kafkats/flow-state-testkit` | Private: test suites shared by the state store providers |
 | `@kafkats/codec-zod` | Zod-based serialization codecs |
 | `@kafkats/benchmark` | Performance benchmarks vs kafkajs |
 | `docs` | VitePress documentation site |

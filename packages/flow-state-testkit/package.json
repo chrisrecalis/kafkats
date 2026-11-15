@@ -1,0 +1,26 @@
+{
+	"name": "@kafkats/flow-state-testkit",
+	"private": true,
+	"version": "0.0.0",
+	"description": "Shared test suites for @kafkats/flow state store providers",
+	"type": "module",
+	"exports": {
+		".": "./src/index.ts"
+	},
+	"scripts": {
+		"typecheck": "tsc -p tsconfig.json --noEmit"
+	},
+	"dependencies": {
+		"@kafkats/client": "workspace:^",
+		"@kafkats/flow": "workspace:^",
+		"tsx": "^4.20.6"
+	},
+	"peerDependencies": {
+		"vitest": "^4.0.12"
+	},
+	"devDependencies": {
+		"@types/node": "^24.10.1",
+		"typescript": "^7.0.2",
+		"vitest": "^4.0.12"
+	}
+}
