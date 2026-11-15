@@ -27,6 +27,7 @@ import type {
 	KeyOf,
 	Message,
 	ConsumeContext,
+	BatchContext,
 	MessageHandler,
 	BatchHandler,
 	RunEachOptions,
@@ -386,6 +387,28 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	}
 
 	/**
+	 * Commit the current fetch position of the given assigned partitions.
+	 *
+	 * Called from a `partitionsAssigned` listener (or before anything was consumed), this makes
+	 * the start position durable: a partition without a committed offset would otherwise be
+	 * resolved by `autoOffsetReset` again after a restart, and with `'latest'` skip whatever was
+	 * read but not committed. Partitions that are not assigned are ignored.
+	 *
+	 * This commits the position the consumer will fetch from next, not what handlers have
+	 * processed: records already fetched for a partition are skipped by the commit. Only call it
+	 * for partitions that have not started fetching (paused in the `partitionsAssigned` listener).
+	 */
+	async commitPosition(partitions: Array<{ topic: string; partition: number }>): Promise<void> {
+		if (!this.offsetManager) return
+		const positions: Array<{ topic: string; partition: number; offset: bigint }> = []
+		for (const { topic, partition } of partitions) {
+			const offset = this.position(topic, partition)
+			if (offset !== undefined) positions.push({ topic, partition, offset })
+		}
+		await this.offsetManager.commitPositions(positions)
+	}
+
+	/**
 	 * Seek to a specific offset for a partition.
 	 *
 	 * Repositions the fetch position for the specified partition to the given offset.
@@ -650,15 +673,22 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 
 				const messages = records.map(r => decodeRecord(topic, partition, r, decoders))
 				const lastRecord = records[records.length - 1]!
-				const consumeCtx = this.createConsumeContext(ctx.signal, topic, partition, lastRecord.offset)
-
-				await handler(messages as Message<MsgOf<S>, KeyOf<S>>[], consumeCtx)
-
-				if (ctx.commitOffsets) {
-					for (const record of records) {
-						ctx.offsetManager.markConsumed(topic, partition, record.offset)
+				let resolved = 0
+				const resolveOffset = (offset: bigint): void => {
+					if (!ctx.commitOffsets) return
+					while (resolved < records.length && records[resolved]!.offset <= offset) {
+						ctx.offsetManager.markConsumed(topic, partition, records[resolved]!.offset)
+						resolved++
 					}
 				}
+				const batchCtx: BatchContext = {
+					...this.createConsumeContext(ctx.signal, topic, partition, lastRecord.offset),
+					resolveOffset,
+				}
+
+				await handler(messages as Message<MsgOf<S>, KeyOf<S>>[], batchCtx)
+
+				resolveOffset(lastRecord.offset)
 			},
 			opts.autoCommitIntervalMs ?? DEFAULT_RUN_BATCH_OPTIONS.autoCommitIntervalMs,
 			opts.autoCommit !== false

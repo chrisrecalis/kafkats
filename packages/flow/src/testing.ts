@@ -25,7 +25,13 @@
 
 import { EventEmitter } from 'node:events'
 import { vi } from 'vitest'
-import { KafkaClient, type ConsumeContext, type Message, type RunEachOptions } from '@kafkats/client'
+import {
+	KafkaClient,
+	type BatchContext,
+	type ConsumeContext,
+	type Message,
+	type RunBatchOptions,
+} from '@kafkats/client'
 import type { Codec } from '@/codec.js'
 import { flow, type FlowApp, type FlowConfig, type Consumed } from '@/flow.js'
 
@@ -62,24 +68,24 @@ type TopicPartitionOffset = { topic: string; partition: number; offset: bigint }
 // ============================================================================
 
 /**
- * Stands in for a client consumer. `runEach()` stores the topology's handler and blocks until
+ * Stands in for a client consumer. `runBatch()` stores the topology's handler and blocks until
  * `stop()`; `sendMessage()` delivers a record to that handler.
  */
 export class MockConsumer extends EventEmitter {
 	/** Topics this consumer subscribed to. */
 	subscription: string[] = []
 
-	private handler: ((message: Message<Buffer>, ctx: ConsumeContext) => Promise<void>) | null = null
+	private handler: ((batch: Message<Buffer>[], ctx: BatchContext) => Promise<void>) | null = null
 	private stopResolve: (() => void) | null = null
 	private nextOffset = 0n
 	/** Records produced to a subscribed topic while another record is being processed. */
 	private readonly pending: Array<{ topic: string; value: Buffer | null; options: SendOptions }> = []
 	private delivering = false
 
-	async runEach(
+	async runBatch(
 		subscription: string[],
-		handler: (message: Message<Buffer>, ctx: ConsumeContext) => Promise<void>,
-		_options?: RunEachOptions
+		handler: (batch: Message<Buffer>[], ctx: BatchContext) => Promise<void>,
+		_options?: RunBatchOptions
 	): Promise<void> {
 		this.subscription = subscription
 		this.handler = handler
@@ -132,16 +138,25 @@ export class MockConsumer extends EventEmitter {
 		const offset = this.nextOffset++
 		const partition = options.partition ?? 0
 		await this.handler!(
+			[
+				{
+					topic,
+					partition,
+					offset,
+					timestamp: options.timestamp ?? BigInt(Date.now()),
+					key: options.key ?? null,
+					value: value as Buffer,
+					headers: options.headers ?? {},
+				},
+			],
 			{
+				signal: new AbortController().signal,
 				topic,
 				partition,
 				offset,
-				timestamp: options.timestamp ?? BigInt(Date.now()),
-				key: options.key ?? null,
-				value: value as Buffer,
-				headers: options.headers ?? {},
-			},
-			{ signal: new AbortController().signal, topic, partition, offset, groupId: 'test-group' }
+				groupId: 'test-group',
+				resolveOffset: () => {},
+			}
 		)
 	}
 }

@@ -19,6 +19,8 @@ const app = flow({
 
 No record is lost. After a crash or a redelivery, records since the last committed offset are processed again, so their **outputs and state updates may be applied again**. A `count()` can over-count, and a record can be written to the output topic twice.
 
+Records are processed in the batches the consumer delivers. Output and changelog records are sent without waiting for each acknowledgement; before offsets are committed, every one of them must have been acknowledged. This happens at the end of a batch and, within a long batch, every `commitIntervalMs`. If a send fails, the worker fails without committing and the batch is processed again. An output record can therefore be written before the changelog record of the same input is acknowledged, and is written again after such a failure. This is the same contract as Kafka Streams: flush everything, then commit.
+
 ### Exactly-Once
 
 Input offsets, output records and changelog records are committed atomically in a single Kafka transaction. Transactions are committed every `commitIntervalMs` (default `100`), when the app closes, and before a rebalance.
@@ -142,7 +144,7 @@ A [global table](/flow/tables#global-tables) is fully loaded before any record i
 ## Known Limitations
 
 - **Name your state stores and repartition topics before changing a topology.** Unnamed stores get names from the order in which operators are defined (`count-store-0`, `repartition-1`, ...). Adding or removing a stateful operator earlier in the topology shifts those numbers, and an operator then picks up another operator's changelog. Set `storeName` (and `name` for `groupBy()`) on every stateful operator of an application you plan to evolve.
-- **`offsetReset: 'latest'` can skip records after a crash before the first commit.** Within a running process the start position is kept until the first commit. A process that crashes before committing anything starts from the then-current end of the topic again. Use `'earliest'` when no record may be skipped.
+- **`offsetReset: 'latest'` and failures before the first commit.** A partition without a committed offset is pinned to the position it was first read from, and that position is committed right away, so a restart or crash before the first processed batch resumes from it instead of from the then-current end of the topic. If that initial commit fails (a warning is logged), a process that crashes before committing anything starts from the end of the topic again. Use `'earliest'` when no record may be skipped.
 - **Stream time after a restart is rebuilt from the restored store.** For windowed aggregations it resumes from the newest window start, which can be up to one window size behind the stream time before the restart. A late record inside that margin can be accepted where an uninterrupted run would have dropped it.
 
 - **Stream-stream `leftJoin()` and `outerJoin()` emit the unmatched result eagerly.** When a later record matches, a second record is emitted for the same input.

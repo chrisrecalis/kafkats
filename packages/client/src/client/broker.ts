@@ -236,6 +236,9 @@ export class Broker {
 
 	private readonly connection: Connection
 	private readonly fetchConnection: Connection
+	/** Fetch connections of individual consumers, by owner (see fetch()). */
+	private readonly ownedFetchConnections = new Map<object, Connection>()
+	private readonly fetchConnectionOptions: ConnectionOptions
 	private readonly controlOnly: boolean
 	private apiVersions: Map<ApiKey, VersionRange> = new Map()
 	private versionsFetchedAt: number = 0
@@ -274,10 +277,11 @@ export class Broker {
 
 		this.connection = new Connection(connectionOptions)
 
-		this.fetchConnection = new Connection({
+		this.fetchConnectionOptions = {
 			...connectionOptions,
 			logger: config.logger?.child({ connection: 'fetch' }) ?? config.logger,
-		})
+		}
+		this.fetchConnection = new Connection(this.fetchConnectionOptions)
 	}
 
 	get isConnected(): boolean {
@@ -317,9 +321,12 @@ export class Broker {
 		this.logger.debug('disconnecting', { host: this.host, port: this.port })
 		this.autoReconnect = false
 		const wait = waitForPendingMs > 0
+		const owned = [...this.ownedFetchConnections.values()]
+		this.ownedFetchConnections.clear()
 		await Promise.all([
 			this.connection.close(wait, waitForPendingMs),
 			this.fetchConnection.close(wait, waitForPendingMs),
+			...owned.map(connection => connection.close(false)),
 		])
 		this.apiVersions.clear()
 		this.versionsFetchedAt = 0
@@ -387,6 +394,27 @@ export class Broker {
 	private async fetchSend(...args: Parameters<Connection['send']>): Promise<Buffer> {
 		await this.ensureConnected(this.fetchConnection)
 		return this.fetchConnection.send(...args)
+	}
+
+	/** The fetch connection of `owner`, created on first use and dialed by ensureConnected(). */
+	private ownedFetchConnection(owner: object): Connection {
+		let connection = this.ownedFetchConnections.get(owner)
+		if (!connection) {
+			connection = new Connection(this.fetchConnectionOptions)
+			this.ownedFetchConnections.set(owner, connection)
+		}
+		return connection
+	}
+
+	/**
+	 * Close the fetch connection opened for `owner` (see fetch()). Its in-flight request, if any, is
+	 * rejected with ConnectionClosedError.
+	 */
+	async closeFetchConnection(owner: object): Promise<void> {
+		const connection = this.ownedFetchConnections.get(owner)
+		if (!connection) return
+		this.ownedFetchConnections.delete(owner)
+		await connection.close(false)
 	}
 
 	/**
@@ -522,12 +550,28 @@ export class Broker {
 		return response
 	}
 
-	async fetch(request: FetchRequest): Promise<FetchResponse> {
+	/**
+	 * Send a Fetch request.
+	 *
+	 * A broker answers the requests of one connection one at a time, and holds a Fetch for up to
+	 * `maxWaitMs` when there is no data. Fetches that share a connection therefore wait for each
+	 * other's long polls. A consumer passes an `owner` (one per consumer) to fetch on a connection of
+	 * its own, and releases it with closeFetchConnection(owner).
+	 */
+	async fetch(request: FetchRequest, owner?: object): Promise<FetchResponse> {
 		const version = this.getApiVersion(ApiKey.Fetch)
 		const startTime = Date.now()
 		this.logger.debug('sending request', { api: 'Fetch', version, maxWaitMs: request.maxWaitMs })
 
-		const responseBuffer = await this.fetchSend(
+		const connection = owner ? this.ownedFetchConnection(owner) : this.fetchConnection
+		await this.ensureConnected(connection)
+		if (owner && this.ownedFetchConnections.get(owner) !== connection) {
+			// Released (closeFetchConnection, disconnect) while it was being dialed: nothing tracks
+			// this connection any more, so it must not stay open.
+			await connection.close(false)
+			throw new ConnectionClosedError('fetch connection was released')
+		}
+		const responseBuffer = await connection.send(
 			ApiKey.Fetch,
 			version,
 			encoder => {

@@ -35,27 +35,21 @@ export class RecordOutput implements RecordSender {
 		// record's timestamp, not the wall-clock time at which it happened to be produced.
 		const timestamp = record.timestamp > 0n ? new Date(Number(record.timestamp)) : undefined
 
-		if (this.eosEnabled) {
-			if (!worker.activeTransaction) {
-				throw new Error('exactly_once requires a transactional context')
-			}
-			await worker.activeTransaction.send(topic, {
+		if (this.eosEnabled && !worker.activeTransaction) {
+			throw new Error('exactly_once requires a transactional context')
+		}
+
+		// The acknowledgement is awaited at the worker's next commit point (see PendingSends).
+		const target = worker.activeTransaction ?? producer
+		worker.sends.track(
+			target.send(topic, {
 				key: key ?? undefined,
 				value,
 				headers: record.headers,
 				partition,
 				timestamp,
 			})
-			return
-		}
-
-		await producer.send(topic, {
-			key: key ?? undefined,
-			value,
-			headers: record.headers,
-			partition,
-			timestamp,
-		})
+		)
 	}
 
 	private async resolvePartition<K, V>(

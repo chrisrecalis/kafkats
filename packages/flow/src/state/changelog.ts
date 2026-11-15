@@ -19,7 +19,7 @@ abstract class ChangelogBackedStore<K, V, S extends KeyValueStore<K, V>> impleme
 		return this.inner.name
 	}
 
-	async get(key: K): Promise<V | undefined> {
+	get(key: K): Promise<V | undefined> {
 		return this.inner.get(key)
 	}
 
@@ -43,19 +43,19 @@ abstract class ChangelogBackedStore<K, V, S extends KeyValueStore<K, V>> impleme
 		return this.inner.range(from, to)
 	}
 
-	async approximateNumEntries(): Promise<number> {
+	approximateNumEntries(): Promise<number> {
 		return this.inner.approximateNumEntries()
 	}
 
-	async init(): Promise<void> {
+	init(): Promise<void> {
 		return this.inner.init()
 	}
 
-	async flush(): Promise<void> {
+	flush(): Promise<void> {
 		return this.inner.flush()
 	}
 
-	async close(): Promise<void> {
+	close(): Promise<void> {
 		return this.inner.close()
 	}
 }

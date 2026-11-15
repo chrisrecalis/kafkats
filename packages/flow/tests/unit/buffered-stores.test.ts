@@ -193,3 +193,65 @@ describe('Buffered stores - overlay iterators behave as if writes were applied (
 		expect(await raw.approximateNumEntries()).toBe(0)
 	})
 })
+
+describe('Buffered stores - applying a committed buffer', () => {
+	/** A key-value store whose writes complete only when the test settles them. */
+	function slowStore() {
+		const raw = new InMemoryKeyValueStore<string, string>('kv', { keyCodec: str, valueCodec: str })
+		const pending: Array<(error?: Error) => void> = []
+		const write = (apply: () => Promise<void>) =>
+			new Promise<void>((resolve, reject) => {
+				pending.push(error => (error ? reject(error) : apply().then(resolve, reject)))
+			})
+		const store = Object.assign(Object.create(raw) as InMemoryKeyValueStore<string, string>, {
+			put: (key: string, value: string) => write(() => raw.put(key, value)),
+			delete: (key: string) => write(() => raw.delete(key)),
+		})
+		return { raw, store, pending }
+	}
+
+	it('issues every buffered write before waiting for any of them', async () => {
+		const { raw, store, pending } = slowStore()
+		await raw.put('gone', 'old')
+		const buf = new BufferedKeyValueStore<string, string>(store, str, str)
+		const c = ctx()
+		await inTx(c, async () => {
+			await buf.put('a', '1')
+			await buf.put('b', '2')
+			await buf.put('a', '3')
+			await buf.delete('gone')
+		})
+		const committed = commit(c)
+		await new Promise(resolve => setImmediate(resolve))
+		// One write per buffered key, all in flight at once (a batching provider commits them together).
+		expect(pending).toHaveLength(3)
+		for (const settle of pending) settle()
+		await committed
+		expect(await raw.get('a')).toBe('3')
+		expect(await raw.get('b')).toBe('2')
+		expect(await raw.get('gone')).toBeUndefined()
+	})
+
+	it('fails the commit when a write fails, once no write is in flight any more', async () => {
+		const { raw, store, pending } = slowStore()
+		const buf = new BufferedKeyValueStore<string, string>(store, str, str)
+		const c = ctx()
+		await inTx(c, async () => {
+			await buf.put('a', '1')
+			await buf.put('b', '2')
+		})
+		let outcome: unknown = 'pending'
+		const committed = commit(c).then(
+			() => (outcome = 'committed'),
+			(error: Error) => (outcome = error.message)
+		)
+		await new Promise(resolve => setImmediate(resolve))
+		pending[0]!(new Error('disk full'))
+		await new Promise(resolve => setImmediate(resolve))
+		expect(outcome).toBe('pending')
+		pending[1]!()
+		await committed
+		expect(outcome).toBe('disk full')
+		expect(await raw.get('b')).toBe('2')
+	})
+})

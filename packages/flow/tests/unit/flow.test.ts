@@ -1,12 +1,12 @@
 import { EventEmitter } from 'node:events'
 import { describe, expect, it, vi, afterEach } from 'vitest'
-import { KafkaClient, type ConsumeContext, type Message, type ProducerConfig } from '@kafkats/client'
+import { KafkaClient, type BatchContext, type ConsumeContext, type Message, type ProducerConfig } from '@kafkats/client'
 import { codec, flow, TimeWindows, SessionWindows } from '../../src/index.js'
 import { PartitionedWindowStore, PartitionedSessionStore } from '../../src/state/partitioned.js'
 
 type TestMessage = Omit<Message<Buffer>, 'value'> & { value: Buffer | null }
-type TestContext = ConsumeContext
-type TestHandler = (message: TestMessage, ctx: TestContext) => Promise<void>
+type TestContext = BatchContext
+type TestHandler = (batch: TestMessage[], ctx: TestContext) => Promise<void>
 
 class TestConsumer extends EventEmitter {
 	private handler: TestHandler | null = null
@@ -20,7 +20,7 @@ class TestConsumer extends EventEmitter {
 		key?: Buffer | null
 		headers?: Record<string, Buffer>
 	}> = []
-	async runEach(subscription: string[], handler: TestHandler): Promise<void> {
+	async runBatch(subscription: string[], handler: TestHandler): Promise<void> {
 		this.subscription = subscription
 		this.handler = handler
 		this.emit('running')
@@ -73,8 +73,9 @@ class TestConsumer extends EventEmitter {
 			partition: 0,
 			offset: 0n,
 			groupId: 'test-app',
+			resolveOffset: () => {},
 		}
-		await this.handler(message, ctx)
+		await this.handler([message], ctx)
 		const next = this.loopback.shift()
 		if (next) {
 			await this.emitMessage(next.topic, next.value, next.key, timestamp, next.headers)

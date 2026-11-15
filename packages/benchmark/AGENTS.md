@@ -9,6 +9,7 @@ pnpm bench:producer   # Run producer benchmarks
 pnpm bench:consumer   # Run consumer benchmarks
 pnpm bench:share      # Run ShareConsumer benchmarks (kafkats only)
 pnpm bench:all        # Run all benchmarks
+pnpm bench:flow       # @kafkats/flow topology throughput (needs KAFKA_BROKERS)
 ```
 
 ## Structure
@@ -17,6 +18,7 @@ pnpm bench:all        # Run all benchmarks
 src/
 ├── producer-benchmark.ts  # Producer throughput comparisons
 ├── consumer-benchmark.ts  # Consumer throughput comparisons
+├── flow-benchmark.ts      # @kafkats/flow topologies (stateless, count, windowed, session, joins, repartition, restore)
 ├── kafka-cluster.ts       # Testcontainers Kafka setup
 ├── utils.ts               # Benchmark utilities
 └── index.ts               # Entry point for all benchmarks
@@ -63,6 +65,19 @@ Results compare:
 
 - **@kafkats/client**: This library
 - **kafkajs**: Popular existing Kafka client
+
+### Flow
+
+`bench:flow` measures end-to-end records per second of seven `@kafkats/flow` topologies (stateless, count, windowed-count, session-count, table-join, global-table-join, repartition-count) and the restoration speed of the count state (`restore`), under both processing guarantees, against the broker in `KAFKA_BROKERS`:
+
+```bash
+KAFKA_BROKERS=localhost:9092 pnpm -C packages/benchmark bench:flow
+KAFKA_BROKERS=localhost:9092 pnpm -C packages/benchmark bench:flow -- --records 200000 --scenario count,table-join --guarantee exactly_once --runs 3
+KAFKA_BROKERS=localhost:9092 pnpm -C packages/benchmark bench:flow -- --scenario stateless,restore --threads 2
+KAFKA_BROKERS=localhost:9092 pnpm -C packages/benchmark bench:flow -- --scenario count --provider lmdb # LMDB state stores (default: in-memory)
+```
+
+Each run preloads the input topic, starts one application (`--threads` stream threads, default 1), and times how long it takes for every record to pass through the whole topology. `restore` builds the count state, closes the app and times `start()` of a fresh instance with empty in-memory state (changelog records per second).
 
 ## Adding Benchmarks
 

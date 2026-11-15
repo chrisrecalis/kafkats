@@ -182,4 +182,98 @@ describe('start() retry', () => {
 			}
 		}, 40_000)
 	}
+
+	it('at-least-once: close() stops inside a batch and the next start resumes after what was acknowledged', async () => {
+		const input = uniqueTopicName('r2-midbatch-in')
+		const applicationId = uniqueTopicName('r2-midbatch-app')
+		await createTopics(admin, [{ name: input }])
+		const N = 300
+		await producer.send(
+			input,
+			Array.from({ length: N }, (_, i) => ({ key: 'k', value: Buffer.from(String(i)) }))
+		)
+		const run = (seen: number[]): FlowApp => {
+			const app = flow({
+				applicationId,
+				client: newClient('r2-midbatch-app'),
+				consumer: { autoOffsetReset: 'earliest', maxWaitMs: 50 },
+			})
+			app.stream(input, { key: stringCodec, value: stringCodec }).peek((_, value) => {
+				seen.push(Number(value))
+				// A slow processor: the whole batch takes several seconds.
+				for (const until = Date.now() + 10; Date.now() < until;) {
+					// busy
+				}
+			})
+			return app
+		}
+
+		const first: number[] = []
+		const a1 = run(first)
+		await a1.start()
+		for (const deadline = Date.now() + 20_000; first.length < 20 && Date.now() < deadline;) await sleep(20)
+		await a1.close()
+		expect(first.length).toBeGreaterThanOrEqual(20)
+		// It did not work through the rest of the batch first.
+		expect(first.length).toBeLessThan(N)
+
+		const second: number[] = []
+		const a2 = run(second)
+		try {
+			await a2.start()
+			for (const deadline = Date.now() + 30_000; !second.includes(N - 1) && Date.now() < deadline;)
+				await sleep(50)
+		} finally {
+			await a2.close()
+		}
+		// Nothing skipped, and what the first run acknowledged is not processed again.
+		expect(second[0]).toBeLessThanOrEqual(first.length)
+		expect(second[0]).toBeGreaterThan(0)
+		expect(new Set([...first, ...second]).size).toBe(N)
+	})
+
+	it('at-least-once: partitions processed concurrently count every record', async () => {
+		const P = 4
+		const input = uniqueTopicName('r2-conc-in')
+		const output = uniqueTopicName('r2-conc-out')
+		const applicationId = uniqueTopicName('r2-conc-app')
+		await createTopics(admin, [
+			{ name: input, partitions: P },
+			{ name: output, partitions: P },
+		])
+		const PER_KEY = 200
+		await producer.send(
+			input,
+			Array.from({ length: P * PER_KEY }, (_, i) => ({
+				key: `k${i % P}`,
+				value: Buffer.from('x'),
+				partition: i % P,
+			}))
+		)
+		const app = flow({
+			applicationId,
+			client: newClient('r2-conc-app'),
+			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 50 },
+			runEach: { partitionConcurrency: P },
+		})
+		app.stream(input, { key: stringCodec, value: stringCodec })
+			.groupByKey()
+			.count({ key: stringCodec, value: numberCodec })
+			.toStream()
+			.to(output, { key: stringCodec, value: numberCodec })
+		try {
+			await app.start()
+			const latest = new Map<string, number>()
+			for (const deadline = Date.now() + 30_000; Date.now() < deadline;) {
+				for (const m of await readAllCommitted(admin, output)) {
+					latest.set(m.key!.toString(), JSON.parse(m.value!.toString()) as number)
+				}
+				if (latest.size === P && [...latest.values()].every(count => count === PER_KEY)) break
+				await sleep(300)
+			}
+			expect([...latest.entries()].sort()).toEqual(Array.from({ length: P }, (_, i) => [`k${i}`, PER_KEY]))
+		} finally {
+			await app.close()
+		}
+	})
 })

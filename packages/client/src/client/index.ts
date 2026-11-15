@@ -39,6 +39,7 @@ export type {
 	TopicSubscription,
 	Message,
 	ConsumeContext,
+	BatchContext,
 	ConsumerGroupMetadata,
 	MessageHandler,
 	BatchHandler,

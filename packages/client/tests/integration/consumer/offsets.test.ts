@@ -233,4 +233,45 @@ describe.concurrent('Consumer (integration) - offsets', () => {
 		await producer.disconnect()
 		await Promise.all([client1.disconnect(), client2.disconnect()])
 	})
+
+	it('runBatch commits what the handler resolved when it then fails', async () => {
+		const client = createClient('it-batch-resolve')
+		await client.connect()
+
+		const topicName = uniqueName('it-batch-resolve')
+		const testTopic = topic<string>(topicName, { value: string() })
+		await client.createTopics([{ name: topicName, numPartitions: 1, replicationFactor: 1 }])
+
+		const producer = client.producer({ lingerMs: 0 })
+		await producer.send(
+			testTopic,
+			Array.from({ length: 10 }, (_, i) => ({ value: `m-${i}` }))
+		)
+		await producer.flush()
+
+		const groupId = uniqueName('it-group')
+
+		// Works through the batch, resolves the first 4 records, then fails.
+		const consumer1 = client.consumer({ groupId, autoOffsetReset: 'earliest' })
+		await expect(
+			consumer1.runBatch(testTopic, async (batch, ctx) => {
+				expect(batch.length).toBe(10)
+				ctx.resolveOffset(batch[3]!.offset)
+				throw new Error('handler failed')
+			})
+		).rejects.toThrow('handler failed')
+
+		// The next consumer of the group resumes after the resolved records.
+		const consumer2 = client.consumer({ groupId, autoOffsetReset: 'earliest' })
+		const received: string[] = []
+		await consumer2.runBatch(testTopic, async batch => {
+			received.push(...batch.map(m => m.value))
+			consumer2.stop()
+		})
+		expect(received[0]).toBe('m-4')
+		expect(received).toHaveLength(6)
+
+		await producer.disconnect()
+		await client.disconnect()
+	})
 })

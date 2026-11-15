@@ -1,7 +1,8 @@
-import type { ConsumeContext, KafkaClient, Logger, Message } from '@kafkats/client'
+import type { BatchContext, ConsumeContext, KafkaClient, Logger, Message } from '@kafkats/client'
 import type { AnyProcessor, SourceNode, WorkerContext } from '@/processors/index.js'
 import type { FlowConfig } from '@/types.js'
 import { PendingCheckpoints, type Checkpoints } from '@/runtime/checkpoints.js'
+import { PendingSends } from '@/runtime/pending-sends.js'
 import { recordContextStorage, type RecordContext } from '@/runtime/context.js'
 import {
 	RESTART_INITIAL_BACKOFF_MS,
@@ -48,6 +49,7 @@ export type WorkerDeps = {
 export class StreamWorker {
 	readonly context: WorkerContext
 	private readonly transactions: WorkerTransactions
+	private readonly commitIntervalMs: number
 	private readonly eosEnabled: boolean
 
 	constructor(
@@ -73,14 +75,16 @@ export class StreamWorker {
 			sourcesByTopic: new Map(),
 			assignedPartitions: new Map(),
 			pendingCheckpoints: new PendingCheckpoints(),
+			sends: new PendingSends(),
 			dirtyStores: new Set(),
 			streamClocks: new Map(),
 			failure: null,
 			processedSinceRestart: false,
 		}
+		this.commitIntervalMs = config.commitIntervalMs ?? DEFAULT_COMMIT_INTERVAL_MS
 		this.transactions = new WorkerTransactions(
 			this.context,
-			config.commitIntervalMs ?? DEFAULT_COMMIT_INTERVAL_MS,
+			this.commitIntervalMs,
 			deps.checkpoints,
 			(err, recoverable) => this.fail(err, recoverable)
 		)
@@ -143,13 +147,13 @@ export class StreamWorker {
 		for (;;) {
 			let runError: unknown = null
 			try {
-				await worker.consumer.runEach(
+				await worker.consumer.runBatch(
 					topics,
-					(message, ctx) => this.handleMessage(message, ctx),
+					(batch, ctx) => this.handleBatch(batch, ctx),
 					workerRunEachOptions(config, this.eosEnabled)
 				)
 			} catch (err) {
-				runError = err
+				if (!(err instanceof BatchInterrupted)) runError = err
 			}
 
 			const failure =
@@ -253,40 +257,86 @@ export class StreamWorker {
 		worker.failure = null
 	}
 
-	private async handleMessage(message: Message<Buffer>, ctx: ConsumeContext): Promise<void> {
+	/**
+	 * Process one consumed batch (records of one partition, in order).
+	 *
+	 * At-least-once: the batch's offsets are committed by the consumer once this returns, so it
+	 * returns only after everything the batch produced has been acknowledged.
+	 * Exactly-once: every record joins the worker's transaction batch, which commits offsets itself.
+	 */
+	private async handleBatch(batch: Message<Buffer>[], ctx: BatchContext): Promise<void> {
 		const worker = this.context
-		// Fail-stop: once a worker has failed, nothing more may be processed (and thereby
-		// acknowledged) until it has restarted from the last committed offsets.
-		if (worker.failure) throw worker.failure.error
+		this.throwIfFailed()
 
-		// close() first seals message delivery, then commits everything already queued.
-		// Records that were fetched but not started remain uncommitted for the next owner.
-		if (this.deps.status.closing && this.eosEnabled) return
-
-		const sources = worker.sourcesByTopic.get(message.topic)
-		if (!sources) return
-
-		const recordContext: RecordContext = { worker, topic: message.topic, partition: message.partition }
-		const handle = async () => {
-			for (const source of sources) {
-				await source.handleMessage(message, ctx)
-			}
-		}
-
-		if (!this.eosEnabled) {
-			try {
-				await recordContextStorage.run(recordContext, handle)
-				worker.processedSinceRestart = true
-			} catch (err) {
-				this.fail(err, isRecoverable(err))
-				throw err
+		if (this.eosEnabled) {
+			for (const message of batch) {
+				// close() first seals message delivery, then commits everything already queued.
+				// Records that were fetched but not started remain uncommitted for the next owner.
+				if (this.deps.status.closing) return
+				const process = this.processorFor(message, ctx)
+				if (!process) continue
+				await this.transactions.enqueue(() => this.transactions.process(message, ctx, process))
 			}
 			return
 		}
 
-		await this.transactions.enqueue(() =>
-			recordContextStorage.run(recordContext, () => this.transactions.process(message, ctx, handle))
-		)
+		// A batch can take long to work through (many records, a slow processor), so its progress is
+		// acknowledged every commit interval: a failure then repeats at most that much.
+		const acknowledge = async (offset: bigint): Promise<void> => {
+			await worker.sends.flush()
+			// Another partition's batch of this worker may have failed in the meantime.
+			this.throwIfFailed()
+			ctx.resolveOffset(offset)
+			worker.processedSinceRestart = true
+		}
+		try {
+			let acknowledgedAt = Date.now()
+			let processed: bigint | undefined
+			for (const message of batch) {
+				this.throwIfFailed()
+				await this.processorFor(message, ctx)?.()
+				processed = message.offset
+				if (Date.now() - acknowledgedAt >= this.commitIntervalMs) {
+					await acknowledge(processed)
+					// Processing may never wait for I/O (nothing produced, in-memory state). Let
+					// timers and sockets run, or a long batch would starve heartbeats and close().
+					await new Promise<void>(resolve => setImmediate(resolve))
+					// Stopping: everything so far is acknowledged, the rest of the batch is left
+					// to the next owner instead of holding up the shutdown.
+					if (ctx.signal.aborted || this.deps.status.closing) throw new BatchInterrupted()
+					acknowledgedAt = Date.now()
+				}
+			}
+			if (processed !== undefined) await acknowledge(processed)
+		} catch (err) {
+			if (err instanceof BatchInterrupted) throw err
+			void worker.sends.discard()
+			this.fail(err, isRecoverable(err))
+			throw err
+		}
+	}
+
+	/**
+	 * Fail-stop: once a worker has failed, nothing more may be processed (and thereby
+	 * acknowledged) until it has restarted from the last committed offsets.
+	 */
+	private throwIfFailed(): void {
+		const failure = this.context.failure
+		if (failure) throw failure.error
+	}
+
+	/** Runs a record through its source nodes, in the record's context. Undefined if nothing consumes it. */
+	private processorFor(message: Message<Buffer>, ctx: ConsumeContext): (() => Promise<void>) | undefined {
+		const worker = this.context
+		const sources = worker.sourcesByTopic.get(message.topic)
+		if (!sources) return undefined
+		const recordContext: RecordContext = { worker, topic: message.topic, partition: message.partition }
+		return () =>
+			recordContextStorage.run(recordContext, async () => {
+				for (const source of sources) {
+					await source.handleMessage(message, ctx)
+				}
+			})
 	}
 
 	private attachConsumerEvents(): void {
@@ -374,8 +424,12 @@ export class StreamWorker {
 			void restoration
 				.enqueue(partitions)
 				.then(() =>
-					startPositions.settle(partitions, positions, (topic, partition, offset) => {
-						if (heldSinceThisAssignment(topic, partition)) consumer.seek(topic, partition, offset)
+					startPositions.settle(partitions, positions, {
+						seek: (topic, partition, offset) => {
+							if (heldSinceThisAssignment(topic, partition)) consumer.seek(topic, partition, offset)
+						},
+						commitPosition: held =>
+							consumer.commitPosition(held.filter(tp => heldSinceThisAssignment(tp.topic, tp.partition))),
 					})
 				)
 				.then(() => {
@@ -428,5 +482,12 @@ export class StreamWorker {
 	private producerConfig() {
 		const { config, eosEnabled, processId } = this.deps
 		return workerProducerConfig(config, eosEnabled, processId, this.slot)
+	}
+}
+
+/** Thrown out of a batch handler that stopped early because the worker is stopping. */
+class BatchInterrupted extends Error {
+	constructor() {
+		super('batch interrupted: the worker is stopping')
 	}
 }

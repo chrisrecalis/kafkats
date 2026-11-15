@@ -271,6 +271,61 @@ describe('changelog restorer', () => {
 		expect(await store.get('a')).toBe(1)
 		expect(await store.get('ghost')).toBeUndefined()
 	}, 30_000)
+
+	it('applies the last change of every key when a key changes several times within one fetched batch', async () => {
+		const topic = uniqueTopicName('restore-batch-order')
+		await createTopics(client, [{ name: topic }])
+		const put = (key: string, value: number) => ({ key, value: numberCodec.encode(value) })
+		const del = (key: string) => ({ key, value: null })
+		// One send: the restore consumer receives all of it in one batch.
+		await producer.send(topic, [
+			put('a', 1),
+			put('b', 1),
+			del('a'),
+			put('b', 2),
+			put('a', 3),
+			put('c', 1),
+			del('c'),
+			put('d', 1),
+			put('b', 4),
+		])
+
+		const store = await newKvStore('batch-order')
+		await store.put('d', 99) // stale local state: wiped, then rebuilt from the changelog
+		const restorer = new ChangelogRestorer(topic, stringCodec, numberCodec, store)
+		const restored = await restorer.restore(client, RESTORE_FAST, [0], new MemoryCheckpointStore())
+
+		expect(restored).toBe(7) // every non-deleting record counts, also the overwritten ones
+		expect(await store.get('a')).toBe(3)
+		expect(await store.get('b')).toBe(4)
+		expect(await store.get('c')).toBeUndefined()
+		expect(await store.get('d')).toBe(1)
+	}, 30_000)
+
+	it('does not apply records written after the restore started', async () => {
+		const topic = uniqueTopicName('restore-past-end')
+		await createTopics(client, [{ name: topic }])
+		await producer.send(topic, [
+			{ key: 'a', value: numberCodec.encode(1) },
+			{ key: 'b', value: numberCodec.encode(1) },
+		])
+
+		const inner = await newKvStore('past-end')
+		const hooks = { armed: true, delayMs: 1_500 }
+		const restorer = new ChangelogRestorer(topic, stringCodec, numberCodec, delayPuts(inner, blockNextPut(hooks)))
+		const restoring = restorer.restore(client, RESTORE_FAST, [0], new MemoryCheckpointStore())
+		// While the first write is held, a concurrent writer appends past the captured end offset.
+		await waitUntil('first restore write held', () => !hooks.armed)
+		await producer.send(topic, [
+			{ key: 'a', value: numberCodec.encode(2) },
+			{ key: 'c', value: numberCodec.encode(2) },
+		])
+		await restoring
+
+		expect(await inner.get('a')).toBe(1)
+		expect(await inner.get('b')).toBe(1)
+		expect(await inner.get('c')).toBeUndefined()
+	}, 30_000)
 })
 
 describe('restart cycles with a persistent store and checkpoint store', () => {
@@ -455,11 +510,19 @@ describe('processing failures', () => {
 			await app.start()
 			for (let i = 0; i < 4; i++) await producer.send(input, { key: 'a', value: numberCodec.encode(1) })
 			await collector.waitFor<string, number>(out, m => m.value === 2, 10_000)
-			await sleep(3_000)
-			// the record whose changelog write fails (count 3) must never be emitted downstream
-			const seen = collector.getTopicMessages<string, number>(out).map(m => m.value)
-			expect(seen).not.toContain(3)
-			expect(seen).not.toContain(4)
+			// The failure is reported, and the worker stops instead of carrying on.
+			await waitUntil('app ERROR', () => app.state() === 'ERROR', 10_000)
+			expect(app.getError()?.message).toMatch(/changelog/)
+			// The record whose changelog write failed is not acknowledged: the group's committed
+			// offset stays at or before it (2 records were processed successfully). Its output may
+			// already have been produced; at-least-once allows that duplicate after a restart.
+			const coordinator = await client.cluster.getCoordinator('GROUP', appId)
+			const committed = await coordinator.offsetFetch({
+				groupId: appId,
+				topics: [{ name: input, partitions: [{ partitionIndex: 0 }] }],
+				requireStable: false,
+			})
+			expect(committed.topics[0]!.partitions[0]!.committedOffset).toBeLessThanOrEqual(2n)
 		} finally {
 			await app.close().catch(() => {})
 			await collector.stop()

@@ -169,7 +169,17 @@ export type MessageHandler<V = Buffer, K = Buffer> = (message: Message<V, K>, ct
 /**
  * Handler for batch message mode
  */
-export type BatchHandler<V = Buffer, K = Buffer> = (batch: Message<V, K>[], ctx: ConsumeContext) => Promise<void>
+export type BatchHandler<V = Buffer, K = Buffer> = (batch: Message<V, K>[], ctx: BatchContext) => Promise<void>
+
+/** Context of a batch handler. `offset` is the offset of the last record of the batch. */
+export interface BatchContext extends ConsumeContext {
+	/**
+	 * Mark the records of this batch up to and including `offset` as processed, so their offsets
+	 * can be committed before the handler returns. A handler that works through a large batch
+	 * calls this as it goes; otherwise nothing of the batch is committed until it has finished.
+	 */
+	resolveOffset(offset: bigint): void
+}
 
 // ==================== Run Options ====================
 

@@ -119,10 +119,14 @@ export class WorkerTransactions {
 		if (!open) return
 
 		const offsets = Array.from(this.pendingOffsets.values())
-		const changelogPositions = worker.pendingCheckpoints.list()
 		const dirtyStores = [...worker.dirtyStores]
+		let changelogPositions: ReturnType<typeof worker.pendingCheckpoints.list>
 
 		try {
+			// Everything the batch produced must be acknowledged before the transaction commits.
+			// The acknowledgements also report the changelog positions to checkpoint.
+			await worker.sends.flush()
+			changelogPositions = worker.pendingCheckpoints.list()
 			if (offsets.length > 0) {
 				if (!this.offsetCommitContext) {
 					throw new Error('exactly_once requires a consume context for transactional offset commits')
@@ -164,10 +168,15 @@ export class WorkerTransactions {
 		const open = this.open
 
 		for (const store of worker.dirtyStores) store.discardBuffer(worker.dirtyStores)
+		// Acknowledgements of what the transaction produced are not acted on any more.
+		const sendsSettled = worker.sends.discard()
 		this.clearState()
 		// Stream time advanced by the aborted records must not make their replay look late.
 		worker.streamClocks.clear()
 
+		// The transaction must not end while its produce requests are still in flight: a request
+		// answered after the abort marker would leave records outside any transaction.
+		await sendsSettled
 		await open?.abort(toError(error))
 	}
 

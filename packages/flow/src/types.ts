@@ -21,6 +21,9 @@ export interface FlowConfig {
 	 * Lower values provide lower latency but more transaction overhead.
 	 * Higher values provide better throughput but higher latency.
 	 * Default: 100ms
+	 *
+	 * Under at_least_once it is how often the progress within a consumed batch becomes
+	 * committable (the offsets themselves are committed by the consumer's auto-commit).
 	 */
 	commitIntervalMs?: number
 	stateDir?: string

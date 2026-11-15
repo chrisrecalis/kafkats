@@ -9,6 +9,8 @@ import {
 
 type Buffered<SK> = { key: SK; keyBytes: Buffer; value: Buffer | null }
 
+const BUFFERED = Promise.resolve()
+
 /**
  * Write buffer that makes local state transactional under exactly-once processing.
  *
@@ -57,36 +59,34 @@ abstract class BufferedStoreBase<SK, V, S extends KeyValueStore<SK, V>> implemen
 		return this.inner.name
 	}
 
-	async get(key: SK): Promise<V | undefined> {
+	// get/put/delete are not async: they run for every record, and only pass the call through or
+	// touch the in-memory buffer. They are only called through the (async) partitioned facade.
+	get(key: SK): Promise<V | undefined> {
 		const buffer = this.buffer
 		if (buffer && buffer.size > 0) {
 			const hit = buffer.get(this.storeKeyCodec.encode(key).toString('hex'))
 			if (hit) {
-				return hit.value === null ? undefined : this.valueCodec.decode(hit.value)
+				return Promise.resolve(hit.value === null ? undefined : this.valueCodec.decode(hit.value))
 			}
 		}
 		return this.inner.get(key)
 	}
 
-	async put(key: SK, value: V): Promise<void> {
+	put(key: SK, value: V): Promise<void> {
 		const scope = currentTransactionScope()
-		if (!scope) {
-			await this.inner.put(key, value)
-			return
-		}
+		if (!scope) return this.inner.put(key, value)
 		const keyBytes = this.storeKeyCodec.encode(key)
 		// Buffer the serialized value so later in-place mutation of the object can't leak in.
 		this.bufferFor(scope).set(keyBytes.toString('hex'), { key, keyBytes, value: this.valueCodec.encode(value) })
+		return BUFFERED
 	}
 
-	async delete(key: SK): Promise<void> {
+	delete(key: SK): Promise<void> {
 		const scope = currentTransactionScope()
-		if (!scope) {
-			await this.inner.delete(key)
-			return
-		}
+		if (!scope) return this.inner.delete(key)
 		const keyBytes = this.storeKeyCodec.encode(key)
 		this.bufferFor(scope).set(keyBytes.toString('hex'), { key, keyBytes, value: null })
+		return BUFFERED
 	}
 
 	all(): AsyncIterable<[SK, V]> {
@@ -124,12 +124,21 @@ abstract class BufferedStoreBase<SK, V, S extends KeyValueStore<SK, V>> implemen
 		const buffer = this.buffers.get(scope)
 		if (!buffer) return
 		this.buffers.delete(scope)
-		for (const entry of buffer.values()) {
-			if (entry.value === null) {
-				await this.inner.delete(entry.key)
-			} else {
-				await this.inner.put(entry.key, this.valueCodec.decode(entry.value))
-			}
+		// Issue every write before waiting for any: a provider that batches the writes of an event
+		// turn (LMDB commits them in one transaction) then applies the buffer in one go instead of
+		// one commit per entry. The entries have distinct keys, so the order they land in is irrelevant.
+		// Wait for all of them even when one fails, so that none lands after this has returned.
+		const results = await Promise.allSettled(
+			Array.from(buffer.values(), async entry => {
+				if (entry.value === null) {
+					await this.inner.delete(entry.key)
+				} else {
+					await this.inner.put(entry.key, this.valueCodec.decode(entry.value))
+				}
+			})
+		)
+		for (const result of results) {
+			if (result.status === 'rejected') throw result.reason
 		}
 	}
 
