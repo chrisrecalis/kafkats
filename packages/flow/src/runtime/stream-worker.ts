@@ -294,12 +294,6 @@ export class StreamWorker {
 			let processed: bigint | undefined
 			for (const message of batch) {
 				this.throwIfFailed()
-				if (ctx.signal.aborted || this.deps.status.closing) {
-					// Stopping: acknowledge what was processed and leave the rest of the batch to
-					// the next owner.
-					if (processed !== undefined) await acknowledge(processed)
-					throw new BatchInterrupted()
-				}
 				await this.processorFor(message, ctx)?.()
 				processed = message.offset
 				if (Date.now() - acknowledgedAt >= this.commitIntervalMs) {
@@ -307,6 +301,9 @@ export class StreamWorker {
 					// Processing may never wait for I/O (nothing produced, in-memory state). Let
 					// timers and sockets run, or a long batch would starve heartbeats and close().
 					await new Promise<void>(resolve => setImmediate(resolve))
+					// Stopping: everything so far is acknowledged, the rest of the batch is left
+					// to the next owner instead of holding up the shutdown.
+					if (ctx.signal.aborted || this.deps.status.closing) throw new BatchInterrupted()
 					acknowledgedAt = Date.now()
 				}
 			}
