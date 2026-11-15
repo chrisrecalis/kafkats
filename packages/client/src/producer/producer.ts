@@ -50,7 +50,7 @@ import type {
 	ProducerTraceFn,
 	ProducerMetrics,
 } from './types.js'
-import { diagnostics, trace, type ProduceRequestDiagnostics } from '@/diagnostics.js'
+import { SendOperation, diagnostics, register, trace, type ProduceRequestDiagnostics } from '@/diagnostics.js'
 
 const EMPTY_BUFFER = Buffer.alloc(0)
 
@@ -241,7 +241,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 
 		this.config = this.resolveConfig(config)
 		this.accumulator = new RecordAccumulator(this.config, this.logger)
-		diagnostics.instances.publish({ type: 'producer', clientId: cluster.clientId, instance: this })
+		register({ type: 'producer', clientId: cluster.clientId }, this)
 		this.accumulator.on('batchReady', batch => {
 			const key = `${batch.topic}:${batch.partition}`
 			const queue = this.pendingBatches.get(key)
@@ -1071,25 +1071,14 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		send: (messages: ProducerMessage<V, K> | ProducerMessage<V, K>[]) => Promise<SendResult | SendResult[]>
 	): Promise<SendResult | SendResult[]> {
 		const list = Array.isArray(messages) ? messages : [messages]
-		let added: Array<Record<string, string | Buffer> | undefined> | undefined
 		return trace(
 			diagnostics.send,
-			() => ({
-				clientId: this.cluster.clientId,
-				topic: topicDef.topic,
-				transactional,
-				messages: list,
-				addHeaders: (headers, index) => {
-					added ??= Array.from({ length: list.length })
-					const indexes = index === undefined ? list.keys() : [index]
-					for (const i of indexes) added[i] = { ...added[i], ...headers }
-				},
-			}),
-			() => {
+			() => new SendOperation(this.cluster.clientId, topicDef.topic, transactional, list),
+			sending => {
+				const added = sending?.added
 				if (!added) return send(messages)
-				const extra = added
 				const withHeaders = list.map((message, i) =>
-					extra[i] ? { ...message, headers: { ...message.headers, ...extra[i] } } : message
+					added[i] ? { ...message, headers: { ...message.headers, ...added[i] } } : message
 				)
 				return send(Array.isArray(messages) ? withHeaders : withHeaders[0]!)
 			}

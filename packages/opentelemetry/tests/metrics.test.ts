@@ -1,9 +1,9 @@
 import {
 	ErrorCode,
+	KafkaClient,
 	diagnostics,
 	type CommitDiagnostics,
 	type ConsumerMetrics,
-	type InstanceDiagnostics,
 	type ProcessDiagnostics,
 	type ProduceRequestDiagnostics,
 	type ProducerMetrics,
@@ -17,6 +17,7 @@ import { ATTR, KAFKATS_METRIC, METRIC, instrumentKafka } from '../src/index.js'
 import { metricRecorder } from './setup.js'
 
 const settle = () => new Promise(resolve => setTimeout(resolve, 5))
+const unique = (prefix: string) => `${prefix}-${Math.random().toString(36).slice(2, 8)}`
 
 describe('metrics', () => {
 	let recorder: ReturnType<typeof metricRecorder>
@@ -143,70 +144,55 @@ describe('metrics', () => {
 		}
 		const consumerMetrics: ConsumerMetrics = {
 			partitions: [
-				{
-					topic: 'orders',
-					partition: 0,
-					position: 90n,
-					endOffset: 100n,
-					bufferedBytes: 512,
-					paused: false,
-				},
+				{ topic: 'orders', partition: 0, position: 90n, endOffset: 100n, bufferedBytes: 512, paused: false },
 				{ topic: 'orders', partition: 1, position: 7n, bufferedBytes: 0, paused: true },
 			],
 		}
-		const producer = { metrics: () => producerMetrics }
-		const consumer = { metrics: () => consumerMetrics }
-		diagnostics.instances.publish({
-			type: 'producer',
-			clientId: 'app',
-			instance: producer,
-		} satisfies InstanceDiagnostics)
-		diagnostics.instances.publish({
-			type: 'consumer',
-			clientId: 'app',
-			groupId: 'billing',
-			instance: consumer,
-		} satisfies InstanceDiagnostics)
+		// Created before or after instrumentKafka(): both are found.
+		const clientId = unique('app')
+		const client = new KafkaClient({ brokers: ['localhost:1'], clientId, logLevel: 'silent' })
+		const producer = client.producer()
+		producer.metrics = () => producerMetrics
+		const consumer = client.consumer({ groupId: 'billing' })
+		consumer.metrics = () => consumerMetrics
 
-		const metrics = await recorder.collect()
-		expect(metrics.get(KAFKATS_METRIC.queuedRecords)![0]!.value).toBe(30)
-		expect(metrics.get(KAFKATS_METRIC.queuedBytes)![0]!.value).toBe(4000)
-		expect(metrics.get(KAFKATS_METRIC.inFlightRequests)![0]!.value).toBe(1)
-		expect(metrics.get(KAFKATS_METRIC.unacknowledgedSends)![0]!.value).toBe(5)
-		expect(metrics.get(KAFKATS_METRIC.assignedPartitions)![0]!.value).toBe(2)
-		expect(metrics.get(KAFKATS_METRIC.pausedPartitions)![0]!.value).toBe(1)
-		// Only where the end of the partition is known.
-		const lag = metrics.get(KAFKATS_METRIC.positionLag)!
+		const mine = async (name: string) =>
+			(await recorder.collect()).get(name)!.filter(point => point.attributes[ATTR.clientId] === clientId)
+		expect((await mine(KAFKATS_METRIC.queuedRecords))[0]!.value).toBe(30)
+		expect((await mine(KAFKATS_METRIC.queuedBytes))[0]!.value).toBe(4000)
+		expect((await mine(KAFKATS_METRIC.inFlightRequests))[0]!.value).toBe(1)
+		expect((await mine(KAFKATS_METRIC.unacknowledgedSends))[0]!.value).toBe(5)
+		expect((await mine(KAFKATS_METRIC.assignedPartitions))[0]!.value).toBe(2)
+		expect((await mine(KAFKATS_METRIC.pausedPartitions))[0]!.value).toBe(1)
+		// Only where it is known how far the partition can be read.
+		const lag = await mine(KAFKATS_METRIC.positionLag)
 		expect(lag.map(point => [point.attributes[ATTR.partition], point.value])).toEqual([['0', 10]])
-		expect(metrics.get(KAFKATS_METRIC.bufferedBytes)!.map(point => point.value)).toEqual([512, 0])
+		expect((await mine(KAFKATS_METRIC.bufferedBytes)).map(point => point.value)).toEqual([512, 0])
 
 		// The numbers are read again each time.
 		producerMetrics.queuedRecords = 0
-		expect((await recorder.collect()).get(KAFKATS_METRIC.queuedRecords)![0]!.value).toBe(0)
-		expect(producer && consumer).toBeTruthy()
+		expect((await mine(KAFKATS_METRIC.queuedRecords))[0]!.value).toBe(0)
 	})
 
 	it('adds up instances that share their attributes instead of reporting only one of them', async () => {
-		const backlog = (queuedRecords: number): { metrics(): ProducerMetrics } => ({
-			metrics: () => ({
-				queuedBatches: 1,
-				queuedRecords,
-				queuedBytes: 0,
-				inFlightRequests: 1,
-				unacknowledgedSends: 0,
-			}),
+		const backlog = (queuedRecords: number): ProducerMetrics => ({
+			queuedBatches: 1,
+			queuedRecords,
+			queuedBytes: 0,
+			inFlightRequests: 1,
+			unacknowledgedSends: 0,
 		})
 		// Two producers of one client, as with transaction lanes.
-		const producers = [backlog(40), backlog(2)]
-		for (const instance of producers) diagnostics.instances.publish({ type: 'producer', clientId: 'app', instance })
-		const other = backlog(7)
-		diagnostics.instances.publish({ type: 'producer', clientId: 'other-app', instance: other })
+		const clientId = unique('app')
+		const client = new KafkaClient({ brokers: ['localhost:1'], clientId, logLevel: 'silent' })
+		const producers = [client.producer(), client.producer()]
+		producers[0]!.metrics = () => backlog(40)
+		producers[1]!.metrics = () => backlog(2)
 
-		const queued = (await recorder.collect()).get(KAFKATS_METRIC.queuedRecords)!
-		expect(queued.map(point => [point.attributes[ATTR.clientId], point.value]).sort()).toEqual([
-			['app', 42],
-			['other-app', 7],
-		])
-		expect(producers.length + (other ? 1 : 0)).toBe(3)
+		const queued = (await recorder.collect())
+			.get(KAFKATS_METRIC.queuedRecords)!
+			.filter(point => point.attributes[ATTR.clientId] === clientId)
+		expect(queued.map(point => point.value)).toEqual([42])
+		expect(producers).toHaveLength(2)
 	})
 })

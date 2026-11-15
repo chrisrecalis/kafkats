@@ -39,7 +39,7 @@ import type {
 	PartitionBatch,
 	ConsumerMetrics,
 } from './types.js'
-import { diagnostics, trace, type Scope } from '@/diagnostics.js'
+import { ProcessOperation, diagnostics, register, trace } from '@/diagnostics.js'
 import {
 	DEFAULT_CONSUMER_CONFIG,
 	DEFAULT_RUN_EACH_OPTIONS,
@@ -88,12 +88,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		super()
 		this.cluster = cluster
 		this.logger = cluster.getLogger()?.child({ component: 'consumer', groupId: config.groupId }) ?? noopLogger
-		diagnostics.instances.publish({
-			type: 'consumer',
-			clientId: cluster.clientId,
-			groupId: config.groupId,
-			instance: this,
-		})
+		register({ type: 'consumer', clientId: cluster.clientId, groupId: config.groupId }, this)
 		this.config = {
 			groupId: config.groupId,
 			groupInstanceId: config.groupInstanceId || undefined,
@@ -399,20 +394,10 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		batch: boolean,
 		handle: () => Promise<void>
 	): Promise<void> {
-		const scopes: Scope[] = []
 		return trace(
 			diagnostics.process,
-			() => ({
-				clientId: this.cluster.clientId,
-				groupId: this.config.groupId,
-				topic,
-				partition,
-				messages,
-				batch,
-				runHandlerIn: scope => void scopes.push(scope),
-			}),
-			handle,
-			scopes
+			() => new ProcessOperation(this.cluster.clientId, this.config.groupId, topic, partition, messages, batch),
+			processing => (processing ? processing.run(handle) : handle())
 		)
 	}
 

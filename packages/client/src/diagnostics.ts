@@ -1,4 +1,4 @@
-import { channel, tracingChannel, type TracingChannel } from 'node:diagnostics_channel'
+import { tracingChannel, type TracingChannel } from 'node:diagnostics_channel'
 
 import type { ConsumerMetrics, Message, TopicPartition, TopicPartitionOffset } from '@/consumer/types.js'
 import type { ProducerMessage, ProducerMetrics, SendResult } from '@/producer/types.js'
@@ -90,10 +90,34 @@ export interface RebalanceDiagnostics {
 	error?: unknown
 }
 
-/** A producer or consumer was created. Its `metrics()` can be read for as long as it is used. */
+/** A producer or consumer that is still in use, with what identifies it. */
 export type InstanceDiagnostics =
 	| { type: 'producer'; clientId: string; instance: { metrics(): ProducerMetrics } }
 	| { type: 'consumer'; clientId: string; groupId: string; instance: { metrics(): ConsumerMetrics } }
+
+type Identity = { type: 'producer'; clientId: string } | { type: 'consumer'; clientId: string; groupId: string }
+type Instance = InstanceDiagnostics['instance']
+
+/** The producers and consumers of this process, held weakly: one that is no longer used drops out. */
+const registered = new Map<WeakRef<Instance>, Identity>()
+const forget = new FinalizationRegistry<WeakRef<Instance>>(reference => {
+	registered.delete(reference)
+})
+
+/** Make a producer or consumer visible to `diagnostics.instances()`. */
+export function register(
+	identity: { type: 'producer'; clientId: string },
+	instance: { metrics(): ProducerMetrics }
+): void
+export function register(
+	identity: { type: 'consumer'; clientId: string; groupId: string },
+	instance: { metrics(): ConsumerMetrics }
+): void
+export function register(identity: Identity, instance: Instance): void {
+	const reference = new WeakRef(instance)
+	registered.set(reference, identity)
+	forget.register(instance, reference)
+}
 
 export const diagnostics = {
 	send: tracingChannel<unknown, SendDiagnostics>('kafkats:producer:send'),
@@ -101,32 +125,89 @@ export const diagnostics = {
 	process: tracingChannel<unknown, ProcessDiagnostics>('kafkats:consumer:process'),
 	commit: tracingChannel<unknown, CommitDiagnostics>('kafkats:consumer:commit'),
 	rebalance: tracingChannel<unknown, RebalanceDiagnostics>('kafkats:consumer:rebalance'),
-	/** Publishes an {@link InstanceDiagnostics} for every producer and consumer created. */
-	instances: channel('kafkats:instance'),
+	/**
+	 * The producers and consumers of this process that are still in use, whenever they were
+	 * created. Read their `metrics()` on whatever schedule a monitor collects.
+	 */
+	instances(): InstanceDiagnostics[] {
+		const live: InstanceDiagnostics[] = []
+		for (const [reference, identity] of registered) {
+			const instance = reference.deref()
+			if (instance) live.push({ ...identity, instance } as InstanceDiagnostics)
+		}
+		return live
+	},
 } as const
 
 /**
  * Run `operation` as one traced operation of `traced`. Without subscribers this is a plain call:
  * `describe` is not invoked and `operation` gets no context.
- *
- * `scopes` are what subscribers asked the operation to run inside (see {@link scoped}).
  */
-export function trace<C extends object, T>(
+export function trace<C extends object, D extends C, T>(
 	traced: TracingChannel<unknown, C>,
-	describe: () => C,
-	operation: (context?: C) => Promise<T>,
-	scopes?: Scope[]
+	describe: () => D,
+	operation: (context?: D) => Promise<T>
 ): Promise<T> {
 	if (!traced.hasSubscribers) return operation()
 	const context = describe()
-	// An async function, so that a synchronous throw of the operation is also an asynchronous
-	// failure: subscribers then always see `asyncEnd`, whichever way the operation ends.
-	return traced.tracePromise(async () => {
-		// Subscribers have seen `start` by now. The first one to ask is the outermost scope.
-		const run = (scopes ?? []).reduceRight<() => Promise<T>>(
-			(inner, scope) => () => scope(inner),
-			() => operation(context)
-		)
-		return run()
+	// A synchronous throw of the operation is turned into a rejection, so that subscribers always
+	// see `asyncEnd`, whichever way the operation ends. (Not an async function: that would put
+	// three more microtask turns between every operation and its caller.)
+	return traced.tracePromise(() => {
+		try {
+			return operation(context)
+		} catch (error) {
+			return Promise.reject(error)
+		}
 	}, context)
+}
+
+/**
+ * The context of a send. One object per traced send and nothing more: the per-message work a
+ * subscriber may ask for (headers) is only set up when it asks.
+ */
+export class SendOperation implements SendDiagnostics {
+	result?: SendResult | SendResult[]
+	error?: unknown
+	/** Headers subscribers asked to add, by message index. */
+	added?: Array<Record<string, string | Buffer> | undefined>
+
+	constructor(
+		readonly clientId: string,
+		readonly topic: string,
+		readonly transactional: boolean,
+		readonly messages: ReadonlyArray<Readonly<ProducerMessage<unknown, unknown>>>
+	) {}
+
+	addHeaders(headers: Record<string, string | Buffer>, index?: number): void {
+		this.added ??= Array.from({ length: this.messages.length })
+		const indexes = index === undefined ? this.messages.keys() : [index]
+		for (const i of indexes) this.added[i] = { ...this.added[i], ...headers }
+	}
+}
+
+/** The context of a handler call. */
+export class ProcessOperation implements ProcessDiagnostics {
+	error?: unknown
+	/** What subscribers asked the handler to run inside; the first to ask is the outermost. */
+	private scopes?: Scope[]
+
+	constructor(
+		readonly clientId: string,
+		readonly groupId: string,
+		readonly topic: string,
+		readonly partition: number,
+		readonly messages: Array<Message<unknown, unknown>>,
+		readonly batch: boolean
+	) {}
+
+	runHandlerIn(scope: Scope): void {
+		;(this.scopes ??= []).push(scope)
+	}
+
+	/** Call the handler, inside the scopes that were asked for. */
+	run<T>(handler: () => T): T {
+		if (!this.scopes) return handler()
+		return this.scopes.reduceRight<() => T>((inner, scope) => () => scope(inner), handler)()
+	}
 }

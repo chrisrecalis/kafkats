@@ -1,10 +1,39 @@
-import type { Attributes, Meter, Observable } from '@opentelemetry/api'
-import { ErrorCode, diagnostics, type InstanceDiagnostics } from '@kafkats/client'
+import type { Attributes, BatchObservableCallback, Meter, Observable } from '@opentelemetry/api'
+import { ErrorCode, diagnostics } from '@kafkats/client'
 
 import { ATTR, KAFKATS_METRIC, METRIC, SYSTEM_KAFKA, errorType } from './attributes.js'
 import { onOperation, secondsSince } from './operations.js'
 
 const failure = (error: unknown): Attributes => (error === undefined ? {} : { [ATTR.errorType]: errorType(error) })
+
+/**
+ * One time series of a metric: its attributes, created once, and how many messages it has counted.
+ *
+ * The SDK hashes the attributes of every measurement it is given. Counting here and handing the
+ * totals over when metrics are collected keeps that off the path of every message, and the same
+ * attributes object is reused for the duration histogram of the series.
+ */
+type Series = { attributes: Attributes; count: number }
+
+/** The series of one counter, by what distinguishes them. */
+class Counted {
+	private readonly series = new Map<string, Series>()
+
+	/** Add `count` to the series `key`, creating it from `attributes` the first time; returns its attributes. */
+	add(key: string, count: number, attributes: () => Attributes): Attributes {
+		let series = this.series.get(key)
+		if (!series) {
+			series = { attributes: attributes(), count: 0 }
+			this.series.set(key, series)
+		}
+		series.count += count
+		return series.attributes
+	}
+
+	all(): Iterable<Series> {
+		return this.series.values()
+	}
+}
 
 /**
  * Metrics of the client's own work: the four the messaging conventions define, and a few more
@@ -14,26 +43,34 @@ const failure = (error: unknown): Attributes => (error === undefined ? {} : { [A
  */
 export function measureClients(meter: Meter): () => void {
 	const duration = { unit: 's' }
-	const sentMessages = meter.createCounter(METRIC.sentMessages, { unit: '{message}' })
-	const consumedMessages = meter.createCounter(METRIC.consumedMessages, { unit: '{message}' })
+	const sentMessages = meter.createObservableCounter(METRIC.sentMessages, { unit: '{message}' })
+	const consumedMessages = meter.createObservableCounter(METRIC.consumedMessages, { unit: '{message}' })
 	const operationDuration = meter.createHistogram(METRIC.operationDuration, duration)
 	const processDuration = meter.createHistogram(METRIC.processDuration, duration)
 	const requestDuration = meter.createHistogram(KAFKATS_METRIC.requestDuration, duration)
 	const requestRecords = meter.createHistogram(KAFKATS_METRIC.requestRecords, { unit: '{record}' })
 	const rebalanceDuration = meter.createHistogram(KAFKATS_METRIC.rebalanceDuration, duration)
 
+	const sent = new Counted()
+	const consumed = new Counted()
+	const reportCounts: BatchObservableCallback = result => {
+		for (const { count, attributes } of sent.all()) result.observe(sentMessages, count, attributes)
+		for (const { count, attributes } of consumed.all()) result.observe(consumedMessages, count, attributes)
+	}
+	meter.addBatchObservableCallback(reportCounts, [sentMessages, consumedMessages])
+
 	const timed = { started: () => performance.now() }
 	const stop = [
 		onOperation(diagnostics.send, {
 			...timed,
 			finished(send, startedAt, error) {
-				const attributes = {
+				const failed = error === undefined ? '' : errorType(error)
+				const attributes = sent.add(`${send.topic}\n${failed}`, send.messages.length, () => ({
 					[ATTR.system]: SYSTEM_KAFKA,
 					[ATTR.topic]: send.topic,
 					[ATTR.operationName]: 'send',
-					...failure(error),
-				}
-				sentMessages.add(send.messages.length, attributes)
+					...(failed && { [ATTR.errorType]: failed }),
+				}))
 				operationDuration.record(secondsSince(startedAt), attributes)
 			},
 		}),
@@ -53,15 +90,20 @@ export function measureClients(meter: Meter): () => void {
 		onOperation(diagnostics.process, {
 			...timed,
 			finished(processing, startedAt, error) {
-				const attributes = {
-					[ATTR.system]: SYSTEM_KAFKA,
-					[ATTR.topic]: processing.topic,
-					[ATTR.partition]: String(processing.partition),
-					[ATTR.consumerGroup]: processing.groupId,
-					[ATTR.operationName]: 'process',
-					...failure(error),
-				}
-				consumedMessages.add(processing.messages.length, attributes)
+				const { topic, partition, groupId } = processing
+				const failed = error === undefined ? '' : errorType(error)
+				const attributes = consumed.add(
+					`${topic}\n${partition}\n${groupId}\n${failed}`,
+					processing.messages.length,
+					() => ({
+						[ATTR.system]: SYSTEM_KAFKA,
+						[ATTR.topic]: topic,
+						[ATTR.partition]: String(partition),
+						[ATTR.consumerGroup]: groupId,
+						[ATTR.operationName]: 'process',
+						...(failed && { [ATTR.errorType]: failed }),
+					})
+				)
 				processDuration.record(secondsSince(startedAt), attributes)
 			},
 		}),
@@ -86,6 +128,7 @@ export function measureClients(meter: Meter): () => void {
 			},
 		}),
 		observeInstances(meter),
+		() => meter.removeBatchObservableCallback(reportCounts, [sentMessages, consumedMessages]),
 	]
 	return () => {
 		for (const stopOne of stop) stopOne()
@@ -93,21 +136,10 @@ export function measureClients(meter: Meter): () => void {
 }
 
 /**
- * Gauges read from `metrics()` of every producer and consumer created from now on, each time the
- * meter collects. The instances are held weakly: one that is no longer used stops being reported.
+ * Gauges read from `metrics()` of every producer and consumer still in use, each time the meter
+ * collects.
  */
 function observeInstances(meter: Meter): () => void {
-	/** Each returns its producer or consumer for as long as the application still holds it. */
-	const instances = new Set<() => InstanceDiagnostics | undefined>()
-	const created = (message: unknown): void => {
-		const { instance, ...identity } = message as InstanceDiagnostics
-		const reference = new WeakRef(instance)
-		instances.add(() => {
-			const live = reference.deref()
-			return live && ({ ...identity, instance: live } as InstanceDiagnostics)
-		})
-	}
-
 	const gauge = (name: string, unit: string) => meter.createObservableGauge(name, { unit })
 	const queuedRecords = gauge(KAFKATS_METRIC.queuedRecords, '{record}')
 	const queuedBytes = gauge(KAFKATS_METRIC.queuedBytes, 'By')
@@ -128,7 +160,7 @@ function observeInstances(meter: Meter): () => void {
 		pausedPartitions,
 	]
 
-	const collect: Parameters<Meter['addBatchObservableCallback']>[0] = result => {
+	const collect: BatchObservableCallback = result => {
 		// Instances that share their attributes (two producers of one client, the members of a group
 		// in one process) are one series: their values add up instead of the last one winning.
 		const totals = new Map<Observable, Map<string, { attributes: Attributes; value: number }>>()
@@ -141,12 +173,7 @@ function observeInstances(meter: Meter): () => void {
 			else series.set(key, { attributes, value })
 		}
 
-		for (const find of instances) {
-			const created = find()
-			if (!created) {
-				instances.delete(find)
-				continue
-			}
+		for (const created of diagnostics.instances()) {
 			if (created.type === 'producer') {
 				const client = { [ATTR.clientId]: created.clientId }
 				const metrics = created.instance.metrics()
@@ -179,10 +206,6 @@ function observeInstances(meter: Meter): () => void {
 		}
 	}
 
-	diagnostics.instances.subscribe(created)
 	meter.addBatchObservableCallback(collect, gauges)
-	return () => {
-		diagnostics.instances.unsubscribe(created)
-		meter.removeBatchObservableCallback(collect, gauges)
-	}
+	return () => meter.removeBatchObservableCallback(collect, gauges)
 }

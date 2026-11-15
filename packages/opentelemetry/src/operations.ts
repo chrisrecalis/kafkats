@@ -10,21 +10,23 @@ export function onOperation<C extends { error?: unknown }, S>(
 	channel: TracingChannel<unknown, C>,
 	hooks: { started(context: C): S; finished(context: C, state: S, error: unknown): void }
 ): () => void {
-	const running = new WeakMap<C, { state: S }>()
+	// What `started` returned travels on the operation's own context, under a key nobody else has.
+	const state = Symbol('state')
+	type Running = C & { [state]?: { value: S } }
 	let inFlight = 0
 	let stopping = false
 	const start = (message: unknown): void => {
-		const context = message as C
-		running.set(context, { state: hooks.started(context) })
+		const context = message as Running
+		context[state] = { value: hooks.started(context) }
 		inFlight++
 	}
 	// The client settles every operation asynchronously, so this is always the last event.
 	const asyncEnd = (message: unknown): void => {
-		const context = message as C
-		const operation = running.get(context)
-		if (!operation) return
-		running.delete(context)
-		hooks.finished(context, operation.state, context.error)
+		const context = message as Running
+		const running = context[state]
+		if (!running) return
+		context[state] = undefined
+		hooks.finished(context, running.value, context.error)
 		if (--inFlight === 0 && stopping) channel.asyncEnd.unsubscribe(asyncEnd)
 	}
 	channel.start.subscribe(start)

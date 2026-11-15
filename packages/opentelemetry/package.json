@@ -50,7 +50,9 @@
 		"prepack": "pnpm -w turbo run build --filter=$npm_package_name",
 		"test": "vitest run tests",
 		"test:unit": "vitest run tests",
-		"test:integration": "vitest run -c vitest.integration.config.ts"
+		"test:integration": "vitest run -c vitest.integration.config.ts",
+		"bench:client": "tsx bench/client-bench.ts",
+		"bench:flow": "tsx bench/flow-bench.ts"
 	},
 	"peerDependencies": {
 		"@kafkats/client": "workspace:^",
@@ -65,6 +67,7 @@
 		"@opentelemetry/sdk-trace-base": "^2.0.0",
 		"@types/node": "^24.10.1",
 		"tsdown": "^0.22.14",
+		"tsx": "^4.20.6",
 		"typescript": "^7.0.2",
 		"vitest": "^4.0.12"
 	}

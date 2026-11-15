@@ -22,3 +22,14 @@ pnpm typecheck  # Type checking
 ## Tests
 
 `tests/tracing.test.ts` and `tests/metrics.test.ts` drive the client's channels directly, with in-memory OpenTelemetry exporters. `tests/end-to-end.test.ts` uses a real producer and consumer; `pnpm test:integration` runs it with a broker from testcontainers, which is what CI does.
+
+## What Instrumentation Costs
+
+`bench/` measures throughput with OpenTelemetry set up by `OTEL_MODE` (`off`, `metrics`, `traces`, `both`, `sampled` for 1% of traces), exporting to nothing:
+
+```bash
+OTEL_MODE=both KAFKA_BROKERS=localhost:9092 pnpm bench:client   # send() per message, then runEach
+OTEL_MODE=both KAFKA_BROKERS=localhost:9092 pnpm bench:flow -- --scenario count
+```
+
+Counters are summed per series in `src/metrics.ts` and handed to the SDK when it collects, because the SDK hashes the attributes of every measurement. Histograms cannot be handed over that way, so each operation still costs one SDK histogram update.

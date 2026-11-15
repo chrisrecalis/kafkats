@@ -274,4 +274,53 @@ describe.concurrent('Consumer (integration) - offsets', () => {
 		await producer.disconnect()
 		await client.disconnect()
 	})
+
+	it('commitStartPosition commits where a partition starts, and refuses once records were fetched', async () => {
+		const client = createClient('it-start-position')
+		await client.connect()
+
+		const topicName = uniqueName('it-start-position')
+		const testTopic = topic<string>(topicName, { value: string() })
+		await client.createTopics([{ name: topicName, numPartitions: 1, replicationFactor: 1 }])
+		const producer = client.producer({ lingerMs: 0 })
+		await producer.send(
+			testTopic,
+			Array.from({ length: 3 }, (_, i) => ({ value: `before-${i}` }))
+		)
+		await producer.flush()
+
+		const groupId = uniqueName('it-group')
+		const partition = { topic: topicName, partition: 0 }
+
+		// 'latest' with no committed offset starts at the end (3). Commit that as the start.
+		const first = client.consumer({ groupId, autoOffsetReset: 'latest' })
+		let committed: Promise<void> | undefined
+		first.on('partitionsAssigned', () => {
+			committed = first.commitStartPosition([partition])
+		})
+		const firstRun = first.runEach(testTopic, async () => {})
+		await vi.waitFor(() => expect(committed).toBeDefined(), { timeout: 15_000 })
+		await committed
+		first.stop()
+		await firstRun
+
+		// Arrives while nobody consumes: a restart resolving 'latest' again would skip it.
+		await producer.send(testTopic, { value: 'in-between' })
+		await producer.flush()
+
+		const second = client.consumer({ groupId, autoOffsetReset: 'latest' })
+		const received: string[] = []
+		let refused: unknown
+		await second.runEach(testTopic, async message => {
+			received.push(message.value)
+			// Records were fetched by now: the position is past what handlers have seen.
+			refused = await second.commitStartPosition([partition]).catch(error => error)
+			second.stop()
+		})
+		expect(received).toEqual(['in-between'])
+		expect((refused as Error).message).toMatch(/already fetched records/)
+
+		await producer.disconnect()
+		await client.disconnect()
+	})
 })
