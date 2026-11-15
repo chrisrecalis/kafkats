@@ -565,6 +565,12 @@ export class Broker {
 
 		const connection = owner ? this.ownedFetchConnection(owner) : this.fetchConnection
 		await this.ensureConnected(connection)
+		if (owner && this.ownedFetchConnections.get(owner) !== connection) {
+			// Released (closeFetchConnection, disconnect) while it was being dialed: nothing tracks
+			// this connection any more, so it must not stay open.
+			await connection.close(false)
+			throw new ConnectionClosedError('fetch connection was released')
+		}
 		const responseBuffer = await connection.send(
 			ApiKey.Fetch,
 			version,

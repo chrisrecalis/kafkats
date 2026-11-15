@@ -83,6 +83,28 @@ describe('Producer: batches queued behind an in-flight request are merged', () =
 		await producer.disconnect()
 	})
 
+	it('does not hold a send behind the preparation of a send to another topic', async () => {
+		const metadata = await mockCluster.refreshMetadata(['test-topic'])
+		let releaseSlowLookup!: () => void
+		const slowLookup = new Promise<void>(resolve => {
+			releaseSlowLookup = resolve
+		})
+		mockCluster.refreshMetadata.mockImplementation(async (topics?: string[]) => {
+			if (topics?.includes('slow-topic')) await slowLookup
+			return metadata
+		})
+		const producer = new Producer(mockCluster, { retries: 0 })
+
+		const slow = producer.send('slow-topic', { value: Buffer.from('s'), partition: 0 })
+		slow.catch(() => {})
+		const fast = await producer.send('test-topic', { value: Buffer.from('f'), partition: 0 })
+		expect(fast.offset).toBe(0n)
+
+		releaseSlowLookup()
+		await producer.disconnect()
+		await slow.catch(() => {})
+	})
+
 	it('does not merge anything into a batch that is already at the limit', async () => {
 		const maxBatchBytes = 1000
 		const producer = new Producer(mockCluster, { maxBatchBytes, retries: 0 })

@@ -31,7 +31,7 @@ describe('PendingSends', () => {
 		expect(flushed).toBe(true)
 	})
 
-	it('flush throws the first failure, after all sends have settled, and then starts clean', async () => {
+	it('flush throws the first failure, after all sends have settled, until discarded', async () => {
 		const sends = new PendingSends()
 		const slow = deferred<void>()
 		sends.track(Promise.reject(new Error('first')))
@@ -47,7 +47,49 @@ describe('PendingSends', () => {
 		slow.resolve()
 		await expect(flushing).rejects.toThrow('first')
 
+		// Every flush reports it (batches of several partitions flush the same sends) ...
+		await expect(sends.flush()).rejects.toThrow('first')
+		// ... until the failed work has been rolled back.
+		await sends.discard()
 		await expect(sends.flush()).resolves.toBeUndefined()
+	})
+
+	it('concurrent flushes all wait for all sends', async () => {
+		const sends = new PendingSends()
+		const first = deferred<void>()
+		const second = deferred<void>()
+		sends.track(first.promise)
+		const flushA = sends.flush()
+		sends.track(second.promise)
+		let doneB = false
+		const flushB = sends.flush().then(() => {
+			doneB = true
+		})
+
+		first.resolve()
+		await new Promise(resolve => setTimeout(resolve, 5))
+		expect(doneB).toBe(false)
+		second.resolve()
+		await Promise.all([flushA, flushB])
+	})
+
+	it('a failing acknowledgement callback fails the flush only after the other sends have settled', async () => {
+		const sends = new PendingSends()
+		const slow = deferred<void>()
+		sends.track(Promise.resolve(), () => {
+			throw new Error('ack failed')
+		})
+		sends.track(slow.promise)
+
+		let settled = false
+		const flushing = sends.flush().finally(() => {
+			settled = true
+		})
+		await new Promise(resolve => setTimeout(resolve, 5))
+		expect(settled).toBe(false)
+		slow.resolve()
+		await expect(flushing).rejects.toThrow('ack failed')
+		await expect(sends.discard()).resolves.toBeUndefined()
 	})
 
 	it('a failed send does not surface as an unhandled rejection before the flush', async () => {

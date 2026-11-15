@@ -153,7 +153,7 @@ export class StreamWorker {
 					workerRunEachOptions(config, this.eosEnabled)
 				)
 			} catch (err) {
-				runError = err
+				if (!(err instanceof BatchInterrupted)) runError = err
 			}
 
 			const failure =
@@ -266,9 +266,7 @@ export class StreamWorker {
 	 */
 	private async handleBatch(batch: Message<Buffer>[], ctx: BatchContext): Promise<void> {
 		const worker = this.context
-		// Fail-stop: once a worker has failed, nothing more may be processed (and thereby
-		// acknowledged) until it has restarted from the last committed offsets.
-		if (worker.failure) throw worker.failure.error
+		this.throwIfFailed()
 
 		if (this.eosEnabled) {
 			for (const message of batch) {
@@ -282,26 +280,52 @@ export class StreamWorker {
 			return
 		}
 
+		// A batch can take long to work through (many records, a slow processor), so its progress is
+		// acknowledged every commit interval: a failure then repeats at most that much.
+		const acknowledge = async (offset: bigint): Promise<void> => {
+			await worker.sends.flush()
+			// Another partition's batch of this worker may have failed in the meantime.
+			this.throwIfFailed()
+			ctx.resolveOffset(offset)
+			worker.processedSinceRestart = true
+		}
 		try {
-			// A batch can take long to work through (many records, a slow processor). Its progress
-			// is made committable every commit interval, so a failure repeats at most that much.
-			let flushedAt = Date.now()
+			let acknowledgedAt = Date.now()
+			let processed: bigint | undefined
 			for (const message of batch) {
+				this.throwIfFailed()
+				if (ctx.signal.aborted || this.deps.status.closing) {
+					// Stopping: acknowledge what was processed and leave the rest of the batch to
+					// the next owner.
+					if (processed !== undefined) await acknowledge(processed)
+					throw new BatchInterrupted()
+				}
 				await this.processorFor(message, ctx)?.()
-				if (Date.now() - flushedAt >= this.commitIntervalMs) {
-					await worker.sends.flush()
-					ctx.resolveOffset(message.offset)
-					worker.processedSinceRestart = true
-					flushedAt = Date.now()
+				processed = message.offset
+				if (Date.now() - acknowledgedAt >= this.commitIntervalMs) {
+					await acknowledge(processed)
+					// Processing may never wait for I/O (nothing produced, in-memory state). Let
+					// timers and sockets run, or a long batch would starve heartbeats and close().
+					await new Promise<void>(resolve => setImmediate(resolve))
+					acknowledgedAt = Date.now()
 				}
 			}
-			await worker.sends.flush()
-			worker.processedSinceRestart = true
+			if (processed !== undefined) await acknowledge(processed)
 		} catch (err) {
+			if (err instanceof BatchInterrupted) throw err
 			void worker.sends.discard()
 			this.fail(err, isRecoverable(err))
 			throw err
 		}
+	}
+
+	/**
+	 * Fail-stop: once a worker has failed, nothing more may be processed (and thereby
+	 * acknowledged) until it has restarted from the last committed offsets.
+	 */
+	private throwIfFailed(): void {
+		const failure = this.context.failure
+		if (failure) throw failure.error
 	}
 
 	/** Runs a record through its source nodes, in the record's context. Undefined if nothing consumes it. */
@@ -461,5 +485,12 @@ export class StreamWorker {
 	private producerConfig() {
 		const { config, eosEnabled, processId } = this.deps
 		return workerProducerConfig(config, eosEnabled, processId, this.slot)
+	}
+}
+
+/** Thrown out of a batch handler that stopped early because the worker is stopping. */
+class BatchInterrupted extends Error {
+	constructor() {
+		super('batch interrupted: the worker is stopping')
 	}
 }

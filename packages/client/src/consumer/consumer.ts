@@ -393,6 +393,10 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	 * the start position durable: a partition without a committed offset would otherwise be
 	 * resolved by `autoOffsetReset` again after a restart, and with `'latest'` skip whatever was
 	 * read but not committed. Partitions that are not assigned are ignored.
+	 *
+	 * This commits the position the consumer will fetch from next, not what handlers have
+	 * processed: records already fetched for a partition are skipped by the commit. Only call it
+	 * for partitions that have not started fetching (paused in the `partitionsAssigned` listener).
 	 */
 	async commitPosition(partitions: Array<{ topic: string; partition: number }>): Promise<void> {
 		if (!this.offsetManager) return

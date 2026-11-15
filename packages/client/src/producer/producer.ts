@@ -208,10 +208,9 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	// settles, so at most one batch per partition is ever in flight (preserves
 	// per-partition ordering for the idempotent producer).
 	private mutedPartitions = new Set<string>()
-	// Tail of the chain that keeps the asynchronous part of send() in call order (see inSendOrder),
-	// and the number of sends in it that have not appended yet.
-	private sendOrder: Promise<unknown> = Promise.resolve()
-	private sendsInOrder = 0
+	// Per topic with sends that have not appended yet: the tail of the chain that keeps the
+	// asynchronous part of send() in call order (see inSendOrder).
+	private readonly sendOrder = new Map<string, Promise<unknown>>()
 
 	// Transaction state (only used when transactionalId is set)
 	private transactionState: TransactionState = 'idle'
@@ -1190,12 +1189,15 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		if (partitionCount !== undefined) {
 			return settleSend(this.enqueueMessages(topicDef, msgArray, partitionCount), isSingle)
 		}
-		return this.inSendOrder(() => this.append(topicDef, msgArray)).then(promises => settleSend(promises, isSingle))
+		return this.inSendOrder(topicDef.topic, () => this.append(topicDef, msgArray)).then(promises =>
+			settleSend(promises, isSingle)
+		)
 	}
 
 	/**
 	 * Run the asynchronous preparation of a send (initialization, metadata lookup, transaction
-	 * registration) and its append, after every earlier send() has appended its messages.
+	 * registration) and its append, after every earlier send() to the same topic has appended its
+	 * messages. Sends to other topics are not held up: order only matters within a partition.
 	 *
 	 * The preparation takes a varying number of asynchronous steps (a cache hit or a metadata
 	 * request, a partition already in the transaction or not), so without this two send() calls
@@ -1204,16 +1206,17 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	 * not awaited one by one.
 	 *
 	 * A send that has nothing to wait for skips this and appends synchronously, but only while no
-	 * send is in here (see partitionCountToAppendNow), so it cannot overtake one.
+	 * send to its topic is in here (see partitionCountToAppendNow), so it cannot overtake one.
 	 */
-	private inSendOrder<T>(prepareAndAppend: () => Promise<T>): Promise<T> {
-		this.sendsInOrder++
-		const run = this.sendOrder.then(prepareAndAppend, prepareAndAppend)
-		// Counted down only once the send has appended (or failed), never before.
+	private inSendOrder<T>(topic: string, prepareAndAppend: () => Promise<T>): Promise<T> {
+		const run = (this.sendOrder.get(topic) ?? Promise.resolve()).then(prepareAndAppend, prepareAndAppend)
+		// The topic stays in the map until its last waiting send has appended (or failed), never
+		// less: that is what keeps a later send from appending right away and overtaking it.
 		const done = () => {
-			this.sendsInOrder--
+			if (this.sendOrder.get(topic) === tail) this.sendOrder.delete(topic)
 		}
-		this.sendOrder = run.then(done, done)
+		const tail = run.then(done, done)
+		this.sendOrder.set(topic, tail)
 		return run
 	}
 
@@ -1224,7 +1227,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	 * cached.
 	 */
 	private partitionCountToAppendNow(topic: string): number | undefined {
-		if (this.sendsInOrder > 0) return undefined
+		if (this.sendOrder.has(topic)) return undefined
 		if (this.config.idempotent && this.idempotentState !== 'running') return undefined
 		return this.cachedPartitionCount(topic)
 	}
@@ -1570,7 +1573,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		// In send order: a partition is registered by the first send that needs it, and every
 		// later send finds it registered instead of issuing its own AddPartitionsToTxn. Nothing
 		// is appended to a partition before it is part of the transaction.
-		const promises = await this.inSendOrder(async () => {
+		const promises = await this.inSendOrder(topicDef.topic, async () => {
 			const resolved =
 				resolvedNow ??
 				this.resolveMessagePartitions(topicDef, msgArray, await this.getPartitionCount(topicDef.topic))

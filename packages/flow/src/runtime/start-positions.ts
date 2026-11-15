@@ -52,6 +52,7 @@ export class StartPositions {
 		if (relevant.length === 0 || !this.status.clusterAvailable) return
 
 		const admin = this.client.admin()
+		const commits: Promise<void>[] = []
 		for (const [topic, uncommitted] of await this.uncommittedPartitions(relevant)) {
 			if (topology.isInternalTopic(topic)) {
 				const earliest = await admin.fetchTopicOffsets(topic, uncommitted, 'earliest')
@@ -73,10 +74,15 @@ export class StartPositions {
 			// Commit that position, so a restart (of this or another instance) before the first
 			// commit resumes from it as well instead of resolving 'latest' again and skipping
 			// what was read in between. Best effort: the in-process pin above still holds.
-			await consumer.commitPosition(uncommitted.map(partition => ({ topic, partition }))).catch(err => {
-				this.logger.warn('could not commit the start position', { topic, error: toError(err).message })
-			})
+			commits.push(
+				consumer.commitPosition(uncommitted.map(partition => ({ topic, partition }))).catch(err => {
+					this.logger.warn('could not commit the start position', { topic, error: toError(err).message })
+				})
+			)
 		}
+		// Awaited before the partitions resume: a start position committed after processing has
+		// begun could overwrite a newer offset.
+		await Promise.all(commits)
 	}
 
 	/** The given partitions for which the group has no committed offset, by topic. */
