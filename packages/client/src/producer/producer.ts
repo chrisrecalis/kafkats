@@ -48,7 +48,9 @@ import type {
 	ProducerTransaction,
 	GroupMetadata,
 	ProducerTraceFn,
+	ProducerMetrics,
 } from './types.js'
+import { SendOperation, diagnostics, register, trace, type ProduceRequestDiagnostics } from '@/diagnostics.js'
 
 const EMPTY_BUFFER = Buffer.alloc(0)
 
@@ -239,6 +241,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 
 		this.config = this.resolveConfig(config)
 		this.accumulator = new RecordAccumulator(this.config, this.logger)
+		register({ type: 'producer', clientId: cluster.clientId }, this)
 		this.accumulator.on('batchReady', batch => {
 			const key = `${batch.topic}:${batch.partition}`
 			const queue = this.pendingBatches.get(key)
@@ -603,7 +606,27 @@ export class Producer extends EventEmitter<ProducerEvents> {
 				prepared.everSent = true
 			}
 			const requestStart = performance.now()
-			const response = await broker.produce(request)
+			const response = await trace(
+				diagnostics.produceRequest,
+				(): ProduceRequestDiagnostics => ({
+					clientId: this.cluster.clientId,
+					brokerId: broker.nodeId,
+					partitions: preparedBatches.length,
+					records: preparedBatches.reduce((sum, p) => sum + p.recordCount, 0),
+					bytes: preparedBatches.reduce((sum, p) => sum + p.encodedBatch.length, 0),
+				}),
+				async produceRequest => {
+					const produced = await broker.produce(request)
+					if (produceRequest) {
+						produceRequest.rejected = produced.topics.flatMap(topic =>
+							topic.partitions
+								.filter(partition => partition.errorCode !== ErrorCode.None)
+								.map(p => ({ topic: topic.name, partition: p.partitionIndex, errorCode: p.errorCode }))
+						)
+					}
+					return produced
+				}
+			)
 			const requestEnd = performance.now()
 			if (this.trace) {
 				this.trace({
@@ -1034,7 +1057,56 @@ export class Producer extends EventEmitter<ProducerEvents> {
 					} satisfies TopicDefinition<Buffer, Buffer>)
 				: topic
 
-		return this.trackSend(this.internalSend(topicDef, messages))
+		return this.trackSend(this.tracedSend(topicDef, messages, false, m => this.internalSend(topicDef, m)))
+	}
+
+	/**
+	 * Send as one traced operation (see `diagnostics.send`). Headers that subscribers ask to add are
+	 * merged into copies of the messages; without any, the caller's messages are sent as they are.
+	 */
+	private tracedSend<V, K>(
+		topicDef: TopicDefinition<V, K>,
+		messages: ProducerMessage<V, K> | ProducerMessage<V, K>[],
+		transactional: boolean,
+		send: (messages: ProducerMessage<V, K> | ProducerMessage<V, K>[]) => Promise<SendResult | SendResult[]>
+	): Promise<SendResult | SendResult[]> {
+		const list = Array.isArray(messages) ? messages : [messages]
+		return trace(
+			diagnostics.send,
+			() => new SendOperation(this.cluster.clientId, topicDef.topic, transactional, list),
+			sending => {
+				const added = sending?.added
+				if (!added) return send(messages)
+				const withHeaders = list.map((message, i) =>
+					added[i] ? { ...message, headers: { ...message.headers, ...added[i] } } : message
+				)
+				return send(Array.isArray(messages) ? withHeaders : withHeaders[0]!)
+			}
+		)
+	}
+
+	/**
+	 * What is waiting inside this producer right now. Lets a monitor see backpressure building up
+	 * before `send()` latency shows it.
+	 */
+	metrics(): ProducerMetrics {
+		let queuedBatches = 0
+		let queuedRecords = 0
+		let queuedBytes = 0
+		for (const queue of this.pendingBatches.values()) {
+			for (const batch of queue) {
+				queuedBatches++
+				queuedRecords += batch.messages.length
+				queuedBytes += batch.sizeBytes
+			}
+		}
+		return {
+			queuedBatches,
+			queuedRecords,
+			queuedBytes,
+			inFlightRequests: this.inflightCount,
+			unacknowledgedSends: this.activeSends.size,
+		}
 	}
 
 	/**
@@ -1501,7 +1573,9 @@ export class Producer extends EventEmitter<ProducerEvents> {
 							} satisfies TopicDefinition<Buffer, Buffer>)
 						: topic
 
-				const promise = this.trackSend(this.transactionalSend(topicDef, messages))
+				const promise = this.trackSend(
+					this.tracedSend(topicDef, messages, true, m => this.transactionalSend(topicDef, m))
+				)
 				// Even a fire-and-forget failure must poison the transaction so commit aborts.
 				promise.catch(error => this.recordTransactionalSendFailure(error))
 				return promise

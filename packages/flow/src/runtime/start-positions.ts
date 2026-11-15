@@ -35,14 +35,14 @@ export class StartPositions {
 	/**
 	 * Settle where newly assigned partitions without a committed offset start.
 	 * `startPositions` holds where the consumer resolved them; `consumer.seek` is called for each
-	 * one whose position must move, and `consumer.commitPosition` to make start positions durable.
+	 * one whose position must move, and `consumer.commitStartPosition` to make start positions durable.
 	 */
 	async settle(
 		partitions: TopicPartition[],
 		startPositions: Map<string, bigint>,
 		consumer: {
 			seek(topic: string, partition: number, offset: bigint): void
-			commitPosition(partitions: TopicPartition[]): Promise<void>
+			commitStartPosition(partitions: TopicPartition[]): Promise<void>
 		}
 	): Promise<void> {
 		const topology = this.topology
@@ -75,7 +75,7 @@ export class StartPositions {
 			// commit resumes from it as well instead of resolving 'latest' again and skipping
 			// what was read in between. Best effort: the in-process pin above still holds.
 			commits.push(
-				consumer.commitPosition(uncommitted.map(partition => ({ topic, partition }))).catch(err => {
+				consumer.commitStartPosition(uncommitted.map(partition => ({ topic, partition }))).catch(err => {
 					this.logger.warn('could not commit the start position', { topic, error: toError(err).message })
 				})
 			)

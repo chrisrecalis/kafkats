@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest'
-import { OrderedWindowStore, codec, readSignedTime, type OrderedByteStore } from '../../src/index.js'
+import { codec } from '../../src/index.js'
+import { OrderedWindowStore, type OrderedByteStore } from '../../src/state/ordered.js'
+import { readSignedTime, writeSignedTime } from '../../src/state/ordered-keys.js'
 
 /** A byte-ordered store in memory that records where range scans started. */
 function memoryBytes(): OrderedByteStore & { scans: Array<Buffer | undefined> } {
@@ -81,5 +83,28 @@ describe('OrderedWindowStore.expireOldWindows', () => {
 		await store.put({ key: 'late', windowStart: 10, windowEnd: 20 }, 2)
 		expect(await store.expireOldWindows(105)).toBe(1)
 		expect(await starts(store)).toEqual([100])
+	})
+})
+
+describe('times in store keys', () => {
+	it('round-trip signed integers exactly', () => {
+		const buf = Buffer.alloc(8)
+		for (const time of [-1_000_000, -1, 0, 1, 1_700_000_000_000]) {
+			writeSignedTime(buf, time, 0)
+			expect(readSignedTime(buf, 0)).toBe(time)
+		}
+	})
+
+	// Written as plain signed integers, negative times would sort after positive ones as bytes,
+	// and a scan crossing zero would return nothing.
+	it('sort as bytes in numeric order', () => {
+		const encoded = [-1_000_000, -1, 0, 1, 1_000_000].map(time => {
+			const buf = Buffer.alloc(8)
+			writeSignedTime(buf, time, 0)
+			return buf
+		})
+		for (let i = 1; i < encoded.length; i++) {
+			expect(encoded[i - 1]!.compare(encoded[i]!)).toBeLessThan(0)
+		}
 	})
 })

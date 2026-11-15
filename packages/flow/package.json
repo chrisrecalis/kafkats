@@ -27,6 +27,16 @@
 				"types": "./dist/testing.d.cts",
 				"default": "./dist/testing.cjs"
 			}
+		},
+		"./state": {
+			"import": {
+				"types": "./dist/state.d.ts",
+				"default": "./dist/state.js"
+			},
+			"require": {
+				"types": "./dist/state.d.cts",
+				"default": "./dist/state.cjs"
+			}
 		}
 	},
 	"files": [
@@ -54,7 +64,7 @@
 		"url": "https://github.com/chrisrecalis/kafkats/issues"
 	},
 	"engines": {
-		"node": ">=18"
+		"node": ">=22"
 	},
 	"scripts": {
 		"build": "pnpm clean && tsdown --config-loader native",

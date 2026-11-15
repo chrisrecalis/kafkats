@@ -1,4 +1,4 @@
-import type { KafkaClient, KafkaClientConfig, ConsumerConfig, ProducerConfig, RunEachOptions } from '@kafkats/client'
+import type { KafkaClient, KafkaClientConfig, ConsumerConfig, ProducerConfig, RunBatchOptions } from '@kafkats/client'
 import type { Codec } from '@/codec.js'
 import type { StateStoreProvider } from '@/state.js'
 import type { ChangelogConfig, ChangelogRestorationOptions } from '@/changelog.js'
@@ -30,7 +30,11 @@ export interface FlowConfig {
 	stateStoreProvider?: StateStoreProvider
 	consumer?: Omit<ConsumerConfig, 'groupId'>
 	producer?: ProducerConfig
-	runEach?: RunEachOptions
+	/**
+	 * How each worker's consumer runs: partition concurrency and offset auto-commit. Under
+	 * exactly_once, offsets are committed by the transaction and partitions are processed one at a time.
+	 */
+	consumerRun?: RunBatchOptions
 	/**
 	 * Whether a stream worker that fails with a recoverable error (broker outage, failed commit,
 	 * lost session, ...) restarts itself and resumes from the last committed offsets.

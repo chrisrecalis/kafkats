@@ -1,0 +1,8 @@
+{
+	"extends": ["//"],
+	"tasks": {
+		"test:unit": {
+			"inputs": ["src/**", "tests/**", "vitest*.config.ts"]
+		}
+	}
+}

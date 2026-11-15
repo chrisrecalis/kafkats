@@ -58,6 +58,11 @@ function parseBrokerAddress(address: string): { host: string; port: number } {
  */
 export class Cluster extends EventEmitter<ClusterEvents> {
 	private readonly config: ClusterConfig
+
+	/** The client id this cluster's connections identify themselves with. */
+	get clientId(): string {
+		return this.config.clientId
+	}
 	private readonly brokers: Map<number, Broker> = new Map()
 	private readonly dedicatedBrokers: Set<Broker> = new Set()
 	private readonly bootstrapBrokers: Broker[] = []

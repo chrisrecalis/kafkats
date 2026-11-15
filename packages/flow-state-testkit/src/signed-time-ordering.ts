@@ -4,35 +4,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { numberCodec, stringCodec } from './codecs.js'
-import { readSignedTime, writeSignedTime } from '@kafkats/flow'
 import type { EngineUnderTest } from './engine.js'
 
 export function signedTimeOrderingSuite(engine: EngineUnderTest): void {
-	// F5b: the engine time-key encoding must preserve signed-integer order. Pre-fix `writeBigInt64BE`
-	// stored negatives as 0xFF…FF which sort AFTER positives in unsigned-byte order, so range
-	// scans crossing zero (e.g. fetchAll(-1000, 1000)) would silently return nothing.
-
-	describe(`${engine.name}: writeSignedTime/readSignedTime encoding contract`, () => {
-		it('round-trips signed integers exactly', () => {
-			const buf = Buffer.alloc(8)
-			for (const t of [-1_000_000, -1, 0, 1, 1_700_000_000_000]) {
-				writeSignedTime(buf, t, 0)
-				expect(readSignedTime(buf, 0)).toBe(t)
-			}
-		})
-
-		it('produces lex-byte order matching signed numeric order', () => {
-			const sortedTimes = [-1_000_000, -1, 0, 1, 1_000_000]
-			const encoded = sortedTimes.map(t => {
-				const b = Buffer.alloc(8)
-				writeSignedTime(b, t, 0)
-				return b
-			})
-			for (let i = 1; i < encoded.length; i++) {
-				expect(encoded[i - 1]!.compare(encoded[i]!)).toBeLessThan(0)
-			}
-		})
-	})
+	// Times in store keys must sort as signed numbers: a scan crossing zero (fetchAll(-1000, 1000))
+	// has to return what is there. The encoding itself is tested in @kafkats/flow.
 
 	describe(`${engine.name}: WindowStore signed-time ordering`, () => {
 		let stateDir: string

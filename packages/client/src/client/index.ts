@@ -30,6 +30,7 @@ export type {
 	Partitioner,
 	PartitionerName,
 	PartitionerFunction,
+	ProducerMetrics,
 } from '@/producer/index.js'
 
 // Consumer
@@ -57,6 +58,8 @@ export type {
 	ShareMessageHandler,
 	ShareRunEachOptions,
 	ShareConsumerEvents,
+	ConsumerMetrics,
+	ConsumerPartitionMetrics,
 } from '@/consumer/index.js'
 
 // Admin

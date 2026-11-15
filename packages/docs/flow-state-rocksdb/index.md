@@ -44,18 +44,19 @@ Prefer RocksDB for write-heavy topologies, aggregations under `at_least_once` in
 
 ```typescript
 rocksdb({
-	stateDir: './state',
-	rocksdb: {
-		writeBufferSize: 64 * 1024 * 1024,
-		compression: 'zstd',
-	},
+	stateDir: './state', // Directory of the RocksDB database
+	writeBufferSize: 64 * 1024 * 1024, // Optional: bytes collected in memory before a file is written (default 16 MiB)
+	compression: 'zstd', // Optional: 'none' | 'lz4' | 'zstd' | 'snappy' (default 'lz4')
+	maxOpenFiles: 4096, // Optional: data files kept open (default: from the process limit)
 })
 ```
 
-| Option     | Description                                                                                                                                         |
-| ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `stateDir` | Directory of the database. Created if missing; its parent must exist. One process at a time can have it open.                                       |
-| `rocksdb`  | Options passed to RocksDB when the database is opened, such as `writeBufferSize` (default 16 MB), `compression` (default `lz4`) and `maxOpenFiles`. |
+| Option            | Description                                                                                                   |
+| ----------------- | ------------------------------------------------------------------------------------------------------------- |
+| `stateDir`        | Directory of the database. Created if missing; its parent must exist. One process at a time can have it open. |
+| `writeBufferSize` | Bytes of writes collected in memory before they are written to a file (default 16 MiB).                       |
+| `compression`     | Compression of the data files: `'none'`, `'lz4'` (default), `'zstd'` or `'snappy'`.                           |
+| `maxOpenFiles`    | Data files kept open. Derived from the process's open-file limit by default.                                  |
 
 All stores of an application, and every partition of each, share one RocksDB database. Memory and file settings therefore apply to the application as a whole and do not grow with the number of stores or partitions.
 
@@ -68,4 +69,4 @@ All stores of an application, and every partition of each, share one RocksDB dat
 
 ## Custom Engines
 
-The store logic used by this package and by the LMDB provider is exported from `@kafkats/flow`: `OrderedKeyValueStore`, `OrderedWindowStore`, `OrderedSessionStore` and `OrderedChangelogCheckpointStore` implement flow's store interfaces on top of an `OrderedByteStore`, a map of byte keys to byte values that iterates in byte order. A provider for another engine only has to implement that interface.
+The store logic used by this package and by the LMDB provider is exported from `@kafkats/flow/state`: `OrderedKeyValueStore`, `OrderedWindowStore`, `OrderedSessionStore` and `OrderedChangelogCheckpointStore` implement flow's store interfaces on top of an `OrderedByteStore`, a map of byte keys to byte values that iterates in byte order. A provider for another engine only has to implement that interface.

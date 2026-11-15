@@ -254,7 +254,7 @@ describe('start() retry', () => {
 			applicationId,
 			client: newClient('r2-conc-app'),
 			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 50 },
-			runEach: { partitionConcurrency: P },
+			consumerRun: { partitionConcurrency: P },
 		})
 		app.stream(input, { key: stringCodec, value: stringCodec })
 			.groupByKey()

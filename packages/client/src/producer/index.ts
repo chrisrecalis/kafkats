@@ -24,6 +24,7 @@ export type {
 	PartitionerFunction,
 	ProducerState,
 	ProducerEvents,
+	ProducerMetrics,
 	ResolvedProducerConfig,
 	QueuedMessage,
 	PartitionBatch,

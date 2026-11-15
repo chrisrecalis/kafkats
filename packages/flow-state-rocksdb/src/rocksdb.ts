@@ -1,19 +1,21 @@
-import { RocksDatabase, type RocksDatabaseOptions } from '@harperfast/rocksdb-js'
+import { RocksDatabase } from '@harperfast/rocksdb-js'
+import type {
+	ChangelogCheckpointStore,
+	KeyValueStore,
+	KeyValueStoreOptions,
+	SessionStore,
+	SessionStoreOptions,
+	StateStoreProvider,
+	WindowStore,
+	WindowStoreOptions,
+} from '@kafkats/flow'
 import {
 	OrderedChangelogCheckpointStore,
 	OrderedKeyValueStore,
 	OrderedSessionStore,
 	OrderedWindowStore,
-	type ChangelogCheckpointStore,
-	type KeyValueStore,
-	type KeyValueStoreOptions,
 	type OrderedByteStore,
-	type SessionStore,
-	type SessionStoreOptions,
-	type StateStoreProvider,
-	type WindowStore,
-	type WindowStoreOptions,
-} from '@kafkats/flow'
+} from '@kafkats/flow/state'
 import { Coalesced } from './coalesced.js'
 import { CHECKPOINTS, prefixedBytes, storeKeyspace } from './keyspace.js'
 
@@ -24,14 +26,17 @@ export interface RocksDBProviderOptions {
 	/** Directory of the RocksDB database. One process at a time can have it open. */
 	stateDir: string
 	/**
-	 * Options passed to RocksDB when the database is opened (memtable size, compression, ...).
-	 * The provider fixes the key and value encoding and keeps the write-ahead log on: it is what
-	 * makes flushed state and checkpoints durable.
+	 * How many bytes of writes are collected in memory before they are written to a file
+	 * (default 16 MiB). Larger values batch more per file and use more memory.
 	 */
-	rocksdb?: Omit<
-		RocksDatabaseOptions,
-		'name' | 'keyEncoding' | 'encoding' | 'readOnly' | 'secondaryPath' | 'store' | 'disableWAL'
-	>
+	writeBufferSize?: number
+	/** Compression of the data files (default `'lz4'`). */
+	compression?: 'none' | 'lz4' | 'zstd' | 'snappy'
+	/**
+	 * How many data files RocksDB keeps open. By default it is derived from the process's open-file
+	 * limit; raise that limit for very large state.
+	 */
+	maxOpenFiles?: number
 }
 
 /**
@@ -59,10 +64,14 @@ export class RocksDBStateStoreProvider implements StateStoreProvider {
 
 	/** The database, (re)opened on demand so a provider can be used again after close(). */
 	private database(): RocksDatabase {
-		this.db ??= RocksDatabase.open(this.options.stateDir, {
-			...this.options.rocksdb,
+		const { stateDir, writeBufferSize, compression, maxOpenFiles } = this.options
+		this.db ??= RocksDatabase.open(stateDir, {
+			...(writeBufferSize !== undefined && { writeBufferSize }),
+			...(compression !== undefined && { compression }),
+			...(maxOpenFiles !== undefined && { maxOpenFiles }),
 			keyEncoding: 'binary',
 			encoding: 'binary',
+			// The write-ahead log is what makes flushed state and checkpoints durable.
 			disableWAL: false,
 		})
 		return this.db

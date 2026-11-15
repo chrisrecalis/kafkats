@@ -40,6 +40,8 @@ export type {
 	ConsumerGroupState,
 	ConsumerGroupEvents,
 	ConsumerEvents,
+	ConsumerMetrics,
+	ConsumerPartitionMetrics,
 } from './types.js'
 
 export { strict, weighted } from './priority.js'

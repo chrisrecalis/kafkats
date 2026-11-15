@@ -448,6 +448,28 @@ export enum ConsumerGroupState {
 	LEAVING = 'LEAVING',
 }
 
+/** Where a consumer stands at one moment (see `Consumer.metrics()`). */
+export interface ConsumerMetrics {
+	partitions: ConsumerPartitionMetrics[]
+}
+
+export interface ConsumerPartitionMetrics {
+	topic: string
+	partition: number
+	/** The next offset this consumer will fetch. */
+	position: bigint
+	/**
+	 * How far this consumer could read as of its last fetch response: the high watermark, or the
+	 * last stable offset under `read_committed`. `endOffset - position` is how far its fetching is
+	 * behind. Undefined before the first response and while the partition is paused, because a
+	 * paused partition is not fetched and its end is not known.
+	 */
+	endOffset?: bigint
+	/** Bytes fetched for this partition that no handler has received yet. */
+	bufferedBytes: number
+	paused: boolean
+}
+
 export interface ConsumerGroupEvents {
 	rebalance: []
 	joined: [assignment: TopicPartition[]]

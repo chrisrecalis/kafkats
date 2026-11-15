@@ -14,6 +14,7 @@ import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import { isConnectionFailure, isKafkaError, KafkaProtocolError, shouldRefreshMetadata } from '@/client/errors.js'
 import { OFFSET_TIMESTAMP } from '@/protocol/messages/requests/list-offsets.js'
 import type { TopicPartition, AutoOffsetReset } from './types.js'
+import { diagnostics, trace } from '@/diagnostics.js'
 import { noopLogger, type Logger } from '@/logger.js'
 import { tpKey } from '@/utils/topic-partition.js'
 import { retry } from '@/utils/retry.js'
@@ -240,7 +241,8 @@ export class OffsetManager {
 	 * Filters to only assigned partitions (Java client model protection)
 	 */
 	async commitPendingOffsets(): Promise<void> {
-		if (this.consumedOffsets.size === 0 || !this.coordinator) {
+		const coordinator = this.coordinator
+		if (this.consumedOffsets.size === 0 || !coordinator) {
 			return
 		}
 
@@ -279,9 +281,31 @@ export class OffsetManager {
 			})),
 		}))
 
+		await trace(
+			diagnostics.commit,
+			() => ({
+				clientId: this.cluster.clientId,
+				groupId: this.groupId,
+				offsets: topics.flatMap(topic =>
+					topic.partitions.map(p => ({
+						topic: topic.name,
+						partition: p.partitionIndex,
+						offset: p.committedOffset,
+					}))
+				),
+			}),
+			() => this.sendOffsetCommit(coordinator, topics)
+		)
+	}
+
+	/** Send one OffsetCommit request and settle the pending offsets by its per-partition results. */
+	private async sendOffsetCommit(
+		coordinator: Broker,
+		topics: Parameters<Broker['offsetCommit']>[0]['topics']
+	): Promise<void> {
 		let response: Awaited<ReturnType<Broker['offsetCommit']>>
 		try {
-			response = await this.coordinator.offsetCommit({
+			response = await coordinator.offsetCommit({
 				groupId: this.groupId,
 				generationId: this.generationId,
 				memberId: this.memberId,

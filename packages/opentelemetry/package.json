@@ -1,0 +1,74 @@
+{
+	"name": "@kafkats/opentelemetry",
+	"private": false,
+	"version": "0.13.0",
+	"description": "OpenTelemetry traces and metrics for @kafkats/client.",
+	"type": "module",
+	"main": "dist/index.cjs",
+	"module": "dist/index.js",
+	"types": "dist/index.d.cts",
+	"exports": {
+		".": {
+			"import": {
+				"types": "./dist/index.d.ts",
+				"default": "./dist/index.js"
+			},
+			"require": {
+				"types": "./dist/index.d.cts",
+				"default": "./dist/index.cjs"
+			}
+		}
+	},
+	"files": [
+		"dist"
+	],
+	"license": "MIT",
+	"keywords": [
+		"kafka",
+		"opentelemetry",
+		"tracing",
+		"metrics",
+		"observability",
+		"typescript"
+	],
+	"homepage": "https://chrisrecalis.github.io/kafkats",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/chrisrecalis/kafkats.git",
+		"directory": "packages/opentelemetry"
+	},
+	"bugs": {
+		"url": "https://github.com/chrisrecalis/kafkats/issues"
+	},
+	"engines": {
+		"node": ">=22"
+	},
+	"scripts": {
+		"build": "pnpm clean && tsdown --config-loader native",
+		"typecheck": "tsc -p tsconfig.json --noEmit",
+		"clean": "rm -rf dist",
+		"prepack": "pnpm -w turbo run build --filter=$npm_package_name",
+		"test": "vitest run tests",
+		"test:unit": "vitest run tests",
+		"test:integration": "vitest run -c vitest.integration.config.ts",
+		"bench:client": "tsx bench/client-bench.ts",
+		"bench:flow": "tsx bench/flow-bench.ts"
+	},
+	"peerDependencies": {
+		"@kafkats/client": "workspace:^",
+		"@opentelemetry/api": "^1.9.0"
+	},
+	"devDependencies": {
+		"@kafkats/client": "workspace:^",
+		"@opentelemetry/api": "^1.9.0",
+		"@opentelemetry/context-async-hooks": "^2.0.0",
+		"@opentelemetry/core": "^2.0.0",
+		"@opentelemetry/sdk-metrics": "^2.0.0",
+		"@opentelemetry/sdk-trace-base": "^2.0.0",
+		"@types/node": "^24.10.1",
+		"tsdown": "^0.22.14",
+		"tsx": "^4.20.6",
+		"typescript": "^7.0.2",
+		"vitest": "^4.0.12"
+	}
+}

@@ -21,7 +21,7 @@ import {
 	type WorkerSlot,
 	workerConsumerConfig,
 	workerProducerConfig,
-	workerRunEachOptions,
+	workerRunOptions,
 	workerStartTimeoutMs,
 } from '@/runtime/worker-config.js'
 
@@ -150,7 +150,7 @@ export class StreamWorker {
 				await worker.consumer.runBatch(
 					topics,
 					(batch, ctx) => this.handleBatch(batch, ctx),
-					workerRunEachOptions(config, this.eosEnabled)
+					workerRunOptions(config, this.eosEnabled)
 				)
 			} catch (err) {
 				if (!(err instanceof BatchInterrupted)) runError = err
@@ -428,8 +428,10 @@ export class StreamWorker {
 						seek: (topic, partition, offset) => {
 							if (heldSinceThisAssignment(topic, partition)) consumer.seek(topic, partition, offset)
 						},
-						commitPosition: held =>
-							consumer.commitPosition(held.filter(tp => heldSinceThisAssignment(tp.topic, tp.partition))),
+						commitStartPosition: held =>
+							consumer.commitStartPosition(
+								held.filter(tp => heldSinceThisAssignment(tp.topic, tp.partition))
+							),
 					})
 				)
 				.then(() => {

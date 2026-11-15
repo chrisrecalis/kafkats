@@ -21,8 +21,17 @@ src/
 ├── client/       # Broker connections, cluster topology, metadata
 ├── producer/     # Batching, partitioners, RecordAccumulator
 ├── consumer/     # Consumer groups, FetchManager, partition assignors
+├── diagnostics.ts # What the client publishes about its work on node:diagnostics_channel
 └── index.ts      # Public API exports
 ```
+
+### Diagnostics
+
+The client depends on no telemetry library. `src/diagnostics.ts` defines tracing channels (send, produce request, handler call, offset commit, rebalance) and `Producer.metrics()` / `Consumer.metrics()` return what is waiting inside. Rules for adding to it:
+
+- Publish only what a broker cannot see (application-side latency, handlers, backlog inside the client). Group lag, topic offsets and broker rates belong to broker exporters.
+- Go through `trace()`: it builds no context and publishes nothing when a channel has no subscribers.
+- Names of telemetry standards (OpenTelemetry attributes and metrics) do not belong here; they live in `@kafkats/opentelemetry`.
 
 ### Key Classes
 

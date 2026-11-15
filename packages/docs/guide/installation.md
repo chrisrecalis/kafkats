@@ -2,7 +2,7 @@
 
 ## Requirements
 
-- Node.js 18 or later (`@kafkats/flow-state-rocksdb` needs Node.js 22.18 or later)
+- Node.js 22 or later (`@kafkats/flow-state-rocksdb` needs 22.18 or later)
 - A running Kafka broker (for integration)
 
 ## Installing the Client

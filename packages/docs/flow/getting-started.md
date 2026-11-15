@@ -37,7 +37,7 @@ const app = flow({
 | `changelog`           | `object`                            | -                 | Changelog topic settings: `replicationFactor`, `topicConfigs`, `autoCreate`, `restoration`                    |
 | `consumer`            | `Omit<ConsumerConfig, 'groupId'>`   | -                 | Consumer overrides (Flow sets `groupId` to `applicationId` and always uses the `range` assignor)              |
 | `producer`            | `ProducerConfig`                    | -                 | Producer overrides                                                                                            |
-| `runEach`             | `RunEachOptions`                    | -                 | Consumer run-loop options (e.g. `partitionConcurrency`, `autoCommitIntervalMs`, `assignment`)                 |
+| `consumerRun`         | `RunBatchOptions`                   | -                 | Consumer run-loop options (e.g. `partitionConcurrency`, `autoCommitIntervalMs`, `assignment`)                 |
 
 #### Client Config (KafkaClientConfig)
 
@@ -66,7 +66,7 @@ const app = flow({
 })
 ```
 
-Consumer offsets are committed periodically (controlled by `autoCommitIntervalMs` in `runEach` options).
+Consumer offsets are committed periodically (controlled by `autoCommitIntervalMs` in `consumerRun` options).
 
 ### Exactly-Once
 

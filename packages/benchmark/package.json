@@ -30,7 +30,7 @@
 		"heap:consumer": "node dist/heap-consumer.js"
 	},
 	"engines": {
-		"node": ">=18"
+		"node": ">=22"
 	},
 	"dependencies": {
 		"@kafkats/client": "workspace:*",

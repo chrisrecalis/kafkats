@@ -26,7 +26,7 @@ const app = flow({
 ## Design
 
 - **Binding**: `@harperfast/rocksdb-js` (prebuilt binaries, Node >= 22.18). The Level `rocksdb` package is discontinued.
-- **Store logic is not here.** Key layouts, window/session queries, expiry and checkpoints are the `Ordered*Store` classes of `@kafkats/flow` (`packages/flow/src/state/ordered.ts`), shared with the LMDB provider. This package only adapts a RocksDB database to their `OrderedByteStore` interface:
+- **Store logic is not here.** Key layouts, window/session queries, expiry and checkpoints are the `Ordered*Store` classes of `@kafkats/flow/state` (`packages/flow/src/state/ordered.ts`), shared with the LMDB provider. This package only adapts a RocksDB database to their `OrderedByteStore` interface:
     - `src/rocksdb.ts`: the provider (opens and closes the database, creates stores).
     - `src/keyspace.ts`: which keys belong to which store, and the byte store over one store's keys.
     - `src/coalesced.ts`: runs the write-ahead log sync once for all flushes that ask during another sync.

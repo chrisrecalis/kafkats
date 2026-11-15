@@ -11,6 +11,7 @@ import type { Logger } from '@/logger.js'
 import type { ConsumerGroup, JoinResult } from './consumer-group.js'
 import type { OffsetManager } from './offset-manager.js'
 import type { TopicPartition, ManualAssignment, AutoOffsetReset } from './types.js'
+import { diagnostics, trace, type RebalanceDiagnostics } from '@/diagnostics.js'
 import { retry } from '@/utils/retry.js'
 import { sleep } from '@/utils/sleep.js'
 import { CoordinatorNotAvailableError, NotCoordinatorError, isConnectionFailure } from '@/client/errors.js'
@@ -253,10 +254,21 @@ export class GroupPartitionProvider implements PartitionProvider {
 		}
 
 		this.rebalancePending = false
+		await trace(
+			diagnostics.rebalance,
+			(): RebalanceDiagnostics => ({ clientId: this.cluster.clientId, groupId: this.groupId }),
+			async rebalance => {
+				await this.rebalance(this.callbacks!)
+				if (rebalance) rebalance.assignment = this.consumerGroup.currentAssignment
+			}
+		)
+	}
 
+	/** Go through one rebalance: let the application finish, give up partitions, rejoin, take the new assignment. */
+	private async rebalance(callbacks: NonNullable<GroupPartitionProvider['callbacks']>): Promise<void> {
 		try {
 			// Awaited so transactional consumers can commit in-flight work before partitions move.
-			await this.callbacks.onRebalance()
+			await callbacks.onRebalance()
 
 			const previousAssignment = this.consumerGroup.currentAssignment
 			const wasEager = this.consumerGroup.currentRebalanceProtocol === 'eager'
@@ -266,7 +278,7 @@ export class GroupPartitionProvider implements PartitionProvider {
 			// accepts until the member rejoins — committing after JoinGroup would let the
 			// new owner fetch a stale committed offset and reprocess records.
 			if (wasEager && previousAssignment.length > 0) {
-				await this.callbacks.onPartitionsRevoked(previousAssignment)
+				await callbacks.onPartitionsRevoked(previousAssignment)
 			}
 
 			const rejoinResult = await this.whileReachable(() => this.consumerGroup.rejoin(this.topics))

@@ -42,11 +42,9 @@ await app.start()
 ```typescript
 rocksdb({
 	stateDir: './state', // Directory of the RocksDB database
-	rocksdb: {
-		// Optional: passed to RocksDB when the database is opened
-		writeBufferSize: 64 * 1024 * 1024, // in-memory table size before it is written to a file (default 16 MB)
-		compression: 'zstd', // default 'lz4'
-	},
+	writeBufferSize: 64 * 1024 * 1024, // Optional: bytes collected in memory before a file is written (default 16 MiB)
+	compression: 'zstd', // Optional: 'none' | 'lz4' | 'zstd' | 'snappy' (default 'lz4')
+	maxOpenFiles: 4096, // Optional: data files kept open (default: from the process limit)
 })
 ```
 

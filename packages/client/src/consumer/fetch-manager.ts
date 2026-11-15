@@ -19,7 +19,14 @@ import {
 } from '@/protocol/records/index.js'
 import type { DecodedRecord } from '@/protocol/records/index.js'
 import { Decoder } from '@/protocol/primitives/decoder.js'
-import type { TopicPartition, TopicPartitionOffset, AutoOffsetReset, IsolationLevel, PartitionBatch } from './types.js'
+import type {
+	TopicPartition,
+	TopicPartitionOffset,
+	AutoOffsetReset,
+	IsolationLevel,
+	PartitionBatch,
+	ConsumerPartitionMetrics,
+} from './types.js'
 import type { OffsetManager } from './offset-manager.js'
 import { noopLogger, type Logger } from '@/logger.js'
 import { tpKey, formatPartitions } from '@/utils/topic-partition.js'
@@ -423,6 +430,10 @@ interface PartitionState {
 	partition: number
 	offset: bigint
 	paused: boolean
+	/** How far the partition could be read as of the last fetch response. */
+	endOffset?: bigint
+	/** Whether records were fetched for it since it was assigned or last sought. */
+	fetched?: boolean
 	abortController: AbortController // Per-partition abort signal for incremental control
 	cachedLeader: Broker | null // Cached leader broker - invalidated on NotLeaderOrFollower
 	// Bumped by seek(). A fetch captures the epoch at issue time; a response whose
@@ -673,6 +684,8 @@ export class FetchManager {
 			const state = this.partitionStates.get(key)
 			if (state) {
 				state.paused = true
+				// Not fetched while paused: what is known of the partition's end goes stale.
+				state.endOffset = undefined
 				const earliestBuffered = earliest.get(key)
 				if (earliestBuffered !== undefined && earliestBuffered < state.offset) {
 					state.offset = earliestBuffered
@@ -707,6 +720,11 @@ export class FetchManager {
 	}
 
 	/** The offset the next fetch of an assigned partition starts at, if the partition is assigned. */
+	/** Whether records of an assigned partition were fetched since it was assigned or last sought. */
+	hasFetched(topic: string, partition: number): boolean {
+		return this.partitionStates.get(tpKey(topic, partition))?.fetched === true
+	}
+
 	getFetchPosition(topic: string, partition: number): bigint | undefined {
 		return this.partitionStates.get(tpKey(topic, partition))?.offset
 	}
@@ -734,6 +752,7 @@ export class FetchManager {
 			state.offset = offset
 			// Fence any in-flight fetch issued at the old position, and drop buffered
 			// records from before the seek, so neither clobbers the new position.
+			state.fetched = false
 			state.fetchEpoch++
 			this.fetchBuffer?.removePartitions([{ topic, partition }])
 		} else {
@@ -1173,6 +1192,11 @@ export class FetchManager {
 					await this.handleFetchError(state, partitionResponse.errorCode)
 					continue
 				}
+				// What this consumer can read up to: under read_committed, not past an open transaction.
+				state.endOffset =
+					this.config.isolationLevel === 'read_committed'
+						? partitionResponse.lastStableOffset
+						: partitionResponse.highWatermark
 
 				if (partitionResponse.recordsData && partitionResponse.recordsData.length > 0) {
 					const fetchOffset = state.offset
@@ -1195,6 +1219,7 @@ export class FetchManager {
 					const records = filterRecordsFromOffset(decoded, fetchOffset)
 
 					if (records.length > 0) {
+						state.fetched = true
 						this.fetchBuffer.add({
 							topic: state.topic,
 							partition: state.partition,
@@ -1276,6 +1301,21 @@ export class FetchManager {
 		const error = this.pendingError
 		this.pendingError = null
 		throw error
+	}
+
+	/** Position, readable end, buffered bytes and pause state of every assigned partition. */
+	partitionMetrics(): ConsumerPartitionMetrics[] {
+		const buffered = new Map(
+			this.fetchBuffer?.snapshot().map(stat => [tpKey(stat.topic, stat.partition), stat.bytes])
+		)
+		return Array.from(this.partitionStates, ([key, state]) => ({
+			topic: state.topic,
+			partition: state.partition,
+			position: state.offset,
+			endOffset: state.endOffset,
+			bufferedBytes: buffered.get(key) ?? 0,
+			paused: state.paused,
+		}))
 	}
 
 	/**
