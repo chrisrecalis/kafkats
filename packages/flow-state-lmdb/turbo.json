@@ -1,0 +1,8 @@
+{
+	"extends": ["//"],
+	"tasks": {
+		"test:unit": {
+			"inputs": ["src/**", "tests/**", "../flow-state-testkit/src/**", "vitest*.config.ts"]
+		}
+	}
+}

@@ -25,6 +25,7 @@
 | `@kafkats/client` | Kafka client with producer, consumer, and admin APIs |
 | `@kafkats/flow` | Kafka Streams-like DSL for stream processing |
 | `@kafkats/flow-state-lmdb` | Persistent LMDB state stores |
+| `@kafkats/flow-state-rocksdb` | Persistent RocksDB state stores |
 | `@kafkats/codec-zod` | Zod schema validation codecs |
 
 ## Quick Start

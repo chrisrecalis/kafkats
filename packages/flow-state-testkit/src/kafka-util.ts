@@ -1,17 +1,22 @@
 /**
- * Helpers for the broker-backed LMDB tests: client/topic setup, a read_committed reader and the
- * `hardening-worker.ts` child process. Requires a built @kafkats/client.
+ * Helpers for the broker-backed tests: client/topic setup, a read_committed reader and the
+ * `hardening-worker.ts` child process.
  */
 import { spawn, type ChildProcess } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
-// @kafkats/client is not a dependency of this package; load the workspace build directly.
-import { KafkaClient } from '../../client/dist/index.js'
+import type { EngineUnderTest } from './engine.js'
+import { KafkaClient } from '@kafkats/client'
 
 export const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms))
 export const uniq = (p: string) => `${p}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
 const here = path.dirname(fileURLToPath(import.meta.url))
-const TSX = path.resolve(here, '../../flow/node_modules/tsx/dist/loader.mjs')
+
+/** Environment that tells `hardening-worker.ts` which provider to create. */
+export const workerEnv = (engine: EngineUnderTest): Record<string, string> => ({
+	R3_PROVIDER_MODULE: engine.module.url,
+	R3_PROVIDER_FACTORY: engine.module.factory,
+})
 
 export class ChildWorker {
 	proc!: ChildProcess
@@ -20,7 +25,7 @@ export class ChildWorker {
 	pid = 0
 	constructor(readonly env: Record<string, string>) {}
 	start(): this {
-		this.proc = spawn(process.execPath, ['--import', TSX, path.join(here, 'hardening-worker.ts')], {
+		this.proc = spawn(process.execPath, ['--import', 'tsx', path.join(here, 'hardening-worker.ts')], {
 			cwd: path.resolve(here, '..'),
 			env: { ...process.env, ...this.env },
 			stdio: ['ignore', 'pipe', 'pipe'],

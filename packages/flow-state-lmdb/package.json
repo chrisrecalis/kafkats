@@ -47,6 +47,7 @@
 	"scripts": {
 		"build": "pnpm clean && tsdown --config-loader native",
 		"test": "vitest run tests",
+		"test:unit": "vitest run tests",
 		"typecheck": "tsc -p tsconfig.json --noEmit",
 		"clean": "rm -rf dist",
 		"prepack": "pnpm -w turbo run build --filter=$npm_package_name"
@@ -55,10 +56,11 @@
 		"lmdb": "^3.2.6"
 	},
 	"peerDependencies": {
-		"@kafkats/flow": "workspace:>=0.13.0"
+		"@kafkats/flow": "workspace:^"
 	},
 	"devDependencies": {
 		"@kafkats/flow": "workspace:^",
+		"@kafkats/flow-state-testkit": "workspace:*",
 		"@types/node": "^24.10.1",
 		"tsdown": "^0.22.14",
 		"typescript": "^7.0.2",

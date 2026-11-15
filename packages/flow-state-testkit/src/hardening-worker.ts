@@ -1,16 +1,19 @@
 /**
- * Child worker for hardening LMDB crash tests (spawned, never run directly by vitest).
- * Env: R3_BROKERS, R3_APP, R3_IN, R3_OUT, R3_STATE, R3_MODE=count|window, R3_GUARANTEE, R3_RESTORE_DELAY_MS (slow restore)
+ * Child worker for the crash tests (spawned, never run directly by vitest).
+ * Env: R3_BROKERS, R3_APP, R3_IN, R3_OUT, R3_STATE, R3_MODE=count|window, R3_GUARANTEE, R3_RESTORE_DELAY_MS (slow restore),
+ *      R3_PROVIDER_MODULE + R3_PROVIDER_FACTORY (the provider under test, see EngineUnderTest.module)
  */
 import { codec, flow, SessionWindows, TimeWindows } from '@kafkats/flow'
-import { lmdb } from '../src/lmdb.js'
-import { KafkaClient } from '../../client/dist/index.js'
+import type { StateStoreProvider } from '@kafkats/flow'
+import { KafkaClient } from '@kafkats/client'
 
 const env = (k: string, d?: string): string => {
 	const v = process.env[k] ?? d
 	if (v === undefined) throw new Error(`missing env ${k}`)
 	return v
 }
+const provider = (await import(env('R3_PROVIDER_MODULE'))) as Record<string, unknown>
+const createProvider = provider[env('R3_PROVIDER_FACTORY')] as (options: { stateDir: string }) => StateStoreProvider
 const str = codec.string()
 const num = codec.json<number>()
 const log = (type: string, extra: Record<string, unknown> = {}) =>
@@ -72,7 +75,7 @@ const app = flow({
 	commitIntervalMs: 100,
 	consumer: { autoOffsetReset: 'earliest', maxWaitMs: 100, sessionTimeoutMs: 6000 },
 	producer: { lingerMs: 0, transactionTimeoutMs: 10000 },
-	stateStoreProvider: lmdb({ stateDir: env('R3_STATE') }),
+	stateStoreProvider: createProvider({ stateDir: env('R3_STATE') }),
 	changelog: {
 		restoration: { idleTimeoutMs: 1000, initialIdleTimeoutMs: 5000, checkIntervalMs: 50, consumerMaxWaitMs: 50 },
 	},

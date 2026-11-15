@@ -74,7 +74,7 @@ Results compare:
 KAFKA_BROKERS=localhost:9092 pnpm -C packages/benchmark bench:flow
 KAFKA_BROKERS=localhost:9092 pnpm -C packages/benchmark bench:flow -- --records 200000 --scenario count,table-join --guarantee exactly_once --runs 3
 KAFKA_BROKERS=localhost:9092 pnpm -C packages/benchmark bench:flow -- --scenario stateless,restore --threads 2
-KAFKA_BROKERS=localhost:9092 pnpm -C packages/benchmark bench:flow -- --scenario count --provider lmdb # LMDB state stores (default: in-memory)
+KAFKA_BROKERS=localhost:9092 pnpm -C packages/benchmark bench:flow -- --scenario count --provider lmdb # LMDB state stores; also rocksdb (default: in-memory)
 ```
 
 Each run preloads the input topic, starts one application (`--threads` stream threads, default 1), and times how long it takes for every record to pass through the whole topology. `restore` builds the count state, closes the app and times `start()` of a fresh instance with empty in-memory state (changelog records per second).

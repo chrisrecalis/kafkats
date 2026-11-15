@@ -67,6 +67,11 @@ import { withBase } from 'vitepress'
   <p>LMDB-backed persistent state stores for production stream processing.</p>
 </a>
 
+<a :href="withBase('/flow-state-rocksdb/')" class="package-card">
+  <h3>@kafkats/flow-state-rocksdb</h3>
+  <p>RocksDB-backed persistent state stores for write-heavy and larger-than-memory state.</p>
+</a>
+
 </div>
 
 ## Quick Example

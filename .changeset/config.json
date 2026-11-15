@@ -3,13 +3,13 @@
 	"changelog": "@changesets/cli/changelog",
 	"commit": false,
 	"fixed": [
-		["@kafkats/client", "@kafkats/flow", "@kafkats/codec-zod", "@kafkats/flow-state-lmdb"]
+		["@kafkats/client", "@kafkats/flow", "@kafkats/codec-zod", "@kafkats/flow-state-lmdb", "@kafkats/flow-state-rocksdb"]
 	],
 	"linked": [],
 	"access": "public",
 	"baseBranch": "main",
 	"updateInternalDependencies": "patch",
-	"ignore": ["@kafkats/benchmark", "@kafkats/docs", "@kafkats/flow-examples"],
+	"ignore": ["@kafkats/benchmark", "@kafkats/docs", "@kafkats/flow-examples", "@kafkats/flow-state-testkit"],
 	"___experimentalUnsafeOptions_WILL_CHANGE_IN_PATCH": {
 		"onlyUpdatePeerDependentsWhenOutOfRange": true
 	}
