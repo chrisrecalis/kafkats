@@ -45,6 +45,22 @@ Nothing in the client is patched: the client publishes what it does on `node:dia
 
 The `messaging.*` names follow OpenTelemetry's messaging semantic conventions, which are still in development and may be renamed.
 
+## What It Costs
+
+Nothing while `instrumentKafka()` has not been called: the client then publishes nothing.
+
+Once it is on, every send and every handler call costs a few microseconds, measured on Node.js 22 with spans and metrics exported to nothing:
+
+| The handler                       | Metrics only | Traces and metrics | Same, 1% of traces sampled |
+| --------------------------------- | ------------ | ------------------ | -------------------------- |
+| does nothing (the worst case)     | about −70%   | about −88%         | about −83%                 |
+| parses 1 KB of JSON               | about −20%   | about −48%         | about −38%                 |
+| waits 1 ms (a fast database call) | about −1.5%  | about −6%          | about −5%                  |
+
+Throughput of `runEach`, relative to no instrumentation. What you pay depends on what your handler does: next to real I/O it is small, next to an empty handler it dominates. `pnpm bench:client` in this package measures it for your machine.
+
+A message that belongs to a trace that was not sampled gets no span: the decision of the sender is followed, as OpenTelemetry's default sampler does, and it is passed on to whatever the handler sends.
+
 ## Options
 
 ```typescript

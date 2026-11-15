@@ -162,6 +162,24 @@ describe('tracing', () => {
 		expect(span!.events[0]!.name).toBe('exception')
 	})
 
+	it('creates no spans inside a trace that is not sampled, but passes the decision on', async () => {
+		// What a sampler leaves behind for the 99% it does not sample: a valid trace, flagged "not sampled".
+		const unsampled = '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00'
+		let sentOn: Record<string, string | Buffer> | undefined
+		let activeInHandler: number | undefined
+		await process([message(1n, { traceparent: unsampled })], false, async () => {
+			activeInHandler = trace.getSpanContext(context.active())?.traceFlags
+			// Sending from the handler: still the same, unsampled trace.
+			const { headers, done } = send(1)
+			await done
+			sentOn = headers[0]
+		})
+
+		expect(recorder.spans()).toEqual([])
+		expect(activeInHandler).toBe(0)
+		expect(sentOn?.traceparent).toBe(unsampled)
+	})
+
 	it('stops when asked to, but still ends what was under way', async () => {
 		let finishHandler!: () => void
 		const handling = process(

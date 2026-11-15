@@ -182,7 +182,11 @@ export class SendOperation implements SendDiagnostics {
 	addHeaders(headers: Record<string, string | Buffer>, index?: number): void {
 		this.added ??= Array.from({ length: this.messages.length })
 		const indexes = index === undefined ? this.messages.keys() : [index]
-		for (const i of indexes) this.added[i] = { ...this.added[i], ...headers }
+		for (const i of indexes) {
+			// The usual case is one subscriber adding the same headers to every message: share them.
+			const already = this.added[i]
+			this.added[i] = already ? { ...already, ...headers } : headers
+		}
 	}
 }
 

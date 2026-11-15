@@ -2,10 +2,12 @@ import {
 	ROOT_CONTEXT,
 	SpanKind,
 	SpanStatusCode,
+	TraceFlags,
 	context,
 	propagation,
 	trace,
 	type Attributes,
+	type Context,
 	type Link,
 	type Span,
 	type TextMapGetter,
@@ -40,6 +42,17 @@ function end(span: Span, error: unknown): void {
 }
 
 /**
+ * Whether `parent` belongs to a trace that was decided not to be sampled. Such a trace gets no
+ * spans here: with a small sampling rate that is nearly every message, and a span that records
+ * nothing still costs as much to create as one that does. This follows the parent's decision, as
+ * the SDK's default sampler does.
+ */
+function notSampled(parent: Context): boolean {
+	const origin = trace.getSpanContext(parent)
+	return origin !== undefined && (origin.traceFlags & TraceFlags.SAMPLED) === 0
+}
+
+/**
  * Spans for what the application does with messages, connected across the topic.
  *
  * - A `send` span per `send()` call. Its context is written into the headers of every message of
@@ -47,6 +60,7 @@ function end(span: Span, error: unknown): void {
  * - A `process` span per handler call. For a single message it continues the trace of the send
  *   that produced it. A batch has no single origin, so its span starts a trace and links to the
  *   sends of its messages. The handler runs with the span active, so spans it creates are children.
+ * - No span for a send or a message inside a trace that is not sampled (see {@link notSampled}).
  */
 export function traceMessages(tracer: Tracer): () => void {
 	const stopSends = onOperation(diagnostics.send, {
@@ -59,14 +73,20 @@ export function traceMessages(tracer: Tracer): () => void {
 				[ATTR.clientId]: send.clientId,
 			}
 			if (send.messages.length > 1) attributes[ATTR.batchSize] = send.messages.length
-			const span = tracer.startSpan(`send ${send.topic}`, { kind: SpanKind.PRODUCER, attributes })
-			// One span for the call, so one context for all its messages.
+			const caller = context.active()
+			// A send inside a trace that is not sampled gets no span of its own; the caller's context
+			// still travels with the messages, so the consumer knows the trace is not sampled either.
+			const span = notSampled(caller)
+				? undefined
+				: tracer.startSpan(`send ${send.topic}`, { kind: SpanKind.PRODUCER, attributes }, caller)
+			// One context for all the messages of the call.
 			const headers: Record<string, string> = {}
-			propagation.inject(trace.setSpan(context.active(), span), headers, intoHeaders)
+			propagation.inject(span ? trace.setSpan(caller, span) : caller, headers, intoHeaders)
 			send.addHeaders(headers)
 			return span
 		},
 		finished(send, span, error) {
+			if (!span) return
 			// One message: where it ended up. A batch can be spread over partitions.
 			if (send.result && !Array.isArray(send.result)) {
 				span.setAttribute(ATTR.partition, String(send.result.partition))
@@ -97,17 +117,21 @@ export function traceMessages(tracer: Tracer): () => void {
 				if (message) parent = propagation.extract(ROOT_CONTEXT, message.headers, fromHeaders)
 				attributes[ATTR.offset] = Number(message?.offset)
 			}
-			const span = tracer.startSpan(
-				`process ${processing.topic}`,
-				{ kind: SpanKind.CONSUMER, attributes, links },
-				parent
-			)
-			const active = trace.setSpan(parent, span)
+			// A message of a trace that is not sampled: no span, but the handler still runs in that
+			// trace's context, so what it sends on is not sampled either.
+			const span = notSampled(parent)
+				? undefined
+				: tracer.startSpan(
+						`process ${processing.topic}`,
+						{ kind: SpanKind.CONSUMER, attributes, links },
+						parent
+					)
+			const active = span ? trace.setSpan(parent, span) : parent
 			processing.runHandlerIn(handler => context.with(active, handler))
 			return span
 		},
 		finished(_, span, error) {
-			end(span, error)
+			if (span) end(span, error)
 		},
 	})
 

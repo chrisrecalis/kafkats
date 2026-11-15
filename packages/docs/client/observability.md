@@ -43,6 +43,8 @@ The two are connected through message headers. On send, the trace context is wri
 - A `runEach` handler's span continues the trace of the send that produced the message.
 - A `runBatch` handler's span starts a new trace and **links** to the sends of its messages, because a batch has no single origin.
 
+A send or a message inside a trace that was not sampled gets no span. The sampling decision of the sender is followed, as OpenTelemetry's default sampler does, and it is passed on to whatever the handler sends.
+
 ### Metrics
 
 | Metric                                  | Type      | What it tells you                                            |
@@ -68,6 +70,10 @@ Durations are in seconds. Failed operations carry an `error.type` attribute. The
 Gauges cover producers and consumers created after `instrumentKafka()` was called. Instances that share their attributes, such as two producers of one client, are added up into one series.
 
 `kafkats.consumer.position.lag` is measured against the offset the consumer can read up to: the high watermark, or the last stable offset under `read_committed`. It is not reported for a paused partition, which is not fetched, so its end is not known.
+
+### What It Costs
+
+Nothing until `instrumentKafka()` is called. After that, each send and each handler call costs a few microseconds. Next to a handler that does real I/O that is small (about 1.5% for metrics and about 6% with traces, for a handler waiting 1 ms); next to a handler that does almost nothing it dominates. The package's README has the measurements and a benchmark to run on your own machine.
 
 ## Without OpenTelemetry
 
