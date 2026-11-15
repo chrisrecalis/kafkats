@@ -47,6 +47,8 @@ When you call `producer.send(...)`:
 2. Batches are flushed to the broker when they become “ready” (see triggers below).
 3. The returned promise resolves when the broker acknowledges the produced records (based on `acks`).
 
+Records of a topic are appended in the order `send()` was called, also when the calls are not awaited one by one, so records for the same partition are written in call order.
+
 This design makes `send()` fast under load, but it also means you should think about **backpressure**: if you produce faster than Kafka can accept, the in-memory queue can grow.
 
 #### Flush Triggers
@@ -159,6 +161,8 @@ const producer = client.producer({
 	maxBatchBytes: 16384, // Flush when batch reaches 16KB
 })
 ```
+
+One request per partition is in flight at a time. Batches that queue up for a partition behind its in-flight request are merged, in order, into requests of up to `maxBatchBytes`, so concurrent `send()` calls to a busy partition do not each cost a round trip. A single `send()` larger than `maxBatchBytes` is still sent as one batch.
 
 ### Flushing
 

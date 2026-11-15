@@ -67,6 +67,19 @@ receives more than one partition's byte budget at once. A record larger than the
 Lower `maxBytesPerPartition` when per-record work is slow: a rebalance waits for in-flight batches, so smaller batches
 keep rebalances and topic priority responsive (smaller fetches are the trade-off).
 
+Offsets of a batch are marked as consumed when the handler returns. A handler that works through a large batch can
+mark its progress as it goes with `ctx.resolveOffset(offset)`, so that what it has finished is committed even if it
+fails or the consumer stops before the end of the batch:
+
+```typescript
+await consumer.runBatch('events', async (messages, ctx) => {
+	for (const message of messages) {
+		await processMessage(message)
+		ctx.resolveOffset(message.offset) // everything up to this record can be committed
+	}
+})
+```
+
 ### Async Iterator Mode (stream)
 
 Consume messages via `for await ... of`:
@@ -235,9 +248,19 @@ When `autoCommit: true` and `commitOffsets: true`, the consumer:
 
 If you set `autoCommit: false` (or `commitOffsets: false`), the consumer will not commit offsets. On restart it will resume from the last committed offsets (or apply `autoOffsetReset` if none exist).
 
+### Position
+
+`consumer.position(topic, partition)` returns the offset the consumer will fetch next for an assigned partition.
+
+`consumer.commitPosition([{ topic, partition }])` commits that position. It is meant for a partition that has no committed offset yet: committing where it starts makes a restart resume from there instead of applying `autoOffsetReset` again (with `'latest'`, that would skip whatever arrived in between). It commits the fetch position, not what handlers have processed, so only call it before the partition has started fetching, for example on partitions paused in a `partitionsAssigned` listener.
+
 ::: tip Manual commits
-The public consumer API currently focuses on automatic commits. If you need explicit offset commits, consider managing offsets externally until manual commit APIs are exposed.
+Apart from `commitPosition()`, the public consumer API focuses on automatic commits. In `runBatch`, `ctx.resolveOffset()` controls how far they may go.
 :::
+
+### Connections
+
+Every consumer fetches on its own connection to each broker. A broker answers one request per connection at a time and holds a fetch for up to `maxWaitMs` when there is no data, so consumers that shared a connection would wait for each other's long polls.
 
 ## Backpressure: Pause and Resume
 

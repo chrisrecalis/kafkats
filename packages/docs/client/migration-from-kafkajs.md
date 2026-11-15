@@ -337,8 +337,9 @@ await consumer.runBatch(
 	async (messages, ctx) => {
 		for (const message of messages) {
 			await processMessage(message)
+			ctx.resolveOffset(message.offset) // optional: lets progress within the batch be committed
 		}
-		// Offsets are committed after batch completes successfully
+		// Without resolveOffset, offsets are committed after the batch completes successfully
 	},
 	{
 		autoCommit: true,

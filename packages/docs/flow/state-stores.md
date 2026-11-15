@@ -85,7 +85,7 @@ interface KeyValueStore<K, V> {
 	delete(key: K): Promise<void>
 	all(): AsyncIterable<[K, V]>
 	range(from: K, to: K): AsyncIterable<[K, V]>
-	approximateNumEntries(): Promise<number>
+	approximateNumEntries(): Promise<number> // may be an estimate (RocksDB); 0 exactly when the store is empty
 	init(): Promise<void>
 	flush(): Promise<void>
 	close(): Promise<void>
