@@ -1,7 +1,7 @@
 import { channel, tracingChannel, type TracingChannel } from 'node:diagnostics_channel'
 
-import type { Message, TopicPartition, TopicPartitionOffset } from '@/consumer/types.js'
-import type { ProducerMessage, SendResult } from '@/producer/types.js'
+import type { ConsumerMetrics, Message, TopicPartition, TopicPartitionOffset } from '@/consumer/types.js'
+import type { ProducerMessage, ProducerMetrics, SendResult } from '@/producer/types.js'
 
 /**
  * What the client tells the outside about its own work, published on `node:diagnostics_channel`.
@@ -81,10 +81,9 @@ export interface RebalanceDiagnostics {
 }
 
 /** A producer or consumer was created. Its `metrics()` can be read for as long as it is used. */
-export interface InstanceDiagnostics {
-	type: 'producer' | 'consumer'
-	instance: { metrics(): unknown }
-}
+export type InstanceDiagnostics =
+	| { type: 'producer'; clientId: string; instance: { metrics(): ProducerMetrics } }
+	| { type: 'consumer'; clientId: string; groupId: string; instance: { metrics(): ConsumerMetrics } }
 
 export const diagnostics = {
 	send: tracingChannel<unknown, SendDiagnostics>('kafkats:producer:send'),
@@ -92,6 +91,7 @@ export const diagnostics = {
 	process: tracingChannel<unknown, ProcessDiagnostics>('kafkats:consumer:process'),
 	commit: tracingChannel<unknown, CommitDiagnostics>('kafkats:consumer:commit'),
 	rebalance: tracingChannel<unknown, RebalanceDiagnostics>('kafkats:consumer:rebalance'),
+	/** Publishes an {@link InstanceDiagnostics} for every producer and consumer created. */
 	instances: channel('kafkats:instance'),
 } as const
 
@@ -117,7 +117,9 @@ export function trace<C extends object, T>(
 ): Promise<T> {
 	if (!hasSubscribers(traced)) return operation()
 	const context = describe()
-	return traced.tracePromise(() => {
+	// An async function, so that a synchronous throw of the operation is also an asynchronous
+	// failure: subscribers then always see `asyncEnd`, whichever way the operation ends.
+	return traced.tracePromise(async () => {
 		const { runInContext } = context as { runInContext?: ProcessDiagnostics['runInContext'] }
 		return runInContext ? runInContext(() => operation(context)) : operation(context)
 	}, context)

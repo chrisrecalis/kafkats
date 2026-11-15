@@ -27,6 +27,7 @@
 | `@kafkats/flow-state-lmdb` | Persistent LMDB state stores |
 | `@kafkats/flow-state-rocksdb` | Persistent RocksDB state stores |
 | `@kafkats/codec-zod` | Zod schema validation codecs |
+| `@kafkats/opentelemetry` | OpenTelemetry traces and metrics |
 
 ## Quick Start
 

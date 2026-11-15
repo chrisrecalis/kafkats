@@ -70,6 +70,7 @@ jobs:
                     # State store providers; their broker-backed tests are skipped without KAFKA_BROKERS.
                     - flow-state-lmdb
                     - flow-state-rocksdb
+                    - opentelemetry
         steps:
             - name: Checkout
               uses: actions/checkout@v4

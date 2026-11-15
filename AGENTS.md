@@ -16,6 +16,7 @@ This is a pnpm monorepo containing a pure-protocol TypeScript Kafka client and s
 | `@kafkats/flow-state-rocksdb` | Persistent RocksDB state stores for flow |
 | `@kafkats/flow-state-testkit` | Private: test suites shared by the state store providers |
 | `@kafkats/codec-zod` | Zod-based serialization codecs |
+| `@kafkats/opentelemetry` | OpenTelemetry traces and metrics for the client |
 | `@kafkats/benchmark` | Performance benchmarks vs kafkajs |
 | `docs` | VitePress documentation site |
 
@@ -23,7 +24,7 @@ Each package has its own `AGENTS.md` with package-specific guidance. **Read the 
 
 ## Versioning
 
-All publishable packages (`@kafkats/client`, `@kafkats/flow`, `@kafkats/codec-zod`, `@kafkats/flow-state-lmdb`, `@kafkats/flow-state-rocksdb`) are released in lockstep and share the same version number for minor and major releases. When creating changesets, include all five packages with the same bump type.
+All publishable packages (`@kafkats/client`, `@kafkats/flow`, `@kafkats/codec-zod`, `@kafkats/flow-state-lmdb`, `@kafkats/flow-state-rocksdb`, `@kafkats/opentelemetry`) are released in lockstep and share the same version number for minor and major releases. When creating changesets, include all six packages with the same bump type.
 
 ## Development Commands
 

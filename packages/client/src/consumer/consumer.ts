@@ -88,7 +88,12 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		super()
 		this.cluster = cluster
 		this.logger = cluster.getLogger()?.child({ component: 'consumer', groupId: config.groupId }) ?? noopLogger
-		diagnostics.instances.publish({ type: 'consumer', instance: this })
+		diagnostics.instances.publish({
+			type: 'consumer',
+			clientId: cluster.clientId,
+			groupId: config.groupId,
+			instance: this,
+		})
 		this.config = {
 			groupId: config.groupId,
 			groupInstanceId: config.groupInstanceId || undefined,

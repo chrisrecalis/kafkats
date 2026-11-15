@@ -241,7 +241,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 
 		this.config = this.resolveConfig(config)
 		this.accumulator = new RecordAccumulator(this.config, this.logger)
-		diagnostics.instances.publish({ type: 'producer', instance: this })
+		diagnostics.instances.publish({ type: 'producer', clientId: cluster.clientId, instance: this })
 		this.accumulator.on('batchReady', batch => {
 			const key = `${batch.topic}:${batch.partition}`
 			const queue = this.pendingBatches.get(key)
