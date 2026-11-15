@@ -82,7 +82,7 @@ npm install @mongodb-js/zstd
 ```
 
 ::: warning
-`@mongodb-js/zstd` v7+ requires Node 20.19 or later. On Node 18, install `@mongodb-js/zstd@2` (or `zstd-napi`) instead.
+`@mongodb-js/zstd` v7+ requires Node 20.19 or later, which every supported Node.js version (22 and later) satisfies.
 :::
 
 ### Disabling auto-registration

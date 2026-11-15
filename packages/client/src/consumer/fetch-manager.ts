@@ -432,6 +432,8 @@ interface PartitionState {
 	paused: boolean
 	/** How far the partition could be read as of the last fetch response. */
 	endOffset?: bigint
+	/** Whether records were fetched for it since it was assigned or last sought. */
+	fetched?: boolean
 	abortController: AbortController // Per-partition abort signal for incremental control
 	cachedLeader: Broker | null // Cached leader broker - invalidated on NotLeaderOrFollower
 	// Bumped by seek(). A fetch captures the epoch at issue time; a response whose
@@ -718,6 +720,11 @@ export class FetchManager {
 	}
 
 	/** The offset the next fetch of an assigned partition starts at, if the partition is assigned. */
+	/** Whether records of an assigned partition were fetched since it was assigned or last sought. */
+	hasFetched(topic: string, partition: number): boolean {
+		return this.partitionStates.get(tpKey(topic, partition))?.fetched === true
+	}
+
 	getFetchPosition(topic: string, partition: number): bigint | undefined {
 		return this.partitionStates.get(tpKey(topic, partition))?.offset
 	}
@@ -745,6 +752,7 @@ export class FetchManager {
 			state.offset = offset
 			// Fence any in-flight fetch issued at the old position, and drop buffered
 			// records from before the seek, so neither clobbers the new position.
+			state.fetched = false
 			state.fetchEpoch++
 			this.fetchBuffer?.removePartitions([{ topic, partition }])
 		} else {
@@ -1211,6 +1219,7 @@ export class FetchManager {
 					const records = filterRecordsFromOffset(decoded, fetchOffset)
 
 					if (records.length > 0) {
+						state.fetched = true
 						this.fetchBuffer.add({
 							topic: state.topic,
 							partition: state.partition,

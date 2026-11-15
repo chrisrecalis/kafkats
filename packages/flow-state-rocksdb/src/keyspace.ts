@@ -1,5 +1,5 @@
 import type { RocksDatabase } from '@harperfast/rocksdb-js'
-import type { OrderedByteStore } from '@kafkats/flow'
+import type { OrderedByteStore } from '@kafkats/flow/state'
 
 /**
  * All stores of a provider live in one RocksDB keyspace, told apart by a prefix: every key starts

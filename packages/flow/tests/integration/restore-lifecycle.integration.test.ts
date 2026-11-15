@@ -444,7 +444,7 @@ describe('processing failures', () => {
 				client,
 				numStreamThreads: 1,
 				consumer: { maxWaitMs: 100 },
-				runEach: { autoCommitIntervalMs: 200 },
+				consumerRun: { autoCommitIntervalMs: 200 },
 			})
 			app.stream(input, { key: stringCodec, value: numberCodec })
 				.mapValues(v => v)

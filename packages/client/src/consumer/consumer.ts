@@ -428,23 +428,28 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	}
 
 	/**
-	 * Commit the current fetch position of the given assigned partitions.
+	 * Commit the position a partition starts from, for partitions that have no committed offset.
 	 *
-	 * Called from a `partitionsAssigned` listener (or before anything was consumed), this makes
-	 * the start position durable: a partition without a committed offset would otherwise be
-	 * resolved by `autoOffsetReset` again after a restart, and with `'latest'` skip whatever was
-	 * read but not committed. Partitions that are not assigned are ignored.
+	 * Without it, such a partition is resolved by `autoOffsetReset` again after a restart, and with
+	 * `'latest'` that skips whatever arrived in between. Call it from a `partitionsAssigned`
+	 * listener, optionally after `seek()`. Partitions that are not assigned are ignored.
 	 *
-	 * This commits the position the consumer will fetch from next, not what handlers have
-	 * processed: records already fetched for a partition are skipped by the commit. Only call it
-	 * for partitions that have not started fetching (paused in the `partitionsAssigned` listener).
+	 * @throws If records of a partition were already fetched: its position is then past records
+	 * no handler has seen, and committing it would skip them.
 	 */
-	async commitPosition(partitions: Array<{ topic: string; partition: number }>): Promise<void> {
-		if (!this.offsetManager) return
+	async commitStartPosition(partitions: Array<{ topic: string; partition: number }>): Promise<void> {
+		if (!this.offsetManager || !this.fetchManager) return
 		const positions: Array<{ topic: string; partition: number; offset: bigint }> = []
 		for (const { topic, partition } of partitions) {
 			const offset = this.position(topic, partition)
-			if (offset !== undefined) positions.push({ topic, partition, offset })
+			if (offset === undefined) continue
+			if (this.fetchManager.hasFetched(topic, partition)) {
+				throw new Error(
+					`commitStartPosition: ${topic}-${partition} has already fetched records; ` +
+						'its position is no longer where it started'
+				)
+			}
+			positions.push({ topic, partition, offset })
 		}
 		await this.offsetManager.commitPositions(positions)
 	}

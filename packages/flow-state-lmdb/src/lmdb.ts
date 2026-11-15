@@ -1,19 +1,21 @@
 import { open, type Database, type RootDatabase } from 'lmdb'
+import type {
+	ChangelogCheckpointStore,
+	KeyValueStore,
+	KeyValueStoreOptions,
+	SessionStore,
+	SessionStoreOptions,
+	StateStoreProvider,
+	WindowStore,
+	WindowStoreOptions,
+} from '@kafkats/flow'
 import {
 	OrderedChangelogCheckpointStore,
 	OrderedKeyValueStore,
 	OrderedSessionStore,
 	OrderedWindowStore,
-	type ChangelogCheckpointStore,
-	type KeyValueStore,
-	type KeyValueStoreOptions,
 	type OrderedByteStore,
-	type SessionStore,
-	type SessionStoreOptions,
-	type StateStoreProvider,
-	type WindowStore,
-	type WindowStoreOptions,
-} from '@kafkats/flow'
+} from '@kafkats/flow/state'
 
 /**
  * An LMDB database as the ordered byte store flow's state stores are built on. `database` is

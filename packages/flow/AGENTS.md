@@ -47,10 +47,11 @@ src/
 │   ├── transactions.ts    # Exactly-once batch of one worker (begin/commit/abort, commit timer)
 │   ├── worker-pool.ts     # WorkerPool: starts/stops the stream workers, commit on close
 │   ├── stream-worker.ts   # StreamWorker: run/restart loop, message handling, rebalance events
-│   ├── worker-config.ts   # Per-worker producer/consumer/runEach config (transactional id, group instance id, timeouts)
+│   ├── worker-config.ts   # Per-worker producer/consumer/run config (transactional id, group instance id, timeouts)
 │   ├── global-tables.ts   # Loading and following global tables
 │   └── output.ts          # RecordOutput: encoding, partitioner, transactional send
-├── testing.ts     # TestDriver, MockProducer/MockConsumer
+├── testing.ts     # TestDriver, MockProducer/MockConsumer (`@kafkats/flow/testing`)
+├── state-kit.ts   # What state store providers are built from (`@kafkats/flow/state`)
 └── index.ts       # Public exports
 ```
 

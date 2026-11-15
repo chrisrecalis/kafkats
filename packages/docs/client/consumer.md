@@ -252,10 +252,10 @@ If you set `autoCommit: false` (or `commitOffsets: false`), the consumer will no
 
 `consumer.position(topic, partition)` returns the offset the consumer will fetch next for an assigned partition.
 
-`consumer.commitPosition([{ topic, partition }])` commits that position. It is meant for a partition that has no committed offset yet: committing where it starts makes a restart resume from there instead of applying `autoOffsetReset` again (with `'latest'`, that would skip whatever arrived in between). It commits the fetch position, not what handlers have processed, so only call it before the partition has started fetching, for example on partitions paused in a `partitionsAssigned` listener.
+`consumer.commitStartPosition([{ topic, partition }])` commits the position a partition starts from. It is for a partition that has no committed offset yet: committing where it starts makes a restart resume from there instead of applying `autoOffsetReset` again (with `'latest'`, that would skip whatever arrived in between). Call it from a `partitionsAssigned` listener, optionally after `seek()`. It throws once records of the partition have been fetched, because the position is then past records no handler has seen.
 
 ::: tip Manual commits
-Apart from `commitPosition()`, the public consumer API focuses on automatic commits. In `runBatch`, `ctx.resolveOffset()` controls how far they may go.
+Apart from `commitStartPosition()`, the public consumer API focuses on automatic commits. In `runBatch`, `ctx.resolveOffset()` controls how far they may go.
 :::
 
 ### Connections

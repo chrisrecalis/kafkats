@@ -1,4 +1,4 @@
-import type { ConsumerConfig, ProducerConfig, RunEachOptions } from '@kafkats/client'
+import type { ConsumerConfig, ProducerConfig, RunBatchOptions } from '@kafkats/client'
 import type { FlowConfig } from '@/types.js'
 import type { OffsetReset } from '@/runtime/topology.js'
 
@@ -92,13 +92,13 @@ export function workerConsumerConfig(
 }
 
 /** Under exactly_once, offsets are committed by the transaction, one record of a partition at a time. */
-export function workerRunEachOptions(config: FlowConfig, eosEnabled: boolean): RunEachOptions | undefined {
+export function workerRunOptions(config: FlowConfig, eosEnabled: boolean): RunBatchOptions | undefined {
 	if (!eosEnabled) {
-		return config.runEach
+		return config.consumerRun
 	}
 
 	return {
-		...config.runEach,
+		...config.consumerRun,
 		autoCommit: false,
 		commitOffsets: false,
 		partitionConcurrency: 1,

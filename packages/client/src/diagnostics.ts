@@ -1,4 +1,4 @@
-import diagnosticsChannel, { type TracingChannel } from 'node:diagnostics_channel'
+import { channel, tracingChannel, type TracingChannel } from 'node:diagnostics_channel'
 
 import type { ConsumerMetrics, Message, TopicPartition, TopicPartitionOffset } from '@/consumer/types.js'
 import type { ProducerMessage, ProducerMetrics, SendResult } from '@/producer/types.js'
@@ -16,8 +16,6 @@ import type { ProducerMessage, ProducerMetrics, SendResult } from '@/producer/ty
  * operation settles. Nothing is built and nothing is published for a channel without subscribers.
  * The client depends on no telemetry library: `@kafkats/opentelemetry` turns these events into
  * spans and metrics, and anything else can subscribe the same way.
- *
- * Tracing channels need Node.js 18.19; on an older runtime nothing is published.
  */
 
 /** Runs a function, usually inside some asynchronous context, and returns what it returns. */
@@ -97,14 +95,6 @@ export type InstanceDiagnostics =
 	| { type: 'producer'; clientId: string; instance: { metrics(): ProducerMetrics } }
 	| { type: 'consumer'; clientId: string; groupId: string; instance: { metrics(): ConsumerMetrics } }
 
-/** Tracing channels, or stand-ins nobody can subscribe to where the runtime has none (Node < 18.19). */
-const tracingChannel: typeof diagnosticsChannel.tracingChannel =
-	diagnosticsChannel.tracingChannel ??
-	((): unknown => {
-		const silent = { hasSubscribers: false, subscribe() {}, unsubscribe: () => false }
-		return { start: silent, end: silent, asyncStart: silent, asyncEnd: silent, error: silent }
-	})
-
 export const diagnostics = {
 	send: tracingChannel<unknown, SendDiagnostics>('kafkats:producer:send'),
 	produceRequest: tracingChannel<unknown, ProduceRequestDiagnostics>('kafkats:producer:request'),
@@ -112,19 +102,8 @@ export const diagnostics = {
 	commit: tracingChannel<unknown, CommitDiagnostics>('kafkats:consumer:commit'),
 	rebalance: tracingChannel<unknown, RebalanceDiagnostics>('kafkats:consumer:rebalance'),
 	/** Publishes an {@link InstanceDiagnostics} for every producer and consumer created. */
-	instances: diagnosticsChannel.channel('kafkats:instance'),
+	instances: channel('kafkats:instance'),
 } as const
-
-/** Whether anything listens to a tracing channel. `TracingChannel.hasSubscribers` needs Node 20.13. */
-export function hasSubscribers(traced: TracingChannel<unknown, object>): boolean {
-	return (
-		traced.start.hasSubscribers ||
-		traced.end.hasSubscribers ||
-		traced.asyncStart.hasSubscribers ||
-		traced.asyncEnd.hasSubscribers ||
-		traced.error.hasSubscribers
-	)
-}
 
 /**
  * Run `operation` as one traced operation of `traced`. Without subscribers this is a plain call:
@@ -138,7 +117,7 @@ export function trace<C extends object, T>(
 	operation: (context?: C) => Promise<T>,
 	scopes?: Scope[]
 ): Promise<T> {
-	if (!hasSubscribers(traced)) return operation()
+	if (!traced.hasSubscribers) return operation()
 	const context = describe()
 	// An async function, so that a synchronous throw of the operation is also an asynchronous
 	// failure: subscribers then always see `asyncEnd`, whichever way the operation ends.

@@ -111,8 +111,6 @@ diagnostics.process.subscribe({
 
 `asyncEnd` is always the last event of an operation; a failed one has `context.error` set. A produce request the broker answered is not a failed operation even when it rejected partitions: those are listed in `context.rejected`.
 
-Tracing channels need Node.js 18.19 or later. On an older runtime the client works as before and publishes nothing.
-
 Two things a subscriber can do besides observing, both in a `start` handler:
 
 - **Add headers to messages being sent.** `context.addHeaders(headers)` on a send adds them to every message of the call; `context.addHeaders(headers, index)` to one. The objects the caller passed are not modified.
