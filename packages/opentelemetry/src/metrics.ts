@@ -1,5 +1,5 @@
 import type { Attributes, Meter, Observable } from '@opentelemetry/api'
-import { diagnostics, type InstanceDiagnostics } from '@kafkats/client'
+import { ErrorCode, diagnostics, type InstanceDiagnostics } from '@kafkats/client'
 
 import { ATTR, KAFKATS_METRIC, METRIC, SYSTEM_KAFKA, errorType } from './attributes.js'
 import { onOperation, secondsSince } from './operations.js'
@@ -40,7 +40,12 @@ export function measureClients(meter: Meter): () => void {
 		onOperation(diagnostics.produceRequest, {
 			...timed,
 			finished(request, startedAt, error) {
-				const attributes = { [ATTR.brokerId]: request.brokerId, ...failure(error) }
+				// A request the broker answered can still have had partitions rejected.
+				const rejected = request.rejected?.[0]
+				const attributes = {
+					[ATTR.brokerId]: request.brokerId,
+					...(rejected ? { [ATTR.errorType]: ErrorCode[rejected.errorCode] ?? 'rejected' } : failure(error)),
+				}
 				requestDuration.record(secondsSince(startedAt), attributes)
 				requestRecords.record(request.records, attributes)
 			},
@@ -124,6 +129,18 @@ function observeInstances(meter: Meter): () => void {
 	]
 
 	const collect: Parameters<Meter['addBatchObservableCallback']>[0] = result => {
+		// Instances that share their attributes (two producers of one client, the members of a group
+		// in one process) are one series: their values add up instead of the last one winning.
+		const totals = new Map<Observable, Map<string, { attributes: Attributes; value: number }>>()
+		const add = (gauge: Observable, value: number, attributes: Attributes): void => {
+			const series = totals.get(gauge) ?? new Map<string, { attributes: Attributes; value: number }>()
+			totals.set(gauge, series)
+			const key = JSON.stringify(attributes)
+			const total = series.get(key)
+			if (total) total.value += value
+			else series.set(key, { attributes, value })
+		}
+
 		for (const find of instances) {
 			const created = find()
 			if (!created) {
@@ -133,27 +150,32 @@ function observeInstances(meter: Meter): () => void {
 			if (created.type === 'producer') {
 				const client = { [ATTR.clientId]: created.clientId }
 				const metrics = created.instance.metrics()
-				result.observe(queuedRecords, metrics.queuedRecords, client)
-				result.observe(queuedBytes, metrics.queuedBytes, client)
-				result.observe(inFlightRequests, metrics.inFlightRequests, client)
-				result.observe(unacknowledgedSends, metrics.unacknowledgedSends, client)
+				add(queuedRecords, metrics.queuedRecords, client)
+				add(queuedBytes, metrics.queuedBytes, client)
+				add(inFlightRequests, metrics.inFlightRequests, client)
+				add(unacknowledgedSends, metrics.unacknowledgedSends, client)
 				continue
 			}
 			const group = { [ATTR.consumerGroup]: created.groupId, [ATTR.clientId]: created.clientId }
 			const { partitions } = created.instance.metrics()
-			result.observe(assignedPartitions, partitions.length, group)
-			result.observe(pausedPartitions, partitions.filter(p => p.paused).length, group)
+			add(assignedPartitions, partitions.length, group)
+			add(pausedPartitions, partitions.filter(p => p.paused).length, group)
 			for (const partition of partitions) {
 				const attributes = {
 					...group,
 					[ATTR.topic]: partition.topic,
 					[ATTR.partition]: String(partition.partition),
 				}
-				result.observe(bufferedBytes, partition.bufferedBytes, attributes)
-				if (partition.highWatermark !== undefined) {
-					result.observe(positionLag, Number(partition.highWatermark - partition.position), attributes)
+				add(bufferedBytes, partition.bufferedBytes, attributes)
+				// Unknown before the first fetch and while the partition is paused.
+				if (partition.endOffset !== undefined) {
+					add(positionLag, Number(partition.endOffset - partition.position), attributes)
 				}
 			}
+		}
+
+		for (const [gauge, series] of totals) {
+			for (const { attributes, value } of series.values()) result.observe(gauge, value, attributes)
 		}
 	}
 

@@ -17,10 +17,9 @@ import { diagnostics, type Message } from '@kafkats/client'
 import { ATTR, SYSTEM_KAFKA, errorType } from './attributes.js'
 import { onOperation } from './operations.js'
 
-type OutgoingHeaders = Record<string, string | Buffer>
 type IncomingHeaders = Message<unknown, unknown>['headers']
 
-const intoHeaders: TextMapSetter<OutgoingHeaders> = {
+const intoHeaders: TextMapSetter<Record<string, string>> = {
 	set: (headers, key, value) => {
 		headers[key] = value
 	},
@@ -61,8 +60,10 @@ export function traceMessages(tracer: Tracer): () => void {
 			}
 			if (send.messages.length > 1) attributes[ATTR.batchSize] = send.messages.length
 			const span = tracer.startSpan(`send ${send.topic}`, { kind: SpanKind.PRODUCER, attributes })
-			const sending = trace.setSpan(context.active(), span)
-			for (const message of send.messages) propagation.inject(sending, message.headers, intoHeaders)
+			// One span for the call, so one context for all its messages.
+			const headers: Record<string, string> = {}
+			propagation.inject(trace.setSpan(context.active(), span), headers, intoHeaders)
+			send.addHeaders(headers)
 			return span
 		},
 		finished(send, span, error) {
@@ -86,17 +87,15 @@ export function traceMessages(tracer: Tracer): () => void {
 				[ATTR.consumerGroup]: processing.groupId,
 				[ATTR.clientId]: processing.clientId,
 			}
-			const origins = processing.messages.map(message =>
-				propagation.extract(ROOT_CONTEXT, message.headers, fromHeaders)
-			)
 			let parent = ROOT_CONTEXT
 			let links: Link[] = []
 			if (processing.batch) {
 				attributes[ATTR.batchSize] = processing.messages.length
-				links = distinctLinks(origins.map(origin => trace.getSpanContext(origin)))
+				links = sendsOf(processing.messages)
 			} else {
-				parent = origins[0] ?? ROOT_CONTEXT
-				attributes[ATTR.offset] = Number(processing.messages[0]?.offset)
+				const [message] = processing.messages
+				if (message) parent = propagation.extract(ROOT_CONTEXT, message.headers, fromHeaders)
+				attributes[ATTR.offset] = Number(message?.offset)
 			}
 			const span = tracer.startSpan(
 				`process ${processing.topic}`,
@@ -104,7 +103,7 @@ export function traceMessages(tracer: Tracer): () => void {
 				parent
 			)
 			const active = trace.setSpan(parent, span)
-			processing.runInContext = handler => context.with(active, handler)
+			processing.runHandlerIn(handler => context.with(active, handler))
 			return span
 		},
 		finished(_, span, error) {
@@ -118,11 +117,19 @@ export function traceMessages(tracer: Tracer): () => void {
 	}
 }
 
-/** One link per distinct sending span: the messages of one `send()` call share theirs. */
-function distinctLinks(origins: Array<ReturnType<typeof trace.getSpanContext>>): Link[] {
-	const links = new Map<string, Link>()
-	for (const origin of origins) {
-		if (origin) links.set(`${origin.traceId}:${origin.spanId}`, { context: origin })
+/**
+ * A link to every send that produced one of `messages`. The messages of one `send()` call carry
+ * the same trace headers, and a batch is often thousands of messages from a few calls, so the
+ * headers are compared as bytes and each distinct set is parsed once.
+ */
+function sendsOf(messages: ReadonlyArray<Message<unknown, unknown>>): Link[] {
+	const fields = propagation.fields()
+	const links = new Map<string, Link | undefined>()
+	for (const { headers } of messages) {
+		const carried = fields.map(field => headers[field]?.toString('latin1') ?? '').join('\n')
+		if (links.has(carried)) continue
+		const origin = trace.getSpanContext(propagation.extract(ROOT_CONTEXT, headers, fromHeaders))
+		links.set(carried, origin && { context: origin })
 	}
-	return [...links.values()]
+	return [...links.values()].filter(link => link !== undefined)
 }

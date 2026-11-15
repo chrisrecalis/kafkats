@@ -49,7 +49,8 @@
 		"clean": "rm -rf dist",
 		"prepack": "pnpm -w turbo run build --filter=$npm_package_name",
 		"test": "vitest run tests",
-		"test:unit": "vitest run tests"
+		"test:unit": "vitest run tests",
+		"test:integration": "vitest run -c vitest.integration.config.ts"
 	},
 	"peerDependencies": {
 		"@kafkats/client": "workspace:^",

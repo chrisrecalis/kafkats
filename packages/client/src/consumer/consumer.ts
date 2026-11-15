@@ -39,7 +39,7 @@ import type {
 	PartitionBatch,
 	ConsumerMetrics,
 } from './types.js'
-import { diagnostics, trace } from '@/diagnostics.js'
+import { diagnostics, trace, type Scope } from '@/diagnostics.js'
 import {
 	DEFAULT_CONSUMER_CONFIG,
 	DEFAULT_RUN_EACH_OPTIONS,
@@ -399,6 +399,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		batch: boolean,
 		handle: () => Promise<void>
 	): Promise<void> {
+		const scopes: Scope[] = []
 		return trace(
 			diagnostics.process,
 			() => ({
@@ -408,8 +409,10 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 				partition,
 				messages,
 				batch,
+				runHandlerIn: scope => void scopes.push(scope),
 			}),
-			handle
+			handle,
+			scopes
 		)
 	}
 

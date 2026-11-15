@@ -62,9 +62,7 @@ describe('Producer diagnostics', () => {
 
 	it('sends the headers a subscriber adds, without touching the message the caller passed', async () => {
 		subscribe<SendDiagnostics>(diagnostics.send, {
-			start: context => {
-				for (const message of context.messages) message.headers.traceparent = '00-abc-def-01'
-			},
+			start: context => context.addHeaders({ traceparent: '00-abc-def-01' }),
 		})
 		const producer = new Producer(mockCluster, { retries: 0 })
 		const message = { value: Buffer.from('v'), partition: 0, headers: { mine: 'kept' } }
@@ -76,6 +74,47 @@ describe('Producer diagnostics', () => {
 		expect(headers).toEqual({ mine: 'kept', traceparent: '00-abc-def-01' })
 		expect(message.headers).toEqual({ mine: 'kept' })
 		await producer.disconnect()
+	})
+
+	it('adds headers to one message of a call when given its index', async () => {
+		subscribe<SendDiagnostics>(diagnostics.send, {
+			start: context => {
+				context.addHeaders({ all: 'yes' })
+				context.addHeaders({ second: 'only' }, 1)
+			},
+		})
+		const producer = new Producer(mockCluster, { retries: 0 })
+
+		await producer.send('test-topic', [
+			{ value: Buffer.from('a'), partition: 0 },
+			{ value: Buffer.from('b'), partition: 0 },
+		])
+
+		const { records } = await decodeRecordBatch(produced[0]!.topics[0]!.partitions[0]!.records)
+		expect(records.map(record => record.headers.map(header => header.key))).toEqual([['all'], ['all', 'second']])
+		await producer.disconnect()
+	})
+
+	it('reports the partitions a broker rejected, on a request that did not fail as a whole', async () => {
+		mockBroker.produce.mockResolvedValue(
+			buildProduceResponse([
+				{
+					name: 'test-topic',
+					partitions: [{ partitionIndex: 0, errorCode: ErrorCode.MessageTooLarge, baseOffset: -1n }],
+				},
+			])
+		)
+		let finished: ProduceRequestDiagnostics | undefined
+		subscribe<ProduceRequestDiagnostics>(diagnostics.produceRequest, { asyncEnd: context => (finished = context) })
+		const producer = new Producer(mockCluster, { retries: 0 })
+
+		await expect(producer.send('test-topic', { value: Buffer.from('v'), partition: 0 })).rejects.toThrow()
+
+		expect(finished?.error).toBeUndefined()
+		expect(finished?.rejected).toEqual([
+			{ topic: 'test-topic', partition: 0, errorCode: ErrorCode.MessageTooLarge },
+		])
+		await producer.disconnect().catch(() => {})
 	})
 
 	it('publishes each produce request with what it carried', async () => {
@@ -91,6 +130,7 @@ describe('Producer diagnostics', () => {
 		expect(requests).toHaveLength(1)
 		expect(requests[0]).toMatchObject({ brokerId: 1, partitions: 1, records: 2 })
 		expect(requests[0]!.bytes).toBeGreaterThan(0)
+		expect(requests[0]!.rejected).toEqual([])
 		await producer.disconnect()
 	})
 

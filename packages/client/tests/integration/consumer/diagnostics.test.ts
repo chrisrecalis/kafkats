@@ -38,18 +38,21 @@ describe.concurrent('Consumer (integration) - diagnostics', () => {
 		await client.createTopics([{ name: topic, numPartitions: 1, replicationFactor: 1 }])
 
 		const activeTrace = new AsyncLocalStorage<string>()
+		const otherContext = new AsyncLocalStorage<string>()
 		const stop = [
 			subscribe<SendDiagnostics>(diagnostics.send, c => c.topic === topic, {
-				start: context => {
-					for (const message of context.messages) message.headers.traceparent = 'trace-1'
-				},
+				start: context => context.addHeaders({ traceparent: 'trace-1' }),
 			}),
 			subscribe<ProcessDiagnostics>(diagnostics.process, c => c.topic === topic, {
 				start: context => {
 					// What a tracer does: continue the trace found in the message for the handler's duration.
 					const trace = context.messages[0]!.headers.traceparent!.toString()
-					context.runInContext = handler => activeTrace.run(trace, handler)
+					context.runHandlerIn(handler => activeTrace.run(trace, handler))
 				},
+			}),
+			// A second subscriber with a context of its own: both apply.
+			subscribe<ProcessDiagnostics>(diagnostics.process, c => c.topic === topic, {
+				start: context => context.runHandlerIn(handler => otherContext.run('other', handler)),
 			}),
 		]
 		try {
@@ -62,10 +65,10 @@ describe.concurrent('Consumer (integration) - diagnostics', () => {
 			await consumer.runEach(topic, async () => {
 				// Also after an await: the context follows the handler's asynchronous work.
 				await new Promise(resolve => setTimeout(resolve, 1))
-				seen.push(activeTrace.getStore())
+				seen.push(activeTrace.getStore(), otherContext.getStore())
 				consumer.stop()
 			})
-			expect(seen).toEqual(['trace-1'])
+			expect(seen).toEqual(['trace-1', 'other'])
 			await producer.disconnect()
 		} finally {
 			for (const unsubscribe of stop) unsubscribe()
@@ -166,7 +169,7 @@ describe.concurrent('Consumer (integration) - diagnostics', () => {
 
 			const waiting = first.metrics().partitions.find(p => p.partition === 0)!
 			expect(waiting.position).toBe(20n)
-			expect(waiting.highWatermark).toBe(20n)
+			expect(waiting.endOffset).toBe(20n)
 			expect(waiting.paused).toBe(false)
 			expect(
 				first

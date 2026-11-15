@@ -430,8 +430,8 @@ interface PartitionState {
 	partition: number
 	offset: bigint
 	paused: boolean
-	/** End of the partition as of the last fetch response. */
-	highWatermark?: bigint
+	/** How far the partition could be read as of the last fetch response. */
+	endOffset?: bigint
 	abortController: AbortController // Per-partition abort signal for incremental control
 	cachedLeader: Broker | null // Cached leader broker - invalidated on NotLeaderOrFollower
 	// Bumped by seek(). A fetch captures the epoch at issue time; a response whose
@@ -682,6 +682,8 @@ export class FetchManager {
 			const state = this.partitionStates.get(key)
 			if (state) {
 				state.paused = true
+				// Not fetched while paused: what is known of the partition's end goes stale.
+				state.endOffset = undefined
 				const earliestBuffered = earliest.get(key)
 				if (earliestBuffered !== undefined && earliestBuffered < state.offset) {
 					state.offset = earliestBuffered
@@ -1182,7 +1184,11 @@ export class FetchManager {
 					await this.handleFetchError(state, partitionResponse.errorCode)
 					continue
 				}
-				state.highWatermark = partitionResponse.highWatermark
+				// What this consumer can read up to: under read_committed, not past an open transaction.
+				state.endOffset =
+					this.config.isolationLevel === 'read_committed'
+						? partitionResponse.lastStableOffset
+						: partitionResponse.highWatermark
 
 				if (partitionResponse.recordsData && partitionResponse.recordsData.length > 0) {
 					const fetchOffset = state.offset
@@ -1288,7 +1294,7 @@ export class FetchManager {
 		throw error
 	}
 
-	/** Position, last known end, buffered bytes and pause state of every assigned partition. */
+	/** Position, readable end, buffered bytes and pause state of every assigned partition. */
 	partitionMetrics(): ConsumerPartitionMetrics[] {
 		const buffered = new Map(
 			this.fetchBuffer?.snapshot().map(stat => [tpKey(stat.topic, stat.partition), stat.bytes])
@@ -1297,7 +1303,7 @@ export class FetchManager {
 			topic: state.topic,
 			partition: state.partition,
 			position: state.offset,
-			highWatermark: state.highWatermark,
+			endOffset: state.endOffset,
 			bufferedBytes: buffered.get(key) ?? 0,
 			paused: state.paused,
 		}))

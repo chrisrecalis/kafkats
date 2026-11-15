@@ -65,7 +65,9 @@ The two are connected through message headers. On send, the trace context is wri
 
 Durations are in seconds. Failed operations carry an `error.type` attribute. The `messaging.*` names follow OpenTelemetry's messaging semantic conventions, which are still marked as in development and may be renamed.
 
-Gauges cover producers and consumers created after `instrumentKafka()` was called.
+Gauges cover producers and consumers created after `instrumentKafka()` was called. Instances that share their attributes, such as two producers of one client, are added up into one series.
+
+`kafkats.consumer.position.lag` is measured against the offset the consumer can read up to: the high watermark, or the last stable offset under `read_committed`. It is not reported for a paused partition, which is not fetched, so its end is not known.
 
 ## Without OpenTelemetry
 
@@ -76,7 +78,7 @@ producer.metrics()
 // { queuedBatches, queuedRecords, queuedBytes, inFlightRequests, unacknowledgedSends }
 
 consumer.metrics()
-// { partitions: [{ topic, partition, position, highWatermark, bufferedBytes, paused }] }
+// { partitions: [{ topic, partition, position, endOffset, bufferedBytes, paused }] }
 ```
 
 Read them on whatever schedule your monitoring uses, for example in a Prometheus collector.
@@ -88,7 +90,7 @@ Every operation is a [tracing channel](https://nodejs.org/api/diagnostics_channe
 | Channel                      | Operation                                | Context                                              |
 | ---------------------------- | ---------------------------------------- | ---------------------------------------------------- |
 | `kafkats:producer:send`      | A `send()` call until it is acknowledged | `topic`, `messages`, `transactional`, `result`       |
-| `kafkats:producer:request`   | One produce request                      | `brokerId`, `partitions`, `records`, `bytes`         |
+| `kafkats:producer:request`   | One produce request                      | `brokerId`, `records`, `bytes`, `rejected`           |
 | `kafkats:consumer:process`   | One handler call                         | `groupId`, `topic`, `partition`, `messages`, `batch` |
 | `kafkats:consumer:commit`    | One offset commit                        | `groupId`, `offsets`                                 |
 | `kafkats:consumer:rebalance` | One rebalance of this member             | `groupId`, `assignment`                              |
@@ -107,11 +109,13 @@ diagnostics.process.subscribe({
 })
 ```
 
-`asyncEnd` is always the last event of an operation; a failed one has `context.error` set.
+`asyncEnd` is always the last event of an operation; a failed one has `context.error` set. A produce request the broker answered is not a failed operation even when it rejected partitions: those are listed in `context.rejected`.
+
+Tracing channels need Node.js 18.19 or later. On an older runtime the client works as before and publishes nothing.
 
 Two things a subscriber can do besides observing, both in a `start` handler:
 
-- **Add headers to messages being sent.** `context.messages` of a send are copies of what the caller passed; headers added to them are sent.
-- **Run a handler in its own asynchronous context.** Set `context.runInContext` on a `process` event to a function that calls the handler, for example inside an `AsyncLocalStorage`.
+- **Add headers to messages being sent.** `context.addHeaders(headers)` on a send adds them to every message of the call; `context.addHeaders(headers, index)` to one. The objects the caller passed are not modified.
+- **Run a handler in its own asynchronous context.** `context.runHandlerIn(scope)` on a `process` event makes the consumer call the handler through `scope`, for example `handler => storage.run(value, handler)` with an `AsyncLocalStorage`. Several subscribers can each ask; their scopes nest.
 
 These two are what trace propagation needs, and they are how `@kafkats/opentelemetry` is built.

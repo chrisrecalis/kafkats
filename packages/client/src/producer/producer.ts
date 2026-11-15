@@ -50,7 +50,7 @@ import type {
 	ProducerTraceFn,
 	ProducerMetrics,
 } from './types.js'
-import { diagnostics, hasSubscribers, trace } from '@/diagnostics.js'
+import { diagnostics, trace, type ProduceRequestDiagnostics } from '@/diagnostics.js'
 
 const EMPTY_BUFFER = Buffer.alloc(0)
 
@@ -608,14 +608,24 @@ export class Producer extends EventEmitter<ProducerEvents> {
 			const requestStart = performance.now()
 			const response = await trace(
 				diagnostics.produceRequest,
-				() => ({
+				(): ProduceRequestDiagnostics => ({
 					clientId: this.cluster.clientId,
 					brokerId: broker.nodeId,
 					partitions: preparedBatches.length,
 					records: preparedBatches.reduce((sum, p) => sum + p.recordCount, 0),
 					bytes: preparedBatches.reduce((sum, p) => sum + p.encodedBatch.length, 0),
 				}),
-				() => broker.produce(request)
+				async produceRequest => {
+					const produced = await broker.produce(request)
+					if (produceRequest) {
+						produceRequest.rejected = produced.topics.flatMap(topic =>
+							topic.partitions
+								.filter(partition => partition.errorCode !== ErrorCode.None)
+								.map(p => ({ topic: topic.name, partition: p.partitionIndex, errorCode: p.errorCode }))
+						)
+					}
+					return produced
+				}
 			)
 			const requestEnd = performance.now()
 			if (this.trace) {
@@ -1051,8 +1061,8 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	}
 
 	/**
-	 * Send as one traced operation (see `diagnostics.send`). Subscribers get copies of the messages
-	 * and may add headers to them; those copies are what is sent.
+	 * Send as one traced operation (see `diagnostics.send`). Headers that subscribers ask to add are
+	 * merged into copies of the messages; without any, the caller's messages are sent as they are.
 	 */
 	private tracedSend<V, K>(
 		topicDef: TopicDefinition<V, K>,
@@ -1060,18 +1070,29 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		transactional: boolean,
 		send: (messages: ProducerMessage<V, K> | ProducerMessage<V, K>[]) => Promise<SendResult | SendResult[]>
 	): Promise<SendResult | SendResult[]> {
-		if (!hasSubscribers(diagnostics.send)) return send(messages)
-		const copy = (message: ProducerMessage<V, K>) => ({ ...message, headers: { ...message.headers } })
-		const copies = Array.isArray(messages) ? messages.map(copy) : copy(messages)
+		const list = Array.isArray(messages) ? messages : [messages]
+		let added: Array<Record<string, string | Buffer> | undefined> | undefined
 		return trace(
 			diagnostics.send,
 			() => ({
 				clientId: this.cluster.clientId,
 				topic: topicDef.topic,
 				transactional,
-				messages: Array.isArray(copies) ? copies : [copies],
+				messages: list,
+				addHeaders: (headers, index) => {
+					added ??= Array.from({ length: list.length })
+					const indexes = index === undefined ? list.keys() : [index]
+					for (const i of indexes) added[i] = { ...added[i], ...headers }
+				},
 			}),
-			() => send(copies)
+			() => {
+				if (!added) return send(messages)
+				const extra = added
+				const withHeaders = list.map((message, i) =>
+					extra[i] ? { ...message, headers: { ...message.headers, ...extra[i] } } : message
+				)
+				return send(Array.isArray(messages) ? withHeaders : withHeaders[0]!)
+			}
 		)
 	}
 

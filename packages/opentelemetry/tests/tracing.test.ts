@@ -1,20 +1,26 @@
 import { SpanKind, SpanStatusCode, context, trace } from '@opentelemetry/api'
 import { diagnostics, type Message, type ProcessDiagnostics, type SendDiagnostics } from '@kafkats/client'
+
+type Scope = Parameters<ProcessDiagnostics['runHandlerIn']>[0]
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 
 import { ATTR, instrumentKafka } from '../src/index.js'
 import { spanRecorder, useW3CContext } from './setup.js'
 
-/** Run a send through the client's channel, the way the producer does. */
+/** Run a send through the client's channel, the way the producer does. Returns the headers each message got. */
 function send(messages: number, outcome: () => Promise<unknown> = async () => ({ partition: 2, offset: 40n })) {
+	const headers: Array<Record<string, string | Buffer>> = Array.from({ length: messages }, () => ({}))
 	const sending: SendDiagnostics = {
 		clientId: 'app',
 		topic: 'orders',
 		transactional: false,
-		messages: Array.from({ length: messages }, () => ({ value: null, headers: {} })),
+		messages: headers.map(() => ({ value: null })),
+		addHeaders: (added, index) => {
+			for (const i of index === undefined ? headers.keys() : [index]) Object.assign(headers[i]!, added)
+		},
 	}
 	const done = diagnostics.send.tracePromise(async () => outcome() as never, sending)
-	return { sending, done }
+	return { headers, done }
 }
 
 const message = (offset: bigint, headers: Record<string, string | Buffer>): Message<unknown, unknown> => ({
@@ -29,6 +35,7 @@ const message = (offset: bigint, headers: Record<string, string | Buffer>): Mess
 
 /** Run a handler through the client's channel, the way the consumer does. */
 function process(messages: Array<Message<unknown, unknown>>, batch: boolean, handler: () => Promise<void>) {
+	const scopes: Scope[] = []
 	const processing: ProcessDiagnostics = {
 		clientId: 'app',
 		groupId: 'billing',
@@ -36,9 +43,10 @@ function process(messages: Array<Message<unknown, unknown>>, batch: boolean, han
 		partition: 1,
 		messages,
 		batch,
+		runHandlerIn: scope => void scopes.push(scope),
 	}
 	return diagnostics.process.tracePromise(
-		async () => (processing.runInContext ? processing.runInContext(handler) : handler()),
+		async () => scopes.reduceRight<() => Promise<void>>((inner, scope) => () => scope(inner), handler)(),
 		processing
 	)
 }
@@ -55,7 +63,7 @@ describe('tracing', () => {
 	afterEach(() => stop())
 
 	it('a send is a producer span whose context is written into the message headers', async () => {
-		const { sending, done } = send(1)
+		const { headers, done } = send(1)
 		await done
 
 		const [span] = recorder.spans()
@@ -69,7 +77,7 @@ describe('tracing', () => {
 			[ATTR.offset]: 40,
 		})
 		const { traceId, spanId } = span!.spanContext()
-		expect(sending.messages[0]!.headers.traceparent).toBe(`00-${traceId}-${spanId}-01`)
+		expect(headers[0]!.traceparent).toBe(`00-${traceId}-${spanId}-01`)
 	})
 
 	it('a send is a child of the span that was active when send() was called', async () => {
@@ -96,12 +104,12 @@ describe('tracing', () => {
 	})
 
 	it('handling one message continues the trace of the send, and the handler runs inside the span', async () => {
-		const { sending, done } = send(1)
+		const { headers, done } = send(1)
 		await done
 		const sendSpan = recorder.spans()[0]!
 
 		let activeInHandler: string | undefined
-		await process([message(40n, sending.messages[0]!.headers)], false, async () => {
+		await process([message(40n, headers[0]!)], false, async () => {
 			await new Promise(resolve => setTimeout(resolve, 1))
 			activeInHandler = trace.getActiveSpan()?.spanContext().spanId
 		})
@@ -127,9 +135,9 @@ describe('tracing', () => {
 
 		await process(
 			[
-				message(1n, first.sending.messages[0]!.headers),
-				message(2n, first.sending.messages[1]!.headers),
-				message(3n, second.sending.messages[0]!.headers),
+				message(1n, first.headers[0]!),
+				message(2n, first.headers[1]!),
+				message(3n, second.headers[0]!),
 				message(4n, {}), // produced by something that does not trace
 			],
 			true,
@@ -154,11 +162,40 @@ describe('tracing', () => {
 		expect(span!.events[0]!.name).toBe('exception')
 	})
 
-	it('stops when asked to', async () => {
+	it('stops when asked to, but still ends what was under way', async () => {
+		let finishHandler!: () => void
+		const handling = process(
+			[message(1n, {})],
+			false,
+			() => new Promise<void>(resolve => (finishHandler = resolve))
+		)
+		await new Promise(resolve => setTimeout(resolve, 1))
+
 		stop()
-		const { sending, done } = send(1)
+		const { headers, done } = send(1)
 		await done
 		expect(recorder.spans()).toEqual([])
-		expect(sending.messages[0]!.headers).toEqual({})
+		expect(headers[0]).toEqual({})
+
+		finishHandler()
+		await handling
+		expect(recorder.spans().map(span => span.name)).toEqual(['process orders'])
+	})
+
+	it('two instrumentations at once each get their span active in the handler', async () => {
+		const other = spanRecorder()
+		const stopOther = instrumentKafka({ tracerProvider: other.tracerProvider, metrics: false })
+		try {
+			const active: Array<string | undefined> = []
+			await process([message(1n, {})], false, async () => {
+				active.push(trace.getActiveSpan()?.spanContext().spanId)
+			})
+			// The handler ran inside both scopes; the innermost one (asked for last) is the active span.
+			expect(recorder.spans()).toHaveLength(1)
+			expect(other.spans()).toHaveLength(1)
+			expect(active).toEqual([other.spans()[0]!.spanContext().spanId])
+		} finally {
+			stopOther()
+		}
 	})
 })

@@ -3,9 +3,6 @@
 		"target": "ES2022",
 		"module": "NodeNext",
 		"moduleResolution": "NodeNext",
-		"paths": {
-			"@kafkats/client": ["./src/client-shim.d.ts"]
-		},
 		"lib": ["ES2022"],
 		"types": ["node"],
 		"allowJs": false,

@@ -38,7 +38,7 @@ Nothing in the client is patched: the client publishes what it does on `node:dia
 | `kafkats.producer.requests.in_flight`   | Requests not answered yet                                     |
 | `kafkats.producer.sends.unacknowledged` | `send()` calls not acknowledged yet                           |
 | `kafkats.consumer.rebalance.duration`   | How long a rebalance stopped this member                      |
-| `kafkats.consumer.position.lag`         | How far this consumer's fetching is behind the partition end  |
+| `kafkats.consumer.position.lag`         | How far this consumer's fetching is behind what it can read   |
 | `kafkats.consumer.buffered.bytes`       | Fetched but not yet handled                                   |
 | `kafkats.consumer.partitions.assigned`  | Partitions this member owns                                   |
 | `kafkats.consumer.partitions.paused`    | Partitions this member has paused                             |

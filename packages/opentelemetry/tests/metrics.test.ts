@@ -1,4 +1,5 @@
 import {
+	ErrorCode,
 	diagnostics,
 	type CommitDiagnostics,
 	type ConsumerMetrics,
@@ -32,10 +33,8 @@ describe('metrics', () => {
 			clientId: 'app',
 			topic: 'orders',
 			transactional: false,
-			messages: [
-				{ value: null, headers: {} },
-				{ value: null, headers: {} },
-			],
+			messages: [{ value: null }, { value: null }],
+			addHeaders: () => {},
 		}
 		await diagnostics.send.tracePromise(async () => {
 			await settle()
@@ -68,6 +67,7 @@ describe('metrics', () => {
 				{ topic: 'orders', partition: 3, offset: 1n, timestamp: 0n, key: null, value: null, headers: {} },
 			],
 			batch: false,
+			runHandlerIn: () => {},
 		})
 		await diagnostics.process.tracePromise(async () => {}, processing())
 		await diagnostics.process
@@ -113,6 +113,24 @@ describe('metrics', () => {
 		const records = metrics.get(KAFKATS_METRIC.requestRecords)![0]!
 		expect((records.value as Histogram).sum).toBe(120)
 		expect(records.attributes[ATTR.brokerId]).toBe(2)
+		expect(records.attributes[ATTR.errorType]).toBeUndefined()
+	})
+
+	it('marks a produce request whose partitions the broker rejected, though the request itself succeeded', async () => {
+		const request: ProduceRequestDiagnostics = {
+			clientId: 'app',
+			brokerId: 2,
+			partitions: 1,
+			records: 3,
+			bytes: 90,
+		}
+		await diagnostics.produceRequest.tracePromise(async () => {
+			request.rejected = [{ topic: 'orders', partition: 0, errorCode: ErrorCode.NotLeaderOrFollower }]
+			return {} as never
+		}, request)
+
+		const [duration] = (await recorder.collect()).get(KAFKATS_METRIC.requestDuration)!
+		expect(duration!.attributes[ATTR.errorType]).toBe('NotLeaderOrFollower')
 	})
 
 	it('reports the backlog of producers and the position of consumers when metrics are collected', async () => {
@@ -129,7 +147,7 @@ describe('metrics', () => {
 					topic: 'orders',
 					partition: 0,
 					position: 90n,
-					highWatermark: 100n,
+					endOffset: 100n,
 					bufferedBytes: 512,
 					paused: false,
 				},
@@ -166,5 +184,29 @@ describe('metrics', () => {
 		producerMetrics.queuedRecords = 0
 		expect((await recorder.collect()).get(KAFKATS_METRIC.queuedRecords)![0]!.value).toBe(0)
 		expect(producer && consumer).toBeTruthy()
+	})
+
+	it('adds up instances that share their attributes instead of reporting only one of them', async () => {
+		const backlog = (queuedRecords: number): { metrics(): ProducerMetrics } => ({
+			metrics: () => ({
+				queuedBatches: 1,
+				queuedRecords,
+				queuedBytes: 0,
+				inFlightRequests: 1,
+				unacknowledgedSends: 0,
+			}),
+		})
+		// Two producers of one client, as with transaction lanes.
+		const producers = [backlog(40), backlog(2)]
+		for (const instance of producers) diagnostics.instances.publish({ type: 'producer', clientId: 'app', instance })
+		const other = backlog(7)
+		diagnostics.instances.publish({ type: 'producer', clientId: 'other-app', instance: other })
+
+		const queued = (await recorder.collect()).get(KAFKATS_METRIC.queuedRecords)!
+		expect(queued.map(point => [point.attributes[ATTR.clientId], point.value]).sort()).toEqual([
+			['app', 42],
+			['other-app', 7],
+		])
+		expect(producers.length + (other ? 1 : 0)).toBe(3)
 	})
 })

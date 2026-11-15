@@ -1,4 +1,4 @@
-import { channel, tracingChannel, type TracingChannel } from 'node:diagnostics_channel'
+import diagnosticsChannel, { type TracingChannel } from 'node:diagnostics_channel'
 
 import type { ConsumerMetrics, Message, TopicPartition, TopicPartitionOffset } from '@/consumer/types.js'
 import type { ProducerMessage, ProducerMetrics, SendResult } from '@/producer/types.js'
@@ -16,19 +16,25 @@ import type { ProducerMessage, ProducerMetrics, SendResult } from '@/producer/ty
  * operation settles. Nothing is built and nothing is published for a channel without subscribers.
  * The client depends on no telemetry library: `@kafkats/opentelemetry` turns these events into
  * spans and metrics, and anything else can subscribe the same way.
+ *
+ * Tracing channels need Node.js 18.19; on an older runtime nothing is published.
  */
+
+/** Runs a function, usually inside some asynchronous context, and returns what it returns. */
+export type Scope = <T>(run: () => T) => T
 
 /** `producer.send()` / `tx.send()`: from the call until every message is acknowledged. */
 export interface SendDiagnostics {
 	clientId: string
 	topic: string
 	transactional: boolean
+	/** The messages about to be sent, as the caller passed them. Not to be modified. */
+	messages: ReadonlyArray<Readonly<ProducerMessage<unknown, unknown>>>
 	/**
-	 * The messages about to be sent, before they are encoded. A `start` subscriber may add headers
-	 * (trace context); they are sent with the message. These are copies: the caller's objects are
-	 * not modified.
+	 * For a `start` subscriber: send these headers (trace context) with the message at `index`, or
+	 * with every message of the call when no index is given. The caller's objects are not touched.
 	 */
-	messages: Array<ProducerMessage<unknown, unknown> & { headers: Record<string, string | Buffer> }>
+	addHeaders(headers: Record<string, string | Buffer>, index?: number): void
 	result?: SendResult | SendResult[]
 	error?: unknown
 }
@@ -41,6 +47,11 @@ export interface ProduceRequestDiagnostics {
 	partitions: number
 	records: number
 	bytes: number
+	/**
+	 * Partitions the broker answered with an error code, set once the response is in. Such a
+	 * request did not fail as a whole (`error` stays unset), and its batches may be retried.
+	 */
+	rejected?: Array<{ topic: string; partition: number; errorCode: number }>
 	error?: unknown
 }
 
@@ -55,10 +66,11 @@ export interface ProcessDiagnostics {
 	/** Whether the handler received them as one batch. */
 	batch: boolean
 	/**
-	 * A `start` subscriber may set this to run the handler inside its own asynchronous context,
-	 * so that what the handler does (an active span) is attributed to it.
+	 * For a `start` subscriber: run the handler inside `scope`, so that what the handler does is
+	 * attributed to the subscriber's asynchronous context (an active span). Every subscriber may
+	 * ask; the scopes nest in the order they were asked for.
 	 */
-	runInContext?: <T>(handler: () => T) => T
+	runHandlerIn(scope: Scope): void
 	error?: unknown
 }
 
@@ -85,6 +97,14 @@ export type InstanceDiagnostics =
 	| { type: 'producer'; clientId: string; instance: { metrics(): ProducerMetrics } }
 	| { type: 'consumer'; clientId: string; groupId: string; instance: { metrics(): ConsumerMetrics } }
 
+/** Tracing channels, or stand-ins nobody can subscribe to where the runtime has none (Node < 18.19). */
+const tracingChannel: typeof diagnosticsChannel.tracingChannel =
+	diagnosticsChannel.tracingChannel ??
+	((): unknown => {
+		const silent = { hasSubscribers: false, subscribe() {}, unsubscribe: () => false }
+		return { start: silent, end: silent, asyncStart: silent, asyncEnd: silent, error: silent }
+	})
+
 export const diagnostics = {
 	send: tracingChannel<unknown, SendDiagnostics>('kafkats:producer:send'),
 	produceRequest: tracingChannel<unknown, ProduceRequestDiagnostics>('kafkats:producer:request'),
@@ -92,7 +112,7 @@ export const diagnostics = {
 	commit: tracingChannel<unknown, CommitDiagnostics>('kafkats:consumer:commit'),
 	rebalance: tracingChannel<unknown, RebalanceDiagnostics>('kafkats:consumer:rebalance'),
 	/** Publishes an {@link InstanceDiagnostics} for every producer and consumer created. */
-	instances: channel('kafkats:instance'),
+	instances: diagnosticsChannel.channel('kafkats:instance'),
 } as const
 
 /** Whether anything listens to a tracing channel. `TracingChannel.hasSubscribers` needs Node 20.13. */
@@ -109,18 +129,25 @@ export function hasSubscribers(traced: TracingChannel<unknown, object>): boolean
 /**
  * Run `operation` as one traced operation of `traced`. Without subscribers this is a plain call:
  * `describe` is not invoked and `operation` gets no context.
+ *
+ * `scopes` are what subscribers asked the operation to run inside (see {@link scoped}).
  */
 export function trace<C extends object, T>(
 	traced: TracingChannel<unknown, C>,
 	describe: () => C,
-	operation: (context?: C) => Promise<T>
+	operation: (context?: C) => Promise<T>,
+	scopes?: Scope[]
 ): Promise<T> {
 	if (!hasSubscribers(traced)) return operation()
 	const context = describe()
 	// An async function, so that a synchronous throw of the operation is also an asynchronous
 	// failure: subscribers then always see `asyncEnd`, whichever way the operation ends.
 	return traced.tracePromise(async () => {
-		const { runInContext } = context as { runInContext?: ProcessDiagnostics['runInContext'] }
-		return runInContext ? runInContext(() => operation(context)) : operation(context)
+		// Subscribers have seen `start` by now. The first one to ask is the outermost scope.
+		const run = (scopes ?? []).reduceRight<() => Promise<T>>(
+			(inner, scope) => () => scope(inner),
+			() => operation(context)
+		)
+		return run()
 	}, context)
 }

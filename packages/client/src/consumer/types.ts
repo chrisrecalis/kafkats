@@ -459,10 +459,12 @@ export interface ConsumerPartitionMetrics {
 	/** The next offset this consumer will fetch. */
 	position: bigint
 	/**
-	 * The end of the partition as of the last fetch response (undefined before the first one).
-	 * `highWatermark - position` is how far this consumer's fetching is behind.
+	 * How far this consumer could read as of its last fetch response: the high watermark, or the
+	 * last stable offset under `read_committed`. `endOffset - position` is how far its fetching is
+	 * behind. Undefined before the first response and while the partition is paused, because a
+	 * paused partition is not fetched and its end is not known.
 	 */
-	highWatermark?: bigint
+	endOffset?: bigint
 	/** Bytes fetched for this partition that no handler has received yet. */
 	bufferedBytes: number
 	paused: boolean
