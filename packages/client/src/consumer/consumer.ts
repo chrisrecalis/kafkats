@@ -37,7 +37,9 @@ import type {
 	TopicPartition,
 	ManualAssignment,
 	PartitionBatch,
+	ConsumerMetrics,
 } from './types.js'
+import { diagnostics, trace } from '@/diagnostics.js'
 import {
 	DEFAULT_CONSUMER_CONFIG,
 	DEFAULT_RUN_EACH_OPTIONS,
@@ -86,6 +88,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		super()
 		this.cluster = cluster
 		this.logger = cluster.getLogger()?.child({ component: 'consumer', groupId: config.groupId }) ?? noopLogger
+		diagnostics.instances.publish({ type: 'consumer', instance: this })
 		this.config = {
 			groupId: config.groupId,
 			groupInstanceId: config.groupInstanceId || undefined,
@@ -376,6 +379,36 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	}
 
 	/**
+	 * Where this consumer stands right now, per assigned partition: what only the consumer knows
+	 * between two commits. (Lag of the group's committed offsets is a broker-side measure.)
+	 */
+	metrics(): ConsumerMetrics {
+		return { partitions: this.fetchManager?.partitionMetrics() ?? [] }
+	}
+
+	/** Call the application's handler as one traced operation (see `diagnostics.process`). */
+	private tracedProcess(
+		topic: string,
+		partition: number,
+		messages: Array<Message<unknown, unknown>>,
+		batch: boolean,
+		handle: () => Promise<void>
+	): Promise<void> {
+		return trace(
+			diagnostics.process,
+			() => ({
+				clientId: this.cluster.clientId,
+				groupId: this.config.groupId,
+				topic,
+				partition,
+				messages,
+				batch,
+			}),
+			handle
+		)
+	}
+
+	/**
 	 * The offset the next fetch of an assigned partition starts at.
 	 *
 	 * Inside a `partitionsAssigned` listener this is the position the partition starts from (the
@@ -622,7 +655,9 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 					const message = decodeRecord(topic, partition, record, decoders)
 					const consumeCtx = this.createConsumeContext(ctx.signal, topic, partition, record.offset)
 
-					await handler(message as Message<MsgOf<S>, KeyOf<S>>, consumeCtx)
+					await this.tracedProcess(topic, partition, [message], false, () =>
+						handler(message as Message<MsgOf<S>, KeyOf<S>>, consumeCtx)
+					)
 
 					if (ctx.commitOffsets) {
 						ctx.offsetManager.markConsumed(topic, partition, record.offset)
@@ -686,7 +721,9 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 					resolveOffset,
 				}
 
-				await handler(messages as Message<MsgOf<S>, KeyOf<S>>[], batchCtx)
+				await this.tracedProcess(topic, partition, messages, true, () =>
+					handler(messages as Message<MsgOf<S>, KeyOf<S>>[], batchCtx)
+				)
 
 				resolveOffset(lastRecord.offset)
 			},

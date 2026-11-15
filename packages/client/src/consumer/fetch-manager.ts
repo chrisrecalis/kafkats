@@ -19,7 +19,14 @@ import {
 } from '@/protocol/records/index.js'
 import type { DecodedRecord } from '@/protocol/records/index.js'
 import { Decoder } from '@/protocol/primitives/decoder.js'
-import type { TopicPartition, TopicPartitionOffset, AutoOffsetReset, IsolationLevel, PartitionBatch } from './types.js'
+import type {
+	TopicPartition,
+	TopicPartitionOffset,
+	AutoOffsetReset,
+	IsolationLevel,
+	PartitionBatch,
+	ConsumerPartitionMetrics,
+} from './types.js'
 import type { OffsetManager } from './offset-manager.js'
 import { noopLogger, type Logger } from '@/logger.js'
 import { tpKey, formatPartitions } from '@/utils/topic-partition.js'
@@ -423,6 +430,8 @@ interface PartitionState {
 	partition: number
 	offset: bigint
 	paused: boolean
+	/** End of the partition as of the last fetch response. */
+	highWatermark?: bigint
 	abortController: AbortController // Per-partition abort signal for incremental control
 	cachedLeader: Broker | null // Cached leader broker - invalidated on NotLeaderOrFollower
 	// Bumped by seek(). A fetch captures the epoch at issue time; a response whose
@@ -1173,6 +1182,7 @@ export class FetchManager {
 					await this.handleFetchError(state, partitionResponse.errorCode)
 					continue
 				}
+				state.highWatermark = partitionResponse.highWatermark
 
 				if (partitionResponse.recordsData && partitionResponse.recordsData.length > 0) {
 					const fetchOffset = state.offset
@@ -1276,6 +1286,21 @@ export class FetchManager {
 		const error = this.pendingError
 		this.pendingError = null
 		throw error
+	}
+
+	/** Position, last known end, buffered bytes and pause state of every assigned partition. */
+	partitionMetrics(): ConsumerPartitionMetrics[] {
+		const buffered = new Map(
+			this.fetchBuffer?.snapshot().map(stat => [tpKey(stat.topic, stat.partition), stat.bytes])
+		)
+		return Array.from(this.partitionStates, ([key, state]) => ({
+			topic: state.topic,
+			partition: state.partition,
+			position: state.offset,
+			highWatermark: state.highWatermark,
+			bufferedBytes: buffered.get(key) ?? 0,
+			paused: state.paused,
+		}))
 	}
 
 	/**

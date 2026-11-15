@@ -239,6 +239,18 @@ export type IdempotentState = 'idle' | 'initializing' | 'running' | 'fenced' | '
 /**
  * Producer events
  */
+/** What is waiting inside a producer at one moment (see `Producer.metrics()`). */
+export interface ProducerMetrics {
+	/** Batches, records and bytes ready to send but waiting behind a request in flight for their partition. */
+	queuedBatches: number
+	queuedRecords: number
+	queuedBytes: number
+	/** Produce requests sent and not answered yet. */
+	inFlightRequests: number
+	/** `send()` calls whose messages are not all acknowledged yet. */
+	unacknowledgedSends: number
+}
+
 export interface ProducerEvents {
 	error: [error: Error]
 	/**
