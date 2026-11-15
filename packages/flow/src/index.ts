@@ -41,6 +41,15 @@ export {
 	ChangelogBackedWindowStore,
 	ChangelogBackedSessionStore,
 } from '@/state/changelog.js'
+export {
+	OrderedKeyValueStore,
+	OrderedWindowStore,
+	OrderedSessionStore,
+	OrderedChangelogCheckpointStore,
+	writeSignedTime,
+	readSignedTime,
+	type OrderedByteStore,
+} from '@/state/ordered.js'
 export type {
 	StateStoreProvider,
 	ChangelogCheckpointStore,

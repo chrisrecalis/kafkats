@@ -27,6 +27,8 @@ const app = flow({
 
 ## Store Types
 
+The store logic (key layouts, window/session queries, expiry, checkpoints) is the `Ordered*Store` classes of `@kafkats/flow` (`packages/flow/src/state/ordered.ts`), shared with the RocksDB provider. The classes below adapt an LMDB database to them.
+
 - **LMDBKeyValueStore** - Basic key-value store
 - **LMDBWindowStore** - Time-windowed state (keys ordered by time)
 - **LMDBSessionStore** - Session window state (keys ordered by key then time)

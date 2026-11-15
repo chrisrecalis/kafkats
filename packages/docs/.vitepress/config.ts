@@ -40,6 +40,7 @@ export default defineConfig({
 					{ text: '@kafkats/flow', link: '/flow/' },
 					{ text: '@kafkats/flow-codec-zod', link: '/flow-codec-zod/' },
 					{ text: '@kafkats/flow-state-lmdb', link: '/flow-state-lmdb/' },
+					{ text: '@kafkats/flow-state-rocksdb', link: '/flow-state-rocksdb/' },
 				],
 			},
 			{ text: 'Examples', link: '/examples/' },
@@ -160,6 +161,13 @@ export default defineConfig({
 						{ text: 'Configuration', link: '/flow-state-lmdb/configuration' },
 						{ text: 'Store Types', link: '/flow-state-lmdb/stores' },
 					],
+				},
+			],
+
+			'/flow-state-rocksdb/': [
+				{
+					text: '@kafkats/flow-state-rocksdb',
+					items: [{ text: 'Overview', link: '/flow-state-rocksdb/' }],
 				},
 			],
 

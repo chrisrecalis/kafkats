@@ -26,7 +26,7 @@ const app = flow({
 ```
 
 ::: warning
-In-memory stores are lost on restart and rebuilt from the changelog. Use LMDB for persistence.
+In-memory stores are lost on restart and rebuilt from the changelog. Use LMDB or RocksDB for persistence.
 :::
 
 ## Persistent: LMDB Store
@@ -54,6 +54,24 @@ const app = flow({
 ```
 
 Every partition of every store is a separate LMDB database (see [Partitioned State](#partitioned-state)), so `maxDbs` needs to cover the number of stores times the number of partitions.
+
+## Persistent: RocksDB Store
+
+```bash
+pnpm add @kafkats/flow-state-rocksdb
+```
+
+```typescript
+import { rocksdb } from '@kafkats/flow-state-rocksdb'
+
+const app = flow({
+	applicationId: 'my-app',
+	client: { clientId: 'my-app', brokers: ['localhost:9092'] },
+	stateStoreProvider: rocksdb({ stateDir: './state' }),
+})
+```
+
+RocksDB appends writes to a log and an in-memory table instead of waiting for the disk on every write, and keeps state in compressed, sorted files. Prefer it for write-heavy topologies (aggregations under `at_least_once` in particular) and for state larger than memory. See [@kafkats/flow-state-rocksdb](/flow-state-rocksdb/).
 
 ## Store Interfaces
 

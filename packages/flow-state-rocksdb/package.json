@@ -1,0 +1,68 @@
+{
+	"name": "@kafkats/flow-state-rocksdb",
+	"private": false,
+	"version": "0.13.0",
+	"description": "RocksDB state store provider for @kafkats/flow",
+	"type": "module",
+	"main": "dist/index.cjs",
+	"module": "dist/index.js",
+	"types": "dist/index.d.cts",
+	"exports": {
+		".": {
+			"import": {
+				"types": "./dist/index.d.ts",
+				"default": "./dist/index.js"
+			},
+			"require": {
+				"types": "./dist/index.d.cts",
+				"default": "./dist/index.cjs"
+			}
+		}
+	},
+	"files": [
+		"dist"
+	],
+	"license": "MIT",
+	"keywords": [
+		"kafka",
+		"streams",
+		"state",
+		"rocksdb",
+		"persistent",
+		"storage",
+		"typescript"
+	],
+	"homepage": "https://chrisrecalis.github.io/kafkats",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/chrisrecalis/kafkats.git",
+		"directory": "packages/flow-state-rocksdb"
+	},
+	"bugs": {
+		"url": "https://github.com/chrisrecalis/kafkats/issues"
+	},
+	"engines": {
+		"node": "^22.18.0 || >=24.0.0"
+	},
+	"scripts": {
+		"build": "pnpm clean && tsdown --config-loader native",
+		"test": "vitest run tests",
+		"test:unit": "vitest run tests",
+		"typecheck": "tsc -p tsconfig.json --noEmit",
+		"clean": "rm -rf dist",
+		"prepack": "pnpm -w turbo run build --filter=$npm_package_name"
+	},
+	"dependencies": {
+		"@harperfast/rocksdb-js": "^2.14.0"
+	},
+	"peerDependencies": {
+		"@kafkats/flow": "workspace:>=0.13.0"
+	},
+	"devDependencies": {
+		"@kafkats/flow": "workspace:^",
+		"@types/node": "^24.10.1",
+		"tsdown": "^0.22.14",
+		"typescript": "^7.0.2",
+		"vitest": "^4.0.12"
+	}
+}

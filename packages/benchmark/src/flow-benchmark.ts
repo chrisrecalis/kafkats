@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { KafkaClient } from '@kafkats/client'
 import { SessionWindows, TimeWindows, codec, flow, type FlowApp, type FlowConfig, type KStream } from '@kafkats/flow'
 import { lmdb } from '@kafkats/flow-state-lmdb'
+import { rocksdb } from '@kafkats/flow-state-rocksdb'
 
 import { uniqueName } from './utils.js'
 
@@ -18,7 +19,7 @@ import { uniqueName } from './utils.js'
  *   KAFKA_BROKERS=localhost:9092 pnpm -C packages/benchmark bench:flow
  *   ... bench:flow -- --records 200000 --scenario count,restore --guarantee exactly_once --runs 3
  *   ... bench:flow -- --scenario stateless --threads 2
- *   ... bench:flow -- --scenario count,session-count --provider lmdb
+ *   ... bench:flow -- --scenario count,session-count --provider lmdb   (or rocksdb)
  */
 
 type Guarantee = NonNullable<FlowConfig['processingGuarantee']>
@@ -32,8 +33,8 @@ interface Options {
 	runs: number
 	scenarios: string[]
 	guarantees: Guarantee[]
-	/** State store provider: 'memory' (the default provider) or 'lmdb'. */
-	provider: 'memory' | 'lmdb'
+	/** State store provider: 'memory' (the default provider), 'lmdb' or 'rocksdb'. */
+	provider: 'memory' | 'lmdb' | 'rocksdb'
 }
 
 interface Event {
@@ -199,7 +200,7 @@ function parseArgs(argv: string[]): Options {
 		runs: Number(arg('runs') ?? 3),
 		scenarios: arg('scenario')?.split(',') ?? [...SCENARIOS.map(s => s.name), 'restore'],
 		guarantees: (arg('guarantee')?.split(',') as Guarantee[] | undefined) ?? ['at_least_once', 'exactly_once'],
-		provider: arg('provider') === 'lmdb' ? 'lmdb' : 'memory',
+		provider: (['lmdb', 'rocksdb'] as const).find(p => p === arg('provider')) ?? 'memory',
 	}
 }
 
@@ -256,7 +257,7 @@ async function setUp(brokers: string[], scenario: Scenario, options: Options): P
 const stateDirs: string[] = []
 
 function createApp(brokers: string[], applicationId: string, guarantee: Guarantee, options: Options): FlowApp {
-	const stateDir = options.provider === 'lmdb' ? mkdtempSync(join(tmpdir(), 'flow-bench-')) : undefined
+	const stateDir = options.provider === 'memory' ? undefined : mkdtempSync(join(tmpdir(), 'flow-bench-'))
 	if (stateDir) stateDirs.push(stateDir)
 	return flow({
 		applicationId,
@@ -264,7 +265,9 @@ function createApp(brokers: string[], applicationId: string, guarantee: Guarante
 		processingGuarantee: guarantee,
 		numStreamThreads: options.threads,
 		consumer: { autoOffsetReset: 'earliest' },
-		...(stateDir ? { stateStoreProvider: lmdb({ stateDir }) } : {}),
+		...(stateDir
+			? { stateStoreProvider: options.provider === 'rocksdb' ? rocksdb({ stateDir }) : lmdb({ stateDir }) }
+			: {}),
 	})
 }
 

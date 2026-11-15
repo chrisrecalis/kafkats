@@ -47,6 +47,7 @@
 	"scripts": {
 		"build": "pnpm clean && tsdown --config-loader native",
 		"test": "vitest run tests",
+		"test:unit": "vitest run tests",
 		"typecheck": "tsc -p tsconfig.json --noEmit",
 		"clean": "rm -rf dist",
 		"prepack": "pnpm -w turbo run build --filter=$npm_package_name"
