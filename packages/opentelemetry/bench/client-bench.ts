@@ -28,11 +28,26 @@ await producer.disconnect()
 const consumer = client.consumer({ groupId: unique('otel-bench-group'), autoOffsetReset: 'earliest' })
 let seen = 0
 let started = 0
-await consumer.runEach(topic, async () => {
-	if (seen === 0) started = performance.now()
-	if (++seen === N + 1) consumer.stop()
+// HANDLER: what the handler does per message. 'none' (default) measures the ceiling; 'cpu' parses
+// and re-serializes a 1 KB JSON document; 'io' waits for a 1 ms timer, like a fast database call.
+const work = process.env.HANDLER ?? 'none'
+const document = JSON.stringify({
+	id: 1,
+	items: Array.from({ length: 40 }, (_, i) => ({ sku: `sku-${i}`, quantity: i })),
 })
+await consumer.runEach(
+	topic,
+	async () => {
+		if (seen === 0) started = performance.now()
+		if (work === 'cpu') JSON.stringify(JSON.parse(document))
+		else if (work === 'io') await new Promise(resolve => setTimeout(resolve, 1))
+		if (++seen === N + 1) consumer.stop()
+	},
+	{ partitionConcurrency: 4 }
+)
 const consumeRate = (N / (performance.now() - started)) * 1000
 await client.disconnect()
-console.log(`${mode.padEnd(8)} send ${Math.round(sendRate)} msg/s   runEach ${Math.round(consumeRate)} msg/s`)
+console.log(
+	`${mode.padEnd(8)} handler=${work.padEnd(4)} send ${Math.round(sendRate)} msg/s   runEach ${Math.round(consumeRate)} msg/s`
+)
 process.exit(0)
