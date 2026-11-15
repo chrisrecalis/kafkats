@@ -21,6 +21,8 @@ No record is lost. After a crash or a redelivery, records since the last committ
 
 Records are processed in the batches the consumer delivers. Output and changelog records are sent without waiting for each acknowledgement; before offsets are committed, every one of them must have been acknowledged. This happens at the end of a batch and, within a long batch, every `commitIntervalMs`. If a send fails, the worker fails without committing and the batch is processed again. An output record can therefore be written before the changelog record of the same input is acknowledged, and is written again after such a failure. This is the same contract as Kafka Streams: flush everything, then commit.
 
+The offsets themselves are committed by the consumer: every `consumerRun.autoCommitIntervalMs` (default `5000`), when partitions are revoked and when the app closes. A process that is killed therefore repeats everything since its last offset commit, up to that interval of work. Lower `autoCommitIntervalMs` to repeat less after a crash, at the cost of more commit requests.
+
 ### Exactly-Once
 
 Input offsets, output records and changelog records are committed atomically in a single Kafka transaction. Transactions are committed every `commitIntervalMs` (default `100`), when the app closes, and before a rebalance.
@@ -140,7 +142,7 @@ A [global table](/flow/tables#global-tables) is fully loaded before any record i
 - **LMDB:** stores are now named `<applicationId>.<storeName>.p<partition>`. The old unpartitioned databases stay in the file until you delete the state directory, and count towards `maxDbs`. Deleting it is safe, as state is rebuilt from the changelog.
 - Topologies that re-key a stream (`selectKey()`, `map()`, `groupBy()`) before a stateful operation now write through [internal repartition topics](/flow/streams#repartitioning), and inputs to a stateful operation must be co-partitioned. See [Co-partitioning](/flow/state-stores#co-partitioning).
 - `through()` now reads the topic back. The topic must exist.
-- **At-least-once commits per batch, not per record.** Output and changelog records are acknowledged together before offsets are committed (see [At-Least-Once](#at-least-once-default)). After a failure, up to one `commitIntervalMs` of records is processed again, and state updates of those records are applied again.
+- **At-least-once commits per batch, not per record.** Output and changelog records are acknowledged together before offsets are committed (see [At-Least-Once](#at-least-once-default)). After a failed send, up to one `commitIntervalMs` of records is processed again, and state updates of those records are applied again. After a process crash it is everything since the consumer's last offset commit (`consumerRun.autoCommitIntervalMs`, default `5000`).
 - **Every consumer opens its own fetch connection to each broker.** Applications with several stream threads or a global table open more connections than before; check `max.connections.per.ip` on brokers with tight limits.
 - **In-memory window and session stores return a key's windows in time order** from `fetch()` and `findSessions()`, like the persistent stores. They returned them in insertion order before.
 
