@@ -46,6 +46,8 @@ export interface TaskDeps {
 	/** The task builds its own TaskStateManager from these. */
 	readonly stateDirectory: StateDirectory
 	readonly checkpoints: Checkpoints
+	/** The read-only view of a global store (writes throw), which every processor may read without being connected. */
+	readonly globalStore: (name: string) => StateStore
 	/** Called once by the constructor: the TaskOutput bound to this task incarnation. */
 	readonly outputFor: (task: StreamTask) => TaskOutput
 	readonly clock: Clock
@@ -234,6 +236,7 @@ export class StreamTask {
 		this.commitNeeded = false
 		const topology = TaskTopology.create(this, {
 			stores: this.stateManager,
+			globalStore: this.deps.globalStore,
 			output: this.output,
 			metadata: this.metadata,
 			clock: this.deps.clock,
@@ -348,10 +351,14 @@ export class StreamTask {
 		)
 	}
 
-	/** Processes one record. false: none ready. A promise only when the record's subtree went async. */
+	/**
+	 * Processes one record. false: none ready, or the task left RUNNING while the record's subtree ran (a slice that
+	 * outlived a close: its record is not counted). A promise only when the record's subtree went async.
+	 */
 	processOne(now: number): MaybePromise<boolean> {
 		this.drained = false
-		if (!this.active) {
+		const { topology } = this
+		if (!this.active || topology === undefined) {
 			return false
 		}
 		const record = this.group.nextRecord()
@@ -359,18 +366,13 @@ export class StreamTask {
 			return false
 		}
 		if (isSkipMarker(record)) {
-			this.processed(record.queue, record.offset)
-			return true
+			return this.processed(record.queue, record.offset)
 		}
-		const result = this.topology!.process(record, now)
+		const result = topology.process(record, now)
 		if (result === undefined) {
-			this.processed(record.queue, record.offset)
-			return true
+			return this.processed(record.queue, record.offset)
 		}
-		return result.then(() => {
-			this.processed(record.queue, record.offset)
-			return true
-		})
+		return result.then(() => this.topology === topology && this.processed(record.queue, record.offset))
 	}
 
 	/** A queue became empty during the last processOne(): readiness must be evaluated again. */
@@ -392,7 +394,8 @@ export class StreamTask {
 		if (!this.streamTimePunctuationDue()) {
 			return false
 		}
-		return this.punctuated(await this.topology!.punctuateStreamTime(this.group.streamTime))
+		const topology = this.topology!
+		return this.punctuated(topology, await topology.punctuateStreamTime(this.group.streamTime))
 	}
 
 	/** Runs the wall-clock punctuations due at `now`; whether any ran. */
@@ -400,7 +403,8 @@ export class StreamTask {
 		if (!this.wallClockPunctuationDue(now)) {
 			return false
 		}
-		return this.punctuated(await this.topology!.punctuateWallClock(now))
+		const topology = this.topology!
+		return this.punctuated(topology, await topology.punctuateWallClock(now))
 	}
 
 	nextWallClockDue(): number | undefined {
@@ -556,10 +560,8 @@ export class StreamTask {
 	}
 
 	/** The record (or the skipped ones) settled: its offset is consumed and its record context cleared. */
-	private processed(queue: RecordQueue, offset: bigint): void {
-		if (this.topology) {
-			this.topology.context.input = null
-		}
+	private processed(queue: RecordQueue, offset: bigint): true {
+		this.topology!.context.input = null
 		this.consumedOffsets.set(queue, offset)
 		this.commitNeeded = true
 		if (queue.size === 0) {
@@ -569,10 +571,12 @@ export class StreamTask {
 			this.pausedForSize.delete(queue)
 			this.toResume.push(queue.tp)
 		}
+		return true
 	}
 
-	private punctuated(ran: boolean): boolean {
-		if (ran) {
+	/** Punctuations of an incarnation closed meanwhile (a slice that outlived a close) need no commit. */
+	private punctuated(topology: TaskTopology, ran: boolean): boolean {
+		if (ran && this.topology === topology) {
 			this.commitNeeded = true
 		}
 		return ran

@@ -32,6 +32,8 @@ export interface TopologyOwner {
 export interface TaskTopologyDeps {
 	/** The task's store stacks. */
 	readonly stores: Pick<TaskStateManager, 'store' | 'stores'>
+	/** The read-only view of a global store, which every processor may read without being connected (KS). */
+	readonly globalStore: (name: string) => StateStore
 	readonly output: TaskOutput
 	readonly metadata: ProcessorMetadata
 	readonly clock: Clock
@@ -52,7 +54,8 @@ export class TaskTopology {
 		private readonly nodes: readonly AnyNode[],
 		/** Source nodes of each topic in registration order. */
 		private readonly sources: ReadonlyMap<string, readonly AnyNode[]>,
-		private readonly stores: TaskTopologyDeps['stores']
+		private readonly deps: Pick<TaskTopologyDeps, 'stores' | 'globalStore'>,
+		private readonly globals: ReadonlySet<string>
 	) {}
 
 	static create(task: TopologyOwner, deps: TaskTopologyDeps): TaskTopology {
@@ -73,6 +76,7 @@ export class TaskTopology {
 			onScheduled: () => {},
 		})
 		const { processing, production } = deps.handlers
+		const { globalStores } = task.subtopology
 		const nodes = new Map<string, AnyNode>()
 		for (const def of task.subtopology.nodes) {
 			let node: AnyNode
@@ -80,7 +84,8 @@ export class TaskTopology {
 				const ctx = new ProcessorContextImpl<unknown, unknown>(context, def.name)
 				node = new SourceNode<unknown, unknown>(def, ctx, processingErrorRoute(processing, ctx))
 			} else if (def.kind === 'processor') {
-				const ctx = new ProcessorContextImpl<unknown, unknown>(context, def.name, def.stores)
+				const stores = globalStores.length === 0 ? def.stores : [...def.stores, ...globalStores]
+				const ctx = new ProcessorContextImpl<unknown, unknown>(context, def.name, stores)
 				node = new ProcessorNode(def.name, def.supplier(), ctx, processingErrorRoute(processing, ctx))
 			} else {
 				const ctx = new ProcessorContextImpl(context, def.name)
@@ -102,7 +107,7 @@ export class TaskTopology {
 				defs.map(def => nodes.get(def.name)!)
 			)
 		}
-		topology = new TaskTopology(context, [...nodes.values()], sources, deps.stores)
+		topology = new TaskTopology(context, [...nodes.values()], sources, deps, new Set(globalStores))
 		return topology
 	}
 
@@ -154,13 +159,20 @@ export class TaskTopology {
 		return this.context.wallClockPunctuation.maybePunctuate(now)
 	}
 
-	/** A handle on the top of a store's stack whose writes reject once this topology closed (one per store). */
+	/**
+	 * A handle on the top of a task store's stack whose writes reject once this topology closed (one per store); the
+	 * read-only view of a global store, which belongs to no task.
+	 */
 	store(name: string): StateStore {
+		if (this.globals.has(name)) {
+			return this.deps.globalStore(name)
+		}
 		let handle = this.handles.get(name)
 		if (!handle) {
-			const top = this.stores.store(name)
-			const { kind } = this.stores.stores.find(store => store.builder.name === name)!.builder
-			handle = storeHandle(top, kind, () => this.closed, `processors of task ${this.context.options.taskId.key}`)
+			const { stores } = this.deps
+			const { kind } = stores.stores.find(store => store.builder.name === name)!.builder
+			const owner = `processors of task ${this.context.options.taskId.key}`
+			handle = storeHandle(stores.store(name), kind, () => this.closed, owner)
 			this.handles.set(name, handle)
 		}
 		return handle

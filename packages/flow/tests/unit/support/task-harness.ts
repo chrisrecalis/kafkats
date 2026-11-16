@@ -15,7 +15,7 @@ import type { Clock, OffsetAndMetadata, ProducedMessage, ProducerPort, Transacti
 import { RecordCollector } from '@/runtime/record-collector.js'
 import { TaskIdRegistry, tpKey } from '@/runtime/task-id.js'
 import { StreamTask, type PartitionStart } from '@/runtime/task.js'
-import type { ChangelogCheckpointStore } from '@/state.js'
+import type { ChangelogCheckpointStore, StateStore } from '@/state.js'
 import { Checkpoints } from '@/state/checkpoints.js'
 import { inMemory } from '@/state/memory.js'
 import { StateDirectory } from '@/state/state-directory.js'
@@ -326,6 +326,8 @@ export class TaskHarness {
 	readonly consumer = new FakeConsumer()
 	readonly tasks: StreamTask[] = []
 	readonly probes = new Map<StreamTask, StateProbe>()
+	/** The read-only views of the global stores, by name (what `TaskDeps.globalStore` answers). */
+	readonly globalStores = new Map<string, StateStore>()
 	readonly handlers: ResolvedHandlers
 	readonly hardStop = new AbortController()
 	readonly commits: CommitCoordinator
@@ -404,6 +406,13 @@ export class TaskHarness {
 				},
 				stateDirectory: this.stateDirectory,
 				checkpoints: this.checkpoints,
+				globalStore: name => {
+					const store = this.globalStores.get(name)
+					if (!store) {
+						throw new Error(`the harness has no global store '${name}'`)
+					}
+					return store
+				},
 				outputFor: owner => this.collector.forTask(owner),
 				clock: this.clock,
 				logger: this.logger,

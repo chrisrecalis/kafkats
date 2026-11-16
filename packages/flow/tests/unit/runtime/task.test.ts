@@ -1,12 +1,18 @@
 import { describe, expect, it } from 'vitest'
 import { IllegalStateError } from '@/api/errors.js'
 import { string } from '@/codec.js'
-import type { InternalProcessorContext, ProcessorContext, ProcessorSupplier, RecordMetadata } from '@/processor/api.js'
+import type {
+	InternalProcessorContext,
+	MaybePromise,
+	ProcessorContext,
+	ProcessorSupplier,
+	RecordMetadata,
+} from '@/processor/api.js'
 import { decodeCommitMetadata, encodeCommitMetadata, ProcessorMetadataImpl } from '@/processor/metadata.js'
 import type { StreamRecord } from '@/processor/record.js'
 import { ObservedStreamTime } from '@/processor/time-tracker.js'
 import type { PartitionStart, StreamTask, TaskState } from '@/runtime/task.js'
-import type { KeyValueStore } from '@/state.js'
+import type { KeyValueStore, StateStore } from '@/state.js'
 import type { RegisteredStore } from '@/state/state-manager.js'
 import type { InternalTopologyBuilder } from '@/topology/builder.js'
 import { kvStore, passThrough, pipe, TaskHarness } from '../support/task-harness.js'
@@ -306,6 +312,38 @@ describe('incarnation boundary (CR9)', () => {
 		expect(h.producer.sent).toHaveLength(record)
 	})
 
+	it('a record or punctuation still running when its incarnation closed counts for nothing (orphaned slice)', async () => {
+		let release!: () => void
+		const blocked = () => new Promise<void>(resolve => (release = resolve))
+		const start = async (process: () => MaybePromise<void>) => {
+			const h = new TaskHarness({
+				build: b =>
+					pipe(b, {
+						processor: () => ({ init: ctx => void ctx.schedule(10, 'stream-time', blocked), process }),
+					}),
+			})
+			const task = await h.start(h.task())
+			h.enqueue(task, 'input', records(1))
+			return { h, task }
+		}
+		// A record: not consumed, so the task has nothing to commit.
+		const first = await start(blocked)
+		const record = first.task.processOne(first.h.clock.now())
+		await first.task.suspend()
+		release()
+		expect(await record).toBe(false)
+		expect(await first.task.close('clean')).toBe('clean')
+		// A punctuation: it ran, but its incarnation's work is void.
+		const second = await start(() => {})
+		expect(await second.task.processOne(second.h.clock.now())).toBe(true)
+		expect(await second.h.commit()).toBe('committed')
+		const punctuation = second.task.maybePunctuateStreamTime()
+		await second.task.suspend()
+		release()
+		expect(await punctuation).toBe(true)
+		expect(await second.task.close('clean')).toBe('clean')
+	})
+
 	it('records delivered to a suspended task are dropped', async () => {
 		const h = new TaskHarness({ build: b => pipe(b, { processor: passThrough }) })
 		const task = await inState(h, 'SUSPENDED')
@@ -459,6 +497,44 @@ describe('processing', () => {
 		expect(task.needsCommit(() => undefined)).toBe(true)
 		// The record context ends with the record (4.5.6): a later send is not reported with it.
 		expect(task.input).toBeNull()
+	})
+
+	it('every processor reads the global stores without being connected to them (KS)', async () => {
+		const seen: (string | undefined)[] = []
+		const h = new TaskHarness({
+			build: b => {
+				pipe(b, {
+					stores: [kvStore('s')],
+					processor: () => {
+						let context: Ctx
+						return {
+							init: ctx => {
+								context = ctx
+							},
+							process: async record => {
+								const local = context.getStateStore<KeyValueStore<string, string>>('s')
+								const global = context.getStateStore<KeyValueStore<string, string>>('g')
+								seen.push(await local.get(record.key!), await global.get(record.key!))
+							},
+						}
+					},
+				})
+				b.addGlobalStore({
+					topic: 'global',
+					sourceName: 'global-source',
+					processorName: 'global-processor',
+					store: kvStore('g'),
+					supplier: () => ({ process() {} }),
+				})
+			},
+		})
+		const view = { name: 'g', get: (key: string) => Promise.resolve(`global ${key}`) }
+		h.globalStores.set('g', view as unknown as StateStore)
+		const task = await h.start(h.task())
+		await (task.store('s') as KeyValueStore<string, string>).put('k', 'local k')
+		h.enqueue(task, 'input', records(1))
+		await h.process(task)
+		expect(seen).toEqual(['local k', 'global k'])
 	})
 
 	it('every source node of the topic gets the record, in registration order', async () => {
