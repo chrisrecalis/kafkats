@@ -69,8 +69,11 @@ export function murmur2(data: Buffer): number {
  * only the sign bit (`number & 0x7fffffff`). Using `>>> 0` (full unsigned) would
  * diverge for negative hashes and send ~half of all keys to a different
  * partition than the Java client / librdkafka / kafkajs.
+ *
+ * `toPositive(murmur2(key)) % partitionCount` is the partition the Java client's default
+ * partitioner picks for a key.
  */
-function toPositive(n: number): number {
+export function toPositive(n: number): number {
 	return n & 0x7fffffff
 }
 

@@ -11,10 +11,15 @@ import type { ProduceRequest } from '@/protocol/messages/requests/produce.js'
 import { ErrorCode, isRetriableError } from '@/protocol/messages/error-codes.js'
 import {
 	shouldRefreshMetadata,
+	CommitFailedError,
 	ProducerFencedError,
 	InvalidTxnStateError,
 	TransactionAbortedError,
+	KafkaError,
 	KafkaProtocolError,
+	TimeoutError,
+	isConnectionFailure,
+	isRetriable,
 } from '@/client/errors.js'
 import { createRecordBatch, encodeRecordBatch, encodeRecordBatchSync } from '@/protocol/records/record-batch.js'
 import { CompressionType } from '@/protocol/records/compression.js'
@@ -46,6 +51,10 @@ import type {
 	TopicPartitionOffset,
 	SendOffsetsParams,
 	ProducerTransaction,
+	TransactionHandle,
+	BeginTransactionOptions,
+	ProducerCallOptions,
+	DisconnectOptions,
 	GroupMetadata,
 	ProducerTraceFn,
 	ProducerMetrics,
@@ -96,12 +105,20 @@ type PreparedProduceBatch = {
 	 * in-flight (see isStaleEpoch).
 	 */
 	encodedProducerEpoch: number
+	/** Why the last attempt to produce this batch failed: the cause given once its retries are used up. */
+	lastError?: Error
 }
 
 type ProduceAttemptOutcome = {
 	retryBatches: PreparedProduceBatch[]
 	stop: boolean
-	retryError?: Error
+}
+
+/** The transaction a handle stands for, while it is this producer's open transaction. */
+type OpenTransaction = {
+	readonly handle: TransactionHandle
+	/** Resolves once the transaction ended (committed, aborted or failed) and the next one may begin. */
+	readonly ended: Promise<void>
 }
 
 function isCoordinatorErrorCode(errorCode: ErrorCode): boolean {
@@ -111,6 +128,71 @@ function isCoordinatorErrorCode(errorCode: ErrorCode): boolean {
 /** The result of a send() call, from the promises of its messages. */
 function settleSend(promises: Promise<SendResult>[], isSingle: boolean): Promise<SendResult | SendResult[]> {
 	return isSingle ? promises[0]! : Promise.all(promises)
+}
+
+function toError(error: unknown): Error {
+	return error instanceof Error ? error : new Error(String(error))
+}
+
+/** A failure the producer stopped retrying: trying again may succeed. Its cause is the last failure. */
+function retriableFailure(message: string, cause: Error | undefined): KafkaError {
+	const error = new KafkaError(
+		cause ? `${message}: ${cause.message}` : message,
+		cause instanceof KafkaError ? cause.errorCode : undefined,
+		true
+	)
+	if (cause) error.cause = cause
+	return error
+}
+
+/** Settle as `promise` does, or reject with the reason of `signal` once it aborts (the promise then runs on unobserved). */
+function abortable<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+	if (!signal) return promise
+	return new Promise<T>((resolve, reject) => {
+		const onAbort = () => reject(signal.reason)
+		if (signal.aborted) onAbort()
+		else signal.addEventListener('abort', onAbort, { once: true })
+		void promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort))
+	})
+}
+
+/**
+ * Run `operation` with a signal that aborts with the reason of `options.signal`, or with a {@link TimeoutError} once
+ * `options.timeoutMs` passed. Without either the operation is unbounded.
+ */
+async function bounded<T>(
+	what: string,
+	{ timeoutMs, signal }: ProducerCallOptions = {},
+	operation: (stop: AbortSignal | undefined) => Promise<T>
+): Promise<T> {
+	if (timeoutMs === undefined) return operation(signal)
+	const timeout = new AbortController()
+	const timer = setTimeout(() => timeout.abort(new TimeoutError(`${what} did not finish`, timeoutMs)), timeoutMs)
+	try {
+		return await operation(signal ? AbortSignal.any([signal, timeout.signal]) : timeout.signal)
+	} finally {
+		clearTimeout(timer)
+	}
+}
+
+/**
+ * KIP-447: offsets committed with group metadata are fenced by its generation and member, which must therefore be
+ * those of a joined member. The broker accepts an unfenced TxnOffsetCommit in any group state, so a generation of -1
+ * or an empty member id would commit without any fencing.
+ */
+function assertJoinedMember({ groupId, generationId, memberId }: GroupMetadata): void {
+	if (generationId < 0) {
+		throw new CommitFailedError(
+			groupId,
+			new KafkaProtocolError(ErrorCode.IllegalGeneration, `sendOffsets with generation ${generationId}`)
+		)
+	}
+	if (memberId === '') {
+		throw new CommitFailedError(
+			groupId,
+			new KafkaProtocolError(ErrorCode.UnknownMemberId, 'sendOffsets without a member id')
+		)
+	}
 }
 
 /** Poll interval for CONCURRENT_TRANSACTIONS — matches the Java client's ADD_PARTITIONS_RETRY_BACKOFF_MS. */
@@ -226,15 +308,22 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	private readonly preparingSends = new Set<(error: Error) => void>()
 
 	// Transaction state (only used when transactionalId is set)
-	private transactionState: TransactionState = 'idle'
-	// FIFO queue serializing transaction() calls: the protocol allows one open
-	// transaction per producer, so concurrent callers wait instead of throwing.
+	private txnState: TransactionState = 'idle'
+	// FIFO queue serializing transactions: the protocol allows one open transaction
+	// per producer, so concurrent callers wait instead of throwing.
 	private transactionTail: Promise<void> = Promise.resolve()
-	// Number of transaction() calls admitted (active + waiting).
+	// Number of transactions admitted (open + waiting to begin).
 	private transactionQueueDepth = 0
+	// Number of transaction() calls that have not settled: disconnect() refuses to run under them.
+	private transactionCalls = 0
+	private openTransaction: OpenTransaction | null = null
+	// Aborted by disconnect(): rejects the transactions still waiting to begin.
+	private readonly closing = new AbortController()
 	// First definitive failure of a transactional send in the current transaction.
 	// While set, commitTransaction() must abort instead of committing partial data.
 	private transactionAbortCause: Error | null = null
+	// An EndTxn(commit) of the current transaction was sent without an answer: the broker may have committed it.
+	private commitOutcomeUnknown = false
 	private partitionsInTransaction = new Set<string>() // "topic:partition"
 	private offsetsToCommit = new Map<string, { offsets: TopicPartitionOffset[]; groupMetadata?: GroupMetadata }>() // groupId -> { offsets, groupMetadata }
 
@@ -520,45 +609,22 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		while (this.state !== 'idle' && strategy.shouldReconnect()) {
 			try {
 				const outcome = await this.sendPreparedBatchesOnce(pendingBatches)
-				if (outcome.stop) {
+				if (outcome.stop || outcome.retryBatches.length === 0) {
 					return
 				}
-
-				if (outcome.retryBatches.length === 0) {
-					return
-				}
-
-				strategy.recordFailure()
-				if (strategy.shouldReconnect()) {
-					await this.sleep(strategy.nextDelay())
-					pendingBatches = outcome.retryBatches
-					continue
-				}
-
-				if (outcome.retryError) {
-					// broker.produce() rejected before any response arrived.
-					this.failPreparedBatches(outcome.retryBatches, () => outcome.retryError!)
-				} else {
-					this.failPreparedBatches(
-						outcome.retryBatches,
-						prepared =>
-							new Error(
-								`Produce failed for ${prepared.batch.topic}-${prepared.batch.partition}: max retries exceeded`
-							)
-					)
-				}
-				return
+				pendingBatches = outcome.retryBatches
 			} catch (error) {
-				strategy.recordFailure()
-
-				if (!strategy.shouldReconnect()) {
-					const failure = error instanceof Error ? error : new Error(String(error))
-					this.failPreparedBatches(pendingBatches, () => failure)
-					return
-				}
-
-				await this.sleep(strategy.nextDelay())
+				// The leaders could not be looked up: every batch is retried.
+				const failure = toError(error)
+				for (const prepared of pendingBatches) prepared.lastError = failure
 			}
+
+			strategy.recordFailure()
+			if (!strategy.shouldReconnect()) {
+				this.failExhaustedBatches(pendingBatches)
+				return
+			}
+			await this.sleep(strategy.nextDelay())
 		}
 	}
 
@@ -569,11 +635,10 @@ export class Producer extends EventEmitter<ProducerEvents> {
 				try {
 					return await this.sendPreparedBatchesToBroker(broker, batches, preparedBatches)
 				} catch (error) {
-					return {
-						retryBatches: batches,
-						stop: false,
-						retryError: error instanceof Error ? error : new Error(String(error)),
-					}
+					// broker.produce() rejected before any response arrived.
+					const failure = toError(error)
+					for (const prepared of batches) prepared.lastError = failure
+					return { retryBatches: batches, stop: false }
 				}
 			})
 		)
@@ -582,11 +647,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 			return { retryBatches: [], stop: true }
 		}
 
-		return {
-			retryBatches: outcomes.flatMap(outcome => outcome.retryBatches),
-			stop: false,
-			retryError: outcomes.find(outcome => outcome.retryError)?.retryError,
-		}
+		return { retryBatches: outcomes.flatMap(outcome => outcome.retryBatches), stop: false }
 	}
 
 	private async groupPreparedBatchesByLeader(
@@ -680,12 +741,16 @@ export class Producer extends EventEmitter<ProducerEvents> {
 					// state to protect — fence + reinit like a connection failure. Otherwise
 					// treat it as retriable and let the retry budget decide.
 					if (this.config.idempotent) {
-						const ambiguousError = new Error(
-							`Ambiguous produce outcome (no broker response for ${batch.topic}-${batch.partition}) — fencing producer`
+						const ambiguousError = retriableFailure(
+							`Ambiguous produce outcome (no broker response for ${batch.topic}-${batch.partition}) — fencing producer`,
+							undefined
 						)
 						this.fenceAndReinit(ambiguousError, allPendingBatches)
 						return { retryBatches: [], stop: true }
 					}
+					prepared.lastError = new Error(
+						`The produce response has no result for ${batch.topic}-${batch.partition}`
+					)
 					retryBatches.push(prepared)
 					continue
 				}
@@ -712,6 +777,10 @@ export class Producer extends EventEmitter<ProducerEvents> {
 					}
 
 					if (isRetriableError(errorCode)) {
+						prepared.lastError = new KafkaProtocolError(
+							errorCode,
+							`Produce to ${batch.topic}-${batch.partition}`
+						)
 						retryBatches.push(prepared)
 						if (shouldRefreshMetadata(errorCode)) {
 							await this.cluster.refreshMetadata([batch.topic])
@@ -725,9 +794,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 					// not ambiguous.  Roll back the sequence and reject the messages.
 					this.failPreparedBatch(
 						prepared,
-						new Error(
-							`Produce failed for ${batch.topic}-${batch.partition}: ${ErrorCode[errorCode] ?? errorCode}`
-						)
+						new KafkaProtocolError(errorCode, `Produce failed for ${batch.topic}-${batch.partition}`)
 					)
 					continue
 				}
@@ -789,7 +856,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	}
 
 	/**
-	 * Fail a collection of prepared batches.
+	 * Fail batches whose retries are used up, with a retriable KafkaError whose cause is the batch's last failure.
 	 *
 	 * For an idempotent producer, if any batch was already transmitted (everSent) its
 	 * append outcome is unknown — reusing its sequence could later let a
@@ -801,15 +868,16 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	 * Definitive single-batch rejections (an explicit broker error code) call
 	 * failPreparedBatch directly instead.
 	 */
-	private failPreparedBatches(
-		preparedBatches: PreparedProduceBatch[],
-		errorFor: (prepared: PreparedProduceBatch) => Error
-	): void {
+	private failExhaustedBatches(preparedBatches: PreparedProduceBatch[]): void {
+		const exhausted = ({ batch, lastError }: PreparedProduceBatch) =>
+			retriableFailure(`Produce failed for ${batch.topic}-${batch.partition}: max retries exceeded`, lastError)
+
 		if (this.config.idempotent) {
 			const firstSent = preparedBatches.find(p => p.everSent)
 			if (firstSent) {
-				const ambiguousError = new Error(
-					`Ambiguous produce outcome after send — fencing producer for safety: ${errorFor(firstSent).message}`
+				const ambiguousError = retriableFailure(
+					'Ambiguous produce outcome after send — fencing producer for safety',
+					exhausted(firstSent)
 				)
 				this.fenceAndReinit(ambiguousError, preparedBatches)
 				return
@@ -817,7 +885,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		}
 
 		for (const prepared of preparedBatches) {
-			this.failPreparedBatch(prepared, errorFor(prepared))
+			this.failPreparedBatch(prepared, exhausted(prepared))
 		}
 	}
 
@@ -951,7 +1019,10 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		})
 
 		this.fenceAndReinit(
-			new Error(`Out of order sequence for ${batch.topic}-${batch.partition}: baseSequence=${baseSequence}`),
+			new KafkaProtocolError(
+				ErrorCode.OutOfOrderSequenceNumber,
+				`Out of order sequence for ${batch.topic}-${batch.partition}: baseSequence=${baseSequence}`
+			),
 			allPrepared
 		)
 	}
@@ -1369,41 +1440,43 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	/**
 	 * Disconnect the producer
 	 *
-	 * Flushes all pending messages before disconnecting.
+	 * Flushes all pending messages before disconnecting, within `timeoutMs` (default 5000): against an unresponsive
+	 * broker, whatever is not acknowledged by then is rejected. A transaction left open by a
+	 * {@link beginTransaction} handle is aborted within the same budget (one that is committing is waited for); past
+	 * it, the broker aborts the transaction after `transactionTimeoutMs`. Transactions still waiting to begin are
+	 * rejected. Also allowed in the 'error' transaction state.
 	 *
-	 * @throws Error if a transaction is active - await producer.transaction() first
+	 * @throws Error while a `transaction()` call is active or queued - await it first
 	 */
-	async disconnect(): Promise<void> {
+	async disconnect(options: DisconnectOptions = {}): Promise<void> {
 		if (this.state === 'stopping' || this.state === 'idle') {
 			return
 		}
 
-		// Throw if a transaction is active or queued - caller must await
-		// producer.transaction() first. A fatally-errored producer (failed abort)
-		// has no active transaction to wait for and must still be closeable.
-		if (
-			this.config.transactionalId &&
-			(this.transactionQueueDepth > 0 || (this.transactionState !== 'idle' && this.transactionState !== 'error'))
-		) {
+		if (this.transactionCalls > 0) {
 			throw new Error(
 				`Cannot disconnect while transactions are active or queued (state '${this.transactionState}', ` +
 					`queued ${this.transactionQueueDepth}). Await producer.transaction() before calling disconnect().`
 			)
 		}
 
+		const deadlineAt = Date.now() + (options.timeoutMs ?? SHUTDOWN_DEADLINE_MS)
+		const remainingMs = () => Math.max(0, deadlineAt - Date.now())
 		this.state = 'stopping'
+		this.closing.abort(new Error(DISCONNECTED))
 		this.logger.info('disconnecting producer')
 
-		// The guard above rejects while pooled transactions are active or queued,
-		// so lanes are idle here and their disconnects cannot throw.
+		// Lanes run no transaction() call (the pool does), so their disconnects cannot throw.
 		if (this.lanes) {
-			await Promise.all(this.lanes.map(lane => lane.disconnect()))
+			await Promise.all(this.lanes.map(lane => lane.disconnect({ timeoutMs: remainingMs() })))
 		}
+
+		await this.endOpenTransaction(remainingMs)
 
 		try {
 			// Bounded: against an unresponsive broker the remaining batches are rejected below
 			// instead of waiting out the request timeouts.
-			await withTimeout(this.flush(), SHUTDOWN_DEADLINE_MS, 'flush')
+			await withTimeout(this.flush(), remainingMs(), 'flush')
 		} catch (error) {
 			this.logger.warn('flush() failed during disconnect', {
 				error: error instanceof Error ? error.message : String(error),
@@ -1432,7 +1505,65 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		this.logger.info('producer disconnected')
 	}
 
+	/**
+	 * Abort the transaction a handle left open (Java parity: close() aborts an incomplete transaction), or wait for
+	 * the one committing, within the disconnect budget.
+	 */
+	private async endOpenTransaction(remainingMs: () => number): Promise<void> {
+		const open = this.openTransaction
+		if (!open) return
+		// Rejects while committing (waited for below) or when the abort fails, which the 'error' event reports.
+		open.handle.abort({ timeoutMs: remainingMs() }).catch(() => {})
+		try {
+			await withTimeout(open.ended, remainingMs(), 'open transaction')
+		} catch (error) {
+			this.logger.warn('the open transaction did not end during disconnect', { error: toError(error).message })
+		}
+	}
+
 	// ==================== Transaction API ====================
+
+	/**
+	 * State of this producer's transaction: 'idle' between transactions, 'error' once it can run none any more
+	 * (an abort that did not finish, or a commit whose outcome is unknown; replace the producer, disconnect() is still
+	 * allowed). With `transactionConcurrency` above 1 it sums up the lanes: 'error' if one is in it, else the state of a
+	 * lane with a transaction, else 'idle'.
+	 */
+	get transactionState(): TransactionState {
+		if (!this.lanes) return this.txnState
+		const states = this.lanes.map(lane => lane.txnState)
+		return states.includes('error') ? 'error' : (states.find(state => state !== 'idle') ?? 'idle')
+	}
+
+	/**
+	 * Begin a transaction and return its handle, which commits or aborts it.
+	 *
+	 * Transactions run one at a time per transactional ID (with `transactionConcurrency` N, N at a time), first in
+	 * first out together with transaction() calls: this waits until earlier ones ended. The first transaction
+	 * initializes the producer (InitProducerId), which fences older producers with the same transactional ID.
+	 *
+	 * Without `signal`, an open transaction has no client-side timeout; the broker aborts it after
+	 * `transactionTimeoutMs`. Aborting `signal` rejects the call while it waits, and aborts the transaction once open.
+	 *
+	 * @throws InvalidTxnStateError when the producer is in the 'error' state
+	 *
+	 * @example
+	 * ```typescript
+	 * const tx = await producer.beginTransaction()
+	 * try {
+	 *   await tx.send(ordersTopic, { key: orderId, value: order })
+	 *   await tx.sendOffsets({ consumerGroupMetadata, offsets })
+	 * } catch (error) {
+	 *   await tx.abort()
+	 *   throw error
+	 * }
+	 * await tx.commit()
+	 * ```
+	 */
+	async beginTransaction(options: BeginTransactionOptions = {}): Promise<TransactionHandle> {
+		this.assertCanBegin('beginTransaction()')
+		return (await this.begin(options.signal)).handle
+	}
 
 	/**
 	 * Execute operations within a transaction
@@ -1468,97 +1599,140 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	 * ```
 	 */
 	async transaction<T>(fn: (tx: ProducerTransaction) => Promise<T>, options: TransactionOptions = {}): Promise<T> {
-		if (!this.config.transactionalId) {
-			throw new Error('transaction() requires transactionalId to be configured')
+		this.assertCanBegin('transaction()')
+		this.transactionCalls++
+		try {
+			const tx = (await this.begin(undefined)).handle
+			const timeoutMs = options.timeoutMs ?? this.config.transactionTimeoutMs
+			let timeoutId: ReturnType<typeof setTimeout> | undefined
+			let result: T
+			try {
+				const scope = new Set(activeTransactionScopes.getStore())
+				scope.add(this)
+				result = await activeTransactionScopes.run(scope, () =>
+					Promise.race([
+						fn(tx),
+						new Promise<never>((_, reject) => {
+							timeoutId = setTimeout(
+								() => reject(new Error(`Transaction timeout after ${timeoutMs}ms`)),
+								timeoutMs
+							)
+						}),
+					])
+				)
+			} catch (error) {
+				// A failed abort leaves the producer in the 'error' state and is reported by the 'error' event.
+				await tx.abort().catch(() => {})
+				throw error instanceof TransactionAbortedError
+					? error
+					: new TransactionAbortedError(this.config.transactionalId!, toError(error))
+			} finally {
+				clearTimeout(timeoutId)
+			}
+			await tx.commit()
+			return result
+		} finally {
+			this.transactionCalls--
 		}
+	}
 
+	private assertCanBegin(method: string): void {
+		if (!this.config.transactionalId) {
+			throw new Error(`${method} requires transactionalId to be configured`)
+		}
 		if (activeTransactionScopes.getStore()?.has(this)) {
 			throw new Error(
-				'producer.transaction() was called from inside an active transaction callback. ' +
+				`producer.${method} was called from inside an active transaction callback. ` +
 					'Nested transactions are not supported — use tx.send()/tx.sendOffsets() instead.'
 			)
 		}
+	}
 
-		if (this.lanes) {
-			return this.pooledTransaction(fn, options)
+	/** Wait for capacity, then open a transaction here or on a lane. */
+	private async begin(signal: AbortSignal | undefined): Promise<OpenTransaction> {
+		const queuedAhead = this.transactionQueueDepth++
+		try {
+			if (queuedAhead >= (this.lanes?.length ?? 1)) {
+				this.logger.debug('transaction queued behind active transactions', { queued: queuedAhead })
+				// Observability only - a throwing listener must not corrupt queue state.
+				try {
+					this.emit('transaction:queued', { queued: queuedAhead })
+				} catch (error) {
+					this.logger.warn('transaction:queued listener threw', { error: toError(error).message })
+				}
+			}
+			const stop = signal ? AbortSignal.any([signal, this.closing.signal]) : this.closing.signal
+			stop.throwIfAborted()
+			const open = this.lanes ? await this.openOnLane(stop, signal) : await this.openHere(stop, signal)
+			void open.ended.then(() => this.transactionQueueDepth--)
+			return open
+		} catch (error) {
+			this.transactionQueueDepth--
+			throw error
 		}
+	}
 
+	/** Take this producer's turn (FIFO), initialize it, and open the transaction. */
+	private async openHere(stop: AbortSignal, signal: AbortSignal | undefined): Promise<OpenTransaction> {
 		const previous = this.transactionTail
 		let release!: () => void
 		this.transactionTail = new Promise(resolve => {
 			release = resolve
 		})
-		const queuedAhead = this.transactionQueueDepth
-		this.transactionQueueDepth++
-
 		try {
-			if (queuedAhead > 0) {
-				this.logger.debug('transaction queued behind active transaction', { queued: queuedAhead })
-				// Observability only - a throwing listener must not corrupt queue state.
-				try {
-					this.emit('transaction:queued', { queued: queuedAhead })
-				} catch (error) {
-					this.logger.warn('transaction:queued listener threw', {
-						error: error instanceof Error ? error.message : String(error),
-					})
-				}
-			}
-
-			await previous
-			const scope = new Set(activeTransactionScopes.getStore())
-			scope.add(this)
-			return await activeTransactionScopes.run(scope, () => this.runTransaction(fn, options))
-		} finally {
-			this.transactionQueueDepth--
-			release()
+			await abortable(previous, stop)
+		} catch (error) {
+			// Given up while waiting: pass the turn on once it comes.
+			void previous.then(release)
+			throw error
 		}
+		try {
+			// Only a producer in a fatal state can be non-idle here: transactions take turns and never overlap.
+			if (this.txnState !== 'idle') {
+				throw new InvalidTxnStateError(this.config.transactionalId!, this.txnState, ['idle'])
+			}
+			await abortable(this.ensureInitialized(), stop)
+			stop.throwIfAborted()
+		} catch (error) {
+			release()
+			throw error
+		}
+		return this.open(release, signal)
 	}
 
 	/**
-	 * Dispatch a transaction to a free lane, or wait FIFO for the next one
-	 * released. Transactions on different lanes may commit out of call order.
+	 * Open the transaction on a free lane, or wait FIFO for the next one released. Transactions on different lanes may
+	 * commit out of call order.
 	 */
-	private async pooledTransaction<T>(
-		fn: (tx: ProducerTransaction) => Promise<T>,
-		options: TransactionOptions
-	): Promise<T> {
-		const queuedAhead = this.transactionQueueDepth
-		this.transactionQueueDepth++
-
+	private async openOnLane(stop: AbortSignal, signal: AbortSignal | undefined): Promise<OpenTransaction> {
+		const lane = await this.acquireLane(stop)
 		try {
-			if (queuedAhead >= this.lanes!.length) {
-				this.logger.debug('transaction queued behind active transactions', { queued: queuedAhead })
-				// Observability only - a throwing listener must not corrupt pool state.
-				try {
-					this.emit('transaction:queued', { queued: queuedAhead })
-				} catch (error) {
-					this.logger.warn('transaction:queued listener threw', {
-						error: error instanceof Error ? error.message : String(error),
-					})
-				}
-			}
-
-			const lane = await this.acquireLane()
-			try {
-				// Add the dispatcher to the scope so re-entry from the callback throws
-				// instead of taking more lanes and deadlocking once the pool is exhausted.
-				const scope = new Set(activeTransactionScopes.getStore())
-				scope.add(this)
-				return await activeTransactionScopes.run(scope, () => lane.transaction(fn, options))
-			} finally {
-				this.releaseLane(lane)
-			}
-		} finally {
-			this.transactionQueueDepth--
+			const open = await lane.begin(signal)
+			void open.ended.then(() => this.releaseLane(lane))
+			return open
+		} catch (error) {
+			this.releaseLane(lane)
+			throw error
 		}
 	}
 
-	private acquireLane(): Promise<Producer> {
+	private acquireLane(stop: AbortSignal): Promise<Producer> {
 		const lane = this.freeLanes.pop()
 		if (lane) {
 			return Promise.resolve(lane)
 		}
-		return new Promise(resolve => this.laneWaiters.push(resolve))
+		return new Promise((resolve, reject) => {
+			const take = (lane: Producer) => {
+				stop.removeEventListener('abort', giveUp)
+				resolve(lane)
+			}
+			const giveUp = () => {
+				this.laneWaiters.splice(this.laneWaiters.indexOf(take), 1)
+				reject(stop.reason)
+			}
+			stop.addEventListener('abort', giveUp, { once: true })
+			this.laneWaiters.push(take)
+		})
 	}
 
 	private releaseLane(lane: Producer): void {
@@ -1570,48 +1744,83 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		}
 	}
 
-	private async runTransaction<T>(
-		fn: (tx: ProducerTransaction) => Promise<T>,
-		options: TransactionOptions
-	): Promise<T> {
-		// Only a producer in a fatal state can be non-idle here: concurrent
-		// transactions queue on transactionTail and never observe each other.
-		if (this.transactionState !== 'idle') {
-			throw new InvalidTxnStateError(this.config.transactionalId!, this.transactionState, ['idle'])
-		}
-
-		await this.ensureInitialized()
-
-		this.transactionState = 'in_transaction'
+	/**
+	 * Open a transaction (this producer's turn taken and the producer initialized) and create its handle. The turn is
+	 * passed on once the handle's commit or abort ended. Aborting `signal` aborts the transaction while it is open.
+	 */
+	private open(release: () => void, signal: AbortSignal | undefined): OpenTransaction {
+		const transactionalId = this.config.transactionalId!
+		this.txnState = 'in_transaction'
 		this.transactionAbortCause = null
+		this.commitOutcomeUnknown = false
 		this.partitionsInTransaction.clear()
 		this.offsetsToCommit.clear()
 
-		const timeoutMs = options.timeoutMs ?? this.config.transactionTimeoutMs
+		const controller = new AbortController()
+		// What this handle did with its transaction; the producer's own state can change under it (a fenced producer
+		// re-initializes, which ends the transaction).
+		let status: TransactionState | 'committed' | 'aborted' = 'in_transaction'
+		let markEnded!: () => void
+		const ended = new Promise<void>(resolve => {
+			markEnded = resolve
+		})
 
-		const abortController = new AbortController()
-		let timeoutId: ReturnType<typeof setTimeout> | null = null
+		const assertOpen = (): void => {
+			const state = status === 'in_transaction' ? this.txnState : status
+			if (state !== 'in_transaction') {
+				throw new InvalidTxnStateError(transactionalId, state, ['in_transaction'])
+			}
+		}
+		const end = (next: 'committing' | 'aborting', run: () => Promise<void>): Promise<void> => {
+			status = next
+			return run().finally(() => {
+				signal?.removeEventListener('abort', abortOnSignal)
+				this.openTransaction = null
+				release()
+				markEnded()
+			})
+		}
+		const commit = async (stop: AbortSignal | undefined): Promise<void> => {
+			try {
+				await this.commitTransaction(stop)
+				status = 'committed'
+			} catch (error) {
+				controller.abort()
+				const cause = toError(error)
+				if (this.commitOutcomeUnknown) {
+					status = 'error'
+					this.enterFatalState(cause, 'EndTxn(commit) was not confirmed: the commit outcome is unknown')
+					throw new TransactionAbortedError(transactionalId, cause, 'unknown')
+				}
+				// A failed abort leaves the producer in the 'error' state and is reported by the 'error' event.
+				await this.abortTransaction(stop).catch(() => {})
+				status = this.txnState === 'error' ? 'error' : 'aborted'
+				throw error instanceof TransactionAbortedError
+					? error
+					: new TransactionAbortedError(transactionalId, cause)
+			}
+		}
+		const abort = async (stop: AbortSignal | undefined): Promise<void> => {
+			controller.abort()
+			try {
+				await this.abortTransaction(stop)
+				status = 'aborted'
+			} catch (error) {
+				status = 'error'
+				throw error
+			}
+		}
 
-		const tx: ProducerTransaction = {
-			signal: abortController.signal,
+		const handle: TransactionHandle = {
+			signal: controller.signal,
 
 			send: async (
 				topic: string | TopicDefinition<unknown, unknown>,
 				messages: ProducerMessage<unknown, unknown> | ProducerMessage<unknown, unknown>[]
 			): Promise<SendResult | SendResult[]> => {
-				if (this.transactionState !== 'in_transaction') {
-					throw new InvalidTxnStateError(this.config.transactionalId!, this.transactionState, [
-						'in_transaction',
-					])
-				}
-
+				assertOpen()
 				const topicDef =
-					typeof topic === 'string'
-						? ({
-								topic,
-							} satisfies TopicDefinition<Buffer, Buffer>)
-						: topic
-
+					typeof topic === 'string' ? ({ topic } satisfies TopicDefinition<Buffer, Buffer>) : topic
 				const promise = this.trackSend(
 					this.tracedSend(topicDef, messages, true, m => this.transactionalSend(topicDef, m))
 				)
@@ -1624,44 +1833,33 @@ export class Producer extends EventEmitter<ProducerEvents> {
 				contextOrParams: ConsumeContext | SendOffsetsParams,
 				offsets?: TopicPartitionOffset[]
 			): Promise<void> => {
-				if (this.transactionState !== 'in_transaction') {
-					throw new InvalidTxnStateError(this.config.transactionalId!, this.transactionState, [
-						'in_transaction',
-					])
-				}
+				assertOpen()
 				await this.prepareOffsetsForCommit(this.resolveSendOffsetsParams(contextOrParams, offsets))
 			},
+
+			commit: async (options?: ProducerCallOptions): Promise<void> => {
+				if (status !== 'in_transaction') {
+					throw new InvalidTxnStateError(transactionalId, status, ['in_transaction'])
+				}
+				return end('committing', () => bounded('Transaction commit', options, commit))
+			},
+
+			abort: async (options?: ProducerCallOptions): Promise<void> => {
+				if (status === 'in_transaction') {
+					return end('aborting', () => bounded('Transaction abort', options, abort))
+				}
+				if (status === 'committing' || status === 'committed') {
+					throw new InvalidTxnStateError(transactionalId, status, ['in_transaction'])
+				}
+				// Ended (or ending) without a commit: nothing more to do once that settled.
+				await bounded('Transaction abort', options, stop => abortable(ended, stop))
+			},
 		}
+		const abortOnSignal = (): void => void handle.abort().catch(() => {})
+		signal?.addEventListener('abort', abortOnSignal, { once: true })
 
-		try {
-			const result = await Promise.race([
-				fn(tx),
-				new Promise<never>((_, reject) => {
-					timeoutId = setTimeout(() => {
-						abortController.abort()
-						reject(new Error(`Transaction timeout after ${timeoutMs}ms`))
-					}, timeoutMs)
-				}),
-			])
-
-			if (timeoutId) clearTimeout(timeoutId)
-
-			await this.commitTransaction()
-			return result as T
-		} catch (error) {
-			if (timeoutId) clearTimeout(timeoutId)
-
-			abortController.abort()
-			await this.abortTransaction()
-
-			if (error instanceof TransactionAbortedError) {
-				throw error
-			}
-			throw new TransactionAbortedError(
-				this.config.transactionalId!,
-				error instanceof Error ? error : new Error(String(error))
-			)
-		}
+		this.openTransaction = { handle, ended }
+		return this.openTransaction
 	}
 
 	/**
@@ -1739,64 +1937,40 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	 * Add partitions to the current transaction
 	 */
 	private async addPartitionsToTransaction(topic: string, partitions: number[]): Promise<void> {
-		let coordinator = await this.cluster.getCoordinator('TRANSACTION', this.config.transactionalId!)
-
-		await retry(async () => {
+		const transactionalId = this.config.transactionalId!
+		await this.coordinatorRequest('TRANSACTION', transactionalId, async coordinator => {
 			const response = await coordinator.addPartitionsToTxn({
-				transactionalId: this.config.transactionalId!,
+				transactionalId,
 				producerId: this.producerId,
 				producerEpoch: this.producerEpoch,
-				topics: [
-					{
-						name: topic,
-						partitions,
-					},
-				],
+				topics: [{ name: topic, partitions }],
 			})
 
 			// A top-level error (v4+) means the broker rejected the whole request; the
 			// per-partition results are empty/meaningless, so check it before they are.
 			if (response.errorCode !== ErrorCode.None) {
-				if (isCoordinatorErrorCode(response.errorCode)) {
-					this.cluster.invalidateCoordinator('TRANSACTION', this.config.transactionalId!)
-					coordinator = await this.cluster.getCoordinator('TRANSACTION', this.config.transactionalId!)
-				}
-
 				throw new KafkaProtocolError(
 					response.errorCode,
-					`AddPartitionsToTxn failed for transaction ${this.config.transactionalId}`
+					`AddPartitionsToTxn failed for transaction ${transactionalId}`
 				)
 			}
 
 			for (const topicResult of response.results) {
 				for (const partitionResult of topicResult.resultsByPartition) {
-					if (partitionResult.errorCode === ErrorCode.None) {
-						continue
+					if (partitionResult.errorCode !== ErrorCode.None) {
+						throw new KafkaProtocolError(
+							partitionResult.errorCode,
+							`AddPartitionsToTxn failed for ${topicResult.name}-${partitionResult.partitionIndex}`
+						)
 					}
-
-					if (isCoordinatorErrorCode(partitionResult.errorCode)) {
-						this.cluster.invalidateCoordinator('TRANSACTION', this.config.transactionalId!)
-						coordinator = await this.cluster.getCoordinator('TRANSACTION', this.config.transactionalId!)
-					}
-
-					throw new KafkaProtocolError(
-						partitionResult.errorCode,
-						`AddPartitionsToTxn failed for ${topicResult.name}-${partitionResult.partitionIndex}`
-					)
 				}
 			}
+		})
 
-			// Success - mark partitions as part of this transaction
-			for (const partition of partitions) {
-				this.partitionsInTransaction.add(`${topic}:${partition}`)
-			}
-
-			this.logger.debug('added partitions to transaction', {
-				transactionalId: this.config.transactionalId,
-				topic,
-				partitions,
-			})
-		}, this.transactionalRetryOptions())
+		for (const partition of partitions) {
+			this.partitionsInTransaction.add(`${topic}:${partition}`)
+		}
+		this.logger.debug('added partitions to transaction', { transactionalId, topic, partitions })
 	}
 
 	/**
@@ -1829,67 +2003,90 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	}
 
 	/**
-	 * Prepare offsets to be committed with the transaction
+	 * Register the transaction's offsets of a group (AddOffsetsToTxn); they are committed with TxnOffsetCommit when
+	 * the transaction commits.
 	 */
 	private async prepareOffsetsForCommit(params: SendOffsetsParams): Promise<void> {
-		// Extract groupId from either groupId or consumerGroupMetadata
-		const groupId = params.consumerGroupMetadata?.groupId ?? params.groupId
+		const groupMetadata = params.consumerGroupMetadata
+		const groupId = groupMetadata?.groupId ?? params.groupId
 		if (!groupId) {
 			throw new Error('sendOffsets requires either groupId or consumerGroupMetadata')
 		}
+		if (groupMetadata) {
+			assertJoinedMember(groupMetadata)
+		}
 
-		let coordinator = await this.cluster.getCoordinator('TRANSACTION', this.config.transactionalId!)
-
-		await retry(async () => {
-			// Register the group with the transaction coordinator
+		const transactionalId = this.config.transactionalId!
+		await this.coordinatorRequest('TRANSACTION', transactionalId, async coordinator => {
 			const response = await coordinator.addOffsetsToTxn({
-				transactionalId: this.config.transactionalId!,
+				transactionalId,
 				producerId: this.producerId,
 				producerEpoch: this.producerEpoch,
 				groupId,
 			})
-
-			if (response.errorCode === ErrorCode.None) {
-				return
+			if (response.errorCode !== ErrorCode.None) {
+				throw new KafkaProtocolError(response.errorCode, `AddOffsetsToTxn failed for group ${groupId}`)
 			}
+		})
 
-			// Handle coordinator move - invalidate cache and re-fetch
-			if (isCoordinatorErrorCode(response.errorCode)) {
-				this.cluster.invalidateCoordinator('TRANSACTION', this.config.transactionalId!)
-				coordinator = await this.cluster.getCoordinator('TRANSACTION', this.config.transactionalId!)
-			}
-
-			throw new KafkaProtocolError(response.errorCode, `AddOffsetsToTxn failed for group ${groupId}`)
-		}, this.transactionalRetryOptions())
-
-		// Store offsets and group metadata for commit during transaction commit phase
 		const existing = this.offsetsToCommit.get(groupId)
 		this.offsetsToCommit.set(groupId, {
 			offsets: [...(existing?.offsets ?? []), ...params.offsets],
-			groupMetadata: params.consumerGroupMetadata ?? existing?.groupMetadata,
+			groupMetadata: groupMetadata ?? existing?.groupMetadata,
 		})
 
 		this.logger.debug('prepared offsets for transaction commit', {
-			transactionalId: this.config.transactionalId,
+			transactionalId,
 			groupId,
 			offsetCount: params.offsets.length,
-			hasGroupMetadata: !!params.consumerGroupMetadata,
+			hasGroupMetadata: !!groupMetadata,
 		})
 	}
 
 	/**
-	 * Retry options for transactional coordinator requests. CONCURRENT_TRANSACTIONS
+	 * A request to the transaction or group coordinator, retried with {@link transactionalRetryOptions}. The coordinator
+	 * is looked up for every attempt and forgotten after a coordinator error or a connection failure, so that a retry
+	 * finds it where it moved. Aborting `stop` rejects with its reason.
+	 */
+	private coordinatorRequest<T>(
+		type: 'TRANSACTION' | 'GROUP',
+		key: string,
+		request: (coordinator: Broker) => Promise<T>,
+		stop?: AbortSignal
+	): Promise<T> {
+		const attempt = async (): Promise<T> => {
+			const coordinator = await this.cluster.getCoordinator(type, key)
+			stop?.throwIfAborted()
+			try {
+				return await request(coordinator)
+			} catch (error) {
+				if (
+					isConnectionFailure(error) ||
+					(error instanceof KafkaProtocolError && isCoordinatorErrorCode(error.errorCode))
+				) {
+					this.cluster.invalidateCoordinator(type, key)
+				}
+				throw error
+			}
+		}
+		return abortable(retry(attempt, this.transactionalRetryOptions(stop)), stop)
+	}
+
+	/**
+	 * Retry options for transactional coordinator requests: retriable errors and connection failures are retried
+	 * (`retries`, bounded by maxBlockMs) until `stop` aborts. CONCURRENT_TRANSACTIONS
 	 * is polled fast and outside the retry budget: the broker returns it while the
 	 * previous transaction's markers are still being written, which clears in
 	 * milliseconds — waiting retryBackoffMs would floor every back-to-back
 	 * transaction at ~100ms, and burning attempts on it would let a slow marker
 	 * write exhaust the budget. maxBlockMs bounds the poll.
 	 */
-	private transactionalRetryOptions(): RetryOptions {
+	private transactionalRetryOptions(stop: AbortSignal | undefined): RetryOptions {
 		return {
 			...createRetryStrategyOptions(this.config),
 			maxElapsedMs: this.config.maxBlockMs,
-			shouldRetry: error => error instanceof KafkaProtocolError && error.retriable,
+			signal: stop,
+			shouldRetry: error => !stop?.aborted && (isRetriable(error) || isConnectionFailure(error)),
 			freeRetry: error =>
 				error instanceof KafkaProtocolError && error.errorCode === ErrorCode.ConcurrentTransactions
 					? CONCURRENT_TRANSACTIONS_POLL_MS
@@ -1904,68 +2101,46 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	 * already underway are expected and not recorded.
 	 */
 	private recordTransactionalSendFailure(error: unknown): void {
-		if (this.transactionState !== 'in_transaction' && this.transactionState !== 'committing') {
+		if (this.txnState !== 'in_transaction' && this.txnState !== 'committing') {
 			return
 		}
-		this.transactionAbortCause ??= error instanceof Error ? error : new Error(String(error))
+		this.transactionAbortCause ??= toError(error)
 	}
 
 	/**
-	 * Commit the current transaction
+	 * Commit the current transaction: flush its sends, commit its offsets, EndTxn(commit). Aborting `stop` rejects
+	 * with its reason and sends nothing more.
 	 */
-	private async commitTransaction(): Promise<void> {
-		if (this.transactionState !== 'in_transaction') {
-			throw new InvalidTxnStateError(this.config.transactionalId!, this.transactionState, ['in_transaction'])
+	private async commitTransaction(stop: AbortSignal | undefined): Promise<void> {
+		if (this.txnState !== 'in_transaction') {
+			throw new InvalidTxnStateError(this.config.transactionalId!, this.txnState, ['in_transaction'])
 		}
 
-		this.transactionState = 'committing'
+		this.txnState = 'committing'
 
 		try {
 			// Flush any pending messages to ensure all are sent
-			await this.flush()
+			await abortable(this.flush(), stop)
 
 			// A transactional send failed definitively — committing now would expose a
-			// partial transaction. Surface the failure so transaction() aborts instead.
+			// partial transaction. Surface the failure so the transaction aborts instead.
 			if (this.transactionAbortCause) {
 				throw this.transactionAbortCause
 			}
 
-			// Commit offsets for each consumer group
 			for (const [groupId, { offsets, groupMetadata }] of this.offsetsToCommit) {
-				await this.commitTransactionOffsets(groupId, offsets, groupMetadata)
+				await this.commitTransactionOffsets(groupId, offsets, groupMetadata, stop)
 			}
 
 			// Nothing was produced and no offsets were prepared: the transaction never
 			// started broker-side, and classic coordinators reject EndTxn for it with
 			// INVALID_TXN_STATE — just reset local state.
 			if (this.partitionsInTransaction.size === 0 && this.offsetsToCommit.size === 0) {
-				this.transactionState = 'idle'
+				this.txnState = 'idle'
 				return
 			}
 
-			// End transaction with commit (with retry for transient errors)
-			let coordinator = await this.cluster.getCoordinator('TRANSACTION', this.config.transactionalId!)
-
-			await retry(async () => {
-				const response = await coordinator.endTxn({
-					transactionalId: this.config.transactionalId!,
-					producerId: this.producerId,
-					producerEpoch: this.producerEpoch,
-					committed: true,
-				})
-
-				if (response.errorCode === ErrorCode.None) {
-					return
-				}
-
-				// Handle coordinator move - invalidate cache and re-fetch
-				if (isCoordinatorErrorCode(response.errorCode)) {
-					this.cluster.invalidateCoordinator('TRANSACTION', this.config.transactionalId!)
-					coordinator = await this.cluster.getCoordinator('TRANSACTION', this.config.transactionalId!)
-				}
-
-				throw new KafkaProtocolError(response.errorCode, 'EndTxn commit failed')
-			}, this.transactionalRetryOptions())
+			await this.endTransaction(true, stop)
 
 			// debug, not info: EOS loops commit per batch, so this fires at batch rate.
 			this.logger.debug('transaction committed', {
@@ -1973,85 +2148,101 @@ export class Producer extends EventEmitter<ProducerEvents> {
 				partitionCount: this.partitionsInTransaction.size,
 				groupCount: this.offsetsToCommit.size,
 			})
-			this.transactionState = 'idle'
+			this.txnState = 'idle'
 			this.partitionsInTransaction.clear()
 			this.offsetsToCommit.clear()
 		} catch (error) {
-			this.transactionState = 'committing'
+			this.txnState = 'committing'
 			throw error
 		}
 	}
 
 	/**
-	 * Abort the current transaction
+	 * Abort the current transaction: reject its queued sends, wait for those in flight, EndTxn(abort). If that does not
+	 * finish (EndTxn fails or `stop` aborts), the producer enters the 'error' state and this rejects.
 	 */
-	private async abortTransaction(): Promise<void> {
-		if (this.transactionState !== 'in_transaction' && this.transactionState !== 'committing') {
+	private async abortTransaction(stop: AbortSignal | undefined): Promise<void> {
+		if (this.txnState !== 'in_transaction' && this.txnState !== 'committing') {
 			// Already idle or in error state
 			return
 		}
 
-		this.transactionState = 'aborting'
+		this.txnState = 'aborting'
 
 		const abortError = new TransactionAbortedError(this.config.transactionalId!)
 		this.accumulator.clearWithRejection(abortError)
 
-		// Drain in-flight sends before EndTxn(abort): a transactional ProduceRequest must
-		// not race the abort marker. Failures are expected — the sends are being aborted.
-		await Promise.allSettled(this.activeSends)
-
 		try {
+			// Drain in-flight sends before EndTxn(abort): a transactional ProduceRequest must
+			// not race the abort marker. Failures are expected — the sends are being aborted.
+			await abortable(Promise.allSettled(this.activeSends), stop)
+
 			// Nothing was added to the transaction: it never started broker-side, and
 			// classic coordinators reject EndTxn for it with INVALID_TXN_STATE — just
 			// reset local state.
 			if (this.partitionsInTransaction.size === 0 && this.offsetsToCommit.size === 0) {
-				this.transactionState = 'idle'
+				this.txnState = 'idle'
 				return
 			}
 
-			// End transaction with abort (with retry for transient errors)
-			let coordinator = await this.cluster.getCoordinator('TRANSACTION', this.config.transactionalId!)
+			await this.endTransaction(false, stop)
 
-			await retry(async () => {
-				const response = await coordinator.endTxn({
-					transactionalId: this.config.transactionalId!,
-					producerId: this.producerId,
-					producerEpoch: this.producerEpoch,
-					committed: false,
-				})
-
-				if (response.errorCode === ErrorCode.None) {
-					return
-				}
-
-				// Handle coordinator move - invalidate cache and re-fetch
-				if (isCoordinatorErrorCode(response.errorCode)) {
-					this.cluster.invalidateCoordinator('TRANSACTION', this.config.transactionalId!)
-					coordinator = await this.cluster.getCoordinator('TRANSACTION', this.config.transactionalId!)
-				}
-
-				throw new KafkaProtocolError(response.errorCode, 'EndTxn abort failed')
-			}, this.transactionalRetryOptions())
-
-			this.transactionState = 'idle'
+			this.txnState = 'idle'
 			this.logger.debug('transaction aborted', {
 				transactionalId: this.config.transactionalId,
 			})
 		} catch (error) {
 			// The abort marker was never written: resetting to idle would let the open
 			// transaction silently merge into the next one. Enter a fatal state instead
-			// (Java FATAL_ERROR parity) so the next transaction() refuses to start.
-			this.transactionState = 'error'
-			const failure = error instanceof Error ? error : new Error(String(error))
-			this.logger.error('EndTxn abort failed — producer entering fatal transaction state', {
-				error: failure.message,
-			})
-			// Emit error so operators can monitor abort failures
-			this.emitError(failure)
+			// (Java FATAL_ERROR parity) so the next transaction refuses to start.
+			this.enterFatalState(toError(error), 'EndTxn(abort) did not complete')
+			throw error
 		} finally {
 			this.partitionsInTransaction.clear()
 			this.offsetsToCommit.clear()
 		}
+	}
+
+	/**
+	 * EndTxn with the current producer id and epoch, resent on retriable failures: the broker answers a resent commit
+	 * of a committed transaction with success. A commit request that was sent and not answered (connection lost, or
+	 * `stop` aborted while it was in flight) may have been applied: {@link commitOutcomeUnknown} records that.
+	 */
+	private async endTransaction(committed: boolean, stop: AbortSignal | undefined): Promise<void> {
+		const transactionalId = this.config.transactionalId!
+		await this.coordinatorRequest(
+			'TRANSACTION',
+			transactionalId,
+			async coordinator => {
+				let response: Awaited<ReturnType<Broker['endTxn']>>
+				try {
+					response = await abortable(
+						coordinator.endTxn({
+							transactionalId,
+							producerId: this.producerId,
+							producerEpoch: this.producerEpoch,
+							committed,
+						}),
+						stop
+					)
+				} catch (error) {
+					if (committed) this.commitOutcomeUnknown = true
+					throw error
+				}
+				if (response.errorCode !== ErrorCode.None) {
+					throw new KafkaProtocolError(response.errorCode, `EndTxn ${committed ? 'commit' : 'abort'} failed`)
+				}
+			},
+			stop
+		)
+	}
+
+	/** Enter the fatal transaction state: no transaction can begin any more; the producer must be replaced. */
+	private enterFatalState(cause: Error, what: string): void {
+		this.txnState = 'error'
+		this.logger.error(`${what} — producer entering fatal transaction state`, { error: cause.message })
+		// Emit error so operators can monitor fatal transaction failures
+		this.emitError(cause)
 	}
 
 	/**
@@ -2060,14 +2251,15 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	private async commitTransactionOffsets(
 		groupId: string,
 		offsets: TopicPartitionOffset[],
-		groupMetadata?: GroupMetadata
+		groupMetadata: GroupMetadata | undefined,
+		stop: AbortSignal | undefined
 	): Promise<void> {
-		// Deduplicate offsets - keep highest offset per (topic, partition)
+		// One offset per (topic, partition): the highest, and the last one given for it (its metadata is the latest).
 		const deduped = new Map<string, TopicPartitionOffset>()
 		for (const offset of offsets) {
 			const key = `${offset.topic}:${offset.partition}`
 			const existing = deduped.get(key)
-			if (!existing || offset.offset > existing.offset) {
+			if (!existing || offset.offset >= existing.offset) {
 				deduped.set(key, offset)
 			}
 		}
@@ -2100,44 +2292,53 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		const groupInstanceId = groupMetadata?.groupInstanceId ?? null
 
 		// TxnOffsetCommit goes to the GROUP coordinator (not transaction coordinator)
-		let groupCoordinator = await this.cluster.getCoordinator('GROUP', groupId)
+		await this.coordinatorRequest(
+			'GROUP',
+			groupId,
+			async coordinator => {
+				const response = await coordinator.txnOffsetCommit({
+					transactionalId: this.config.transactionalId!,
+					groupId,
+					producerId: this.producerId,
+					producerEpoch: this.producerEpoch,
+					generationId,
+					memberId,
+					groupInstanceId,
+					topics: Array.from(topicMap.entries()).map(([name, partitions]) => ({
+						name,
+						partitions,
+					})),
+				})
 
-		await retry(async () => {
-			const response = await groupCoordinator.txnOffsetCommit({
-				transactionalId: this.config.transactionalId!,
-				groupId,
-				producerId: this.producerId,
-				producerEpoch: this.producerEpoch,
-				generationId,
-				memberId,
-				groupInstanceId,
-				topics: Array.from(topicMap.entries()).map(([name, partitions]) => ({
-					name,
-					partitions,
-				})),
-			})
-
-			for (const topic of response.topics) {
-				for (const partition of topic.partitions) {
-					if (partition.errorCode === ErrorCode.None) continue
-
-					if (isCoordinatorErrorCode(partition.errorCode)) {
-						this.cluster.invalidateCoordinator('GROUP', groupId)
-						groupCoordinator = await this.cluster.getCoordinator('GROUP', groupId)
+				for (const topic of response.topics) {
+					for (const partition of topic.partitions) {
+						if (partition.errorCode !== ErrorCode.None) {
+							throw new KafkaProtocolError(
+								partition.errorCode,
+								`TxnOffsetCommit failed for ${topic.name}-${partition.partitionIndex}`
+							)
+						}
 					}
-
-					throw new KafkaProtocolError(
-						partition.errorCode,
-						`TxnOffsetCommit failed for ${topic.name}-${partition.partitionIndex}`
-					)
 				}
-			}
-		}, this.transactionalRetryOptions())
+			},
+			stop
+		)
 	}
 
 	/**
-	 * Get partition count for a topic (cached with TTL)
+	 * The number of partitions of a topic, from this producer's metadata cache (kept for 5 minutes), looked up on a
+	 * miss. Rejects when the topic does not exist, with a `TimeoutError` once `timeoutMs` passed, or with the reason of
+	 * `signal`.
 	 */
+	async partitionCount(topic: string, options?: ProducerCallOptions): Promise<number> {
+		return (
+			this.cachedPartitionCount(topic) ??
+			bounded(`Partition count lookup of ${topic}`, options, stop =>
+				abortable(this.lookUpPartitionCount(topic), stop)
+			)
+		)
+	}
+
 	/** The partition count of a topic. Must run inside {@link inSendOrder}. */
 	private async getPartitionCount(topic: string): Promise<number> {
 		const cached = this.cachedPartitionCount(topic)
@@ -2355,7 +2556,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 			this.reservedSequences.clear()
 
 			// Reset transaction state on (re)initialization
-			this.transactionState = 'idle'
+			this.txnState = 'idle'
 			this.partitionsInTransaction.clear()
 			this.offsetsToCommit.clear()
 

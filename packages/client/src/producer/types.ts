@@ -114,6 +114,7 @@ export interface ProducerConfig {
 	 * 1. **Broker-side**: Passed to InitProducerId; broker aborts transaction if
 	 *    not committed/aborted within this time
 	 * 2. **Client-side**: Used by transaction() to timeout the user callback
+	 *    (a beginTransaction() handle has no client-side timeout unless given a signal)
 	 *
 	 * Keep these in sync to avoid surprises. Only used when transactionalId is set.
 	 */
@@ -322,6 +323,35 @@ export interface TransactionOptions {
 }
 
 /**
+ * Bounds of an asynchronous producer call
+ */
+export interface ProducerCallOptions {
+	/** Reject with a `TimeoutError` once this many ms passed */
+	timeoutMs?: number
+	/** Aborting it rejects the call with the signal's reason */
+	signal?: AbortSignal
+}
+
+/**
+ * Options of `producer.beginTransaction()`
+ */
+export interface BeginTransactionOptions {
+	/**
+	 * Aborting it rejects a call still waiting to begin, and aborts the transaction once it is open. Without it, an
+	 * open transaction has no client-side timeout (the broker's `transactionTimeoutMs` applies).
+	 */
+	signal?: AbortSignal
+}
+
+/**
+ * Options of `producer.disconnect()`
+ */
+export interface DisconnectOptions {
+	/** Upper bound in ms for the flush and for ending an open transaction (default: 5000) */
+	timeoutMs?: number
+}
+
+/**
  * Represents an active transaction context
  */
 export interface ProducerTransaction {
@@ -340,6 +370,11 @@ export interface ProducerTransaction {
 	/**
 	 * Commit consumer offsets as part of the transaction
 	 * (for consume-transform-produce patterns)
+	 *
+	 * With consumer group metadata (directly or from the context), the commit is fenced by the
+	 * member's generation (KIP-447): metadata with a negative generation or an empty member id
+	 * is rejected with `CommitFailedError` before anything is sent. The `{ groupId }` form is
+	 * not fenced.
 	 */
 	sendOffsets(context: ConsumeContext): Promise<void>
 	sendOffsets(context: ConsumeContext, offsets: TopicPartitionOffset[]): Promise<void>
@@ -367,4 +402,36 @@ export interface ProducerTransaction {
 	 * ```
 	 */
 	readonly signal: AbortSignal
+}
+
+/**
+ * An open transaction, from `producer.beginTransaction()`
+ *
+ * It holds the producer's turn until `commit()` or `abort()` ended it (or the signal given to
+ * `beginTransaction()` aborted it): other `beginTransaction()` and `transaction()` calls wait.
+ * Its `signal` is aborted when the transaction ends without committing.
+ */
+export interface TransactionHandle extends ProducerTransaction {
+	/**
+	 * Commit: flush the transaction's sends, commit its offsets (TxnOffsetCommit), EndTxn(commit)
+	 *
+	 * Rejects with `TransactionAbortedError` when the transaction did not commit:
+	 * - `outcome: 'aborted'`: it was aborted, as `abort()` does; or `timeoutMs` passed or `signal`
+	 *   aborted before EndTxn(commit) was sent, and then nothing more is sent: the broker's
+	 *   transaction timeout ends the transaction and the producer enters the 'error' state.
+	 * - `outcome: 'unknown'`: EndTxn(commit) was sent but not confirmed, so the broker may have
+	 *   committed. The producer enters the 'error' state.
+	 *
+	 * Rejects with `InvalidTxnStateError` once the transaction is committing or ended.
+	 */
+	commit(options?: ProducerCallOptions): Promise<void>
+	/**
+	 * Abort: reject the queued sends, wait for those in flight, EndTxn(abort)
+	 *
+	 * If that does not finish (EndTxn fails, `timeoutMs` passes or `signal` aborts), the producer
+	 * enters the 'error' state and this rejects. Resolves once that settled when the transaction
+	 * already ended or is ending without a commit. Rejects with `InvalidTxnStateError` while
+	 * committing or once committed.
+	 */
+	abort(options?: ProducerCallOptions): Promise<void>
 }
