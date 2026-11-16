@@ -3,6 +3,7 @@
  */
 
 import type { ErrorCode } from '@/protocol/messages/error-codes.js'
+import type { KafkaError } from '@/client/errors.js'
 
 /**
  * Admin client configuration
@@ -143,6 +144,45 @@ export interface DeleteTopicsResult {
 	errorCode: ErrorCode
 	/** Error message */
 	errorMessage: string | null
+}
+
+/**
+ * Records to delete from one partition: every record before `offset`
+ */
+export interface RecordsToDelete {
+	/** Topic name */
+	topic: string
+	/** Partition index */
+	partition: number
+	/** The partition's new log start offset; -1n deletes up to the high watermark */
+	offset: bigint
+}
+
+/**
+ * Options of a delete records operation
+ */
+export interface DeleteRecordsOptions {
+	/**
+	 * Time budget of the call, retries included, and how long brokers may wait for the deletion to reach the
+	 * replicas (default: the admin's requestTimeoutMs)
+	 */
+	timeoutMs?: number
+	/** Aborting it rejects the call with the signal's reason */
+	signal?: AbortSignal
+}
+
+/**
+ * Result of a delete records operation for one partition: the new low watermark, or why the deletion failed
+ */
+export interface DeleteRecordsResult {
+	/** Topic name */
+	topic: string
+	/** Partition index */
+	partition: number
+	/** The partition's low watermark (log start offset) after the deletion; set when it succeeded */
+	lowWatermark?: bigint
+	/** Why the deletion failed: the broker's answer, or a TimeoutError once the budget was spent */
+	error?: KafkaError
 }
 
 /**
