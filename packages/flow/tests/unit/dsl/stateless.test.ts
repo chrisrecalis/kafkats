@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import { FailedProcessingError, TopologyError } from '@/api/errors.js'
 import { codec } from '@/codec.js'
+import type { KStreamImpl } from '@/dsl/kstream.js'
+import type { KTableImpl } from '@/dsl/ktable.js'
+import type { Change } from '@/operators/change.js'
+import type { InternalProcessorContext, ProcessorContext } from '@/processor/api.js'
+import type { StreamRecord } from '@/processor/record.js'
 import type { KeyValueStore, ValueAndTimestamp } from '@/state.js'
 import { TestDriver } from '@/testing/driver.js'
 
@@ -360,6 +365,45 @@ describe('table sources', () => {
 			await send('t', 'v', { ...key('k'), codec: str })
 			expect((await getStateStore<Stored>('rekeyed').get('k/v'))?.value).toBe('v')
 		})
+	})
+
+	it('sends old values once downstream asks for them; its value getter reads the latest value and timestamp', async () => {
+		const driver = new TestDriver()
+		const table = driver.table('t', { key: str, value: str }) as KTableImpl<string, string>
+		const changes: Change<string>[] = []
+		const looked: unknown[] = []
+		expect(table.table.enableSendingOldValues(false)).toBe(true)
+		table.ctx.processor('CHANGES', undefined, [table.node], () => ({
+			process: (record: StreamRecord<string, Change<string>>) => void changes.push(record.value),
+		}))
+		const lookups = driver.input('lookups', { key: str }) as KStreamImpl<string, Buffer>
+		const getter = table.table.valueGetter
+		lookups.ctx.processor(
+			'LOOKUP',
+			undefined,
+			[lookups.node],
+			() => {
+				const values = getter.create()
+				return {
+					init: (context: ProcessorContext) =>
+						values.init(context as InternalProcessorContext<unknown, unknown>),
+					process: async (record: StreamRecord<string, Buffer>) =>
+						void looked.push(await values.get(record.key)),
+				}
+			},
+			getter.storeNames
+		)
+		await driver.run(async ({ send }) => {
+			await send('t', 'a', { ...key('k'), codec: str, timestamp: 1n })
+			await send('t', 'b', { ...key('k'), codec: str, timestamp: 2n })
+			await send('lookups', Buffer.from(''), key('k'))
+			await send('lookups', Buffer.from(''), key('missing'))
+		})
+		expect(changes).toEqual([
+			{ newValue: 'a', oldValue: null },
+			{ newValue: 'b', oldValue: 'a' },
+		])
+		expect(looked).toEqual([{ value: 'b', timestamp: 2 }, null])
 	})
 
 	it('globalTable() keeps the latest value of every key of its topic', async () => {

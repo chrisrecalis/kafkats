@@ -73,7 +73,7 @@ describe('TestDriver', () => {
 		await driver.run(async ({ send }) => {
 			await send('in', null, key('a'))
 			await send('in', { n: 1 })
-			await send('in', 'x', { codec: str, keyValue: 'b', keyCodec: str as never })
+			await send('in', 'x', { codec: str, keyValue: 'b', keyCodec: str })
 		})
 		expect(seen).toEqual([
 			['a', null],
