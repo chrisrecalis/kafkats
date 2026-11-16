@@ -4,6 +4,7 @@ import type { KStream } from '@/api/kstream.js'
 import { codec } from '@/codec.js'
 import { KStreamImpl } from '@/dsl/kstream.js'
 import type { InternalProcessorContext, ProcessorContext, ProcessorSupplier } from '@/processor/api.js'
+import { TimestampExtractors } from '@/processor/timestamps.js'
 import type { KeyValueStore } from '@/state.js'
 import { keyValueStoreBuilder } from '@/state/store-builders.js'
 import { TestDriver, type TestDriverConfig } from '@/testing/driver.js'
@@ -334,6 +335,65 @@ describe('TestDriver', () => {
 			const store = getStateStore<KeyValueStore<string, { value: string; timestamp: number }>>('users')
 			expect((await store.get('u1'))?.value).toBe('Alice')
 		})
+	})
+
+	it('skips a global record the deserialization handler lets go, and one with a negative timestamp', async () => {
+		const handled: unknown[] = []
+		const driver = new TestDriver({
+			deserializationExceptionHandler: (ctx, record) => {
+				handled.push([ctx.topic, ctx.offset, record.value?.toString()])
+				return 'continue'
+			},
+		})
+		driver.input('in')
+		driver.globalTable('users', {
+			key: str,
+			value: codec.json<string>(),
+			timestampExtractor: TimestampExtractors.logAndSkipOnInvalid,
+			materialized: { storeName: 'users' },
+		})
+		await driver.run(async ({ send, getStateStore }) => {
+			await send('users', Buffer.from('{not json'), key('u1'))
+			await send('users', 'late', { ...key('u2'), timestamp: -5 })
+			await send('users', 'Bob', key('u3'))
+			const store = getStateStore<KeyValueStore<string, unknown>>('users')
+			expect(await store.approximateNumEntries()).toBe(1)
+		})
+		expect(handled).toEqual([['users', 0n, '{not json']])
+	})
+
+	it('grows topics without a configured count together, so co-partitioned topics stay assignable', async () => {
+		const driver = new TestDriver()
+		const merged = driver.input('a', { key: str, value: str }).merge(driver.input('b', { key: str, value: str }))
+		addStore(merged as KStream<unknown, unknown>, 'seen')
+		processWith(merged, () => {
+			let store: KeyValueStore<string, string>
+			return {
+				init: ctx => {
+					store = ctx.getStateStore('seen')
+				},
+				process: record => store.put(record.key!, record.value!),
+			}
+		}, ['seen'])
+		await driver.run(async ({ send, getStateStore }) => {
+			await send('b', Buffer.from('v'), { ...key('k'), partition: 2 })
+			await send('a', Buffer.from('w'), { ...key('j'), partition: 2 })
+			const store = getStateStore<KeyValueStore<string, string>>('seen', 2)
+			expect([await store.get('k'), await store.get('j')]).toEqual(['v', 'w'])
+		})
+	})
+
+	it('fails start() when a processor fails to initialize, and stops cleanly', async () => {
+		const driver = new TestDriver()
+		processWith(driver.input('in'), () => ({
+			init: () => {
+				throw new Error('no init')
+			},
+			process: () => {},
+		}))
+		await expect(driver.start()).rejects.toThrow("failed to initialize processor 'TEST-PROCESSOR")
+		await driver.stop()
+		await expect(new TestDriver().stop()).resolves.toBeUndefined()
 	})
 
 	it('builds the topology at start: later DSL calls throw', async () => {

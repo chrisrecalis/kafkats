@@ -4,6 +4,7 @@
  */
 import type { Logger, Message } from '@kafkats/client'
 import { IllegalStateError } from '@/api/errors.js'
+import type { RecordContext } from '@/processor/api.js'
 import { ProcessorContextImpl, TaskContext } from '@/processor/context.js'
 import { ProcessorMetadataImpl } from '@/processor/metadata.js'
 import { applyHandler, errorHandlerContext, ProcessorNode, processingErrorRoute } from '@/processor/node.js'
@@ -31,6 +32,8 @@ const NO_OUTPUT: TaskOutput = {
 interface GlobalStore {
 	readonly def: GlobalStoreDef
 	readonly store: KeyValueStore<unknown, unknown>
+	/** Its processor's record context: the record being applied. */
+	readonly task: TaskContext
 	readonly node: ProcessorNode<unknown, unknown, never, never>
 }
 
@@ -80,10 +83,11 @@ export class GlobalStores {
 
 	/**
 	 * Applies one record of a global topic: decoded with the source's codecs (a failure goes to the deserialization
-	 * handler: 'continue' skips the record), timestamped by its extractor, then processed by the store's processor.
+	 * handler: 'continue' skips the record), timestamped by its extractor (a negative timestamp skips it, as in a
+	 * task's record queue), then processed by the store's processor.
 	 */
 	async apply(message: Message<Buffer, Buffer>): Promise<void> {
-		const { def, node } = this.byTopic.get(message.topic)!
+		const { def, task, node } = this.byTopic.get(message.topic)!
 		const { handlers, defaultTimestampExtractor } = this.deps.settings
 		let key: unknown
 		let value: unknown
@@ -91,18 +95,31 @@ export class GlobalStores {
 			key = message.key === null ? null : (def.keyCodec?.decode(message.key) ?? message.key)
 			value = message.value === null ? null : (def.valueCodec?.decode(message.value) ?? message.value)
 		} catch (error) {
-			const ctx = {
-				...errorHandlerContext({ processorName: def.sourceName, taskId: GLOBAL_TASK }, null),
-				topic: message.topic,
-			}
+			const ctx = errorHandlerContext(
+				{ processorName: def.sourceName, taskId: GLOBAL_TASK },
+				recordContext(message)
+			)
 			const failure = `deserialization of a record of global topic '${message.topic}' failed`
 			applyHandler(() => handlers.deserialization(ctx, message, error), error, failure, GLOBAL_TASK)
 			return
 		}
 		const extractor = def.timestampExtractor ?? defaultTimestampExtractor
-		const consumed = { ...message, key, value, timestamp: Number(message.timestamp) }
-		const record = new StreamRecord(key, value, extractor(consumed, -1), message.headers)
-		await node.process(record)
+		const timestamp = extractor({ ...message, key, value, timestamp: Number(message.timestamp) }, -1)
+		if (timestamp < 0) {
+			this.deps.logger.warn('dropped a record of a global topic with a negative timestamp', {
+				topic: message.topic,
+				partition: message.partition,
+				offset: message.offset,
+				timestamp,
+			})
+			return
+		}
+		task.input = message
+		try {
+			await node.process(new StreamRecord(key, value, timestamp, message.headers))
+		} finally {
+			task.input = null
+		}
 	}
 
 	async close(): Promise<void> {
@@ -135,7 +152,7 @@ async function open(def: GlobalStoreDef, deps: GlobalStoresDeps): Promise<Global
 		processingErrorRoute(settings.handlers.processing, context)
 	)
 	await node.init()
-	return { def, store, node }
+	return { def, store, task, node }
 }
 
 /** Reads pass through; writes and lifecycle calls reject. */
@@ -156,4 +173,9 @@ function readOnly(store: KeyValueStore<unknown, unknown>): KeyValueStore<unknown
 		init: reject('init'),
 		close: reject('close'),
 	}
+}
+
+function recordContext(message: Message<Buffer, Buffer>): RecordContext {
+	const { topic, partition, offset, headers, key, value } = message
+	return { topic, partition, offset, timestamp: Number(message.timestamp), headers, rawKey: key, rawValue: value }
 }
