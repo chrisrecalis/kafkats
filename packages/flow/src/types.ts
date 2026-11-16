@@ -1,4 +1,11 @@
-import type { KafkaClient, KafkaClientConfig, ConsumerConfig, ProducerConfig, RunBatchOptions } from '@kafkats/client'
+import type {
+	AutoOffsetReset,
+	KafkaClient,
+	KafkaClientConfig,
+	ConsumerConfig,
+	ProducerConfig,
+	RunBatchOptions,
+} from '@kafkats/client'
 import type { Codec } from '@/codec.js'
 import type { StateStoreProvider } from '@/state.js'
 import type { ChangelogConfig, ChangelogRestorationOptions } from '@/changelog.js'
@@ -28,7 +35,8 @@ export interface FlowConfig {
 	commitIntervalMs?: number
 	stateDir?: string
 	stateStoreProvider?: StateStoreProvider
-	consumer?: Omit<ConsumerConfig, 'groupId'>
+	/** `autoOffsetReset` is one policy for every source topic (a per-partition policy function is not supported). */
+	consumer?: Omit<ConsumerConfig, 'groupId' | 'autoOffsetReset'> & { autoOffsetReset?: AutoOffsetReset }
 	producer?: ProducerConfig
 	/**
 	 * How each worker's consumer runs: partition concurrency and offset auto-commit. Under
