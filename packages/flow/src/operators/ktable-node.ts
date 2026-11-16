@@ -1,6 +1,11 @@
+/**
+ * What the DSL keeps of a table node (KS KTableProcessorSupplier, 6.11): its processor, whether it can send old
+ * values, and how a consuming processor reads the table's current value of a key (the value getter, whose stores
+ * are connected to that processor).
+ */
 import type { Change } from '@/operators/change.js'
 import type { InternalProcessorContext, MaybePromise, ProcessorSupplier } from '@/processor/api.js'
-import type { ValueAndTimestamp } from '@/state.js'
+import type { TimestampedKeyValueStore, ValueAndTimestamp } from '@/state.js'
 
 /** Reads the current value of a key of a table, from its store or recomputed from its parent's getter. */
 export interface KTableValueGetter<K, V> {
@@ -9,10 +14,33 @@ export interface KTableValueGetter<K, V> {
 	close?(): MaybePromise<void>
 }
 
+export interface KTableValueGetterSupplier<K, V> {
+	/** Connected to every processor that creates a getter. */
+	readonly storeNames: readonly string[]
+	create(): KTableValueGetter<K, V>
+}
+
 /** What the DSL keeps of a table node: a plain descriptor, not a callable object. */
 export interface KTableNode<K, V> {
-	readonly supplier: ProcessorSupplier<K, Change<unknown>, K, Change<V>>
+	/** Its input: the parent table's changes, or the records of a source. */
+	readonly supplier: ProcessorSupplier<K, unknown, K, Change<V>>
 	/** Kafka Streams' enableSendingOldValues: false if old values need a store this node does not have and !force. */
 	enableSendingOldValues(force: boolean): boolean
-	readonly valueGetter: { readonly storeNames: readonly string[]; create(): KTableValueGetter<K, V> }
+	readonly valueGetter: KTableValueGetterSupplier<K, V>
+}
+
+/** The getter of a materialized table: a point read of its timestamped store. */
+export function storeValueGetter<K, V>(storeName: string): KTableValueGetterSupplier<K, V> {
+	return {
+		storeNames: [storeName],
+		create: () => {
+			let store: TimestampedKeyValueStore<K, V>
+			return {
+				init: context => {
+					store = context.getStateStore(storeName)
+				},
+				get: async key => (await store.get(key)) ?? null,
+			}
+		},
+	}
 }

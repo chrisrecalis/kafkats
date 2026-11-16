@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { KStream } from '@/api/kstream.js'
+import type { DslContext } from '@/dsl/context.js'
 import type { KTableNode } from '@/operators/ktable-node.js'
 import { BranchedKStreamImpl } from '@/dsl/branched.js'
 import { GlobalKTableImpl } from '@/dsl/global-ktable.js'
@@ -50,7 +51,7 @@ function instance<T extends object>(type: { prototype: T }): T {
 	return Object.create(type.prototype) as T
 }
 
-const ctx = { applicationId: 'app' }
+const ctx = {} as DslContext
 const fn = vi.fn()
 const options = { name: 'op' }
 
