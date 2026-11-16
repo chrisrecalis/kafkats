@@ -102,8 +102,10 @@ class TimeWindowAggregateProcessor<K, V, A> implements Processor<K | null, V | n
 			return
 		}
 		const { key, value, timestamp, headers } = record
-		const expiredBefore = this.clock.get() - this.windows.sizeMs * WINDOW_STORE_RETENTION_MULTIPLIER
 		const windows = windowsFor(timestamp, this.windows)
+		// Advanced before the late check (6.0), to the newest window the record opens: such a window is never late.
+		const streamTime = this.clock.advance(windows[windows.length - 1]!.start)
+		const expiredBefore = streamTime - this.windows.sizeMs * WINDOW_STORE_RETENTION_MULTIPLIER
 		for (const window of windows) {
 			// Re-creating an expired window from scratch would emit a wrong partial result.
 			if (window.end < expiredBefore) {
@@ -121,9 +123,8 @@ class TimeWindowAggregateProcessor<K, V, A> implements Processor<K | null, V | n
 			const change = { newValue: aggregate ?? null, oldValue: this.sendOldValues() ? (old ?? null) : null }
 			await this.context.forward(new StreamRecord({ key, window }, change, timestamp, headers))
 		}
-		this.clock.advance(windows[windows.length - 1]!.start)
 		if (this.clock.expiryDue()) {
-			await this.store.expireOldWindows(this.clock.get())
+			await this.store.expireOldWindows(streamTime)
 		}
 	}
 }

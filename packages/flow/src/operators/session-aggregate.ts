@@ -82,6 +82,8 @@ class SessionWindowAggregateProcessor<K, V, A> implements Processor<K | null, V 
 			return
 		}
 		const { key, value, timestamp, headers } = record
+		// Advanced before the late check (6.0): a record that moves the clock is never late.
+		const streamTime = this.clock.advance(timestamp)
 		// In (start, end) order (store contract), the order the merge sees them in.
 		const sessions: [WindowedKey<K>, A][] = []
 		for await (const session of this.store.findSessions(key, timestamp - this.gapMs, timestamp + this.gapMs)) {
@@ -89,7 +91,7 @@ class SessionWindowAggregateProcessor<K, V, A> implements Processor<K | null, V 
 		}
 		// A record that joins a live session is merged however old it is; one that would start a session already
 		// past retention is dropped, so an expired session is not re-created.
-		if (sessions.length === 0 && timestamp < this.clock.get() - this.gapMs * WINDOW_STORE_RETENTION_MULTIPLIER) {
+		if (sessions.length === 0 && timestamp < streamTime - this.gapMs * WINDOW_STORE_RETENTION_MULTIPLIER) {
 			this.context.recordDropped('expired-window', { store: this.storeName })
 			return
 		}
@@ -129,9 +131,8 @@ class SessionWindowAggregateProcessor<K, V, A> implements Processor<K | null, V 
 		const change = { newValue: aggregate ?? null, oldValue: sendOldValues ? replaced : null }
 		await this.context.forward(new StreamRecord({ key, window: { start, end } }, change, timestamp, headers))
 
-		this.clock.advance(timestamp)
 		if (this.clock.expiryDue()) {
-			await this.store.expireOldSessions(this.clock.get())
+			await this.store.expireOldSessions(streamTime)
 		}
 	}
 }
