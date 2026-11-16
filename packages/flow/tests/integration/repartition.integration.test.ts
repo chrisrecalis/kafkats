@@ -167,4 +167,42 @@ describe('repartitioning keeps event time, totals and topic identity', () => {
 			await app.close().catch(() => {})
 		}
 	}, 80_000)
+
+	it('a stream re-keyed before a global-table join is repartitioned before it is aggregated', async () => {
+		const input = uniqueTopicName('r2-rp-gt-in')
+		const table = uniqueTopicName('r2-rp-gt-table')
+		const output = uniqueTopicName('r2-rp-gt-out')
+		await createTopics(admin, [{ name: input, partitions: 2 }, { name: table }, { name: output }])
+		await producer.send(table, { key: 'eu', value: Buffer.from('Europe') })
+
+		const app = flow({
+			applicationId: uniqueTopicName('r2-rp-gt-app'),
+			client: newClient('r2-rp-gt-app'),
+			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 50 },
+			producer: { lingerMs: 0 },
+		})
+		const regions = app.globalTable(table, { key: stringCodec, value: stringCodec })
+		app.stream(input, { key: stringCodec, value: stringCodec })
+			.selectKey(region => region!)
+			.join(regions, (_region, name) => name)
+			.groupByKey({ key: stringCodec, value: stringCodec })
+			.count({ storeName: 'per-region', key: stringCodec, value: numberCodec })
+			.toStream()
+			.to(output, { key: stringCodec, value: numberCodec })
+		try {
+			await app.start()
+			// The same new key arrives on two different source partitions.
+			await producer.send(input, { key: 'a', value: Buffer.from('eu'), partition: 0 })
+			await producer.send(input, { key: 'b', value: Buffer.from('eu'), partition: 1 })
+
+			let counts: number[] = []
+			for (const deadline = Date.now() + 20_000; counts.length < 2 && Date.now() < deadline;) {
+				await sleep(300)
+				counts = (await readAllCommitted(admin, output, 800)).map(m => numberCodec.decode(m.value!))
+			}
+			expect(counts).toEqual([1, 2])
+		} finally {
+			await app.close().catch(() => {})
+		}
+	}, 40_000)
 })

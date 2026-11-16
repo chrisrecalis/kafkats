@@ -98,7 +98,7 @@ describe('global tables and worker lifecycle', () => {
 		}
 	}, 80_000)
 
-	it('global table: a row that cannot be decoded after startup stops the app instead of serving a stale table', async () => {
+	it('global table: a row that cannot be decoded after startup stops the app and its stream processing', async () => {
 		const table = uniqueTopicName('r2-gt-bad-table')
 		const events = uniqueTopicName('r2-gt-bad-events')
 		const output = uniqueTopicName('r2-gt-bad-out')
@@ -115,15 +115,55 @@ describe('global tables and worker lifecycle', () => {
 		app.stream(events, { key: stringCodec, value: stringCodec })
 			.join(rows, (event, row) => `${event}+${row}`)
 			.to(output, { key: stringCodec, value: stringCodec })
+		const joined = async (): Promise<string[]> =>
+			(await readAllCommitted(admin, output, 800)).map(message => message.value!.toString())
 		try {
 			await app.start()
-			await producer.send(table, { key: 'k', value: Buffer.from('not json') })
+			await producer.send(events, { key: 'k', value: Buffer.from('before') })
+			for (const deadline = Date.now() + 10_000; (await joined()).length < 1 && Date.now() < deadline;) {
+				await sleep(200)
+			}
+			expect(await joined()).toEqual(['before+1'])
 
+			await producer.send(table, { key: 'k', value: Buffer.from('not json') })
 			for (const deadline = Date.now() + 10_000; app.state() !== 'ERROR' && Date.now() < deadline;) {
 				await sleep(100)
 			}
 			expect(app.state()).toBe('ERROR')
 			expect(app.getError()).toBeInstanceOf(SyntaxError)
+
+			// The table no longer advances, so nothing more may be joined against it.
+			await producer.send(events, { key: 'k', value: Buffer.from('after') })
+			await sleep(3_000)
+			expect(await joined()).toEqual(['before+1'])
+		} finally {
+			await app.close().catch(() => {})
+		}
+	}, 40_000)
+
+	it('global table: a row that cannot be decoded in the last batch of the initial load fails start()', async () => {
+		const table = uniqueTopicName('r2-gt-bad-load-table')
+		const events = uniqueTopicName('r2-gt-bad-load-events')
+		const output = uniqueTopicName('r2-gt-bad-load-out')
+		await createTopics(admin, [{ name: table }, { name: events }, { name: output }])
+		await producer.send(table, [
+			{ key: 'a', value: Buffer.from('1') },
+			{ key: 'b', value: Buffer.from('not json') },
+		])
+
+		const app = flow({
+			applicationId: uniqueTopicName('r2-gt-bad-load-app'),
+			client: newClient('r2-gt-bad-load-app'),
+			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 50 },
+			producer: { lingerMs: 0 },
+		})
+		const rows = app.globalTable(table, { key: stringCodec, value: numberCodec })
+		app.stream(events, { key: stringCodec, value: stringCodec })
+			.join(rows, (event, row) => `${event}+${row}`)
+			.to(output, { key: stringCodec, value: stringCodec })
+		try {
+			await expect(app.start()).rejects.toBeInstanceOf(SyntaxError)
+			expect(app.state()).toBe('ERROR')
 		} finally {
 			await app.close().catch(() => {})
 		}

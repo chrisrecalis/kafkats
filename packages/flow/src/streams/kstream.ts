@@ -279,8 +279,9 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 			// The lookup hits the table's state partition of the stream record's partition.
 			this.builder.topology.requireCopartitioned(new Set([...self.sourceTopics, ...table.sourceTopics]))
 		}
-		// Only the stream's source topics affect the partitioning of the result.
-		return self.chain(createNode(table.storeRef), { keyCodec: self.format.keyCodec }, false)
+		// The join keeps key and partition of the stream's records: the result is partitioned like
+		// `self`, including a pending repartitioning that a global-table join did not need.
+		return self.chain(createNode(table.storeRef), { keyCodec: self.format.keyCodec })
 	}
 
 	/** Stream-stream join: each side buffers its records in a window store and looks up the other's. */

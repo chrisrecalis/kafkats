@@ -134,7 +134,7 @@ In-memory state is caught up from in-process checkpoints after a rebalance, so a
 
 A [global table](/flow/tables#global-tables) is fully loaded before any record is processed, and is rebuilt from its topic on every start (it has no changelog). If it makes no progress for `idleTimeoutMs` while loading, `start()` fails.
 
-After startup the table follows its topic. If the connection to Kafka fails, its consumer restarts from the last row it applied. A row that cannot be applied (its codec throws, or the store rejects the write) would fail the same way again, so the app stops with `state()` `'ERROR'` instead of serving a table that no longer advances.
+After startup the table follows its topic. If the connection to Kafka fails, its consumer restarts from the last row it applied. A row that cannot be applied (its codec throws, or the store rejects the write) would fail the same way again. During the initial load such a row fails `start()`. Afterwards the app goes to `state()` `'ERROR'` and its stream processing stops, so that nothing more is joined against a table that no longer advances.
 
 ## Upgrading From Earlier Versions
 

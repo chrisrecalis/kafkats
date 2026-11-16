@@ -53,6 +53,8 @@ import type {
 import { SendOperation, diagnostics, register, trace, type ProduceRequestDiagnostics } from '@/diagnostics.js'
 
 const EMPTY_BUFFER = Buffer.alloc(0)
+/** What sends that disconnect() did not wait for are rejected with. */
+const DISCONNECTED = 'Producer disconnected'
 
 // Producers whose transaction callback is running in the current async context.
 // Detects producer.transaction() called from inside that same producer's own
@@ -219,6 +221,9 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	// Per topic with waiting sends: its last failed partition lookup, which also answers the sends
 	// that were waiting when it started (see inSendOrder).
 	private readonly failedLookups = new Map<string, { asOf: number; error: unknown }>()
+	// Sends that have not appended yet (see inSendOrder), by how to reject them: disconnect() does
+	// not wait for them beyond its deadline.
+	private readonly preparingSends = new Set<(error: Error) => void>()
 
 	// Transaction state (only used when transactionalId is set)
 	private transactionState: TransactionState = 'idle'
@@ -1289,6 +1294,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	private inSendOrder<T>(topic: string, prepareAndAppend: () => Promise<T>): Promise<T> {
 		const position = ++this.sendsQueued
 		const turn = (): Promise<T> => {
+			if (this.state === 'idle') return Promise.reject(new Error(DISCONNECTED))
 			// A lookup that started while this send was waiting did not find the topic's partitions.
 			// That answers this send too: looking again for every waiting send would fail them one
 			// lookup (about a second each) after another.
@@ -1305,7 +1311,12 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		}
 		const tail = run.then(done, done)
 		this.sendOrder.set(topic, tail)
-		return run
+		// Settles with the send's turn, or earlier when disconnect() gives up waiting for it.
+		return new Promise<T>((resolve, reject) => {
+			this.preparingSends.add(reject)
+			const prepared = (): void => void this.preparingSends.delete(reject)
+			run.then(resolve, reject).then(prepared, prepared)
+		})
 	}
 
 	/**
@@ -1327,6 +1338,9 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	): Promise<Promise<SendResult>[]> {
 		await this.ensureInitialized()
 		const partitionCount = await this.getPartitionCount(topicDef.topic)
+		// disconnect() returned while this send was preparing: it has been rejected there and
+		// must not be produced any more.
+		if (this.state === 'idle') throw new Error(DISCONNECTED)
 		return this.enqueueMessages(topicDef, msgArray, partitionCount)
 	}
 
@@ -1391,9 +1405,14 @@ export class Producer extends EventEmitter<ProducerEvents> {
 			})
 		}
 
-		// If flush() threw, batches may still be in pendingBatches / inflightBatches /
-		// the accumulator. Reject everything so caller promises don't hang.
-		const disconnectError = new Error('Producer disconnected')
+		// If flush() threw, batches may still be in pendingBatches / inflightBatches / the
+		// accumulator, and sends may still be preparing (e.g. waiting for metadata). Reject
+		// everything so caller promises don't hang; a send that finishes preparing after this
+		// finds the producer disconnected and appends nothing.
+		const disconnectError = new Error(DISCONNECTED)
+		this.state = 'idle'
+		for (const reject of this.preparingSends) reject(disconnectError)
+		this.preparingSends.clear()
 		this.rejectAndClearPendingBatches(disconnectError)
 		this.failAllInflightBatches(disconnectError)
 		for (const prepared of this.sendingBatches) {
@@ -1405,7 +1424,6 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		}
 		this.accumulator.clearWithRejection(disconnectError)
 
-		this.state = 'idle'
 		this.logger.info('producer disconnected')
 	}
 

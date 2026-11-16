@@ -22,6 +22,11 @@ export type GlobalTablesDeps = {
 	stores: StoreRegistry
 	status: AppStatus
 	logger: Logger
+	/**
+	 * A table can no longer be kept up to date. Stream processing must not continue: joins would
+	 * keep answering from a table that no longer advances.
+	 */
+	onFatal: (error: Error) => void
 }
 
 /** The background consumer that keeps one global table up to date. */
@@ -147,11 +152,12 @@ export class GlobalTables {
 							} catch (err) {
 								rowFailure = toError(err)
 								throw rowFailure
-							} finally {
-								const state = progress.get(partition)
-								if (state) state.handled += messages.length
-								check(partition)
 							}
+							// Only rows that were applied count as loaded: a batch that failed must
+							// not complete the bootstrap.
+							const state = progress.get(partition)
+							if (state) state.handled += messages.length
+							check(partition)
 						},
 						{
 							commitOffsets: false,
@@ -177,7 +183,7 @@ export class GlobalTables {
 					const recoverable = error === rowFailure ? isRecoverable(error) : isInfrastructureRecoverable(error)
 					if (!recoverable) {
 						logger.error('global table consumer failed', { topic: table.topic, error: error.message })
-						status.state = 'ERROR'
+						this.deps.onFatal(error)
 						return
 					}
 					attempt += 1

@@ -1904,6 +1904,22 @@ describe('windowed/session store changelog wiring', () => {
 		expect([...changelogTopics.get('by-region').sourceTopics]).toEqual(['test-app-repartition-0-repartition'])
 	})
 
+	it('repartitions a re-keyed stream after a global-table join before aggregating it', () => {
+		const { app } = createTestApp()
+		const regions = app.globalTable('regions', { key: codec.string(), value: codec.string() })
+
+		// The join needs no repartitioning (every instance holds the whole table), but the
+		// records still sit in the partition of their old key.
+		app.stream('events', { key: codec.string(), value: codec.json<{ region: string }>() })
+			.selectKey(value => value!.region)
+			.join(regions, (event, name) => ({ ...event, name }))
+			.groupByKey({ key: codec.string(), value: codec.json() })
+			.count({ storeName: 'per-region' })
+
+		const { changelogTopics } = internals(app)
+		expect([...changelogTopics.get('per-region').sourceTopics]).toEqual(['test-app-repartition-0-repartition'])
+	})
+
 	it('keeps state derived from a windowed table partitioned like its input', () => {
 		const { app } = createTestApp()
 

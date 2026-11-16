@@ -104,6 +104,7 @@ class FlowAppImpl implements FlowApp {
 			stores: this.stores,
 			status,
 			logger,
+			onFatal: error => this.halt(error),
 		})
 		this.workers = new WorkerPool({
 			client,
@@ -304,6 +305,22 @@ class FlowAppImpl implements FlowApp {
 			this.startPromise = null
 		})()
 		return this.closePromise
+	}
+
+	/**
+	 * A failure outside the stream workers that processing must not continue past (a global table
+	 * that can no longer be followed). While starting, start() fails with it. Afterwards the workers
+	 * are stopped and the app reports 'ERROR' until it is closed.
+	 */
+	private halt(error: Error): void {
+		const status = this.status
+		status.lastError = error
+		if (!status.started) {
+			status.failStartup(error)
+			return
+		}
+		status.state = 'ERROR'
+		this.workers.stop()
 	}
 
 	/** Stop and release everything. Safe to call on a partially started app. */
