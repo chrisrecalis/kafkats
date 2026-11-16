@@ -1,139 +1,115 @@
-import { describe, it, expect, vi } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+import { codec } from '@/codec.js'
+import { joinBufferWindow } from '@/operators/join-buffer.js'
+import { streamStreamJoinProcessor } from '@/operators/stream-stream-join.js'
+import { CLEANUP_INTERVAL_MS } from '@/processor/time-tracker.js'
+import { InMemoryWindowStore } from '@/state/memory.js'
+import { processorDef, ProcessorHarness, sourceDef } from './support/processor-harness.js'
 
-import {
-	StreamStreamJoinNode,
-	StreamStreamLeftJoinNode,
-	StreamStreamOuterJoinNode,
-} from '@/legacy/processors/joins/stream-stream.js'
-import type { StreamRecord } from '@/legacy/processors/base.js'
-import type { WindowStore, WindowedKey } from '@/state.js'
-import { InMemoryWindowStore, codec } from '../../src/index.js'
+const WINDOW_MS = 1000
+const BASE = 1_000_000_000_000
 
-const numberCodec = {
-	encode: (n: number) => Buffer.from(String(n)),
-	decode: (b: Buffer) => Number(b.toString()),
+/** A join of topics 'left' and 'right' over two in-memory buffers, wired as the DSL wires it. */
+async function joinHarness(outer: { left: boolean; right: boolean }, metadata?: Record<string, number>) {
+	const buffer = (name: string) =>
+		new InMemoryWindowStore<string, string>(name, {
+			keyCodec: codec.string(),
+			valueCodec: codec.string(),
+			...joinBufferWindow(WINDOW_MS),
+		})
+	const left = buffer('left-store')
+	const right = buffer('right-store')
+	const side = { clock: 'left-store', windowMs: WINDOW_MS, beforeMs: WINDOW_MS, afterMs: WINDOW_MS }
+	const harness = await ProcessorHarness.start(
+		[
+			sourceDef('left-source', ['left']),
+			sourceDef('right-source', ['right']),
+			processorDef(
+				'this',
+				['left-source'],
+				streamStreamJoinProcessor<string, string, string, string>({
+					...side,
+					thisStore: 'left-store',
+					otherStore: 'right-store',
+					joiner: (l, r) => `${l}+${r}`,
+					outer: outer.left,
+				}),
+				['left-store', 'right-store']
+			),
+			processorDef(
+				'other',
+				['right-source'],
+				streamStreamJoinProcessor<string, string, string, string>({
+					...side,
+					thisStore: 'right-store',
+					otherStore: 'left-store',
+					joiner: (r, l) => `${l}+${r}`,
+					outer: outer.right,
+				}),
+				['right-store', 'left-store']
+			),
+		],
+		{ stores: [left, right], metadata }
+	)
+	const expiries = [vi.spyOn(left, 'expireOldWindows'), vi.spyOn(right, 'expireOldWindows')] as const
+	return { harness, expiries, left }
 }
 
-function makeStubStore<K, V>() {
-	const expireSpy = vi.fn<(cutoff: number) => Promise<number>>().mockResolvedValue(0)
-	async function* empty(): AsyncIterable<[WindowedKey<K>, V]> {
-		// no entries
-	}
-	const store = {
-		name: 's',
-		get: vi.fn(async () => undefined),
-		put: vi.fn(async () => {}),
-		delete: vi.fn(async () => {}),
-		all: vi.fn(() => empty()),
-		range: vi.fn(() => empty()),
-		fetch: vi.fn(() => empty()),
-		fetchAll: vi.fn(() => empty()),
-		fetchRange: vi.fn(() => empty()),
-		expireOldWindows: expireSpy,
-		approximateNumEntries: vi.fn().mockResolvedValue(0),
-		init: vi.fn(),
-		flush: vi.fn(),
-		close: vi.fn(),
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	} as any as WindowStore<K, V>
-	return { store, expireSpy }
-}
-
-function record(ts: number, offset: number): StreamRecord<string, number> {
-	return {
-		key: 'a',
-		value: 1,
-		timestamp: BigInt(ts),
-		topic: 't',
-		partition: 0,
-		offset: BigInt(offset),
-		headers: {},
-	}
-}
-
-type Side = WindowStore<string, number>
-
-const nodeFactories = {
-	inner: (l: Side, r: Side) =>
-		new StreamStreamJoinNode<string, number, number, string>(
-			{ store: l },
-			{ store: r },
-			(a, b) => `${a}:${b}`,
-			1000
-		),
-	left: (l: Side, r: Side) =>
-		new StreamStreamLeftJoinNode<string, number, number, string>(
-			{ store: l },
-			{ store: r },
-			(a, b) => `${a}:${b}`,
-			1000
-		),
-	outer: (l: Side, r: Side) =>
-		new StreamStreamOuterJoinNode<string, number, number, string>(
-			{ store: l },
-			{ store: r },
-			(a, b) => `${a}:${b}`,
-			1000
-		),
+const kinds = {
+	inner: { left: false, right: false },
+	left: { left: true, right: false },
+	outer: { left: true, right: true },
 } as const
 
-describe('Stream-stream join store expiry', () => {
-	for (const kind of ['inner', 'left', 'outer'] as const) {
-		it(`${kind} join expires BOTH window stores as stream time advances`, async () => {
-			const left = makeStubStore<string, number>()
-			const right = makeStubStore<string, number>()
-			const node = nodeFactories[kind](left.store, right.store)
-
-			await node.process(record(1_000_000_000_000, 0))
-
-			// Both this stream's store and the other stream's store must be expired, so a
-			// join store never grows unbounded — even if one input stream goes idle.
-			expect(left.expireSpy).toHaveBeenCalledTimes(1)
-			expect(right.expireSpy).toHaveBeenCalledTimes(1)
-			// Expiry is driven by stream time (the record timestamp), not wall clock.
-			expect(left.expireSpy.mock.calls[0]![0]).toBe(1_000_000_000_000)
+describe('stream-stream join buffer expiry', () => {
+	for (const [kind, outer] of Object.entries(kinds)) {
+		it(`${kind} join expires BOTH buffers by stream time`, async () => {
+			const { harness, expiries } = await joinHarness(outer)
+			await harness.process('left', { key: 'a', value: '1', timestamp: BASE })
+			// This side's buffer and the other side's, so neither grows while the other stream is idle.
+			for (const expire of expiries) {
+				expect(expire).toHaveBeenCalledTimes(1)
+				// By stream time (the record timestamp), not the wall clock.
+				expect(expire).toHaveBeenCalledWith(BASE)
+			}
 		})
 	}
 
-	it('does not re-expire until stream time advances past the cleanup interval', async () => {
-		const left = makeStubStore<string, number>()
-		const right = makeStubStore<string, number>()
-		const node = nodeFactories.inner(left.store, right.store)
-
-		await node.process(record(1_000_000_000_000, 0))
-		expect(left.expireSpy).toHaveBeenCalledTimes(1)
-
-		// +100ms is below the 60s cleanup interval → no additional expiry.
-		await node.process(record(1_000_000_000_100, 1))
-		expect(left.expireSpy).toHaveBeenCalledTimes(1)
+	it('does not expire again until the clock moved past the cleanup interval', async () => {
+		const { harness, expiries } = await joinHarness(kinds.inner)
+		const [left] = expiries
+		await harness.process('left', { key: 'a', value: '1', timestamp: BASE })
+		await harness.process('left', { key: 'a', value: '2', timestamp: BASE + 100 })
+		expect(left).toHaveBeenCalledTimes(1)
+		await harness.process('left', { key: 'a', value: '3', timestamp: BASE + CLEANUP_INTERVAL_MS + 1 })
+		expect(left).toHaveBeenCalledTimes(2)
+		expect(left).toHaveBeenLastCalledWith(BASE + CLEANUP_INTERVAL_MS + 1)
 	})
 
-	it('bounds a REAL window store as stream time advances far beyond retention', async () => {
-		const joinWindowMs = 1000
-		const makeStore = () =>
-			new InMemoryWindowStore<string, number>('s', {
-				keyCodec: codec.string(),
-				valueCodec: numberCodec,
-				retentionMs: joinWindowMs * 2,
-				windowSizeMs: joinWindowMs,
-			})
-		const left = makeStore()
-		const right = makeStore()
-		const node = new StreamStreamJoinNode<string, number, number, string>(
-			{ store: left },
-			{ store: right },
-			(a, b) => `${a}:${b}`,
-			joinWindowMs
-		)
+	it('both sides advance one clock, kept in the task metadata under the left buffer name', async () => {
+		const { harness, expiries } = await joinHarness(kinds.inner)
+		await harness.process('right', { key: 'a', value: 'r', timestamp: BASE })
+		await harness.process('left', { key: 'a', value: 'l', timestamp: BASE - 5 })
+		expect(harness.metadata.get('left-store')).toBe(BASE)
+		expect(harness.metadata.needsCommit).toBe(true)
+		// The left side expires by the shared clock, not by its own record's timestamp.
+		expect(expiries[0]).toHaveBeenLastCalledWith(BASE)
+	})
 
-		const base = 1_000_000_000_000
-		// 20 records, each 70s apart — well past the 60s cleanup interval, so expiry fires
-		// on every record and retention (2s) keeps only the most recent window(s).
+	it('a clock seeded from the commit metadata decides expiry after a restart', async () => {
+		const { harness, expiries, left } = await joinHarness(kinds.inner, { 'left-store': BASE })
+		await harness.process('left', { key: 'a', value: 'old', timestamp: BASE - 10 * WINDOW_MS })
+		expect(expiries[0]).toHaveBeenCalledWith(BASE)
+		expect(await left.approximateNumEntries()).toBe(0)
+	})
+
+	it('bounds a buffer as stream time advances far beyond its retention', async () => {
+		const { harness, left } = await joinHarness(kinds.inner)
+		// 20 records 70 s apart: past the cleanup interval each time, so every record expires the older ones.
 		for (let i = 0; i < 20; i++) {
-			await node.process(record(base + i * 70_000, i))
+			await harness.process('left', { key: 'a', value: String(i), timestamp: BASE + i * 70_000 })
 		}
-
-		// Without expiry the store would hold all 20 windows (the unbounded-growth bug).
+		// Without expiry the buffer would hold all 20 records.
 		expect(await left.approximateNumEntries()).toBeLessThanOrEqual(2)
 	})
 })
