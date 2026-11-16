@@ -403,6 +403,50 @@ describe('incarnation boundary (CR9)', () => {
 		expect(await punctuated.task.close('clean')).toBe('clean')
 	})
 
+	it('processors whose init() outlived a close that did not wait for it are closed; their failure counts for nothing', async () => {
+		const start = async (init: (store: KeyValueStore<string, string>) => Promise<void>) => {
+			let release!: () => void
+			let closes = 0
+			const h = new TaskHarness({
+				build: b =>
+					pipe(b, {
+						stores: [kvStore('s')],
+						processor: () => ({
+							init: async ctx => {
+								const store = ctx.getStateStore<KeyValueStore<string, string>>('s')
+								await new Promise<void>(resolve => (release = resolve))
+								await init(store)
+							},
+							process() {},
+							close() {
+								closes++
+							},
+						}),
+					}),
+			})
+			const task = h.task()
+			await task.initialize()
+			task.setStarts(new Map())
+			const completing = task.completeRestoration(new Map())
+			expect(task.initializing).toBe(true)
+			expect(await task.close('dirty')).toBe('dirty')
+			// The output no longer takes its sends.
+			expect(task.initializing).toBe(false)
+			release()
+			await completing
+			expect(task.state).toBe('CLOSED')
+			expect(task.hasWork(h.clock.now(), h.consumer.lag)).toBe(false)
+			expect(closes).toBe(1)
+			return h
+		}
+		// A store write the close forbade: no failure.
+		const failed = await start(store => store.put('k', 'v'))
+		expect(failed.logger.warnings).toContain('ignoring a failure of processors closed meanwhile')
+		// An init() that succeeds after the close: the task stays CLOSED, without processors.
+		const succeeded = await start(async () => {})
+		expect(succeeded.logger.warnings).toEqual([])
+	})
+
 	it('records delivered to a suspended task are dropped', async () => {
 		const h = new TaskHarness({ build: b => pipe(b, { processor: passThrough }) })
 		const task = await inState(h, 'SUSPENDED')
@@ -470,28 +514,34 @@ describe('seeding from the commits (D5, KF7)', () => {
 			])
 		)
 		const clock = giveClock(task)
-		const stores = task.stores.map(s => s.raw as KeyValueStore<string, string>)
-		const reads = stores.map(store => {
-			let count = 0
-			for (const method of ['get', 'all', 'range'] as const) {
-				const original = store[method].bind(store)
-				;(store as unknown as Record<string, unknown>)[method] = (...args: never[]) => {
-					count++
-					return (original as (...a: never[]) => unknown)(...args)
-				}
-			}
-			return () => count
-		})
 		await task.completeRestoration(new Map([['w', 95]]))
 		expect(metadata.get('w')).toBe(120)
 		expect(metadata.get('w.observed')).toBe(80)
 		expect(metadata.get('removed')).toBeUndefined()
 		expect(task.streamTime).toBe(130)
 		expect(clock.time).toBe(95)
-		// B14: seeding reads no store.
-		expect(reads.map(read => read())).toEqual([0])
 		// Seeding is not a change to commit.
 		expect(task.needsCommit(h.consumer.nextOffset.bind(h.consumer))).toBe(false)
+	})
+
+	it('B14: seeding the clocks reads no store', async () => {
+		const h = new TaskHarness({ build: twoTopics(passThrough) })
+		const task = h.task()
+		await task.initialize()
+		const clock = giveClock(task)
+		const reads: string[] = []
+		for (const { raw } of task.stores) {
+			const store = raw as unknown as Record<string, (...args: never[]) => unknown>
+			for (const method of ['get', 'all', 'range']) {
+				const original = store[method]!.bind(store)
+				store[method] = (...args) => (reads.push(method), original(...args))
+			}
+		}
+		task.setStarts(new Map([['a:0', committed({ w: 100, 'w.observed': 80 }, 90)]]))
+		await task.completeRestoration(new Map([['w', 95]]))
+		expect(clock.time).toBe(95)
+		expect(task.streamTime).toBe(90)
+		expect(reads).toEqual([])
 	})
 
 	it('a store clock is seeded with the larger of its committed and restored times', async () => {

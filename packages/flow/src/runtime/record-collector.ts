@@ -61,8 +61,8 @@ export class RecordCollector {
 	private readonly lifetime = new AbortController()
 	private transaction: TransactionPort | undefined
 	private opening: Promise<TransactionPort> | undefined
-	/** The last abort: the producer runs one transaction at a time, so the next one begins after it. */
-	private aborting: Promise<void> | undefined
+	/** Every abort so far (none rejects): the producer runs one transaction at a time, the next begins after them. */
+	private aborting: Promise<unknown> | undefined
 	/** Exactly-once: the last transaction was aborted and none was opened since, so the work done meanwhile is void. */
 	private aborted = false
 	/** Last acked offset per changelog partition, per task, since the last take. */
@@ -160,7 +160,7 @@ export class RecordCollector {
 		const { opening, transaction } = this
 		this.opening = undefined
 		this.transaction = undefined
-		this.aborting = (async () => {
+		const abort = (async () => {
 			try {
 				const aborted = transaction ?? (opening && (await raceSignal(opening, signal)))
 				await raceSignal(answered, signal)
@@ -169,7 +169,8 @@ export class RecordCollector {
 				this.options.logger.warn('aborting the transaction failed', { error: errorMessage(error) })
 			}
 		})()
-		await this.aborting
+		this.aborting = Promise.all([this.aborting, abort])
+		await abort
 	}
 
 	/** At-least-once dirty: forgets the sends made so far and their failures; late answers are ignored. */
@@ -184,7 +185,7 @@ export class RecordCollector {
 		void this.giveUp()
 	}
 
-	/** Begins a transaction once the last abort finished. */
+	/** Begins a transaction once every abort so far finished. */
 	private begin(signal: AbortSignal): Promise<TransactionPort> {
 		const { aborting } = this
 		const opening: Promise<TransactionPort> = (async () => {

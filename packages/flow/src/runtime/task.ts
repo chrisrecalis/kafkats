@@ -135,9 +135,9 @@ export class StreamTask {
 		return this.isLost
 	}
 
-	/** Its processors' init() is running: the task's output accepts sends. */
+	/** Its processors' init() is running and no close took the task meanwhile: the task's output accepts sends. */
 	get initializing(): boolean {
-		return this.isInitializing
+		return this.isInitializing && this.taskState === 'RESTORING'
 	}
 
 	/** Max timestamp polled and seeded partition times, -1 unknown. */
@@ -228,7 +228,9 @@ export class StreamTask {
 
 	/**
 	 * RESTORING -> RUNNING: seeds the clocks and the processor metadata from the commits, then creates and
-	 * initializes the processor graph (whose sends and store writes may need a commit).
+	 * initializes the processor graph (whose sends and store writes may need a commit). A close that did not wait for
+	 * init() (a close past its deadline) wins: the new processors are closed, and their failure counts for nothing, like
+	 * that of a slice that outlived a close.
 	 */
 	async completeRestoration(restoredStoreTimes: ReadonlyMap<string, number>): Promise<void> {
 		this.expectState('completeRestoration', 'RESTORING')
@@ -249,12 +251,18 @@ export class StreamTask {
 		try {
 			await topology.init()
 		} catch (error) {
-			await topology.close().catch((closeError: unknown) => {
-				this.logger.warn('closing processors after a failed init failed', { error: errorMessage(closeError) })
-			})
-			throw error
+			await this.discardProcessors(topology)
+			if (this.taskState === 'RESTORING') {
+				throw error
+			}
+			this.logger.warn('ignoring a failure of processors closed meanwhile', { error: errorMessage(error) })
+			return
 		} finally {
 			this.isInitializing = false
+		}
+		if (this.taskState !== 'RESTORING') {
+			await this.discardProcessors(topology)
+			return
 		}
 		if (this.stateManager.dirty) {
 			this.commitNeeded = true
@@ -603,6 +611,13 @@ export class StreamTask {
 		}
 		this.logger.warn('ignoring a failure of processors closed meanwhile', { error: errorMessage(error) })
 		return false
+	}
+
+	/** Closes processors that never ran: their init() failed, or a close took the task meanwhile. */
+	private async discardProcessors(topology: TaskTopology): Promise<void> {
+		await topology.close().catch((error: unknown) => {
+			this.logger.warn('closing processors that never ran failed', { error: errorMessage(error) })
+		})
 	}
 
 	private recordDropped(reason: DroppedReason, source: string, detail: Readonly<Record<string, unknown>>): void {

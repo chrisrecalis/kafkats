@@ -468,6 +468,32 @@ describe('RecordCollector exactly-once', () => {
 		expect(h.producer.transactions[1]!.sent).toHaveLength(1)
 	})
 
+	it('a transaction begins only once every abort finished, also one overlapped by a later abort', async () => {
+		const h = new TaskHarness({ build: b => pipe(b, { processor: passThrough }), eos: true })
+		await h.collector.ensureTransaction(signal())
+		const [first] = h.producer.transactions
+		const calls: string[] = []
+		let release!: () => void
+		first!.abort = async () => {
+			calls.push('abort')
+			await new Promise<void>(resolve => (release = resolve))
+			first!.state = 'aborted'
+			calls.push('aborted')
+		}
+		const begin = h.producer.beginTransaction.bind(h.producer)
+		h.producer.beginTransaction = () => (calls.push('begin'), begin())
+		const aborting = h.collector.abortTransaction(signal())
+		// A later abort finds no transaction: it is done at once, while the first one still runs.
+		await h.collector.abortTransaction(signal())
+		const opening = h.collector.ensureTransaction(signal())
+		await new Promise(resolve => setTimeout(resolve, 5))
+		expect(calls).toEqual(['abort'])
+		release()
+		await Promise.all([aborting, opening])
+		expect(calls).toEqual(['abort', 'aborted', 'begin'])
+		expect(h.collector.transactionOpen).toBe(true)
+	})
+
 	it('a commit that an abort took over meanwhile leaves the transaction opened after the abort', async () => {
 		const h = new TaskHarness({ build: b => pipe(b, { processor: passThrough }), eos: true })
 		await h.collector.ensureTransaction(signal())
