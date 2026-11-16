@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { IllegalStateError } from '@/api/errors.js'
+import { FailedProcessingError, IllegalStateError } from '@/api/errors.js'
 import { string } from '@/codec.js'
 import type {
 	InternalProcessorContext,
@@ -342,6 +342,65 @@ describe('incarnation boundary (CR9)', () => {
 		release()
 		expect(await punctuation).toBe(true)
 		expect(await second.task.close('clean')).toBe('clean')
+	})
+
+	it('a failure of an incarnation closed meanwhile counts for nothing; one of the running incarnation is thrown', async () => {
+		let release!: () => void
+		const blocked = () => new Promise<void>(resolve => (release = resolve))
+		const start = async (value: string) => {
+			const h = new TaskHarness({
+				build: b =>
+					pipe(b, {
+						stores: [kvStore('s')],
+						processor: () => {
+							let store: KeyValueStore<string, string>
+							return {
+								init: ctx => {
+									store = ctx.getStateStore('s')
+									ctx.schedule(10, 'stream-time', async () => {
+										await blocked()
+										await store.put('k', 'punctuated')
+									})
+								},
+								process: async record => {
+									await blocked()
+									if (record.value === 'fail') throw new Error('process failed')
+									await store.put(record.key!, record.value!)
+								},
+							}
+						},
+					}),
+			})
+			const task = await h.start(h.task())
+			h.enqueue(task, 'input', [{ key: 'k', value, timestamp: 1 }])
+			return { h, task, stored: () => (task.store('s') as KeyValueStore<string, string>).get('k') }
+		}
+		// The running incarnation: the processing handler's 'fail' reaches the caller.
+		const running = await start('fail')
+		const failing = running.task.processOne(running.h.clock.now())
+		release()
+		await expect(failing).rejects.toThrow(FailedProcessingError)
+		// A record whose write the close forbade: no failure, nothing written, nothing to commit.
+		const record = await start('late')
+		const late = record.task.processOne(record.h.clock.now())
+		await record.task.suspend()
+		release()
+		expect(await late).toBe(false)
+		expect(await record.stored()).toBeUndefined()
+		expect(record.h.logger.warnings).toContain('ignoring a failure of processors closed meanwhile')
+		expect(await record.task.close('clean')).toBe('clean')
+		// A punctuation whose write the close forbade: the same.
+		const punctuated = await start('v')
+		const processing = punctuated.task.processOne(punctuated.h.clock.now())
+		release()
+		expect(await processing).toBe(true)
+		expect(await punctuated.h.commit()).toBe('committed')
+		const punctuation = punctuated.task.maybePunctuateStreamTime()
+		await punctuated.task.suspend()
+		release()
+		expect(await punctuation).toBe(false)
+		expect(await punctuated.stored()).toBe('v')
+		expect(await punctuated.task.close('clean')).toBe('clean')
 	})
 
 	it('records delivered to a suspended task are dropped', async () => {

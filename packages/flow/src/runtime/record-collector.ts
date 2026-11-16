@@ -61,6 +61,8 @@ export class RecordCollector {
 	private readonly lifetime = new AbortController()
 	private transaction: TransactionPort | undefined
 	private opening: Promise<TransactionPort> | undefined
+	/** The last abort: the producer runs one transaction at a time, so the next one begins after it. */
+	private aborting: Promise<void> | undefined
 	/** Exactly-once: the last transaction was aborted and none was opened since, so the work done meanwhile is void. */
 	private aborted = false
 	/** Last acked offset per changelog partition, per task, since the last take. */
@@ -89,10 +91,7 @@ export class RecordCollector {
 			return
 		}
 		const { generation } = this
-		this.opening ??= this.producer.beginTransaction({ signal }).finally(() => {
-			this.opening = undefined
-		})
-		const transaction = await this.opening
+		const transaction = await (this.opening ??= this.begin(signal))
 		// An abort or close meanwhile owns the transaction it found opening.
 		if (generation === this.generation && this.transaction === undefined) {
 			this.transaction = transaction
@@ -154,18 +153,20 @@ export class RecordCollector {
 	async abortTransaction(signal: AbortSignal): Promise<void> {
 		this.aborted = true
 		const answered = this.giveUp()
-		const { opening } = this
-		let transaction = this.transaction
+		// The abort owns the transaction it finds open or opening: no later caller may use it.
+		const { opening, transaction } = this
+		this.opening = undefined
 		this.transaction = undefined
-		try {
-			if (transaction === undefined && opening !== undefined) {
-				transaction = await raceSignal(opening, signal)
+		this.aborting = (async () => {
+			try {
+				const aborted = transaction ?? (opening && (await raceSignal(opening, signal)))
+				await raceSignal(answered, signal)
+				await aborted?.abort({ signal })
+			} catch (error) {
+				this.options.logger.warn('aborting the transaction failed', { error: errorMessage(error) })
 			}
-			await raceSignal(answered, signal)
-			await transaction?.abort({ signal })
-		} catch (error) {
-			this.options.logger.warn('aborting the transaction failed', { error: errorMessage(error) })
-		}
+		})()
+		await this.aborting
 	}
 
 	/** At-least-once dirty: forgets the sends made so far and their failures; late answers are ignored. */
@@ -178,6 +179,22 @@ export class RecordCollector {
 		this.isClosed = true
 		this.lifetime.abort()
 		void this.giveUp()
+	}
+
+	/** Begins a transaction once the last abort finished. */
+	private begin(signal: AbortSignal): Promise<TransactionPort> {
+		const { aborting } = this
+		const opening: Promise<TransactionPort> = (async () => {
+			if (aborting) {
+				await raceSignal(aborting, signal)
+			}
+			return this.producer.beginTransaction({ signal })
+		})().finally(() => {
+			if (this.opening === opening) {
+				this.opening = undefined
+			}
+		})
+		return opening
 	}
 
 	/** Ends the current generation; resolves once its sends were answered. */

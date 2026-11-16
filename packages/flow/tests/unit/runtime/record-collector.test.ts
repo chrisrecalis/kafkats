@@ -442,6 +442,32 @@ describe('RecordCollector exactly-once', () => {
 		expect(h.producer.transactions[0]!.state).toBe('aborted')
 	})
 
+	it('a transaction asked for while an abort runs is a new one, begun once the abort finished', async () => {
+		const h = new TaskHarness({ build: b => pipe(b, { processor: passThrough }), eos: true })
+		const begin = h.producer.beginTransaction.bind(h.producer)
+		let open!: () => void
+		const calls: string[] = []
+		h.producer.beginTransaction = async () => {
+			calls.push('begin')
+			if (calls.length === 1) await new Promise<void>(resolve => (open = resolve))
+			const transaction = await begin()
+			const abort = transaction.abort.bind(transaction)
+			transaction.abort = options => (calls.push('abort'), abort(options))
+			return transaction
+		}
+		const first = h.collector.ensureTransaction(signal())
+		const aborted = h.collector.abortTransaction(signal())
+		const second = h.collector.ensureTransaction(signal())
+		open()
+		await Promise.all([first, aborted, second])
+		expect(calls).toEqual(['begin', 'abort', 'begin'])
+		expect(h.producer.transactions.map(t => t.state)).toEqual(['aborted', 'open'])
+		expect(h.collector.transactionOpen).toBe(true)
+		const task = await running(h)
+		send(h, task, 'sink')
+		expect(h.producer.transactions[1]!.sent).toHaveLength(1)
+	})
+
 	for (const [name, error, expected] of [
 		['a retriable failure', new ConnectionError('broker', 9092), TaskMigratedError],
 		['a fenced producer', new KafkaProtocolError(ErrorCode.InvalidProducerEpoch), TaskMigratedError],

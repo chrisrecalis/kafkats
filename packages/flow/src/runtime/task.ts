@@ -353,7 +353,8 @@ export class StreamTask {
 
 	/**
 	 * Processes one record. false: none ready, or the task left RUNNING while the record's subtree ran (a slice that
-	 * outlived a close: its record is not counted). A promise only when the record's subtree went async.
+	 * outlived a close: its record is not counted, and neither is its failure). A promise only when the record's
+	 * subtree went async.
 	 */
 	processOne(now: number): MaybePromise<boolean> {
 		this.drained = false
@@ -372,7 +373,10 @@ export class StreamTask {
 		if (result === undefined) {
 			return this.processed(record.queue, record.offset)
 		}
-		return result.then(() => this.topology === topology && this.processed(record.queue, record.offset))
+		return result.then(
+			() => this.topology === topology && this.processed(record.queue, record.offset),
+			(error: unknown) => this.orphaned(topology, error)
+		)
 	}
 
 	/** A queue became empty during the last processOne(): readiness must be evaluated again. */
@@ -395,7 +399,7 @@ export class StreamTask {
 			return false
 		}
 		const topology = this.topology!
-		return this.punctuated(topology, await topology.punctuateStreamTime(this.group.streamTime))
+		return this.punctuated(topology, topology.punctuateStreamTime(this.group.streamTime))
 	}
 
 	/** Runs the wall-clock punctuations due at `now`; whether any ran. */
@@ -404,7 +408,7 @@ export class StreamTask {
 			return false
 		}
 		const topology = this.topology!
-		return this.punctuated(topology, await topology.punctuateWallClock(now))
+		return this.punctuated(topology, topology.punctuateWallClock(now))
 	}
 
 	nextWallClockDue(): number | undefined {
@@ -575,11 +579,30 @@ export class StreamTask {
 	}
 
 	/** Punctuations of an incarnation closed meanwhile (a slice that outlived a close) need no commit. */
-	private punctuated(topology: TaskTopology, ran: boolean): boolean {
+	private async punctuated(topology: TaskTopology, punctuation: Promise<boolean>): Promise<boolean> {
+		let ran: boolean
+		try {
+			ran = await punctuation
+		} catch (error) {
+			return this.orphaned(topology, error)
+		}
 		if (ran && this.topology === topology) {
 			this.commitNeeded = true
 		}
 		return ran
+	}
+
+	/**
+	 * A failure of the running incarnation is thrown. One of an incarnation closed meanwhile is void with its work
+	 * (typically a write or forward the close forbade): its record is processed again after the last commit, where a
+	 * real failure shows again.
+	 */
+	private orphaned(topology: TaskTopology, error: unknown): false {
+		if (this.topology === topology) {
+			throw error
+		}
+		this.logger.warn('ignoring a failure of processors closed meanwhile', { error: errorMessage(error) })
+		return false
 	}
 
 	private recordDropped(reason: DroppedReason, source: string, detail: Readonly<Record<string, unknown>>): void {
