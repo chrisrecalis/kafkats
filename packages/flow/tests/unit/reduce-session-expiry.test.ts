@@ -30,14 +30,18 @@ const sessionStore = () =>
 		retentionMs: 24 * GAP_MS,
 	})
 
-/** Runs the processor of `node` over store `s` in the processor harness; returns a function processing a record. */
-async function run(node: KTableNode<unknown, unknown>, store: StateStore) {
+/**
+ * Runs the processor of `node` over store `s` in the processor harness, its task seeded with `metadata`; returns a
+ * function processing a record of key 'a', and the task's metadata.
+ */
+async function run(node: KTableNode<unknown, unknown>, store: StateStore, metadata?: Record<string, number>) {
 	const supplier = node.supplier as ProcessorSupplier<never, never, unknown, unknown>
 	const harness = await ProcessorHarness.start(
 		[sourceDef('source', ['in']), processorDef('agg', ['source'], supplier, ['s'])],
-		{ stores: [store] }
+		{ stores: [store], metadata }
 	)
-	return (timestamp: number) => harness.process('in', { key: 'a', value: 1, timestamp })
+	const process = (timestamp: number) => harness.process('in', { key: 'a', value: 1, timestamp })
+	return { process, metadata: harness.metadata }
 }
 
 const add = (a: number, b: number) => a + b
@@ -46,7 +50,7 @@ describe('windowed/session reduce + session aggregate retention', () => {
 	it('a time-window reduce expires its store once its clock moved past the cleanup interval', async () => {
 		const store = windowStore()
 		const expire = vi.spyOn(store, 'expireOldWindows')
-		const process = await run(
+		const { process } = await run(
 			new TimeWindowAggregate('s', { sizeMs: 1000, advanceMs: 1000 }, reduceWith(add)),
 			store
 		)
@@ -60,7 +64,7 @@ describe('windowed/session reduce + session aggregate retention', () => {
 	it('a session reduce expires its store once its clock moved past the cleanup interval', async () => {
 		const store = sessionStore()
 		const expire = vi.spyOn(store, 'expireOldSessions')
-		const process = await run(new SessionWindowAggregate('s', GAP_MS, sessionReduceWith(add)), store)
+		const { process } = await run(new SessionWindowAggregate('s', GAP_MS, sessionReduceWith(add)), store)
 
 		await process(BASE)
 		expect(expire).toHaveBeenCalledTimes(1)
@@ -75,7 +79,7 @@ describe('windowed/session reduce + session aggregate retention', () => {
 			(_k, v, agg) => agg + v,
 			(_k, a, b) => a + b
 		)
-		const process = await run(new SessionWindowAggregate('s', GAP_MS, merge), store)
+		const { process } = await run(new SessionWindowAggregate('s', GAP_MS, merge), store)
 
 		await process(BASE)
 		expect(expire).toHaveBeenCalledTimes(1)
@@ -89,13 +93,37 @@ describe('windowed/session reduce + session aggregate retention', () => {
 			() => 0,
 			(_k, v, agg) => agg + v
 		)
-		const process = await run(new TimeWindowAggregate('s', { sizeMs: 1000, advanceMs: 1000 }, aggregation), store)
+		const { process } = await run(
+			new TimeWindowAggregate('s', { sizeMs: 1000, advanceMs: 1000 }, aggregation),
+			store
+		)
 
 		await process(BASE)
 		expect(expire).toHaveBeenCalledTimes(1)
 		// 100 ms later: well under the 60 s threshold.
 		await process(BASE + 100)
 		expect(expire).toHaveBeenCalledTimes(1)
+	})
+
+	it('B14: a session clock (record timestamps, under the store name) is seeded from the commit metadata, without a store scan', async () => {
+		const store = sessionStore()
+		const scan = vi.spyOn(store, 'all')
+		const node = new SessionWindowAggregate('s', GAP_MS, sessionReduceWith(add))
+		const { process, metadata } = await run(node, store, { s: BASE })
+
+		await process(BASE - 30_000) // joins no session and is older than the seeded clock minus 24 gaps: dropped
+		await process(BASE - 10_000) // within retention: a new session
+		expect(metadata.get('s')).toBe(BASE)
+		await process(BASE + 500)
+		expect(metadata.get('s')).toBe(BASE + 500)
+
+		const sessions: unknown[] = []
+		for await (const [session] of store.findSessions('a', 0, Number.MAX_SAFE_INTEGER)) sessions.push(session)
+		expect(sessions).toEqual([
+			{ key: 'a', windowStart: BASE - 10_000, windowEnd: BASE - 10_000 },
+			{ key: 'a', windowStart: BASE + 500, windowEnd: BASE + 500 },
+		])
+		expect(scan).not.toHaveBeenCalled()
 	})
 
 	it('InMemorySessionStore.expireOldSessions actually removes data and returns the keys', async () => {

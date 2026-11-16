@@ -872,6 +872,24 @@ describe('aggregations', () => {
 			expect(looked).toEqual([{ value: 2, timestamp: 2 }, null])
 		})
 
+		it("B1: a count of a table's stream sends its own previous counts as old values, never the table's", async () => {
+			const driver = new TestDriver()
+			const table = driver.table('t', { key: str, value: str }).toStream().groupByKey().count() as KTableImpl<
+				string,
+				number
+			>
+			table.table.enableSendingOldValues(true)
+			const changes = changesOf(table)
+			await driver.run(async ({ send }) => {
+				await send('t', 'a', at('k', 1))
+				await send('t', 'b', at('k', 2))
+			})
+			expect(changes).toEqual([
+				{ newValue: 1, oldValue: null },
+				{ newValue: 2, oldValue: 1 },
+			])
+		})
+
 		it('without the request, changes carry no old value', async () => {
 			const driver = new TestDriver()
 			const table = driver.input('in', { key: str, value: str }).groupByKey().count() as KTableImpl<
