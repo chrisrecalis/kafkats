@@ -164,7 +164,8 @@ export class StreamWorker {
 				(runError ? { error: toError(runError), recoverable: isInfrastructureRecoverable(runError) } : null)
 			await this.reset()
 
-			if (status.closing) return
+			// Closing, or halted by a failure outside this worker: nothing is restarted.
+			if (status.closing || status.halted) return
 			if (!failure) {
 				// The consumer stopped without an error and without close(): nothing left to run.
 				return
@@ -196,7 +197,7 @@ export class StreamWorker {
 			})
 			status.state = 'REBALANCING'
 			await status.sleepUnlessClosing(backoffMs)
-			if (status.closing) return
+			if (status.closing || status.halted) return
 
 			if (this.eosEnabled) {
 				// A producer whose transaction failed may be in an undefined state; start clean.

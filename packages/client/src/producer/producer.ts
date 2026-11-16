@@ -516,7 +516,8 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		const strategy = new ReconnectionStrategy(createRetryStrategyOptions(this.config))
 		let pendingBatches = preparedBatches
 
-		while (strategy.shouldReconnect()) {
+		// A disconnected producer sends nothing more (see sendPreparedBatchesToBroker).
+		while (this.state !== 'idle' && strategy.shouldReconnect()) {
 			try {
 				const outcome = await this.sendPreparedBatchesOnce(pendingBatches)
 				if (outcome.stop) {
@@ -611,6 +612,10 @@ export class Producer extends EventEmitter<ProducerEvents> {
 
 		await this.acquireInflightSlot()
 		try {
+			// disconnect() has returned and rejected these messages: writing them now (a retry of
+			// a request that was still in flight then) would contradict what the caller was told.
+			if (this.state === 'idle') return { retryBatches: [], stop: true }
+
 			// Mark as transmitted before awaiting: once broker.produce() is called the broker
 			// may have appended the batch, so any failure after this point is ambiguous.
 			for (const prepared of preparedBatches) {

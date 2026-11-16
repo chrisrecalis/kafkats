@@ -310,16 +310,16 @@ class FlowAppImpl implements FlowApp {
 	/**
 	 * A failure outside the stream workers that processing must not continue past (a global table
 	 * that can no longer be followed). While starting, start() fails with it. Afterwards the workers
-	 * are stopped and the app reports 'ERROR' until it is closed.
+	 * are stopped for good and the app reports 'ERROR' until it is closed.
 	 */
 	private halt(error: Error): void {
 		const status = this.status
-		status.lastError = error
 		if (!status.started) {
+			status.lastError = error
 			status.failStartup(error)
 			return
 		}
-		status.state = 'ERROR'
+		status.halt(error)
 		this.workers.stop()
 	}
 

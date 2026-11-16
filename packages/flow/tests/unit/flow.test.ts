@@ -1,6 +1,14 @@
 import { EventEmitter } from 'node:events'
 import { describe, expect, it, vi, afterEach } from 'vitest'
-import { KafkaClient, type BatchContext, type ConsumeContext, type Message, type ProducerConfig } from '@kafkats/client'
+import {
+	ErrorCode,
+	KafkaClient,
+	KafkaError,
+	type BatchContext,
+	type ConsumeContext,
+	type Message,
+	type ProducerConfig,
+} from '@kafkats/client'
 import { codec, flow, TimeWindows, SessionWindows } from '../../src/index.js'
 import { PartitionedWindowStore, PartitionedSessionStore } from '../../src/state/partitioned.js'
 
@@ -353,6 +361,33 @@ describe('flow', () => {
 		await app.close()
 
 		expect(producer.messages.map(message => message.value.toString())).toEqual(['buffered-during-close'])
+	})
+
+	it('does not restart a worker that was in restart backoff when processing was halted', async () => {
+		const { app } = createTestApp()
+		app.stream('events').to('out')
+
+		let runs = 0
+		let failRun!: (error: Error) => void
+		vi.spyOn(TestConsumer.prototype, 'runBatch').mockImplementation(function (this: TestConsumer) {
+			runs++
+			this.emit('running')
+			return new Promise<void>((_resolve, reject) => (failRun = reject))
+		})
+		await app.start()
+
+		// A recoverable failure: the worker waits out its backoff (500ms) before it rejoins.
+		failRun(new KafkaError('broker went away', ErrorCode.RequestTimedOut))
+		await vi.waitFor(() => expect(app.state()).toBe('REBALANCING'))
+
+		// Meanwhile something outside the workers fails for good (a global table, say).
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		;(app as any).halt(new Error('global table failed'))
+		await new Promise(resolve => setTimeout(resolve, 800))
+
+		expect(runs).toBe(1)
+		expect(app.state()).toBe('ERROR')
+		await app.close()
 	})
 
 	it('spawns one worker per stream thread', async () => {

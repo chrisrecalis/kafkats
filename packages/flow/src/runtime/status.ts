@@ -14,6 +14,8 @@ export class AppStatus {
 	started = false
 	/** True once the cluster was reachable at startup (false only with mocked/offline clients). */
 	clusterAvailable = false
+	/** True once processing was stopped for good by a failure (see halt), until the next start(). */
+	halted = false
 	private startupFailure: Error | null = null
 	private shutdown = new AbortController()
 
@@ -32,8 +34,20 @@ export class AppStatus {
 		this.state = 'CREATED'
 		this.lastError = null
 		this.started = false
+		this.halted = false
 		this.startupFailure = null
 		this.shutdown = new AbortController()
+	}
+
+	/**
+	 * Stop processing for good after a failure that restarting a worker cannot fix. The app reports
+	 * 'ERROR' until it is closed, and no worker (re)starts: not one that is running, and not one
+	 * that is waiting out a restart backoff either.
+	 */
+	halt(error: Error): void {
+		this.lastError = error
+		this.state = 'ERROR'
+		this.halted = true
 	}
 
 	/** Stop starting new work and wake up everything waiting in sleepUnlessClosing(). */
