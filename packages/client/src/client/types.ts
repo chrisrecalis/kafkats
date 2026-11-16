@@ -132,6 +132,7 @@ export interface TopicMetadata {
  */
 export interface PartitionMetadata {
 	partitionIndex: number
+	/** Leader broker id; -1 while the partition has no leader (for example during a leader election). */
 	leaderId: number
 	leaderEpoch: number
 	replicaNodes: number[]
