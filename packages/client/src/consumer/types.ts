@@ -419,6 +419,28 @@ export interface TopicPartitionOffset extends TopicPartition {
 }
 
 /**
+ * An offset to commit for a partition: `offset` is the next offset to read (the last processed offset + 1).
+ */
+export interface CommitOffset extends TopicPartitionOffset {
+	/** Stored with the offset and read back with it (`null` or absent: none). */
+	metadata?: string | null
+	/** Leader epoch of the last processed record, if known. */
+	leaderEpoch?: number
+}
+
+/**
+ * An offset committed for a partition, as the group coordinator returns it.
+ */
+export interface CommittedOffset {
+	/** The next offset to read. */
+	offset: bigint
+	/** The metadata committed with the offset; `null` when none was. */
+	metadata: string | null
+	/** The leader epoch committed with the offset, when the committer gave one. */
+	leaderEpoch?: number
+}
+
+/**
  * A batch of records from a single partition
  */
 export interface PartitionBatch extends TopicPartition {

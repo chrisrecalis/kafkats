@@ -211,7 +211,8 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			this.config.groupId,
 			useConsumerGroup ? this.config.groupInstanceId : undefined,
 			logger,
-			this.config.defaultApiTimeoutMs
+			this.config.defaultApiTimeoutMs,
+			this.config.isolationLevel
 		)
 		// Wire auto-commit failures back to the consumer so generation/coordinator
 		// errors are surfaced as 'error' events and trigger a rejoin instead of

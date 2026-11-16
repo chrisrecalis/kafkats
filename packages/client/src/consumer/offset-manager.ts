@@ -4,6 +4,7 @@
  * Handles:
  * - Tracking consumed offsets
  * - Auto-commit loop
+ * - Committing explicit offsets (with metadata) for the application
  * - Fetching committed offsets
  * - Resolving starting offsets (earliest/latest/committed)
  */
@@ -11,13 +12,52 @@
 import type { Cluster } from '@/client/cluster.js'
 import type { Broker } from '@/client/broker.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
-import { isConnectionFailure, isKafkaError, KafkaProtocolError, shouldRefreshMetadata } from '@/client/errors.js'
+import {
+	CommitFailedError,
+	isConnectionFailure,
+	isKafkaError,
+	KafkaProtocolError,
+	NoOffsetForPartitionError,
+	RebalanceInProgressError,
+	shouldRefreshMetadata,
+	TimeoutError,
+} from '@/client/errors.js'
+import { ISOLATION_LEVEL } from '@/protocol/messages/requests/fetch.js'
 import { OFFSET_TIMESTAMP } from '@/protocol/messages/requests/list-offsets.js'
-import type { TopicPartition, AutoOffsetReset } from './types.js'
-import { diagnostics, trace } from '@/diagnostics.js'
+import type { OffsetCommitPartition, OffsetCommitTopic } from '@/protocol/messages/requests/offset-commit.js'
+import type { AutoOffsetReset, CommitOffset, CommittedOffset, IsolationLevel, TopicPartition } from './types.js'
+import { diagnostics, trace, type CommitDiagnostics } from '@/diagnostics.js'
 import { noopLogger, type Logger } from '@/logger.js'
-import { tpKey } from '@/utils/topic-partition.js'
+import { parseKey, tpKey } from '@/utils/topic-partition.js'
 import { retry } from '@/utils/retry.js'
+import { sleep } from '@/utils/sleep.js'
+
+/** Bounds of a coordinator request made on the application's behalf. */
+export interface OffsetRequestOptions {
+	/** Time budget of the call, retries included (default: the consumer's `defaultApiTimeoutMs`). */
+	timeoutMs?: number
+	/** Aborting it rejects the call with the signal's reason. */
+	signal?: AbortSignal
+}
+
+/** Backoff between attempts of an explicit commit: 100 ms, doubling up to 1 s. */
+const COMMIT_RETRY_INITIAL_DELAY_MS = 100
+const COMMIT_RETRY_MAX_DELAY_MS = 1_000
+
+/** OffsetCommit errors a later attempt can overcome: the coordinator moved, is loading or was slow. */
+const RETRIABLE_COMMIT_ERRORS: ReadonlySet<ErrorCode> = new Set([
+	ErrorCode.CoordinatorLoadInProgress,
+	ErrorCode.NotCoordinator,
+	ErrorCode.CoordinatorNotAvailable,
+	ErrorCode.RequestTimedOut,
+])
+
+/** OffsetCommit errors that mean this member's generation is gone. */
+const GENERATION_LOST_COMMIT_ERRORS: ReadonlySet<ErrorCode> = new Set([
+	ErrorCode.IllegalGeneration,
+	ErrorCode.UnknownMemberId,
+	ErrorCode.FencedInstanceId,
+])
 
 /**
  * Offset manager
@@ -28,6 +68,8 @@ export class OffsetManager {
 	private readonly groupInstanceId?: string
 	private readonly logger: Logger
 	private readonly apiTimeoutMs: number
+	/** Isolation level of ListOffsets requests, as sent on the wire. */
+	private readonly isolationLevel: number
 
 	// Current state (set by consumer group on join/rejoin)
 	private memberId: string = ''
@@ -49,11 +91,24 @@ export class OffsetManager {
 	// (e.g. trigger rejoin on IllegalGeneration).
 	private onCommitError: ((error: Error) => void) | null = null
 
-	constructor(cluster: Cluster, groupId: string, groupInstanceId?: string, logger?: Logger, apiTimeoutMs = 60000) {
+	/**
+	 * @param isolationLevel - The consumer's: under 'read_committed', the 'latest' offset is the last stable offset
+	 *   (the end of the committed records), as the consumer can read up to there.
+	 */
+	constructor(
+		cluster: Cluster,
+		groupId: string,
+		groupInstanceId?: string,
+		logger?: Logger,
+		apiTimeoutMs = 60000,
+		isolationLevel: IsolationLevel = 'read_uncommitted'
+	) {
 		this.cluster = cluster
 		this.groupId = groupId
 		this.groupInstanceId = groupInstanceId
 		this.apiTimeoutMs = apiTimeoutMs
+		this.isolationLevel =
+			isolationLevel === 'read_committed' ? ISOLATION_LEVEL.READ_COMMITTED : ISOLATION_LEVEL.READ_UNCOMMITTED
 		this.logger = logger?.child({ component: 'offset-manager', groupId }) ?? noopLogger
 	}
 
@@ -248,61 +303,137 @@ export class OffsetManager {
 
 		this.logger.debug('committing offsets', { count: this.consumedOffsets.size })
 
-		// Build commit request - filter to only assigned partitions
-		const topicMap = new Map<string, Map<number, bigint>>()
-		const keysToCommit: string[] = []
-		for (const [key, offset] of this.consumedOffsets) {
-			// Skip partitions that were revoked during rebalance
-			if (!this.assignedPartitions.has(key)) {
-				this.logger.debug('skipping commit for unassigned partition', { key })
-				continue
-			}
-			keysToCommit.push(key)
-			const [topic, partitionStr] = key.split(':')
-			const partition = parseInt(partitionStr!, 10)
-
-			if (!topicMap.has(topic!)) {
-				topicMap.set(topic!, new Map())
-			}
-			topicMap.get(topic!)!.set(partition, offset + 1n)
-		}
-
-		// Nothing to commit if all partitions were filtered out
-		if (topicMap.size === 0) {
+		const pending = Array.from(this.consumedOffsets, ([key, consumed]) => ({
+			...parseKey(key),
+			offset: consumed + 1n,
+		}))
+		const topics = commitTopics(this.assignedOnly(pending))
+		if (topics.length === 0) {
 			this.logger.debug('no assigned partitions to commit')
 			return
 		}
 
-		const topics = Array.from(topicMap.entries()).map(([name, partitions]) => ({
-			name,
-			partitions: Array.from(partitions.entries()).map(([partitionIndex, committedOffset]) => ({
-				partitionIndex,
-				committedOffset,
-			})),
-		}))
-
 		await trace(
 			diagnostics.commit,
-			() => ({
-				clientId: this.cluster.clientId,
-				groupId: this.groupId,
-				offsets: topics.flatMap(topic =>
-					topic.partitions.map(p => ({
-						topic: topic.name,
-						partition: p.partitionIndex,
-						offset: p.committedOffset,
-					}))
-				),
-			}),
+			() => this.commitDiagnostics(topics),
 			() => this.sendOffsetCommit(coordinator, topics)
 		)
 	}
 
-	/** Send one OffsetCommit request and settle the pending offsets by its per-partition results. */
-	private async sendOffsetCommit(
+	/**
+	 * Commit the given offsets of assigned partitions, with their metadata and leader epochs, under this member's
+	 * generation (-1 without a group). Unlike {@link commitPendingOffsets}, no record needs to have been consumed.
+	 * Partitions not assigned to this member are skipped.
+	 *
+	 * A moved, loading or slow coordinator and connection failures are retried with backoff (100 ms doubling to 1 s)
+	 * until `timeoutMs` passed, then the call rejects with a `TimeoutError` (cause: the last failure). Other failures
+	 * are not retried: `RebalanceInProgressError` while the group rebalances, `CommitFailedError` when this member's
+	 * generation is gone, `KafkaProtocolError` otherwise. Aborting `signal` rejects with its reason.
+	 *
+	 * Once committed, the consumed offsets the commit covers are dropped, so no later commit moves the partition back.
+	 */
+	async commitExplicit(offsets: readonly CommitOffset[], options: OffsetRequestOptions = {}): Promise<void> {
+		options.signal?.throwIfAborted()
+		const coordinator = this.coordinator
+		if (!coordinator) {
+			throw new Error('Cannot commit offsets before the group coordinator is known')
+		}
+		const topics = commitTopics(this.assignedOnly(offsets))
+		if (topics.length === 0) {
+			return
+		}
+
+		await trace(
+			diagnostics.commit,
+			() => this.commitDiagnostics(topics),
+			() => this.commitUntilDone(coordinator, topics, options.timeoutMs ?? this.apiTimeoutMs, options.signal)
+		)
+	}
+
+	/** The retry loop of {@link commitExplicit}. */
+	private async commitUntilDone(
 		coordinator: Broker,
-		topics: Parameters<Broker['offsetCommit']>[0]['topics']
+		topics: OffsetCommitTopic[],
+		timeoutMs: number,
+		signal: AbortSignal | undefined
 	): Promise<void> {
+		// Aborted by the deadline or by the caller's signal; the caller's is checked first when telling them apart.
+		const stop = new AbortController()
+		const timer = setTimeout(() => stop.abort(), timeoutMs)
+		const onAbort = () => stop.abort()
+		signal?.addEventListener('abort', onAbort, { once: true })
+		let lastError: unknown
+		try {
+			let delayMs = COMMIT_RETRY_INITIAL_DELAY_MS
+			for (;;) {
+				try {
+					// The current coordinator: sendOffsetCommit re-discovers a moved one before it throws.
+					return await abortable(this.sendOffsetCommit(this.coordinator ?? coordinator, topics), stop.signal)
+				} catch (error) {
+					if (stop.signal.aborted || !isRetriableCommitError(error)) throw error
+					lastError = error
+					this.logger.debug('retrying offset commit', { delayMs, error: (error as Error).message })
+					await sleep(delayMs, { signal: stop.signal })
+					delayMs = Math.min(2 * delayMs, COMMIT_RETRY_MAX_DELAY_MS)
+				}
+			}
+		} catch (error) {
+			signal?.throwIfAborted()
+			if (stop.signal.aborted) {
+				const timeout = new TimeoutError(`OffsetCommit for group ${this.groupId} did not succeed`, timeoutMs)
+				if (lastError !== undefined) timeout.cause = lastError
+				throw timeout
+			}
+			throw this.commitError(error)
+		} finally {
+			clearTimeout(timer)
+			signal?.removeEventListener('abort', onAbort)
+		}
+	}
+
+	/** The typed error of a commit failure that is not retried. */
+	private commitError(error: unknown): unknown {
+		if (!(error instanceof KafkaProtocolError)) return error
+		if (error.errorCode === ErrorCode.RebalanceInProgress) return new RebalanceInProgressError(this.groupId)
+		if (GENERATION_LOST_COMMIT_ERRORS.has(error.errorCode)) return new CommitFailedError(this.groupId, error)
+		return error
+	}
+
+	/** The offsets of partitions assigned to this member: a commit for another partition would overwrite its owner's. */
+	private assignedOnly(offsets: Iterable<CommitOffset>): CommitOffset[] {
+		const assigned: CommitOffset[] = []
+		for (const offset of offsets) {
+			if (this.assignedPartitions.has(tpKey(offset.topic, offset.partition))) {
+				assigned.push(offset)
+			} else {
+				this.logger.debug('skipping commit for unassigned partition', {
+					topic: offset.topic,
+					partition: offset.partition,
+				})
+			}
+		}
+		return assigned
+	}
+
+	private commitDiagnostics(topics: OffsetCommitTopic[]): CommitDiagnostics {
+		return {
+			clientId: this.cluster.clientId,
+			groupId: this.groupId,
+			offsets: topics.flatMap(topic =>
+				topic.partitions.map(p => ({
+					topic: topic.name,
+					partition: p.partitionIndex,
+					offset: p.committedOffset,
+				}))
+			),
+		}
+	}
+
+	/**
+	 * Send one OffsetCommit request and settle the pending offsets by its per-partition results: a committed
+	 * partition's consumed offset is dropped unless it moved past the committed offset meanwhile.
+	 */
+	private async sendOffsetCommit(coordinator: Broker, topics: OffsetCommitTopic[]): Promise<void> {
 		let response: Awaited<ReturnType<Broker['offsetCommit']>>
 		try {
 			response = await coordinator.offsetCommit({
@@ -324,15 +455,27 @@ export class OffsetManager {
 			throw error
 		}
 
+		const committed = new Map<string, bigint>()
+		for (const topic of topics) {
+			for (const partition of topic.partitions) {
+				committed.set(tpKey(topic.name, partition.partitionIndex), partition.committedOffset)
+			}
+		}
+
 		// Clear successes before throwing so a failed sibling doesn't poison healthy
 		// partitions on the next retry (stale generation → forever-failing commits).
 		let firstError: KafkaProtocolError | null = null
 
 		for (const topic of response.topics) {
 			for (const partition of topic.partitions) {
-				const key = `${topic.name}:${partition.partitionIndex}`
+				const key = tpKey(topic.name, partition.partitionIndex)
 				if (partition.errorCode === ErrorCode.None) {
-					this.consumedOffsets.delete(key)
+					// The committed offset is the next one to read: it covers consumed offsets below it.
+					const consumed = this.consumedOffsets.get(key)
+					const offset = committed.get(key)
+					if (consumed !== undefined && offset !== undefined && consumed < offset) {
+						this.consumedOffsets.delete(key)
+					}
 					continue
 				}
 				this.logger.error('offset commit error', {
@@ -366,9 +509,17 @@ export class OffsetManager {
 	}
 
 	/**
-	 * Fetch committed offsets for partitions
+	 * Fetch the committed offsets of partitions, keyed by `topic:partition`; partitions without one are absent.
+	 *
+	 * Only stable offsets are read: while a transaction holds pending offsets, the fetch is retried, like other
+	 * retriable errors and coordinator moves, with backoff until `timeoutMs` is spent; then the last error is thrown.
+	 * Aborting `signal` rejects with its reason.
 	 */
-	async fetchCommittedOffsets(partitions: TopicPartition[]): Promise<Map<string, bigint>> {
+	async fetchCommittedOffsets(
+		partitions: readonly TopicPartition[],
+		options: OffsetRequestOptions = {}
+	): Promise<Map<string, CommittedOffset>> {
+		options.signal?.throwIfAborted()
 		if (partitions.length === 0 || !this.coordinator) {
 			return new Map()
 		}
@@ -391,7 +542,7 @@ export class OffsetManager {
 
 		// Retriable top-level codes (coordinator loading/moved) must not fatally fail consumer
 		// start/rebalance — retry with backoff and re-discover the coordinator.
-		const response = await retry(
+		const fetching = retry(
 			async () => {
 				if (!this.coordinator) {
 					throw new KafkaProtocolError(ErrorCode.CoordinatorNotAvailable, 'OffsetFetch: no coordinator')
@@ -421,13 +572,14 @@ export class OffsetManager {
 				return res
 			},
 			{
-				// Time-bounded by defaultApiTimeoutMs; maxAttempts is only a non-firing safety net.
+				// Time-bounded by timeoutMs; maxAttempts is only a non-firing safety net.
 				maxAttempts: 1_000,
-				maxElapsedMs: this.apiTimeoutMs,
+				maxElapsedMs: options.timeoutMs ?? this.apiTimeoutMs,
 				initialDelayMs: 100,
 				maxDelayMs: 1_000,
 				multiplier: 2,
 				jitter: 0,
+				signal: options.signal,
 				shouldRetry: error => isKafkaError(error) && error.retriable,
 				onRetry: async ({ error }) => {
 					const errorCode = isKafkaError(error) ? error.errorCode : undefined
@@ -439,16 +591,21 @@ export class OffsetManager {
 				},
 			}
 		)
+		const response = await (options.signal ? abortable(fetching, options.signal) : fetching)
 
 		// Build result map (partition-level errors were rejected above)
-		const result = new Map<string, bigint>()
+		const result = new Map<string, CommittedOffset>()
 		for (const topic of response.topics) {
 			for (const partition of topic.partitions) {
 				// -1 means no committed offset
-				if (partition.committedOffset >= 0n) {
-					const key = tpKey(topic.name, partition.partitionIndex)
-					result.set(key, partition.committedOffset)
+				if (partition.committedOffset < 0n) continue
+				// The coordinator stores a commit without metadata as '', so '' reads back as none.
+				const committed: CommittedOffset = {
+					offset: partition.committedOffset,
+					metadata: partition.metadata || null,
 				}
+				if (partition.committedLeaderEpoch >= 0) committed.leaderEpoch = partition.committedLeaderEpoch
+				result.set(tpKey(topic.name, partition.partitionIndex), committed)
 			}
 		}
 
@@ -464,18 +621,17 @@ export class OffsetManager {
 	 * @param autoOffsetReset - Strategy when no committed offset exists: 'earliest', 'latest', or 'none'
 	 * @param committedOffsets - Map of committed offsets (from fetchCommittedOffsets)
 	 * @returns Starting offset
+	 * @throws NoOffsetForPartitionError - No committed offset and the strategy is 'none'
 	 */
 	async resolveStartingOffset(
 		topic: string,
 		partition: number,
 		autoOffsetReset: AutoOffsetReset,
-		committedOffsets: Map<string, bigint>
+		committedOffsets: ReadonlyMap<string, CommittedOffset>
 	): Promise<bigint> {
-		const key = tpKey(topic, partition)
-
-		const committed = committedOffsets.get(key)
+		const committed = committedOffsets.get(tpKey(topic, partition))
 		if (committed !== undefined) {
-			return committed
+			return committed.offset
 		}
 
 		// No committed offset - apply reset strategy
@@ -485,7 +641,7 @@ export class OffsetManager {
 			case 'latest':
 				return this.getLatestOffset(topic, partition)
 			case 'none':
-				throw new Error(`No committed offset for ${topic}-${partition} and autoOffsetReset is 'none'`)
+				throw new NoOffsetForPartitionError(topic, partition)
 		}
 	}
 
@@ -497,14 +653,14 @@ export class OffsetManager {
 	}
 
 	/**
-	 * Get latest offset for a partition
+	 * Get latest offset for a partition: the last stable offset under 'read_committed', else the high watermark
 	 */
 	async getLatestOffset(topic: string, partition: number): Promise<bigint> {
 		return this.listOffset(topic, partition, OFFSET_TIMESTAMP.LATEST)
 	}
 
 	/**
-	 * List offset for a specific timestamp
+	 * List offset for a specific timestamp, at the consumer's isolation level
 	 */
 	private async listOffset(topic: string, partition: number, timestamp: bigint): Promise<bigint> {
 		return retry(
@@ -512,6 +668,7 @@ export class OffsetManager {
 				const leader = await this.cluster.getLeaderForPartition(topic, partition)
 
 				const response = await leader.listOffsets({
+					isolationLevel: this.isolationLevel,
 					topics: [
 						{
 							name: topic,
@@ -571,4 +728,40 @@ export class OffsetManager {
 			}
 		)
 	}
+}
+
+function isRetriableCommitError(error: unknown): boolean {
+	return (
+		isConnectionFailure(error) ||
+		(error instanceof KafkaProtocolError && RETRIABLE_COMMIT_ERRORS.has(error.errorCode))
+	)
+}
+
+/** The topics of an OffsetCommit request; of several offsets for one partition, the last is committed. */
+function commitTopics(offsets: Iterable<CommitOffset>): OffsetCommitTopic[] {
+	const topics = new Map<string, Map<number, OffsetCommitPartition>>()
+	for (const { topic, partition, offset, metadata, leaderEpoch } of offsets) {
+		let partitions = topics.get(topic)
+		if (!partitions) {
+			partitions = new Map()
+			topics.set(topic, partitions)
+		}
+		partitions.set(partition, {
+			partitionIndex: partition,
+			committedOffset: offset,
+			committedLeaderEpoch: leaderEpoch,
+			committedMetadata: metadata ?? null,
+		})
+	}
+	return Array.from(topics, ([name, partitions]) => ({ name, partitions: Array.from(partitions.values()) }))
+}
+
+/** Settle as `promise` does, or reject with the reason of `signal` once it aborts; the promise then runs on unobserved. */
+function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+	return new Promise<T>((resolve, reject) => {
+		const onAbort = () => reject(signal.reason)
+		if (signal.aborted) onAbort()
+		else signal.addEventListener('abort', onAbort, { once: true })
+		void promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort))
+	})
 }
