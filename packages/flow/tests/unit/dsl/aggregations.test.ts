@@ -11,7 +11,7 @@ import { SessionWindows, TimeWindows } from '@/dsl/windows.js'
 import type { Change } from '@/operators/change.js'
 import type { InternalProcessorContext, ProcessorContext } from '@/processor/api.js'
 import type { StreamRecord } from '@/processor/record.js'
-import type { TimestampedKeyValueStore } from '@/state.js'
+import type { SessionStore, TimestampedKeyValueStore, WindowStore } from '@/state.js'
 import { TestDriver } from '@/testing/driver.js'
 import type { BuiltTopology } from '@/topology/built-topology.js'
 
@@ -619,6 +619,46 @@ describe('aggregations', () => {
 		expect(out).toEqual(['a', null, 'b'])
 	})
 
+	it('a null windowed aggregate deletes its window or session and is forwarded as a tombstone', async () => {
+		const driver = new TestDriver()
+		const out: unknown[] = []
+		const reset = (agg: string, v: string) => (v === 'reset' ? (null as unknown as string) : agg + v)
+		const grouped = driver.input('in', { key: str, value: str }).groupByKey()
+		grouped
+			.windowedBy(TimeWindows.of(10))
+			.reduce(reset, { storeName: 'windows' })
+			.toStream()
+			.peek((k, v) => out.push(['window', k!.window, v]))
+		grouped
+			.windowedBy(SessionWindows.withInactivityGap(10))
+			.reduce(reset, { storeName: 'sessions' })
+			.toStream()
+			.peek((k, v) => out.push(['session', k!.window, v]))
+		await driver.run(async ({ send, getStateStore }) => {
+			await send('in', 'a', at('k', 1))
+			await send('in', 'reset', at('k', 2))
+			const windows = getStateStore<WindowStore<string, string>>('windows')
+			expect(await windows.get({ key: 'k', windowStart: 0, windowEnd: 10 })).toBeUndefined()
+			const sessions: unknown[] = []
+			for await (const session of getStateStore<SessionStore<string, string>>('sessions').findSessions(
+				'k',
+				0,
+				10
+			)) {
+				sessions.push(session)
+			}
+			expect(sessions).toEqual([])
+		})
+		expect(out).toEqual([
+			['window', { start: 0, end: 10 }, 'a'],
+			['session', { start: 1, end: 1 }, 'a'],
+			['window', { start: 0, end: 10 }, null],
+			// [1,1] is merged into [1,2], so it is retracted; the merged session's null aggregate is a tombstone.
+			['session', { start: 1, end: 1 }, null],
+			['session', { start: 1, end: 2 }, null],
+		])
+	})
+
 	it('aggregation stores keep the aggregate with the timestamp of its last update', async () => {
 		const driver = new TestDriver()
 		driver.input('in', { key: str, value: str }).groupByKey().count({ storeName: 'counts' })
@@ -654,6 +694,30 @@ describe('aggregations', () => {
 			[{ start: 0, end: 0 }, null],
 			[{ start: 0, end: 5 }, 'ab'],
 		])
+	})
+
+	it('exactly-once merges uncommitted sessions in start order too (the order comes from the store)', async () => {
+		const driver = new TestDriver({ processingGuarantee: 'exactly_once', commitEvery: 'stop' })
+		const out: Array<string | null> = []
+		driver
+			.input('in', { key: str, value: str })
+			.groupByKey()
+			.windowedBy(SessionWindows.withInactivityGap(100))
+			.aggregate(
+				() => '',
+				(_k, v, agg) => agg + v,
+				(_k, a, b) => a + b,
+				{ value: str }
+			)
+			.toStream()
+			.peek((_k, v) => out.push(v))
+		await driver.run(async ({ send }) => {
+			// Both sessions are only in the write buffer when the bridging record reads them.
+			await send('in', 'c', at('k', 200))
+			await send('in', 'a', at('k', 0))
+			await send('in', 'b', at('k', 100))
+		})
+		expect(out[out.length - 1]).toBe('acb')
 	})
 
 	describe('codecs', () => {
