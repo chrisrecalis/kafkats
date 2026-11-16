@@ -1920,9 +1920,11 @@ describe('windowed/session store changelog wiring', () => {
 		expect([...changelogTopics.get('per-region').sourceTopics]).toEqual(['test-app-repartition-0-repartition'])
 	})
 
-	it('keeps state derived from a windowed table partitioned like its input', () => {
+	it('repartitions the results of a windowed aggregation before a key-based operation', () => {
 		const { app } = createTestApp()
 
+		// A windowed result sits in the partition of its key, not where the windowed key itself
+		// hashes to. Whatever is keyed by the windowed key elsewhere is in a different partition.
 		for (const [topic, windows] of [
 			['events', TimeWindows.of('10s')],
 			['visits', SessionWindows.withInactivityGap('10s')],
@@ -1936,9 +1938,34 @@ describe('windowed/session store changelog wiring', () => {
 				.count({ storeName: `${topic}-updates` })
 		}
 
-		// Without source topics a store is one app-wide store with a single-partition changelog.
 		const { changelogTopics } = internals(app)
-		expect([...changelogTopics.get('events-updates').sourceTopics]).toEqual(['events'])
-		expect([...changelogTopics.get('visits-updates').sourceTopics]).toEqual(['visits'])
+		expect([...changelogTopics.get('events-updates').sourceTopics]).toEqual(['test-app-repartition-0-repartition'])
+		expect([...changelogTopics.get('visits-updates').sourceTopics]).toEqual(['test-app-repartition-1-repartition'])
+	})
+
+	it('joins the results of a windowed aggregation with a table in the partition of the windowed key', () => {
+		const { app } = createTestApp()
+		type Window = { key: string; window: { start: number; end: number } }
+		const labels = app.table('labels', { key: codec.json<Window>(), value: codec.string() })
+
+		app.stream('events', { key: codec.string(), value: codec.json<{ type: string }>() })
+			.groupByKey()
+			.windowedBy(TimeWindows.of('10s'))
+			.count({ storeName: 'windows' })
+			.mapValues(count => count ?? 0)
+			.filter(() => true)
+			.toStream()
+			.join(labels, (count, label) => `${label}: ${count}`, {
+				key: codec.json<Window>(),
+				value: codec.json<number>(),
+			})
+
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const topology = (app as any).topology
+		expect([...topology.repartitionTopics.keys()]).toEqual(['test-app-repartition-0-repartition'])
+		expect(topology.copartitioned.map((group: Set<string>) => [...group].sort())).toContainEqual([
+			'labels',
+			'test-app-repartition-0-repartition',
+		])
 	})
 })

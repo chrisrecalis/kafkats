@@ -7,7 +7,12 @@ import {
 	type TransactionalBuffer,
 } from '@/runtime/context.js'
 
-type Buffered<SK> = { key: SK; keyBytes: Buffer; value: Buffer | null }
+/**
+ * A buffered write. Key and value are held as the bytes they had when written: the caller's objects
+ * may be mutated afterwards (a downstream peek(), say), and the changelog record of the write already
+ * carries those bytes. `key` is decoded from them on first use (see keyOf).
+ */
+type Buffered<SK> = { keyBytes: Buffer; value: Buffer | null; key?: SK }
 
 const BUFFERED = Promise.resolve()
 
@@ -76,8 +81,7 @@ abstract class BufferedStoreBase<SK, V, S extends KeyValueStore<SK, V>> implemen
 		const scope = currentTransactionScope()
 		if (!scope) return this.inner.put(key, value)
 		const keyBytes = this.storeKeyCodec.encode(key)
-		// Buffer the serialized value so later in-place mutation of the object can't leak in.
-		this.bufferFor(scope).set(keyBytes.toString('hex'), { key, keyBytes, value: this.valueCodec.encode(value) })
+		this.bufferFor(scope).set(keyBytes.toString('hex'), { keyBytes, value: this.valueCodec.encode(value) })
 		return BUFFERED
 	}
 
@@ -85,7 +89,7 @@ abstract class BufferedStoreBase<SK, V, S extends KeyValueStore<SK, V>> implemen
 		const scope = currentTransactionScope()
 		if (!scope) return this.inner.delete(key)
 		const keyBytes = this.storeKeyCodec.encode(key)
-		this.bufferFor(scope).set(keyBytes.toString('hex'), { key, keyBytes, value: null })
+		this.bufferFor(scope).set(keyBytes.toString('hex'), { keyBytes, value: null })
 		return BUFFERED
 	}
 
@@ -131,9 +135,9 @@ abstract class BufferedStoreBase<SK, V, S extends KeyValueStore<SK, V>> implemen
 		const results = await Promise.allSettled(
 			Array.from(buffer.values(), async entry => {
 				if (entry.value === null) {
-					await this.inner.delete(entry.key)
+					await this.inner.delete(this.keyOf(entry))
 				} else {
-					await this.inner.put(entry.key, this.valueCodec.decode(entry.value))
+					await this.inner.put(this.keyOf(entry), this.valueCodec.decode(entry.value))
 				}
 			})
 		)
@@ -148,6 +152,11 @@ abstract class BufferedStoreBase<SK, V, S extends KeyValueStore<SK, V>> implemen
 		} else {
 			this.buffers.clear()
 		}
+	}
+
+	/** The key a buffered entry was written with. */
+	protected keyOf(entry: Buffered<SK>): SK {
+		return (entry.key ??= this.storeKeyCodec.decode(entry.keyBytes))
 	}
 
 	/**
@@ -175,7 +184,7 @@ abstract class BufferedStoreBase<SK, V, S extends KeyValueStore<SK, V>> implemen
 		}
 		for (const entry of overlay.values()) {
 			if (entry.value === null || !matches(entry)) continue
-			results.push({ keyBytes: entry.keyBytes, pair: [entry.key, this.valueCodec.decode(entry.value)] })
+			results.push({ keyBytes: entry.keyBytes, pair: [this.keyOf(entry), this.valueCodec.decode(entry.value)] })
 		}
 		if (sorted) {
 			results.sort((a, b) => Buffer.compare(a.keyBytes, b.keyBytes))
@@ -233,28 +242,30 @@ export class BufferedWindowStore<K, V>
 {
 	fetch(key: K, timeFrom: number, timeTo: number): AsyncIterable<[WindowedKey<K>, V]> {
 		const keyBytes = this.userKeyCodec.encode(key)
-		return this.merged(
-			this.inner.fetch(key, timeFrom, timeTo),
-			entry =>
-				entry.key.windowStart >= timeFrom &&
-				entry.key.windowStart <= timeTo &&
-				this.userKeyCodec.encode(entry.key.key).equals(keyBytes)
-		)
+		return this.merged(this.inner.fetch(key, timeFrom, timeTo), entry => {
+			const window = this.keyOf(entry)
+			return (
+				window.windowStart >= timeFrom &&
+				window.windowStart <= timeTo &&
+				this.userKeyCodec.encode(window.key).equals(keyBytes)
+			)
+		})
 	}
 
 	fetchAll(timeFrom: number, timeTo: number): AsyncIterable<[WindowedKey<K>, V]> {
-		return this.merged(
-			this.inner.fetchAll(timeFrom, timeTo),
-			entry => entry.key.windowStart >= timeFrom && entry.key.windowStart <= timeTo
-		)
+		return this.merged(this.inner.fetchAll(timeFrom, timeTo), entry => {
+			const { windowStart } = this.keyOf(entry)
+			return windowStart >= timeFrom && windowStart <= timeTo
+		})
 	}
 
 	fetchRange(keyFrom: K, keyTo: K, timeFrom: number, timeTo: number): AsyncIterable<[WindowedKey<K>, V]> {
 		const fromBytes = this.userKeyCodec.encode(keyFrom)
 		const toBytes = this.userKeyCodec.encode(keyTo)
 		return this.merged(this.inner.fetchRange(keyFrom, keyTo, timeFrom, timeTo), entry => {
-			if (entry.key.windowStart < timeFrom || entry.key.windowStart > timeTo) return false
-			const bytes = this.userKeyCodec.encode(entry.key.key)
+			const window = this.keyOf(entry)
+			if (window.windowStart < timeFrom || window.windowStart > timeTo) return false
+			const bytes = this.userKeyCodec.encode(window.key)
 			return Buffer.compare(bytes, fromBytes) >= 0 && Buffer.compare(bytes, toBytes) <= 0
 		})
 	}
@@ -277,13 +288,14 @@ export class BufferedSessionStore<K, V>
 {
 	findSessions(key: K, earliestStart: number, latestEnd: number): AsyncIterable<[WindowedKey<K>, V]> {
 		const keyBytes = this.userKeyCodec.encode(key)
-		return this.merged(
-			this.inner.findSessions(key, earliestStart, latestEnd),
-			entry =>
-				entry.key.windowStart <= latestEnd &&
-				entry.key.windowEnd >= earliestStart &&
-				this.userKeyCodec.encode(entry.key.key).equals(keyBytes)
-		)
+		return this.merged(this.inner.findSessions(key, earliestStart, latestEnd), entry => {
+			const session = this.keyOf(entry)
+			return (
+				session.windowStart <= latestEnd &&
+				session.windowEnd >= earliestStart &&
+				this.userKeyCodec.encode(session.key).equals(keyBytes)
+			)
+		})
 	}
 
 	async remove(key: K): Promise<void> {

@@ -124,6 +124,29 @@ describe('Buffered stores - expiry reads only what can have expired', () => {
 	})
 })
 
+describe('Buffered stores - a key is the bytes it had when it was written', () => {
+	type Id = { id: string }
+	const idCodec = codec.json<Id>()
+
+	it('commits to the key that was written, even if the caller mutates the key object afterwards', async () => {
+		const raw = new InMemoryKeyValueStore<Id, string>('kv', { keyCodec: idCodec, valueCodec: str })
+		const buf = new BufferedKeyValueStore<Id, string>(raw, idCodec, str)
+		const key = { id: 'a' }
+		const c = ctx()
+		await inTx(c, async () => {
+			await buf.put(key, 'value')
+			// e.g. a downstream peek() that reuses the key object
+			key.id = 'mutated'
+			expect(await collect(buf.all())).toEqual([[{ id: 'a' }, 'value']])
+		})
+		await commit(c)
+
+		// The changelog record of this write carries the original key; the store must agree with it.
+		expect(await raw.get({ id: 'a' })).toBe('value')
+		expect(await raw.get({ id: 'mutated' })).toBeUndefined()
+	})
+})
+
 describe('Buffered stores - one buffer shared by two workers', () => {
 	// BUG (F4): the buffer is per store, not per worker/transaction. App-scoped stores (KTable.groupBy mapping and
 	// aggregate stores) are one StoreStack shared by every worker (numStreamThreads > 1), so worker B's commit applies

@@ -108,6 +108,8 @@ Stream time is used to:
 - **Drop late records**: a record is dropped when its window (or session) is already past retention, which is 24 times the window size (or session gap) behind stream time. A record for a window that is still retained is applied normally, and a late session record that can merge into a live session is kept.
 - **Expire old windows**: windows and sessions past retention are removed from the store.
 
+For time windows, stream time advances one window at a time: it is the start of the newest window a record has opened (the newest hop for hopping windows). The store holds exactly that, so after a restart or a rebalance a record gets the same late-or-not answer as before. For session windows it is the highest timestamp itself.
+
 Windowed state is partitioned like all other state, see [Partitioned State](/flow/state-stores#partitioned-state).
 
 ## Windowed Keys

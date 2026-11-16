@@ -16,6 +16,7 @@ import type { StartPositions } from '@/runtime/start-positions.js'
 import type { AppStatus } from '@/runtime/status.js'
 import type { StoreRegistry } from '@/runtime/store-registry.js'
 import type { Topology } from '@/runtime/topology.js'
+import { KeyedTurns } from '@/runtime/keyed-turns.js'
 import { DEFAULT_COMMIT_INTERVAL_MS, WorkerTransactions } from '@/runtime/transactions.js'
 import {
 	type WorkerSlot,
@@ -50,6 +51,8 @@ export class StreamWorker {
 	readonly context: WorkerContext
 	private readonly transactions: WorkerTransactions
 	private readonly commitIntervalMs: number
+	/** Under at-least-once: one batch at a time per partition number (see handleBatch). */
+	private readonly statePartitionTurns = new KeyedTurns<number>()
 	private readonly eosEnabled: boolean
 
 	constructor(
@@ -265,7 +268,6 @@ export class StreamWorker {
 	 * Exactly-once: every record joins the worker's transaction batch, which commits offsets itself.
 	 */
 	private async handleBatch(batch: Message<Buffer>[], ctx: BatchContext): Promise<void> {
-		const worker = this.context
 		this.throwIfFailed()
 
 		if (this.eosEnabled) {
@@ -279,6 +281,18 @@ export class StreamWorker {
 			}
 			return
 		}
+
+		// State is kept per partition number, and topics that feed the same stateful operation share
+		// it: with `consumerRun.partitionConcurrency` above 1, batches of a:0 and b:0 would read and
+		// write the same state at the same time and lose each other's updates.
+		return this.statePartitionTurns.run(batch[0]!.partition, () => this.processBatch(batch, ctx))
+	}
+
+	/** Process a batch under at-least-once, acknowledging its progress as it goes. */
+	private async processBatch(batch: Message<Buffer>[], ctx: BatchContext): Promise<void> {
+		const worker = this.context
+		// The batch may have waited for its turn while the worker failed.
+		this.throwIfFailed()
 
 		// A batch can take long to work through (many records, a slow processor), so its progress is
 		// acknowledged every commit interval: a failure then repeats at most that much.
@@ -448,8 +462,9 @@ export class StreamWorker {
 					const error = toError(err)
 					// start() reports the failure.
 					status.failStartup(error)
-					// Never process on unrestored state: stop, then retry from scratch.
-					this.fail(error, true)
+					// Never process on unrestored state: stop, then retry from scratch unless the
+					// error is one no restart can fix (e.g. not authorized to read the changelog).
+					this.fail(error, isInfrastructureRecoverable(error))
 				})
 		}
 

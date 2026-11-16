@@ -205,6 +205,8 @@ State is kept per partition, so all records of a key must be processed in the sa
 
 `groupBy(fn, options)` always repartitions, because it changes the key itself.
 
+The results of a windowed aggregation are repartitioned in the same way. They are keyed by key and window, but stay in the partition of the key alone, which is not where anything else keyed by key and window would be. So `windowedBy(...).count().toStream()` followed by `groupByKey()`, a join or `toTable()` goes through an internal topic too. Writing the results to a topic with `to()` does not.
+
 ```typescript
 app.stream(events)
 	.selectKey(event => event.userId)

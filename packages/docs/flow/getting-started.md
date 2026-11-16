@@ -68,6 +68,8 @@ const app = flow({
 
 Consumer offsets are committed periodically (controlled by `autoCommitIntervalMs` in `consumerRun` options).
 
+With `consumerRun.partitionConcurrency` above 1, partitions with different partition numbers are processed concurrently. Partitions with the same number are processed one at a time, because topics that feed the same stateful operation (a `merge()`, both sides of a join) share the state of that partition number.
+
 ### Exactly-Once
 
 Messages are processed exactly once using Kafka transactions. Input offsets, output messages and changelog records are committed atomically.

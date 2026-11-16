@@ -205,4 +205,59 @@ describe('repartitioning keeps event time, totals and topic identity', () => {
 			await app.close().catch(() => {})
 		}
 	}, 40_000)
+
+	it('the results of a windowed aggregation are joined with a table keyed by (key, window)', async () => {
+		const P = 4
+		const input = uniqueTopicName('r2-rp-win-in')
+		const labels = uniqueTopicName('r2-rp-win-labels')
+		const output = uniqueTopicName('r2-rp-win-out')
+		await createTopics(admin, [{ name: input, partitions: P }, { name: labels, partitions: P }, { name: output }])
+		type Window = { key: string; window: { start: number; end: number } }
+		const windowCodec = codec.json<Window>()
+		const size = 10_000
+		const start = Math.floor(1_650_000_000_000 / size) * size
+
+		// One label per window of each key, wherever the windowed key hashes to.
+		const keys = ['k0', 'k1', 'k2', 'k3', 'k4', 'k5']
+		await producer.send(
+			labels,
+			keys.map(key => ({
+				key: windowCodec.encode({ key, window: { start, end: start + size } }),
+				value: Buffer.from(`label-${key}`),
+			}))
+		)
+
+		const app = flow({
+			applicationId: uniqueTopicName('r2-rp-win-app'),
+			client: newClient('r2-rp-win-app'),
+			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 50 },
+			producer: { lingerMs: 0 },
+		})
+		const labelTable = app.table(labels, { key: windowCodec, value: stringCodec })
+		app.stream(input, { key: stringCodec, value: stringCodec })
+			.groupByKey()
+			.windowedBy(TimeWindows.of(size))
+			.count({ storeName: 'per-window', value: numberCodec })
+			.toStream()
+			.join(labelTable, (count, label) => `${label}=${count}`, { key: windowCodec, value: numberCodec })
+			.to(output, { key: windowCodec, value: stringCodec })
+		try {
+			await app.start()
+			// Let the table load, then send every key into partition 0.
+			await sleep(2_000)
+			await producer.send(
+				input,
+				keys.map(key => ({ key, value: Buffer.from('x'), partition: 0, timestamp: new Date(start + 1) }))
+			)
+
+			let joined: string[] = []
+			for (const deadline = Date.now() + 20_000; joined.length < keys.length && Date.now() < deadline;) {
+				await sleep(300)
+				joined = (await readAllCommitted(admin, output, 800)).map(m => m.value!.toString())
+			}
+			expect(joined.sort()).toEqual(keys.map(key => `label-${key}=1`))
+		} finally {
+			await app.close().catch(() => {})
+		}
+	}, 60_000)
 })

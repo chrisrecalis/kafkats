@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import type { KafkaClient, Producer } from '@kafkats/client'
+import { ErrorCode, KafkaError, type KafkaClient, type Producer } from '@kafkats/client'
 import { codec, flow, type FlowApp } from '../../src/index.js'
 import {
 	createTopics,
@@ -168,6 +168,47 @@ describe('global tables and worker lifecycle', () => {
 			await app.close().catch(() => {})
 		}
 	}, 40_000)
+
+	it('a fatal error while preparing newly assigned partitions puts the app in ERROR instead of restarting forever', async () => {
+		const input = uniqueTopicName('r2-fatal-restore-in')
+		const output = uniqueTopicName('r2-fatal-restore-out')
+		const applicationId = uniqueTopicName('r2-fatal-restore-app')
+		await createTopics(admin, [{ name: input, partitions: 2 }, { name: output }])
+		const build = (): FlowApp => {
+			const app = flow({
+				applicationId,
+				client: newClient('r2-fatal-restore-app'),
+				consumer: { autoOffsetReset: 'earliest', maxWaitMs: 50, sessionTimeoutMs: 6_000 },
+				producer: { lingerMs: 0 },
+			})
+			app.stream(input, { key: stringCodec, value: stringCodec })
+				.groupByKey()
+				.count({ storeName: 'counts', key: stringCodec, value: numberCodec })
+				.toStream()
+				.to(output, { key: stringCodec, value: numberCodec })
+			return app
+		}
+		const first = build()
+		const second = build()
+		try {
+			await first.start()
+			// From now on restoring state fails with an error that no restart can fix.
+			const denied = new KafkaError('not authorized to read the changelog', ErrorCode.TopicAuthorizationFailed)
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			;(first as any).restoration.enqueue = () => Promise.reject(denied)
+
+			// A second instance joins: the first one is assigned its remaining partition anew.
+			await second.start()
+			for (const deadline = Date.now() + 20_000; first.state() !== 'ERROR' && Date.now() < deadline;) {
+				await sleep(100)
+			}
+			expect(first.state()).toBe('ERROR')
+			expect(first.getError()).toBe(denied)
+		} finally {
+			await first.close().catch(() => {})
+			await second.close().catch(() => {})
+		}
+	}, 60_000)
 
 	it('close() while a worker is in restart backoff returns promptly and leaves no extra handles', async () => {
 		const input = uniqueTopicName('r2-lc-in')
@@ -347,4 +388,43 @@ describe('start() retry', () => {
 			await app.close()
 		}
 	})
+
+	it('at-least-once: topics that share state are not processed concurrently for the same partition', async () => {
+		const left = uniqueTopicName('r2-conc-merge-a')
+		const right = uniqueTopicName('r2-conc-merge-b')
+		const output = uniqueTopicName('r2-conc-merge-out')
+		await createTopics(admin, [{ name: left }, { name: right }, { name: output }])
+		// Both topics have the same key in partition 0: one count, kept in state partition 0.
+		const PER_TOPIC = 300
+		for (const topic of [left, right]) {
+			await producer.send(
+				topic,
+				Array.from({ length: PER_TOPIC }, () => ({ key: 'k', value: Buffer.from('x') }))
+			)
+		}
+		const app = flow({
+			applicationId: uniqueTopicName('r2-conc-merge-app'),
+			client: newClient('r2-conc-merge-app'),
+			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 50 },
+			consumerRun: { partitionConcurrency: 2 },
+		})
+		app.stream(left, { key: stringCodec, value: stringCodec })
+			.merge(app.stream(right, { key: stringCodec, value: stringCodec }))
+			.groupByKey()
+			.count({ key: stringCodec, value: numberCodec })
+			.toStream()
+			.to(output, { key: stringCodec, value: numberCodec })
+		try {
+			await app.start()
+			let counts: number[] = []
+			for (const deadline = Date.now() + 20_000; counts.length < 2 * PER_TOPIC && Date.now() < deadline;) {
+				await sleep(300)
+				counts = (await readAllCommitted(admin, output, 800)).map(m => numberCodec.decode(m.value!))
+			}
+			// Every record adds one: no update is lost to a concurrent read of the old count.
+			expect(counts).toEqual(Array.from({ length: 2 * PER_TOPIC }, (_, i) => i + 1))
+		} finally {
+			await app.close()
+		}
+	}, 60_000)
 })

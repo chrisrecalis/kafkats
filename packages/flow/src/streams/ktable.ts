@@ -35,7 +35,13 @@ export class KTableImpl<K, V> implements KTable<K, V> {
 		 */
 		readonly sourceTopics: Set<string>,
 		/** True for globalTable(): fully replicated, only usable as the lookup side of a stream join. */
-		readonly global: boolean = false
+		readonly global: boolean = false,
+		/**
+		 * True when a row does not sit in the partition its key belongs to (see
+		 * KStreamImpl.repartitionRequired): the results of a windowed aggregation are keyed by
+		 * (key, window) but stay in the partition of the key alone.
+		 */
+		readonly repartitionRequired: boolean = false
 	) {
 		this.storeRef = storeRef ?? { store: null }
 	}
@@ -50,7 +56,7 @@ export class KTableImpl<K, V> implements KTable<K, V> {
 
 	toStream(): KStream<K, V> {
 		this.assertNotGlobal('toStream()')
-		return new KStreamImpl(this.builder, this.node, this.format, this.sourceTopics)
+		return new KStreamImpl(this.builder, this.node, this.format, this.sourceTopics, this.repartitionRequired)
 	}
 
 	mapValues<V2>(fn: (value: V | null) => V2 | null): KTable<K, V2> {
@@ -62,7 +68,9 @@ export class KTableImpl<K, V> implements KTable<K, V> {
 			node,
 			{ keyCodec: this.format.keyCodec },
 			undefined,
-			this.sourceTopics
+			this.sourceTopics,
+			false,
+			this.repartitionRequired
 		)
 	}
 
@@ -70,7 +78,15 @@ export class KTableImpl<K, V> implements KTable<K, V> {
 		this.assertNotGlobal('filter()')
 		const node = new TableFilterNode<K, V>(fn)
 		this.node.connect(node)
-		return new KTableImpl<K, V>(this.builder, node, this.format, undefined, this.sourceTopics)
+		return new KTableImpl<K, V>(
+			this.builder,
+			node,
+			this.format,
+			undefined,
+			this.sourceTopics,
+			false,
+			this.repartitionRequired
+		)
 	}
 
 	groupBy<K2>(fn: (key: K, value: V) => KeyValue<K2, V>, options?: Grouped<K2, V>): KGroupedTable<K2, V> {

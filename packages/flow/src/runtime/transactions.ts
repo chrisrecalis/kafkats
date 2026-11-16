@@ -154,7 +154,10 @@ export class WorkerTransactions {
 				await store.commitBuffer(worker.dirtyStores)
 			}
 		} catch (err) {
-			// Local state is now behind the committed changelog; only a restore can repair it.
+			// Local state is now behind the committed changelog; only a restore can repair it. The
+			// stores after the one that failed still hold their buffers, and nothing else knows
+			// about them any more: left behind, they would hide the restored values.
+			for (const store of dirtyStores) store.discardBuffer(worker.dirtyStores)
 			this.fail(err, true)
 			throw err
 		}

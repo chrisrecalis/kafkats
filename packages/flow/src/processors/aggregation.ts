@@ -111,7 +111,10 @@ function* windowStartsFor(
 	}
 }
 
-/** Newest window start in a window store: a lower bound of the stream time that produced it. */
+/**
+ * Newest window start in a window store. Stream time of a windowed aggregation is counted in these
+ * (see WindowedAggregationNode.process), so this is the stream time that produced the store.
+ */
 async function newestWindowStart(store: { all(): AsyncIterable<[WindowedKey<unknown>, unknown]> }) {
 	let newest = 0
 	for await (const [windowedKey] of store.all()) {
@@ -165,7 +168,9 @@ class WindowedAggregationNode<K, V, A> extends Processor<K, V, Windowed<K>, A> {
 		await this.streamTime.ensureClock(record, () => newestWindowStart(store))
 		const retentionCutoff =
 			this.streamTime.streamTime(record) - this.windowSizeMs * WINDOW_STORE_RETENTION_MULTIPLIER
+		let newestStart = 0
 		for (const { start, end } of windowStartsFor(timestamp, this.windowSizeMs, this.advanceMs)) {
+			newestStart = start
 			// Drop a late record whose window has already passed retention: re-creating the
 			// window from scratch emits a wrong partial result that contradicts the
 			// already-finalized (and possibly expired) window.
@@ -177,7 +182,12 @@ class WindowedAggregationNode<K, V, A> extends Processor<K, V, Windowed<K>, A> {
 			await this.forward({ ...record, key: { key, window: { start, end } }, value: aggregate })
 		}
 
-		await this.streamTime.advance(record, timestamp, t => store.expireOldWindows(t))
+		// Stream time advances by window, not by timestamp: it is the start of the newest window a
+		// record has opened. That is exactly what the store shows after a restart, so a clock that
+		// is rebuilt from it gives every record the same late-or-not answer as before. With the
+		// timestamp itself, the rebuilt clock would be up to one window behind and accept a record
+		// that had already been dropped as late.
+		await this.streamTime.advance(record, newestStart, t => store.expireOldWindows(t))
 	}
 }
 

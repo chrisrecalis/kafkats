@@ -237,13 +237,18 @@ export class WindowedKGroupedStreamImpl<K, V> implements WindowedKGroupedStream<
 		}
 		this.node.connect(node)
 
-		// A window of a key stays in the key's partition, so the table is partitioned like its input.
+		// A window of a key stays in the key's partition: the table is partitioned like its input,
+		// which is not where its own key (key + window) hashes to. A key-based operation on its
+		// rows (a join with something else keyed by the window, a further aggregation) therefore
+		// repartitions them first.
 		return new KTableImpl<Windowed<K>, A>(
 			this.builder,
 			node,
 			{ keyCodec: windowedKeyCodec(keyCodec), valueCodec },
 			undefined,
-			this.sourceTopics
+			this.sourceTopics,
+			false,
+			true
 		)
 	}
 
