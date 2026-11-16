@@ -556,6 +556,31 @@ describe('stream-stream joins', () => {
 		])
 	})
 
+	it('names the join nodes of left and outer joins as Kafka Streams does', () => {
+		const app = flow({ applicationId: 'app', client })
+		const [a, b] = ['a', 'b'].map(t => app.stream(t, S))
+		const joiner = (x: string | null, y: string | null) => `${x}${y}`
+		a!.leftJoin(b!, joiner, JoinWindows.of(1000), { name: 'l' })
+		a!.outerJoin(b!, joiner, JoinWindows.of(1000), { name: 'o' })
+		a!.leftJoin(b!, joiner, JoinWindows.of(1000))
+		a!.outerJoin(b!, joiner, JoinWindows.of(1000))
+		const [join] = internals(app).build().subtopologies
+		expect(join!.nodes.map(n => n.name.replace(/-\d+$/, '')).filter(n => n !== 'KSTREAM-SOURCE')).toEqual([
+			'l-this-join',
+			'l-outer-other-join',
+			'l-merge',
+			'o-outer-this-join',
+			'o-outer-other-join',
+			'o-merge',
+			'KSTREAM-JOINTHIS',
+			'KSTREAM-OUTEROTHER',
+			'KSTREAM-MERGE',
+			'KSTREAM-OUTERTHIS',
+			'KSTREAM-OUTEROTHER',
+			'KSTREAM-MERGE',
+		])
+	})
+
 	it('StreamJoined.storeName names the buffers; unnamed buffers keep their generated names', () => {
 		const app = flow({ applicationId: 'app', client })
 		const [a, b, c] = ['a', 'b', 'c'].map(t => app.stream(t, S))

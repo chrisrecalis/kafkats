@@ -84,9 +84,11 @@ export function streamStreamJoin<K, V, VO, VR>(
 
 	// One clock for both sides, under the left buffer's name (4.8.5).
 	const shared = { clock: thisStore, windowMs }
+	// Kafka Streams' node names (KStreamImplJoin): "outer" marks this side's node in an outer join and the other
+	// side's node in left and outer joins.
 	const thisJoin = ctx.processor(
 		kind === 'outer' ? NodePrefix.OUTER_THIS : NodePrefix.JOIN_THIS,
-		named('this-join'),
+		named(kind === 'outer' ? 'outer-this-join' : 'this-join'),
 		[thisSide.node],
 		streamStreamJoinProcessor<K, V, VO, VR>({
 			...shared,
@@ -101,7 +103,7 @@ export function streamStreamJoin<K, V, VO, VR>(
 	)
 	const otherJoin = ctx.processor(
 		kind === 'inner' ? NodePrefix.JOIN_OTHER : NodePrefix.OUTER_OTHER,
-		named('other-join'),
+		named(kind === 'inner' ? 'other-join' : 'outer-other-join'),
 		[otherSide.node],
 		streamStreamJoinProcessor<K, VO, V, VR>({
 			...shared,
