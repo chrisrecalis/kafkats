@@ -76,6 +76,19 @@ describe('hopping windows', () => {
 		expect(() => windowed.reduce((a, b) => a + b)).toThrow(/advanceBy must be <= window size/)
 	})
 
+	it('throws a TopologyError at the aggregation for windows of size 0 (no record would ever fall into one)', () => {
+		const driver = new TestDriver()
+		expect(() => grouped(driver).windowedBy(TimeWindows.of(0)).count()).toThrow(TopologyError)
+	})
+
+	it('advanceBy(0) gives tumbling windows, as today', async () => {
+		const out = await updates(
+			driver => grouped(driver).windowedBy(TimeWindows.of(1000).advanceBy(0)).count(),
+			[[1, 750]]
+		)
+		expect(out).toEqual([{ start: 0, end: 1000, value: 1 }])
+	})
+
 	it('tumbling windows (advance == size) produce exactly one update per record', async () => {
 		const out = await updates(driver => grouped(driver).windowedBy(TimeWindows.of(1000)).count(), [[1, 750]])
 		expect(out).toEqual([{ start: 0, end: 1000, value: 1 }])
