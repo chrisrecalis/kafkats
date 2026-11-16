@@ -21,6 +21,9 @@ export class KGroupedStreamImpl<K, V> implements KGroupedStream<K, V> {
 		readonly name: string | undefined
 	) {}
 
+	/** A named grouping's records read back from its repartition topic: set by its first aggregation that needs it. */
+	repartitioned: KStreamImpl<K, V> | undefined
+
 	count(options?: AggregateOptions<K, number>): KTable<K, number> {
 		return count(this, options)
 	}

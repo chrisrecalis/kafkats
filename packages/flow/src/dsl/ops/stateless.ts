@@ -162,7 +162,8 @@ export function noDefaultBranch<K, V>(_branched: BranchedKStreamImpl<K, V>): Rec
 
 /**
  * KTable.toStream: `change.newValue` of every update. Without a mapper the records stay in the partition of their key;
- * a mapper re-keys them, so a key-based operation downstream repartitions first.
+ * a mapper re-keys them, so a key-based operation downstream repartitions first. So does one on windowed results: in
+ * this build they stay in the partition of their base key, not where their windowed key hashes to (BC10 drops this).
  */
 export function toStream<K, V, KR>(
 	table: KTableImpl<K, V>,
@@ -175,5 +176,5 @@ export function toStream<K, V, KR>(
 	const { ctx } = table
 	const node = ctx.processor(NodePrefix.TABLE_TO_STREAM, named?.name, [table.node], toStreamProcessor(mapper))
 	const format = mapper === undefined ? table.format : withNewKeys(table.format)
-	return new KStreamImpl<K | KR, V>(ctx, node, format, mapper !== undefined)
+	return new KStreamImpl<K | KR, V>(ctx, node, format, mapper !== undefined || table.format.windowed !== undefined)
 }

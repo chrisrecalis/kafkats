@@ -1,146 +1,81 @@
-import { describe, it, expect, vi } from 'vitest'
+import { describe, expect, it } from 'vitest'
+import { codec } from '@/codec.js'
+import { SessionWindows, TimeWindows } from '@/dsl/windows.js'
+import { TestDriver, type TestContextApi } from '@/testing/driver.js'
 
-import { WindowedAggregateNode, SessionAggregateNode } from '@/legacy/processors/aggregation.js'
-import type { StreamRecord } from '@/legacy/processors/base.js'
-import type { SessionStore, WindowStore, WindowedKey } from '@/state.js'
-
-function rec(key: string, value: number, ts: number): StreamRecord<string, number> {
-	return { key, value, timestamp: BigInt(ts), topic: 't', partition: 0, offset: 0n, headers: {} }
-}
-
-function makeWindowStore() {
-	const putSpy = vi.fn(async () => {})
-	async function* empty(): AsyncIterable<[WindowedKey<string>, number]> {
-		// no entries
-	}
-	const store = {
-		name: 's',
-		get: vi.fn(async () => undefined),
-		put: putSpy,
-		delete: vi.fn(async () => {}),
-		all: vi.fn(() => empty()),
-		range: vi.fn(() => empty()),
-		fetch: vi.fn(() => empty()),
-		fetchAll: vi.fn(() => empty()),
-		fetchRange: vi.fn(() => empty()),
-		expireOldWindows: vi.fn(async () => 0),
-		approximateNumEntries: vi.fn(async () => 0),
-		init: vi.fn(),
-		flush: vi.fn(),
-		close: vi.fn(),
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	} as any as WindowStore<string, number>
-	return { store, putSpy }
-}
-
-function makeSessionStore(overlapping: Array<[WindowedKey<string>, number]> = []) {
-	const putSpy = vi.fn(async () => {})
-	async function* sessions(): AsyncIterable<[WindowedKey<string>, number]> {
-		for (const entry of overlapping) yield entry
-	}
-	const store = {
-		name: 's',
-		get: vi.fn(async () => undefined),
-		put: putSpy,
-		delete: vi.fn(async () => {}),
-		all: vi.fn(() => (async function* () {})()),
-		range: vi.fn(),
-		findSessions: vi.fn(() => sessions()),
-		remove: vi.fn(async () => {}),
-		expireOldSessions: vi.fn(async () => []),
-		approximateNumEntries: vi.fn(async () => 0),
-		init: vi.fn(),
-		flush: vi.fn(),
-		close: vi.fn(),
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	} as any as SessionStore<string, number>
-	return { store, putSpy }
-}
-
+const str = codec.string()
+const num = codec.json<number>()
 const WINDOW_MS = 1000
 const BASE = 1_000_000_000_000
-// 30s late comfortably exceeds the 24s retention (WINDOW_MS * 24).
+// Stores keep 24 windows (24 s): 30 s late is past retention, 10 s late is not.
 
-describe('WindowedAggregateNode late-record handling', () => {
+type Update = { key: string; start: number; end: number; value: number | null }
+
+/** A sum per window (or session) of the values of topic 'in'; returns its updates. */
+function windowedSums(driver: TestDriver, sessions: boolean): Update[] {
+	const updates: Update[] = []
+	const grouped = driver.input('in', { key: str, value: num }).groupByKey()
+	const table = sessions
+		? grouped.windowedBy(SessionWindows.withInactivityGap(WINDOW_MS)).reduce((a, b) => a + b)
+		: grouped.windowedBy(TimeWindows.of(WINDOW_MS)).reduce((a, b) => a + b)
+	table
+		.toStream()
+		.peek((k, value) => updates.push({ key: k!.key, start: k!.window.start, end: k!.window.end, value }))
+	return updates
+}
+
+const send = (ctx: TestContextApi, key: string, value: number, timestamp: number) =>
+	ctx.send('in', value, { key: Buffer.from(key), codec: num, timestamp })
+
+describe('time-window aggregation: late records', () => {
 	it('drops a record whose window is already past retention instead of resurrecting it', async () => {
-		const { store, putSpy } = makeWindowStore()
-		const node = new WindowedAggregateNode<string, number, number>(
-			's',
-			{ store },
-			() => 0,
-			(_k, v, agg) => agg + v,
-			WINDOW_MS
-		)
-
-		// On-time record advances stream time to BASE (one window written).
-		await node.process(rec('a', 5, BASE))
-		expect(putSpy).toHaveBeenCalledTimes(1)
-
-		// Record arriving well past retention (30s late > 24s retention): its window is gone,
-		// so it must be dropped, not re-created from the initializer.
-		await node.process(rec('a', 99, BASE - 30_000))
-		expect(putSpy).toHaveBeenCalledTimes(1)
+		const driver = new TestDriver()
+		const updates = windowedSums(driver, false)
+		await driver.run(async ctx => {
+			await send(ctx, 'a', 5, BASE)
+			// 30 s late (> 24 s retention): its window is gone, so it must be dropped, not re-created from scratch.
+			await send(ctx, 'a', 99, BASE - 30_000)
+		})
+		expect(updates).toEqual([{ key: 'a', start: BASE, end: BASE + WINDOW_MS, value: 5 }])
 	})
 
-	it('still processes a moderately-late record that is within retention', async () => {
-		const { store, putSpy } = makeWindowStore()
-		const node = new WindowedAggregateNode<string, number, number>(
-			's',
-			{ store },
-			() => 0,
-			(_k, v, agg) => agg + v,
-			WINDOW_MS
-		)
-
-		await node.process(rec('a', 5, BASE))
-		expect(putSpy).toHaveBeenCalledTimes(1)
-
-		// 10s late is within the 24s retention → still aggregated.
-		await node.process(rec('a', 7, BASE - 10_000))
-		expect(putSpy).toHaveBeenCalledTimes(2)
+	it('still aggregates a moderately late record that is within retention', async () => {
+		const driver = new TestDriver()
+		const updates = windowedSums(driver, false)
+		await driver.run(async ctx => {
+			await send(ctx, 'a', 5, BASE)
+			await send(ctx, 'a', 7, BASE - 10_000)
+		})
+		expect(updates.map(u => [u.start, u.value])).toEqual([
+			[BASE, 5],
+			[BASE - 10_000, 7],
+		])
 	})
 })
 
-describe('SessionAggregateNode late-record handling', () => {
+describe('session aggregation: late records', () => {
 	it('drops a late record that has no live session to merge into', async () => {
-		const { store, putSpy } = makeSessionStore([]) // no overlapping sessions
-		const node = new SessionAggregateNode<string, number, number>(
-			's',
-			{ store },
-			() => 0,
-			(_k, v, agg) => agg + v,
-			(a, b) => a + b,
-			WINDOW_MS
-		)
-
-		await node.process(rec('a', 5, BASE))
-		expect(putSpy).toHaveBeenCalledTimes(1)
-
-		await node.process(rec('a', 99, BASE - 30_000))
-		expect(putSpy).toHaveBeenCalledTimes(1)
+		const driver = new TestDriver()
+		const updates = windowedSums(driver, true)
+		await driver.run(async ctx => {
+			await send(ctx, 'a', 5, BASE)
+			await send(ctx, 'a', 99, BASE - 30_000)
+		})
+		expect(updates).toEqual([{ key: 'a', start: BASE, end: BASE, value: 5 }])
 	})
 
-	it('still processes a late record that merges into a live session', async () => {
-		// A live (within-retention) session exists for the key, so the late record must merge
-		// into it rather than being dropped.
-		const liveSession: [WindowedKey<string>, number] = [
-			{ key: 'a', windowStart: BASE - 30_500, windowEnd: BASE - 30_000 },
-			42,
-		]
-		const { store, putSpy } = makeSessionStore([liveSession])
-		const node = new SessionAggregateNode<string, number, number>(
-			's',
-			{ store },
-			() => 0,
-			(_k, v, agg) => agg + v,
-			(a, b) => a + b,
-			WINDOW_MS
-		)
-
-		await node.process(rec('a', 5, BASE))
-		expect(putSpy).toHaveBeenCalledTimes(1)
-
-		await node.process(rec('a', 99, BASE - 30_000))
-		expect(putSpy).toHaveBeenCalledTimes(2)
+	it('still merges a late record into a live session, however old', async () => {
+		const driver = new TestDriver()
+		const updates = windowedSums(driver, true)
+		await driver.run(async ctx => {
+			await send(ctx, 'a', 42, BASE - 30_500) // a session of 'a', still stored
+			await send(ctx, 'a', 5, BASE)
+			await send(ctx, 'a', 99, BASE - 30_000) // 30 s late, but within the gap of the live session
+			await send(ctx, 'b', 1, BASE - 30_000) // 30 s late and no session of 'b': dropped
+		})
+		expect(updates.slice(2)).toEqual([
+			{ key: 'a', start: BASE - 30_500, end: BASE - 30_500, value: null },
+			{ key: 'a', start: BASE - 30_500, end: BASE - 30_000, value: 141 },
+		])
 	})
 })

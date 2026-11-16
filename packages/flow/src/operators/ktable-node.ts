@@ -22,8 +22,8 @@ export interface KTableValueGetterSupplier<K, V> {
 
 /** What the DSL keeps of a table node: a plain descriptor, not a callable object. */
 export interface KTableNode<K, V> {
-	/** Its input: the parent table's changes, or the records of a source. */
-	readonly supplier: ProcessorSupplier<K, unknown, K, Change<V>>
+	/** Its input: the parent table's changes, the records of a source, or the grouped records an aggregation reads. */
+	readonly supplier: ProcessorSupplier<unknown, unknown, K, Change<V>>
 	/** Kafka Streams' enableSendingOldValues: false if old values need a store this node does not have and !force. */
 	enableSendingOldValues(force: boolean): boolean
 	readonly valueGetter: KTableValueGetterSupplier<K, V>
