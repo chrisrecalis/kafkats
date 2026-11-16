@@ -329,38 +329,31 @@ export class Cluster extends EventEmitter<ClusterEvents> {
 		})
 	}
 
+	/**
+	 * The broker leading a partition. When the cached metadata names no leader (topic or partition not
+	 * known yet, or the partition is between leaders, leaderId -1), the topic's metadata is refreshed
+	 * once first. If there is still no leader, it throws `LeaderNotAvailableError` for the caller to retry.
+	 */
 	async getLeaderForPartition(topic: string, partition: number): Promise<Broker> {
-		this.logger.debug('getting leader for partition', { topic, partition })
-
-		if (!this.metadata) {
+		let leaderId = this.cachedLeaderId(topic, partition)
+		if (leaderId < 0) {
+			this.logger.debug('leader unknown, refreshing metadata', { topic, partition })
 			await this.refreshMetadata([topic])
+			leaderId = this.cachedLeaderId(topic, partition)
 		}
 
-		const topicMetadata = this.metadata?.topics.get(topic)
-		if (!topicMetadata) {
-			// Refresh metadata for this topic
-			this.logger.debug('topic not in metadata, refreshing', { topic })
-			await this.refreshMetadata([topic])
-			const refreshedTopic = this.metadata?.topics.get(topic)
-			if (!refreshedTopic) {
-				this.logger.error('leader not available', { topic, partition })
-				throw new LeaderNotAvailableError(topic, partition)
-			}
-		}
-
-		const partitionMetadata = this.metadata?.topics.get(topic)?.partitions.get(partition)
-		if (!partitionMetadata) {
-			this.logger.error('partition not found', { topic, partition })
+		if (leaderId < 0) {
+			this.logger.debug('leader not available', { topic, partition })
 			throw new LeaderNotAvailableError(topic, partition)
 		}
 
-		if (partitionMetadata.leaderId < 0) {
-			this.logger.error('no leader for partition', { topic, partition })
-			throw new LeaderNotAvailableError(topic, partition)
-		}
+		this.logger.debug('found leader for partition', { topic, partition, leaderId })
+		return this.getBroker(leaderId)
+	}
 
-		this.logger.debug('found leader for partition', { topic, partition, leaderId: partitionMetadata.leaderId })
-		return this.getBroker(partitionMetadata.leaderId)
+	/** The leader of a partition in the cached metadata, -1 when there is none. */
+	private cachedLeaderId(topic: string, partition: number): number {
+		return this.metadata?.topics.get(topic)?.partitions.get(partition)?.leaderId ?? -1
 	}
 
 	async getCoordinator(type: CoordinatorType, key: string): Promise<Broker> {
@@ -624,35 +617,30 @@ export class Cluster extends EventEmitter<ClusterEvents> {
 				// aren't in play, both zero / unknown).
 				const existingTopic =
 					prior && (topic.topicId === ZERO_TOPIC_ID || prior.topicId === topic.topicId) ? prior : undefined
+				// Every partition of the response is kept, including one with a partition-level error
+				// (LEADER_NOT_AVAILABLE during an election comes with leaderId -1), so `partitions.size`
+				// is the topic's real partition count for partitioners and assignors.
 				const partitions = new Map<number, PartitionMetadata>()
 				for (const partition of topic.partitions) {
-					if (partition.errorCode === ErrorCode.None) {
-						const previous = existingTopic?.partitions.get(partition.partitionIndex)
-						// Keep the previously-known leader if this response carries an older epoch.
-						// leaderEpoch < 0 means "unknown" (pre-KIP-320 broker); don't use it to gate.
-						if (
-							previous &&
-							previous.leaderEpoch >= 0 &&
-							partition.leaderEpoch >= 0 &&
-							partition.leaderEpoch < previous.leaderEpoch
-						) {
-							partitions.set(partition.partitionIndex, previous)
-						} else {
-							partitions.set(partition.partitionIndex, {
-								partitionIndex: partition.partitionIndex,
-								leaderId: partition.leaderId,
-								leaderEpoch: partition.leaderEpoch,
-								replicaNodes: partition.replicaNodes,
-								isrNodes: partition.isrNodes,
-								offlineReplicas: partition.offlineReplicas,
-							})
-						}
-					} else if (existingTopic) {
-						// Transient partition-level error: keep the partition we already knew about.
-						const previous = existingTopic.partitions.get(partition.partitionIndex)
-						if (previous) {
-							partitions.set(partition.partitionIndex, previous)
-						}
+					const previous = existingTopic?.partitions.get(partition.partitionIndex)
+					// Keep the previously-known leader if this response carries an older epoch.
+					// leaderEpoch < 0 means "unknown" (pre-KIP-320 broker); don't use it to gate.
+					if (
+						previous &&
+						previous.leaderEpoch >= 0 &&
+						partition.leaderEpoch >= 0 &&
+						partition.leaderEpoch < previous.leaderEpoch
+					) {
+						partitions.set(partition.partitionIndex, previous)
+					} else {
+						partitions.set(partition.partitionIndex, {
+							partitionIndex: partition.partitionIndex,
+							leaderId: partition.leaderId,
+							leaderEpoch: partition.leaderEpoch,
+							replicaNodes: partition.replicaNodes,
+							isrNodes: partition.isrNodes,
+							offlineReplicas: partition.offlineReplicas,
+						})
 					}
 				}
 
