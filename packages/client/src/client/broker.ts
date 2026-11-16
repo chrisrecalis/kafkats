@@ -121,6 +121,15 @@ import {
 } from '@/protocol/messages/requests/delete-topics.js'
 import { decodeDeleteTopicsResponse, type DeleteTopicsResponse } from '@/protocol/messages/responses/delete-topics.js'
 import {
+	encodeDeleteRecordsRequest,
+	DELETE_RECORDS_VERSIONS,
+	type DeleteRecordsRequest,
+} from '@/protocol/messages/requests/delete-records.js'
+import {
+	decodeDeleteRecordsResponse,
+	type DeleteRecordsResponse,
+} from '@/protocol/messages/responses/delete-records.js'
+import {
 	encodeDescribeAclsRequest,
 	DESCRIBE_ACLS_VERSIONS,
 	type DescribeAclsRequest,
@@ -215,6 +224,7 @@ const CLIENT_API_VERSIONS: Partial<Record<ApiKey, { min: number; max: number }>>
 	[ApiKey.EndTxn]: END_TXN_VERSIONS,
 	[ApiKey.TxnOffsetCommit]: TXN_OFFSET_COMMIT_VERSIONS,
 	[ApiKey.DeleteTopics]: DELETE_TOPICS_VERSIONS,
+	[ApiKey.DeleteRecords]: DELETE_RECORDS_VERSIONS,
 	[ApiKey.DescribeAcls]: DESCRIBE_ACLS_VERSIONS,
 	[ApiKey.CreateAcls]: CREATE_ACLS_VERSIONS,
 	[ApiKey.DeleteAcls]: DELETE_ACLS_VERSIONS,
@@ -934,6 +944,30 @@ export class Broker {
 
 		const durationMs = Date.now() - startTime
 		this.logger.debug('received response', { api: 'DeleteTopics', version, durationMs })
+		return response
+	}
+
+	/** Send a DeleteRecords request; the broker may hold it for `request.timeoutMs` before answering. */
+	async deleteRecords(request: DeleteRecordsRequest): Promise<DeleteRecordsResponse> {
+		const version = this.getApiVersion(ApiKey.DeleteRecords)
+		const startTime = Date.now()
+		this.logger.debug('sending request', { api: 'DeleteRecords', version, topicCount: request.topics.length })
+
+		const responseBuffer = await this.controlSend(
+			ApiKey.DeleteRecords,
+			version,
+			encoder => {
+				encodeDeleteRecordsRequest(encoder, version, request)
+			},
+			request.timeoutMs + this.requestTimeoutMs
+		)
+
+		const decoder = new Decoder(responseBuffer)
+		decodeResponseHeader(decoder, ApiKey.DeleteRecords, version)
+		const response = decodeDeleteRecordsResponse(decoder, version)
+
+		const durationMs = Date.now() - startTime
+		this.logger.debug('received response', { api: 'DeleteRecords', version, durationMs })
 		return response
 	}
 

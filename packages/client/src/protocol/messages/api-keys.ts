@@ -105,6 +105,7 @@ export const FLEXIBLE_VERSION_MIN: Partial<Record<ApiKey, number>> = {
 	[ApiKey.ApiVersions]: 3,
 	[ApiKey.CreateTopics]: 5,
 	[ApiKey.DeleteTopics]: 4,
+	[ApiKey.DeleteRecords]: 2,
 	[ApiKey.InitProducerId]: 2,
 	[ApiKey.OffsetForLeaderEpoch]: 4,
 	[ApiKey.AddPartitionsToTxn]: 3,
