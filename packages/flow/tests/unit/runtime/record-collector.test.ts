@@ -324,6 +324,26 @@ describe('RecordCollector at-least-once', () => {
 		await Promise.resolve()
 		expect(collector.takeChangelogOffsets(task)).toEqual(new Map())
 	})
+
+	it('a partition count load cut short by close() is runtime control (migrate), not a processing failure', async () => {
+		const h = new TaskHarness({ build: b => pipe(b, { processor: passThrough }) })
+		h.collector = new RecordCollector(h.producer, {
+			eos: false,
+			handlers: h.handlers,
+			counts: {
+				get: () => undefined,
+				load: (_topic, s) =>
+					new Promise((_resolve, reject) => s.addEventListener('abort', () => reject(s.reason))),
+			},
+			logger: h.logger,
+		})
+		const task = await running(h)
+		const load = h.collector.forTask(task).loadPartitionCount('output')
+		h.collector.close()
+		const failure = await load.catch((e: unknown) => e)
+		expect(failure).toBeInstanceOf(TaskMigratedError)
+		expect(classify(failure, 'processing')).toBe('migrate')
+	})
 })
 
 describe('RecordCollector exactly-once', () => {
@@ -336,6 +356,21 @@ describe('RecordCollector exactly-once', () => {
 		expect(transaction!.sent).toHaveLength(1)
 		await h.collector.commitTransaction([], h.assignment!, signal())
 		expect(h.collector.transactionOpen).toBe(false)
+		expect(() => send(h, task, 'sink')).toThrow(IllegalStateError)
+	})
+
+	it('after an abort, sends of a slice that outlived it are dropped until the next transaction (4.11 a)', async () => {
+		const h = new TaskHarness({ build: b => pipe(b, { processor: passThrough }), eos: true })
+		const task = await running(h)
+		await h.collector.abortTransaction(signal())
+		send(h, task, 'sink')
+		expect(h.producer.sent).toHaveLength(0)
+		expect(h.logger.warnings).toContain('dropped a record sent after its transaction was aborted')
+		expect(task.needsCommit(() => undefined)).toBe(false)
+		await h.collector.ensureTransaction(signal())
+		send(h, task, 'sink')
+		expect(h.producer.transactions[1]!.sent).toHaveLength(1)
+		await h.collector.commitTransaction([], h.assignment!, signal())
 		expect(() => send(h, task, 'sink')).toThrow(IllegalStateError)
 	})
 

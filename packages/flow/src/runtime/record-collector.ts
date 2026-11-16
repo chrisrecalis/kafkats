@@ -61,6 +61,8 @@ export class RecordCollector {
 	private readonly lifetime = new AbortController()
 	private transaction: TransactionPort | undefined
 	private opening: Promise<TransactionPort> | undefined
+	/** Exactly-once: the last transaction was aborted and none was opened since, so the work done meanwhile is void. */
+	private aborted = false
 	/** Last acked offset per changelog partition, per task, since the last take. */
 	private readonly changelogOffsets = new Map<StreamTask, Map<string, bigint>>()
 	/** Tasks whose sends failed with a retriable error under at-least-once since the last flush. */
@@ -77,7 +79,7 @@ export class RecordCollector {
 		return {
 			send: (kind, record) => this.send(task, kind, record),
 			partitionCount: topic => counts.get(topic),
-			loadPartitionCount: topic => counts.load(topic, this.lifetime.signal),
+			loadPartitionCount: topic => this.loadPartitionCount(topic),
 		}
 	}
 
@@ -92,8 +94,9 @@ export class RecordCollector {
 		})
 		const transaction = await this.opening
 		// An abort or close meanwhile owns the transaction it found opening.
-		if (generation === this.generation) {
-			this.transaction ??= transaction
+		if (generation === this.generation && this.transaction === undefined) {
+			this.transaction = transaction
+			this.aborted = false
 		}
 	}
 
@@ -149,6 +152,7 @@ export class RecordCollector {
 	 * marker would land outside any transaction), then aborts. Never throws.
 	 */
 	async abortTransaction(signal: AbortSignal): Promise<void> {
+		this.aborted = true
 		const answered = this.giveUp()
 		const { opening } = this
 		let transaction = this.transaction
@@ -185,16 +189,35 @@ export class RecordCollector {
 		return ended.settled()
 	}
 
+	/** A load cut short by close() is runtime control (migrate), not a processing failure of the record. */
+	private async loadPartitionCount(topic: string): Promise<number> {
+		try {
+			return await this.options.counts.load(topic, this.lifetime.signal)
+		} catch (error) {
+			if (this.isClosed) {
+				throw new TaskMigratedError(`the output closed while loading the partition count of '${topic}'`, {
+					cause: error,
+				})
+			}
+			throw error
+		}
+	}
+
 	private send(task: StreamTask, kind: SendKind, record: CollectedRecord): void {
+		const { eos } = this.options
 		if (this.isClosed || task.lost || !(task.state === 'RUNNING' || task.initializing)) {
-			this.options.logger.warn('dropped a record of a task that is not running', {
-				task: task.id.key,
-				state: task.state,
-				lost: task.lost,
-				topic: record.topic,
-				kind,
-			})
+			this.dropped('dropped a record of a task that is not running', task, kind, record)
 			return
+		}
+		if (eos && this.transaction === undefined) {
+			// A slice that outlived an abort (a close or recovery that stopped waiting for it): its work is void.
+			if (this.aborted) {
+				this.dropped('dropped a record sent after its transaction was aborted', task, kind, record)
+				return
+			}
+			throw new IllegalStateError(`task ${task.id.key} sent a record with no open transaction`, {
+				taskId: task.id,
+			})
 		}
 		const message: ProducedMessage = {
 			key: record.key,
@@ -203,16 +226,7 @@ export class RecordCollector {
 			timestamp: record.timestamp === undefined ? undefined : new Date(record.timestamp),
 			headers: record.headers,
 		}
-		let sent: Promise<SendResult>
-		if (!this.options.eos) {
-			sent = this.producer.send(record.topic, message)
-		} else if (this.transaction !== undefined) {
-			sent = this.transaction.send(record.topic, message)
-		} else {
-			throw new IllegalStateError(`task ${task.id.key} sent a record with no open transaction`, {
-				taskId: task.id,
-			})
-		}
+		const sent = eos ? this.transaction!.send(record.topic, message) : this.producer.send(record.topic, message)
 		task.markCommitNeeded()
 		// KS reports a failed send with the record context of the send, not of the ack.
 		const { input } = task
@@ -236,6 +250,16 @@ export class RecordCollector {
 				generation.answered()
 			}
 		)
+	}
+
+	private dropped(message: string, task: StreamTask, kind: SendKind, record: CollectedRecord): void {
+		this.options.logger.warn(message, {
+			task: task.id.key,
+			state: task.state,
+			lost: task.lost,
+			topic: record.topic,
+			kind,
+		})
 	}
 
 	private changelogAcked(task: StreamTask, result: SendResult): void {
