@@ -15,6 +15,9 @@ export type {
 	BrokerDescription,
 	CreateTopicsResult,
 	DeleteTopicsResult,
+	RecordsToDelete,
+	DeleteRecordsOptions,
+	DeleteRecordsResult,
 	DeleteGroupsResult,
 	// ACL types
 	AclBinding,

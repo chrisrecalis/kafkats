@@ -125,28 +125,37 @@ const consumer = client.consumer({
 
 ### Options Reference
 
-| Option                        | Type                                          | Default                | Description                                           |
-| ----------------------------- | --------------------------------------------- | ---------------------- | ----------------------------------------------------- |
-| `groupId`                     | `string`                                      | -                      | Required. Consumer group ID                           |
-| `groupInstanceId`             | `string`                                      | -                      | Static membership ID                                  |
-| `sessionTimeoutMs`            | `number`                                      | `30000`                | Session timeout (ms)                                  |
-| `rebalanceTimeoutMs`          | `number`                                      | `60000`                | Rebalance timeout (ms)                                |
-| `heartbeatIntervalMs`         | `number`                                      | `3000`                 | Heartbeat interval (ms)                               |
-| `maxBytesPerPartition`        | `number`                                      | `1048576`              | Max bytes per partition per fetch and per batch       |
-| `minBytes`                    | `number`                                      | `1`                    | Min bytes to fetch                                    |
-| `maxWaitMs`                   | `number`                                      | `5000`                 | Max fetch wait time (ms)                              |
-| `autoOffsetReset`             | `'earliest' \| 'latest' \| 'none'`            | `'latest'`             | Offset reset strategy                                 |
-| `isolationLevel`              | `'read_committed' \| 'read_uncommitted'`      | `'read_committed'`     | Transaction isolation                                 |
-| `partitionAssignmentStrategy` | `'cooperative-sticky' \| 'sticky' \| 'range'` | `'cooperative-sticky'` | Assignment strategy                                   |
-| `defaultApiTimeoutMs`         | `number`                                      | `60000`                | Max time to retry offset fetch/commit operations (ms) |
+| Option                        | Type                                                              | Default                | Description                                                                 |
+| ----------------------------- | ----------------------------------------------------------------- | ---------------------- | --------------------------------------------------------------------------- |
+| `groupId`                     | `string`                                                          | -                      | Required. Consumer group ID                                                 |
+| `groupInstanceId`             | `string`                                                          | -                      | Static membership ID                                                        |
+| `sessionTimeoutMs`            | `number`                                                          | `30000`                | Session timeout (ms)                                                        |
+| `rebalanceTimeoutMs`          | `number`                                                          | `60000`                | Rebalance timeout (ms)                                                      |
+| `heartbeatIntervalMs`         | `number`                                                          | `3000`                 | Heartbeat interval (ms)                                                     |
+| `maxBytesPerPartition`        | `number`                                                          | `1048576`              | Max bytes per partition per fetch and per batch                             |
+| `minBytes`                    | `number`                                                          | `1`                    | Min bytes to fetch                                                          |
+| `maxWaitMs`                   | `number`                                                          | `5000`                 | Max fetch wait time (ms)                                                    |
+| `autoOffsetReset`             | `'earliest' \| 'latest' \| 'none'` or `(topic, partition) => ...` | `'latest'`             | Offset reset policy, or a function giving each partition's                  |
+| `isolationLevel`              | `'read_committed' \| 'read_uncommitted'`                          | `'read_committed'`     | Transaction isolation                                                       |
+| `partitionAssignmentStrategy` | `'cooperative-sticky' \| 'sticky' \| 'range'`                     | `'cooperative-sticky'` | Assignment strategy                                                         |
+| `defaultApiTimeoutMs`         | `number`                                                          | `60000`                | Max time to retry offset fetch/commit operations (ms)                       |
+| `onBeforeRebalance`           | `() => Promise<void>`                                             | -                      | Awaited before each rebalance starts                                        |
+| `onPartitionsRevoked`         | `(partitions) => Promise<void>`                                   | -                      | Awaited before revoked partitions are committed and removed                 |
+| `onPartitionsAssigned`        | `(partitions) => Promise<void>`                                   | -                      | Awaited before assigned partitions are fetched                              |
+| `onPartitionsLost`            | `(partitions) => Promise<void>`                                   | -                      | Called when partitions are lost with the session; awaited before the rejoin |
 
 ### Offset Reset Strategies
 
-| Value        | Behavior                                    |
-| ------------ | ------------------------------------------- |
-| `'earliest'` | Start from beginning of topic               |
-| `'latest'`   | Start from end of topic (new messages only) |
-| `'none'`     | Throw error if no committed offset exists   |
+The policy applies to partitions without a committed offset and to positions out of range (records deleted). Pass a
+function `(topic, partition) => policy` to choose per partition.
+
+| Value        | Behavior                                                                                                                                     |
+| ------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `'earliest'` | Start from beginning of topic                                                                                                                |
+| `'latest'`   | Start from end of topic (new messages only); the last stable offset under `read_committed`                                                   |
+| `'none'`     | No committed offset: the run fails with `NoOffsetForPartitionError`. Out of range: the partition is paused and `offsetOutOfRange` is emitted |
+
+See [Rebalance Hooks](/client/consumer#rebalance-hooks) and [Offset Reset](/client/consumer#offset-reset).
 
 ### Isolation Levels
 

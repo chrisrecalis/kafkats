@@ -244,19 +244,73 @@ generic arguments cannot be partially inferred; codec-driven inference preserves
 When `autoCommit: true` and `commitOffsets: true`, the consumer:
 
 - Marks offsets as “consumed” after your handler completes successfully.
-- Commits pending offsets periodically (`autoCommitIntervalMs`) and once more during shutdown (unless the session is lost).
+- Commits pending offsets periodically (`autoCommitIntervalMs`), when partitions are revoked, and once more during shutdown (unless the session is lost).
 
-If you set `autoCommit: false` (or `commitOffsets: false`), the consumer will not commit offsets. On restart it will resume from the last committed offsets (or apply `autoOffsetReset` if none exist).
+If you set `autoCommit: false` (or `commitOffsets: false`), the consumer will not commit offsets on its own. On restart it will resume from the last committed offsets (or apply `autoOffsetReset` if none exist). In `runBatch`, `ctx.resolveOffset()` controls how far automatic commits may go.
 
-### Position
+### Committing Offsets Yourself
 
-`consumer.position(topic, partition)` returns the offset the consumer will fetch next for an assigned partition.
+`consumer.commit()` commits offsets of assigned partitions when you choose: from a handler, from a timer, or from `onPartitionsRevoked`. Each offset is the **next** offset to read (the last processed offset + 1) and can carry a metadata string, stored and read back with it:
 
-`consumer.commitStartPosition([{ topic, partition }])` commits the position a partition starts from. It is for a partition that has no committed offset yet: committing where it starts makes a restart resume from there instead of applying `autoOffsetReset` again (with `'latest'`, that would skip whatever arrived in between). Call it from a `partitionsAssigned` listener, optionally after `seek()`. It throws once records of the partition have been fetched, because the position is then past records no handler has seen.
+```typescript
+await consumer.commit([{ topic: 'events', partition: 0, offset: lastProcessed + 1n, metadata: 'checkpoint-42' }], {
+	timeoutMs: 10_000, // default: defaultApiTimeoutMs
+})
+```
 
-::: tip Manual commits
-Apart from `commitStartPosition()`, the public consumer API focuses on automatic commits. In `runBatch`, `ctx.resolveOffset()` controls how far they may go.
-:::
+- It works with a group or a manual assignment, also with `commitOffsets: false`. Offsets of partitions not assigned to this consumer are skipped. It throws when the consumer is not running.
+- A moved, loading or slow coordinator is retried until `timeoutMs` passed; then it rejects with `TimeoutError`. Aborting `signal` rejects it with the signal's reason.
+- It rejects with `RebalanceInProgressError` while the group rebalances (commit again once it is done, or in `onPartitionsRevoked`), and with `CommitFailedError` when this member's generation is gone: nothing was committed and the consumer rejoins the group.
+
+### Reading Committed Offsets
+
+```typescript
+const committed = await consumer.committed([{ topic: 'events', partition: 0 }])
+const entry = committed.get('events:0') // { offset, metadata, leaderEpoch? }, or null without a committed offset
+```
+
+The map is keyed by `topic:partition`. Offsets of an open transaction are waited for, up to `timeoutMs`. Each assignment also carries the committed offsets of its partitions (see [Rebalance Hooks](#rebalance-hooks)).
+
+### Position, Next Offset and Lag
+
+| Method                         | Returns                                                                                                                                                                                                                                                                  |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `position(topic, partition)`   | The offset the next fetch starts at. Fetching runs ahead of the handlers, so this is past records still buffered.                                                                                                                                                        |
+| `nextOffset(topic, partition)` | The offset of the next record to be delivered to a handler: the earliest record fetched but not delivered yet, else the fetch position (which moves past transaction markers and aborted records). Once everything delivered is processed, this is the offset to commit. |
+| `currentLag(topic, partition)` | How many records can be read beyond `nextOffset`: the partition's end as of its last fetch response (the last stable offset under `read_committed`, else the high watermark) minus `nextOffset`. `undefined` before the first fetch response and while paused.           |
+
+All three return `undefined` for a partition that is not assigned to the consumer. `consumer.metrics()` reports the same per partition (`position`, `nextOffset`, `endOffset`, `bufferedBytes`, `bufferedRecords`, `paused`).
+
+`consumer.commitStartPosition([{ topic, partition }])` commits the position a partition starts from. It is for a partition that has no committed offset yet: committing where it starts makes a restart resume from there instead of applying `autoOffsetReset` again (with `'latest'`, that would skip whatever arrived in between). Call it from `onPartitionsAssigned` or a `partitionsAssigned` listener, optionally after `seek()`. It throws once records of the partition have been fetched, because the position is then past records no handler has seen.
+
+### Offset Reset
+
+`autoOffsetReset` decides where a partition starts when it has no committed offset, and where it goes on when its position is out of range (the records were deleted by retention or `admin.deleteRecords()`). It takes a policy, or a function returning each partition's policy:
+
+```typescript
+const consumer = client.consumer({
+	groupId: 'my-group',
+	autoOffsetReset: (topic, partition) => (topic.startsWith('audit-') ? 'none' : 'earliest'),
+})
+
+consumer.on('offsetReset', ({ topic, partition, from, to, reason }) => {
+	console.log(`${topic}-${partition} moved from ${from} to ${to} (${reason})`) // reason: 'no-commit' | 'out-of-range'
+})
+
+consumer.on('offsetOutOfRange', ({ topic, partition, offset }) => {
+	// Only under 'none': the partition is paused. Decide where it goes on, then resume it.
+	consumer.seek(topic, partition, restartOffsetFor(topic, partition))
+	consumer.resume([{ topic, partition }])
+})
+```
+
+| Policy               | No committed offset                            | Position out of range                                                      |
+| -------------------- | ---------------------------------------------- | -------------------------------------------------------------------------- |
+| `'earliest'`         | Earliest available offset; `offsetReset`       | Earliest available offset; `offsetReset`                                   |
+| `'latest'` (default) | End of the partition; `offsetReset`            | End of the partition; `offsetReset`                                        |
+| `'none'`             | The run fails with `NoOffsetForPartitionError` | The partition is paused and `offsetOutOfRange` is emitted; the run goes on |
+
+Under `read_committed` (the default), the end of a partition is its last stable offset: `'latest'` does not skip records of transactions still open.
 
 ### Connections
 
@@ -272,6 +326,8 @@ consumer.pause([{ topic: 'events', partition: 0 }])
 consumer.resume([{ topic: 'events', partition: 0 }])
 ```
 
+Once `pause()` returns, no record of the partition fetched before is delivered, except to a handler of that partition that is already running; after `resume()` they are fetched and delivered again, none lost and none twice. A pause does not outlive the partition's assignment: under the eager protocol every rebalance assigns partitions anew, unpaused. Pause them in `onPartitionsAssigned` to keep them paused.
+
 ## Seeking to a Specific Offset
 
 Reposition the consumer to a specific offset for a partition:
@@ -284,18 +340,7 @@ consumer.seek('events', 0, 100n)
 consumer.seek('events', 0, 0n)
 ```
 
-The seek only affects the **next fetch** - messages already fetched will still be delivered. For controlled seeking, combine with pause/resume:
-
-```typescript
-await consumer.runEach('events', async (message, ctx) => {
-	if (shouldReplay(message)) {
-		// Pause, seek, resume pattern for controlled repositioning
-		consumer.pause([{ topic: ctx.topic, partition: ctx.partition }])
-		consumer.seek(ctx.topic, ctx.partition, 0n) // Seek to beginning
-		consumer.resume([{ topic: ctx.topic, partition: ctx.partition }])
-	}
-})
-```
+Records of the partition fetched but not delivered yet are dropped: once `seek()` returns, delivery restarts at the new offset. Only a handler of that partition that is already running is not interrupted: called from inside `runEach`'s handler, the remaining records of the batch being processed are still delivered before the seek takes effect. To set where a partition starts before any of its records is fetched, seek it in `onPartitionsAssigned`.
 
 ::: warning
 Seeking does not affect committed offsets. If you want to persist the new position, you'll need to commit after seeking. On restart, the consumer will resume from the last committed offset.
@@ -326,6 +371,61 @@ consumer.on('error', error => {
 	console.error('Consumer error:', error)
 })
 ```
+
+| Event                | Payload                                       | Emitted when                                                                                        |
+| -------------------- | --------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `running`            | -                                             | The consumer joined (or took its manual assignment) and `onPartitionsAssigned` returned             |
+| `stopped`            | -                                             | The run ended                                                                                       |
+| `error`              | `Error`                                       | A failure inside the consumer (a fetch error, an unreachable cluster, ...)                          |
+| `rebalancePending`   | -                                             | The group asked for a rebalance; no new handler starts, running ones finish                         |
+| `rebalance`          | -                                             | The rebalance starts, after `onBeforeRebalance` returned                                            |
+| `partitionsRevoked`  | `TopicPartition[]`                            | Partitions were taken away, after `onPartitionsRevoked` and their final commit                      |
+| `partitionsAssigned` | `AssignedPartition[]`                         | Partitions were assigned, after `onPartitionsAssigned` returned                                     |
+| `partitionsLost`     | `TopicPartition[]`                            | The session was lost with these partitions; their offsets can no longer be committed                |
+| `rebalanceComplete`  | -                                             | The rebalance finished (the member rejoined and took its partitions), unless another one is pending |
+| `offsetReset`        | `{ topic, partition, from, to, reason }`      | A partition's position was set by `'earliest'` or `'latest'` (see [Offset Reset](#offset-reset))    |
+| `offsetOutOfRange`   | `{ topic, partition, offset }`                | A partition's position is out of range under `'none'`: it is paused                                 |
+| `fetchPosition`      | `{ topic, partition, offset }`, `recordCount` | Fetching advanced; `offset` is the next fetch position                                              |
+
+`consumer.rebalancePending` is `true` from `rebalancePending` until `rebalanceComplete`.
+
+## Rebalance Hooks
+
+Three hooks of the consumer config let the application act when partitions move. The consumer awaits them inside the rebalance, unlike the events above:
+
+```typescript
+const consumer = client.consumer({
+	groupId: 'my-group',
+	// Taken away: their handlers have returned, their offsets can still be committed.
+	onPartitionsRevoked: async partitions => {
+		await consumer.commit(checkpointsOf(partitions))
+	},
+	// Assigned: none of them is fetched before this returns.
+	onPartitionsAssigned: async partitions => {
+		for (const { topic, partition, offset, committed } of partitions) {
+			console.log(`${topic}-${partition} starts at ${offset}, committed metadata: ${committed?.metadata}`)
+		}
+	},
+	// Lost with the session: their offsets can no longer be committed.
+	onPartitionsLost: async partitions => {
+		discardWorkOf(partitions)
+	},
+})
+```
+
+| Hook                   | Called                                                                                                                                                                                                            | What it can rely on                                                                                                                                                                                                                                                  |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `onPartitionsRevoked`  | When a rebalance takes partitions away: all of them under the eager protocol, the revoked ones under the cooperative protocol                                                                                     | Their handlers have returned. It runs before the consumer commits their offsets (with `commitOffsets`) and stops fetching them; `commit()` here commits under the generation that owned them. Not called for lost partitions.                                        |
+| `onPartitionsAssigned` | When partitions are assigned: on the first join (before `running`), by each rebalance (every partition under the eager protocol, the added ones under the cooperative protocol), and once for a manual assignment | None of them is fetched before it returns, so `pause()` and `seek()` here take effect before their first record; partitions paused here stay paused. Each entry carries `offset` (where it starts) and `committed` (`{ offset, metadata, leaderEpoch? }` or `null`). |
+| `onPartitionsLost`     | When the group expired or fenced this member                                                                                                                                                                      | It is invoked synchronously as the loss is detected, so its synchronous part runs before any other code (handlers of these partitions may still be running). The member rejoins only once it resolved.                                                               |
+
+A hook that throws fails the rebalance and the run (the `runEach()`/`runBatch()` promise rejects), like `onBeforeRebalance`.
+
+An eager rebalance goes: `rebalancePending` → running handlers finish → `onBeforeRebalance` → `rebalance` → `onPartitionsRevoked` → final commit → `partitionsRevoked` → rejoin → `onPartitionsAssigned` → `partitionsAssigned` → `rebalanceComplete`. A cooperative rebalance calls the same hooks after the rejoin, with the revoked and the added partitions.
+
+### Group Metadata
+
+`consumer.groupMetadata()` returns the group metadata of the consumer's last completed join (`groupId`, `generationId`, `memberId`, `groupInstanceId`): what offsets committed in a transaction for its assignment must carry (`tx.sendOffsets({ consumerGroupMetadata, offsets })`, see [Transactions](/client/transactions)). In `onPartitionsAssigned` it is already that of the new assignment. It is `undefined` with a manual assignment, before the first join, and from the moment the group rejected this member's session or generation until the next join completed.
 
 ## Static Membership
 

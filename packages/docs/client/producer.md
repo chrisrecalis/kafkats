@@ -151,6 +151,17 @@ const producer = client.producer({
 })
 ```
 
+The default partitioner places a keyed record like the Java client does. Its hash is exported, so an application can compute a key's partition itself, for example to route work to the instance that owns it:
+
+```typescript
+import { murmur2, toPositive } from '@kafkats/client'
+
+const partitionCount = await producer.partitionCount('events') // from the producer's metadata cache
+const partition = toPositive(murmur2(Buffer.from('user-1'))) % partitionCount
+```
+
+`producer.partitionCount(topic, { timeoutMs, signal })` reads the producer's metadata cache (kept for 5 minutes) and looks the topic up on a miss. It rejects when the topic does not exist, with a `TimeoutError` once `timeoutMs` passed, or with the reason of an aborted `signal`.
+
 ## Batching
 
 The producer batches messages for efficiency. Configure batching behavior:
@@ -207,18 +218,21 @@ const producer = client.producer({
 })
 ```
 
-Handle errors:
+A send that fails rejects with a `KafkaError`:
+
+- The broker rejected the records for good (`retriable: false`): a `KafkaProtocolError` whose `errorCode` is the broker's answer, for example `ErrorCode.MessageTooLarge`.
+- The producer stopped retrying (`retriable: true`): a `KafkaError` whose `cause` is the last failure, a broker answer or a connection error. The records may or may not have been written.
 
 ```typescript
-import { SendTimeoutError, RecordTooLargeError } from '@kafkats/client'
+import { ErrorCode, KafkaError, KafkaProtocolError } from '@kafkats/client'
 
 try {
 	await producer.send('my-topic', { value: largePayload })
 } catch (error) {
-	if (error instanceof RecordTooLargeError) {
-		console.log('Message too large for broker')
-	} else if (error instanceof SendTimeoutError) {
-		console.log('Send timed out')
+	if (error instanceof KafkaProtocolError && error.errorCode === ErrorCode.MessageTooLarge) {
+		console.log('Message too large for the broker')
+	} else if (error instanceof KafkaError && error.retriable) {
+		console.log('Retries exhausted, last failure:', error.cause)
 	}
 }
 ```
@@ -264,7 +278,12 @@ Always close the producer when done:
 ```typescript
 // Flush pending messages and close
 await producer.disconnect()
+
+// Bounded: whatever is not acknowledged within 2 s is rejected
+await producer.disconnect({ timeoutMs: 2000 })
 ```
+
+`disconnect()` flushes within `timeoutMs` (default 5000). Against an unresponsive broker, the sends not acknowledged by then are rejected, so shutting down never hangs. A transactional producer also aborts the transaction a [transaction handle](/client/transactions#transaction-handles) left open within the same budget.
 
 ## Producer Options
 

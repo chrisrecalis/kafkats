@@ -25,6 +25,10 @@ src/
 └── index.ts      # Public API exports
 ```
 
+### Public API
+
+`package.json` has only the `"."` export, so a type, function or class is public only once `client/index.ts` (re-exported by `index.ts`) exports it. Add a new public name there and to its module's `index.ts` (`consumer/`, `producer/`, `admin/`); `tests/unit/exports.test.ts` checks the root types of the consumer, producer and admin APIs.
+
 ### Diagnostics
 
 The client depends on no telemetry library. `src/diagnostics.ts` defines tracing channels (send, produce request, handler call, offset commit, rebalance) and `Producer.metrics()` / `Consumer.metrics()` return what is waiting inside. Rules for adding to it:

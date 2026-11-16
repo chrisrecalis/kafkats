@@ -20,7 +20,7 @@ export { codec, string, json, buffer } from '@/codec.js'
 export type { Codec } from '@/codec.js'
 
 // Producer
-export { Producer } from '@/producer/index.js'
+export { Producer, murmur2, toPositive } from '@/producer/index.js'
 export type {
 	ProducerConfig,
 	ProducerMessage,
@@ -31,6 +31,14 @@ export type {
 	PartitionerName,
 	PartitionerFunction,
 	ProducerMetrics,
+	ProducerCallOptions,
+	DisconnectOptions,
+	ProducerTransaction,
+	TransactionHandle,
+	TransactionOptions,
+	BeginTransactionOptions,
+	TransactionState,
+	SendOffsetsParams,
 } from '@/producer/index.js'
 
 // Consumer
@@ -60,6 +68,15 @@ export type {
 	ShareConsumerEvents,
 	ConsumerMetrics,
 	ConsumerPartitionMetrics,
+	ConsumerEvents,
+	TopicPartitionOffset,
+	CommitOffset,
+	CommittedOffset,
+	AssignedPartition,
+	AutoOffsetReset,
+	OffsetResetPolicy,
+	OffsetResetEvent,
+	OffsetRequestOptions,
 } from '@/consumer/index.js'
 
 // Admin
@@ -76,6 +93,9 @@ export type {
 	BrokerDescription,
 	CreateTopicsResult,
 	DeleteTopicsResult,
+	RecordsToDelete,
+	DeleteRecordsOptions,
+	DeleteRecordsResult,
 	DeleteGroupsResult,
 	// ACL types
 	AclBinding,
