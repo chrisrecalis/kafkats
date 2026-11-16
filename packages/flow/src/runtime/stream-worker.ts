@@ -39,6 +39,8 @@ export type WorkerDeps = {
 	checkpoints: Checkpoints
 	status: AppStatus
 	logger: Logger
+	/** The worker failed with an error that is not retried: the whole app stops (see FlowAppImpl.halt). */
+	onFatal: (error: Error) => void
 }
 
 /**
@@ -179,7 +181,9 @@ export class StreamWorker {
 			}
 			if (!failure.recoverable || config.restartOnError === false) {
 				logger.error('stream worker failed', { worker: worker.id, error: failure.error.message })
-				status.state = 'ERROR'
+				// Another worker would be assigned this one's partitions and fail on the same
+				// record: the whole app stops, like Kafka Streams does by default.
+				this.deps.onFatal(failure.error)
 				return
 			}
 

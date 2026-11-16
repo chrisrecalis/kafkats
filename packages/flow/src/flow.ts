@@ -118,6 +118,7 @@ class FlowAppImpl implements FlowApp {
 			checkpoints: this.checkpoints,
 			status,
 			logger,
+			onFatal: error => this.halt(error),
 		})
 		this.output = new RecordOutput(client, this.eosEnabled)
 		this.builder = {
@@ -308,9 +309,10 @@ class FlowAppImpl implements FlowApp {
 	}
 
 	/**
-	 * A failure outside the stream workers that processing must not continue past (a global table
-	 * that can no longer be followed). While starting, start() fails with it. Afterwards the workers
-	 * are stopped for good and the app reports 'ERROR' until it is closed.
+	 * A failure that processing must not continue past: a worker failed with an error that is not
+	 * retried, or a global table can no longer be followed. While starting, start() fails with it.
+	 * Afterwards every worker is stopped for good and the app reports 'ERROR' until it is closed
+	 * (what Kafka Streams does by default: SHUTDOWN_CLIENT).
 	 */
 	private halt(error: Error): void {
 		const status = this.status

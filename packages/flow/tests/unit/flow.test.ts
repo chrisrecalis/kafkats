@@ -390,6 +390,24 @@ describe('flow', () => {
 		await app.close()
 	})
 
+	it('stops every worker when one of them fails with an error that is not retried', async () => {
+		const { app, consumers } = createTestApp({ numStreamThreads: 2 })
+		app.stream('events').mapValues(() => {
+			throw new Error('bug in a mapper')
+		})
+		await app.start()
+		const stopped = consumers.map(consumer => new Promise<void>(resolve => consumer.once('stopped', resolve)))
+
+		await consumers[0]!.emitMessage('events', Buffer.from('x')).catch(() => {})
+
+		// The other worker would take over the failed worker's partitions and run into the same
+		// record; like Kafka Streams by default, the whole app stops instead.
+		await Promise.all(stopped)
+		await vi.waitFor(() => expect(app.state()).toBe('ERROR'))
+		expect(app.getError()?.message).toBe('bug in a mapper')
+		await app.close()
+	})
+
 	it('spawns one worker per stream thread', async () => {
 		const { app, consumers, producers, producerConfigs } = createTestApp({
 			numStreamThreads: 2,

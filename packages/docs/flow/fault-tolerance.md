@@ -47,7 +47,7 @@ A worker (one per `numStreamThreads`) that hits a failure **never continues past
 | Failure                                                                                        | What happens                                                                                                           |
 | ---------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
 | **Recoverable**: broker or network errors, failed commits, lost sessions, restore failures     | The worker aborts its transaction, drops buffered state, rejoins the group and resumes from the last committed offsets |
-| **Not retried**: errors thrown by your code (mappers, aggregators, codecs), fatal Kafka errors | `state()` becomes `'ERROR'` and the worker stays stopped                                                               |
+| **Not retried**: errors thrown by your code (mappers, aggregators, codecs), fatal Kafka errors | `state()` becomes `'ERROR'` and every worker stops                                                                     |
 
 Fatal Kafka errors are: fenced static group member, authorization failures, unsupported version, invalid session timeout or config, inconsistent group protocol, and message too large.
 
@@ -64,6 +64,8 @@ const app = flow({
 A transaction that stays open longer than `producer.transactionTimeoutMs` (a stalled broker, a frozen process) is aborted by the broker. The worker treats the resulting fenced-producer error as recoverable: it starts again with a fresh producer and reprocesses from the committed offsets.
 
 If the brokers are unreachable, workers keep retrying until they are back. `close()` stays bounded in that case, but it can take up to the request timeout plus a few seconds, because the final commit is attempted first.
+
+An error that is not retried stops the whole app, not only the worker that hit it: with several stream threads, another worker would be assigned the failed worker's partitions and fail on the same record. This is what Kafka Streams does by default.
 
 When the app is in `'ERROR'`, `app.getError()` returns the error. The records that were not committed are processed again after you restart the app:
 
@@ -97,7 +99,7 @@ A crashed instance leaves its last transaction open until the broker aborts it a
 | `CREATED`     | Created, `start()` not called yet                                                                                                            |
 | `RUNNING`     | Started and processing                                                                                                                       |
 | `REBALANCING` | A rebalance is in progress, or a worker is waiting to restart after a recoverable failure. Returns to `RUNNING` once partitions are assigned |
-| `ERROR`       | A worker stopped on an error that is not retried (or `restartOnError` is `false`), or `start()` failed. Check `getError()`                   |
+| `ERROR`       | Processing stopped on an error that is not retried (or `restartOnError` is `false`), or `start()` failed. Check `getError()`                 |
 | `STOPPED`     | `close()` completed                                                                                                                          |
 
 ## State Restoration
