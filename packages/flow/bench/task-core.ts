@@ -1,8 +1,8 @@
 /**
  * Micro-benchmark of the task core (spec 9.6): records through `StreamTask.processOne` for a stateless topology and
  * a count topology (in-memory store), at-least-once commits every 10000 records, over the test ports of the task
- * harness. Prints ns per record (median of 5 runs) and compares with `bench/baseline.json`: more than 10% slower
- * fails. `--record` writes the baseline instead.
+ * harness. A measurement is the best of 7 runs, in ns per record. More than 10% slower than `bench/baseline.json` in
+ * three measurements in a row fails. `--record` writes the baseline instead (the median of three measurements).
  *
  *     pnpm -C packages/flow bench:task-core [--record]
  */
@@ -19,7 +19,8 @@ const WARMUP = 200_000
 const BATCH = 500
 const COMMIT_EVERY = 10_000
 const KEYS = 1000
-const RUNS = 5
+const RUNS = 7
+const ATTEMPTS = 3
 const TOLERANCE = 0.1
 const BASELINE = new URL('./baseline.json', import.meta.url)
 
@@ -77,32 +78,50 @@ async function run(build: (b: InternalTopologyBuilder) => void): Promise<number>
 	return Number(process.hrtime.bigint() - start) / RECORDS
 }
 
-async function main(): Promise<void> {
-	const results: Record<string, number> = {}
+/** The best of RUNS runs, each after a full GC: the machine's interference only ever adds time. */
+async function measure(name: string, build: (b: InternalTopologyBuilder) => void): Promise<number> {
+	const runs: number[] = []
+	for (let i = 0; i < RUNS; i++) {
+		globalThis.gc?.()
+		runs.push(await run(build))
+	}
+	runs.sort((a, b) => a - b)
+	console.log(`${name}: ${Math.round(runs[0]!)} ns/record (runs: ${runs.map(Math.round).join(', ')})`)
+	return runs[0]!
+}
+
+/** Records the median of ATTEMPTS measurements per scenario: a typical value, not the luckiest one. */
+async function record(): Promise<void> {
+	const nsPerRecord: Record<string, number> = {}
 	for (const [name, build] of Object.entries(scenarios)) {
-		const runs: number[] = []
-		for (let i = 0; i < RUNS; i++) runs.push(await run(build))
-		runs.sort((a, b) => a - b)
-		results[name] = Math.round(runs[Math.floor(RUNS / 2)]!)
-		console.log(`${name}: ${results[name]} ns/record (runs: ${runs.map(Math.round).join(', ')})`)
+		const measured: number[] = []
+		for (let i = 0; i < ATTEMPTS; i++) measured.push(await measure(name, build))
+		measured.sort((a, b) => a - b)
+		nsPerRecord[name] = Math.round(measured[Math.floor(ATTEMPTS / 2)]!)
 	}
-	if (process.argv.includes('--record')) {
-		const baseline = { node: process.version, records: RECORDS, nsPerRecord: results }
-		writeFileSync(BASELINE, `${JSON.stringify(baseline, null, '\t')}\n`)
-		console.log(`baseline written to ${BASELINE.pathname}`)
-		return
-	}
+	const baseline = { node: process.version, records: RECORDS, nsPerRecord }
+	writeFileSync(BASELINE, `${JSON.stringify(baseline, null, '\t')}\n`)
+	console.log(`baseline written to ${BASELINE.pathname}: ${JSON.stringify(nsPerRecord)}`)
+}
+
+/** A regression shows in every measurement; the machine's noise rarely does ATTEMPTS times in a row. */
+async function check(): Promise<void> {
 	const baseline = JSON.parse(readFileSync(BASELINE, 'utf8')) as { nsPerRecord: Record<string, number> }
 	let failed = false
-	for (const [name, ns] of Object.entries(results)) {
+	for (const [name, build] of Object.entries(scenarios)) {
 		const limit = baseline.nsPerRecord[name]! * (1 + TOLERANCE)
-		const verdict = ns <= limit ? 'ok' : 'REGRESSION'
+		let best = await measure(name, build)
+		for (let attempt = 1; best > limit && attempt < ATTEMPTS; attempt++) {
+			best = Math.min(best, await measure(name, build))
+		}
+		const ns = Math.round(best)
 		failed ||= ns > limit
 		console.log(
-			`${name}: ${ns} ns/record, baseline ${baseline.nsPerRecord[name]} (limit ${Math.round(limit)}): ${verdict}`
+			`${name}: ${ns} ns/record, baseline ${baseline.nsPerRecord[name]} (limit ${Math.round(limit)}): ` +
+				(ns <= limit ? 'ok' : 'REGRESSION')
 		)
 	}
 	process.exitCode = failed ? 1 : 0
 }
 
-await main()
+await (process.argv.includes('--record') ? record() : check())

@@ -15,6 +15,9 @@ import { raceSignal } from '@/runtime/signals.js'
 import { tpKey } from '@/runtime/task-id.js'
 import type { StreamTask } from '@/runtime/task.js'
 
+/** The input record a task was processing when it sent. */
+type Input = StreamTask['input']
+
 export interface RecordCollectorOptions {
 	readonly eos: boolean
 	readonly handlers: ResolvedHandlers
@@ -211,6 +214,8 @@ export class RecordCollector {
 			})
 		}
 		task.markCommitNeeded()
+		// KS reports a failed send with the record context of the send, not of the ack.
+		const { input } = task
 		const { generation } = this
 		generation.sent()
 		sent.then(
@@ -223,7 +228,7 @@ export class RecordCollector {
 			(error: unknown) => {
 				if (generation === this.generation) {
 					try {
-						this.sendFailed(task, kind, record, error)
+						this.sendFailed(task, input, kind, record, error)
 					} catch (failure) {
 						generation.failure ??= { error: failure }
 					}
@@ -250,7 +255,7 @@ export class RecordCollector {
 	 * Classifies a send that failed after the producer's retries (KS `RecordCollectorImpl.recordSendError`). Returns
 	 * to drop the record; throws a run-wide failure, which the next flush reports.
 	 */
-	private sendFailed(task: StreamTask, kind: SendKind, record: CollectedRecord, error: unknown): void {
+	private sendFailed(task: StreamTask, input: Input, kind: SendKind, record: CollectedRecord, error: unknown): void {
 		const { eos } = this.options
 		if (isFencedError(error)) {
 			throw new TaskMigratedError(`the producer was fenced while sending to '${record.topic}'`, { cause: error })
@@ -274,7 +279,8 @@ export class RecordCollector {
 		}
 		applyHandler(
 			() => {
-				const response = this.options.handlers.production(handlerContext(task, record), record, error, 'send')
+				const ctx = handlerContext(task, input, record)
+				const response = this.options.handlers.production(ctx, record, error, 'send')
 				// A dropped changelog record would make the store diverge from its changelog.
 				return kind === 'changelog' && response === 'continue' ? 'fail' : response
 			},
@@ -290,17 +296,17 @@ export class RecordCollector {
 	}
 }
 
-/** The failure is reported after the record's processing ended: the input record is not known any more. */
-function handlerContext(task: StreamTask, record: CollectedRecord): ErrorHandlerContext {
+/** The input record of the send (null from init() and punctuators) and the record at the sink. */
+function handlerContext(task: StreamTask, input: Input, record: CollectedRecord): ErrorHandlerContext {
 	return {
-		topic: null,
-		partition: -1,
-		offset: -1n,
+		topic: input?.topic ?? null,
+		partition: input?.partition ?? -1,
+		offset: input?.offset ?? -1n,
 		headers: record.headers ?? {},
 		timestamp: record.timestamp ?? -1,
 		processorNodeId: null,
 		taskId: task.id,
-		sourceRawKey: null,
-		sourceRawValue: null,
+		sourceRawKey: input?.key ?? null,
+		sourceRawValue: input?.value ?? null,
 	}
 }

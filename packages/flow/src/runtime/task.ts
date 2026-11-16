@@ -143,6 +143,11 @@ export class StreamTask {
 		return this.group.streamTime
 	}
 
+	/** The input record being processed (what a send failure is reported with); null in init() and punctuators. */
+	get input(): Message<Buffer | null, Buffer> | null {
+		return this.topology?.context.input ?? null
+	}
+
 	// ---------------------------------------------------------------------------------------------------------
 	// Lifecycle
 	// ---------------------------------------------------------------------------------------------------------

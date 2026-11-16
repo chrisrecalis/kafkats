@@ -74,15 +74,11 @@ export class TaskTopology {
 		})
 		const { processing, production } = deps.handlers
 		const nodes = new Map<string, AnyNode>()
-		const sources = new Map<string, AnyNode[]>()
 		for (const def of task.subtopology.nodes) {
 			let node: AnyNode
 			if (def.kind === 'source') {
 				const ctx = new ProcessorContextImpl<unknown, unknown>(context, def.name)
 				node = new SourceNode<unknown, unknown>(def, ctx, processingErrorRoute(processing, ctx))
-				for (const topic of def.topics) {
-					sources.set(topic, [...(sources.get(topic) ?? []), node])
-				}
 			} else if (def.kind === 'processor') {
 				const ctx = new ProcessorContextImpl<unknown, unknown>(context, def.name, def.stores)
 				node = new ProcessorNode(def.name, def.supplier(), ctx, processingErrorRoute(processing, ctx))
@@ -97,6 +93,14 @@ export class TaskTopology {
 				}
 			}
 			nodes.set(def.name, node)
+		}
+		// The order the record queues decode in.
+		const sources = new Map<string, AnyNode[]>()
+		for (const [topic, defs] of task.subtopology.sourcesByTopic) {
+			sources.set(
+				topic,
+				defs.map(def => nodes.get(def.name)!)
+			)
 		}
 		topology = new TaskTopology(context, [...nodes.values()], sources, deps.stores)
 		return topology

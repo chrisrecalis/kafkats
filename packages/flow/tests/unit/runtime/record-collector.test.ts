@@ -158,6 +158,29 @@ describe('RecordCollector at-least-once', () => {
 		expect(h.logger.warnings).toContain('dropped a record whose send failed')
 	})
 
+	it('the production handler sees the input record the task was processing when it sent (KS)', async () => {
+		const seen: ErrorHandlerContext[] = []
+		const h = new TaskHarness({
+			build: b => pipe(b, { processor: passThrough }),
+			handlers: { production: ctx => (seen.push(ctx), 'continue') },
+		})
+		h.producer.answer = () => Promise.reject(new RecordTooLargeError('output', 0, 2, 1))
+		const task = await running(h)
+		h.enqueue(task, 'input', [{ key: 'k', value: 'v', timestamp: 7 }], 0)
+		await h.process(task)
+		await h.collector.flush(signal())
+		expect(seen).toEqual([
+			expect.objectContaining({
+				topic: 'input',
+				partition: 0,
+				offset: 0n,
+				timestamp: 7,
+				sourceRawKey: Buffer.from('k'),
+				sourceRawValue: Buffer.from('v'),
+			}),
+		])
+	})
+
 	for (const [name, production, kind] of [
 		["'fail'", () => 'fail', 'sink'],
 		[

@@ -63,13 +63,13 @@ describe('CommitCoordinator at-least-once (4.8.1)', () => {
 		expect(h.commits.committedOnce).toBe(true)
 	})
 
-	it("nothing to commit: 'nothing', no offset commit", async () => {
+	it("nothing to commit: 'nothing', no offset commit and no checkpoint", async () => {
 		const { h } = await setup()
 		await h.commit()
 		h.events.length = 0
 		h.clock.advance(10)
 		expect(await h.commit()).toBe('nothing')
-		expect(h.events).toEqual(['flush', 'checkpoints.flush'])
+		expect(h.events).toEqual(['flush'])
 		expect(h.commits.lastCommitAt).toBe(h.clock.now())
 	})
 
@@ -120,6 +120,21 @@ describe('CommitCoordinator at-least-once (4.8.1)', () => {
 		h.consumer.answerCommit = (_offsets, signal) =>
 			new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason)))
 		expect(await h.commits.commit('interval', AbortSignal.timeout(5))).toBe('deferred')
+	})
+
+	it('the commit deadline passing during the flush defers an interval commit; the sends stay pending', async () => {
+		const { h, tasks } = await setup()
+		let ack!: () => void
+		h.producer.answer = (topic, message) =>
+			new Promise(resolve => (ack = () => resolve(h.producer.ack(topic, message))))
+		h.enqueue(tasks[0]!, 'input', [{ key: 'k', value: 'slow', timestamp: 2 }])
+		await h.process(tasks[0]!)
+		expect(await h.commits.commit('interval', AbortSignal.timeout(5))).toBe('deferred')
+		expect(h.consumer.commits).toEqual([])
+		await expect(h.commits.commit('revocation', AbortSignal.timeout(5))).rejects.toThrow()
+		ack()
+		expect(await h.commit()).toBe('committed')
+		expect(h.consumer.commits).toEqual([[expect.objectContaining({ offset: 2n })]])
 	})
 
 	it('a rebalance at a revocation commit leaves the offsets uncommitted but writes the checkpoints', async () => {
@@ -175,6 +190,40 @@ describe('CommitCoordinator at-least-once (4.8.1)', () => {
 		expect(h.consumer.commits).toEqual([[expect.objectContaining({ partition: 1 })]])
 		expect(h.state(a).checkpoints).toEqual([])
 		expect(h.state(b).checkpoints).toHaveLength(1)
+	})
+
+	it('a deferred commit reports the corrupted tasks at once: the flush reported them only once', async () => {
+		const { h, tasks } = await setup({ tasks: 2 })
+		const [a] = tasks as [StreamTask, StreamTask]
+		const flush = h.collector.flush
+		h.collector.flush = async signal => {
+			await flush(signal)
+			return { corrupted: new Set([a]) }
+		}
+		h.consumer.answerCommit = () => Promise.reject(new TimeoutError('commit', 10_000))
+		const start = h.commits.lastSuccessAt
+		h.clock.advance(10)
+		const failure = await h.commit().catch((e: unknown) => e)
+		expect(failure).toBeInstanceOf(TaskCorruptedError)
+		expect((failure as TaskCorruptedError).tasks).toEqual([a.id])
+		// The other task commits at the next interval.
+		expect(h.commits.lastCommitAt).toBe(start + 10)
+		expect(h.commits.lastSuccessAt).toBe(start)
+		expect(tasks.map(t => h.state(t).checkpoints)).toEqual([[], []])
+	})
+
+	it('a task lost or suspended since its sends failed is not reported as corrupted', async () => {
+		const { h, tasks } = await setup({ tasks: 3 })
+		const [a, b, c] = tasks as [StreamTask, StreamTask, StreamTask]
+		const flush = h.collector.flush
+		h.collector.flush = async signal => {
+			await flush(signal)
+			return { corrupted: new Set([b, c]) }
+		}
+		b.markLost()
+		await c.suspend()
+		expect(await h.commit()).toBe('committed')
+		expect(h.consumer.commits).toEqual([[expect.objectContaining({ partition: a.partition })]])
 	})
 
 	it('a revocation commits a task whose fetch position moved past its last commit (CR13, markers)', async () => {

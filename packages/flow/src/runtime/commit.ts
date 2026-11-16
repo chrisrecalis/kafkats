@@ -72,7 +72,7 @@ export class CommitCoordinator {
 		if (this.deps.failed()) {
 			return 'nothing'
 		}
-		if ((reason === 'interval' || reason === 'user') && this.deps.consumer.rebalancePending) {
+		if (isPeriodic(reason) && this.deps.consumer.rebalancePending) {
 			return 'skipped'
 		}
 		const tasks = this.deps.tasks().filter(task => task.state === 'RUNNING' && !task.lost)
@@ -87,9 +87,24 @@ export class CommitCoordinator {
 	): Promise<CommitOutcome> {
 		const { consumer } = this.deps
 		const collector = this.deps.collector()
-		const { corrupted } = await collector.flush(signal)
+		let flushed: { corrupted: ReadonlySet<StreamTask> }
+		try {
+			flushed = await collector.flush(signal)
+		} catch (error) {
+			// Only the commit's own deadline passed: the sends stay pending, the next interval waits for them again.
+			if (isPeriodic(reason) && timedOut(signal)) {
+				return this.defer(error)
+			}
+			throw error
+		}
+		// Their local state is revived from the last commit: no checkpoint. A task closed or lost since its send
+		// failed is not reported: its next incarnation or owner redoes its work anyway.
+		for (const task of flushed.corrupted) {
+			collector.takeChangelogOffsets(task)
+		}
+		const corrupted = tasks.filter(task => flushed.corrupted.has(task))
 		const next = this.next
-		const committing = tasks.filter(task => !corrupted.has(task) && task.needsCommit(next))
+		const committing = tasks.filter(task => !flushed.corrupted.has(task) && task.needsCommit(next))
 		const offsets = committing.flatMap(task => task.committableOffsets(next))
 		let acknowledged = offsets
 		if (offsets.length > 0) {
@@ -97,21 +112,21 @@ export class CommitCoordinator {
 				await consumer.commit(offsets, { signal })
 			} catch (error) {
 				const outcome = this.offsetCommitFailed(reason, error, signal, committing)
+				if (outcome === 'deferred') {
+					// The flush reported the corruption once: it must not wait for the next interval.
+					throwIfCorrupted(corrupted)
+				}
 				if (outcome !== undefined) {
 					return outcome
 				}
 				acknowledged = []
 			}
 		}
-		for (const task of corrupted) {
-			collector.takeChangelogOffsets(task)
+		if (committing.length > 0) {
+			await this.postCommit(committing, task => collector.takeChangelogOffsets(task), acknowledged)
 		}
-		await this.postCommit(committing, task => collector.takeChangelogOffsets(task), acknowledged)
 		this.succeeded(acknowledged)
-		if (corrupted.size > 0) {
-			const ids = [...corrupted].map(task => task.id)
-			throw new TaskCorruptedError(`sends of tasks ${ids.map(id => id.key).join(', ')} failed`, ids)
-		}
+		throwIfCorrupted(corrupted)
 		return committing.length > 0 ? 'committed' : 'nothing'
 	}
 
@@ -127,16 +142,9 @@ export class CommitCoordinator {
 		committing: readonly StreamTask[]
 	): CommitOutcome | undefined {
 		const rebalancing = error instanceof RebalanceInProgressError
-		if (reason === 'interval' || reason === 'user') {
+		if (isPeriodic(reason)) {
 			if (rebalancing || error instanceof TimeoutError || timedOut(signal)) {
-				// KS: retried at the next interval, so a stalled coordinator does not turn every loop into a barrier.
-				const now = this.deps.clock.now()
-				this.lastAttempt = now
-				if (now - this.lastSuccess > this.deps.config.taskTimeoutMs) {
-					throw new TaskMigratedError(`offset commits failed for more than taskTimeoutMs`, { cause: error })
-				}
-				this.deps.logger.debug('offset commit deferred to the next interval', { error: errorMessage(error) })
-				return 'deferred'
+				return this.defer(error)
 			}
 		} else if (rebalancing) {
 			this.deps.logger.warn(`a rebalance prevented the ${reason} offset commit: the next owner reprocesses`, {
@@ -148,6 +156,21 @@ export class CommitCoordinator {
 			return 'lost'
 		}
 		throw error
+	}
+
+	/**
+	 * An at-least-once interval or user commit that timed out or met a rebalance is retried at the next interval (KS),
+	 * so a stalled coordinator does not turn every loop into a barrier; after taskTimeoutMs without success the run
+	 * migrates.
+	 */
+	private defer(error: unknown): 'deferred' {
+		const now = this.deps.clock.now()
+		this.lastAttempt = now
+		if (now - this.lastSuccess > this.deps.config.taskTimeoutMs) {
+			throw new TaskMigratedError('offset commits failed for more than taskTimeoutMs', { cause: error })
+		}
+		this.deps.logger.debug('offset commit deferred to the next interval', { error: errorMessage(error) })
+		return 'deferred'
 	}
 
 	/** Exactly-once: one transaction for all tasks (4.8.2). */
@@ -189,7 +212,7 @@ export class CommitCoordinator {
 		const failure = applied.find(result => result.status === 'rejected')
 		if (failure) {
 			// The store is behind the committed changelog: only a restore repairs it, so every buffer goes.
-			for (const task of tasks) {
+			for (const task of this.deps.tasks()) {
 				task.discardBuffers()
 			}
 			throw failure.reason
@@ -249,6 +272,19 @@ export class CommitCoordinator {
 	}
 
 	private readonly next = (tp: TopicPartition): bigint | undefined => this.deps.consumer.nextOffset(tp)
+}
+
+/** Commits at the interval or on request, as opposed to the ones a rebalance or a close needs now. */
+function isPeriodic(reason: CommitReason): boolean {
+	return reason === 'interval' || reason === 'user'
+}
+
+/** Tasks whose at-least-once sends failed with a retriable error are revived in place (KS TaskCorruptedException). */
+function throwIfCorrupted(tasks: readonly StreamTask[]): void {
+	if (tasks.length > 0) {
+		const ids = tasks.map(task => task.id)
+		throw new TaskCorruptedError(`sends of tasks ${ids.map(id => id.key).join(', ')} failed`, ids)
+	}
 }
 
 /** The commit's own deadline passed (not the run's hard stop). */

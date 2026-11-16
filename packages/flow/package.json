@@ -72,7 +72,7 @@
 		"test:integration": "vitest run -c vitest.integration.config.ts",
 		"test:unit": "vitest run tests/unit",
 		"typecheck": "tsc -p tsconfig.json --noEmit",
-		"bench:task-core": "tsx bench/task-core.ts",
+		"bench:task-core": "tsx --expose-gc bench/task-core.ts",
 		"clean": "rm -rf dist",
 		"prepack": "pnpm -w turbo run build --filter=$npm_package_name"
 	},

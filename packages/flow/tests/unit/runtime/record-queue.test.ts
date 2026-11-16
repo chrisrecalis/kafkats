@@ -125,6 +125,15 @@ describe('RecordQueue', () => {
 		])
 	})
 
+	it('each source node gets its own decoded objects, also with the same codecs', () => {
+		const codec = json<{ n: number }>()
+		const { q } = queue({ sources: [source('a', { valueCodec: codec }), source('b', { valueCodec: codec })] })
+		q.addRawRecords([message('t', 0, 0n, { key: 'k', value: '{"n":1}' })])
+		const head = stamped(q.poll())
+		expect(head.more).toEqual([{ key: 'k', value: { n: 1 } }])
+		expect(head.more![0]!.value).not.toBe(head.value)
+	})
+
 	it('one source node: no other decodings', () => {
 		const { q } = queue()
 		q.addRawRecords(batch(0, [1]))

@@ -59,8 +59,6 @@ export class RecordQueue {
 	private pending = 0
 	private headRecord: StampedRecord | SkipMarker | null = null
 	private readonly rule: TimestampRule | undefined
-	/** Every source of the topic decodes with the same codecs: decode once. */
-	private readonly sameCodecs: boolean
 
 	constructor(
 		readonly tp: TopicPartition,
@@ -74,8 +72,6 @@ export class RecordQueue {
 			throw new IllegalStateError(`no source node reads '${tp.topic}'`)
 		}
 		this.rule = builtInRule(extractor)
-		const [first] = sources
-		this.sameCodecs = sources.every(s => s.keyCodec === first!.keyCodec && s.valueCodec === first!.valueCodec)
 	}
 
 	/** O(1): the batch is kept, not copied. Returns the queue size after the add. */
@@ -184,19 +180,18 @@ export class RecordQueue {
 		}
 	}
 
-	/** Undefined: the deserialization handler answered 'continue' (the record is skipped). */
+	/**
+	 * Decodes for every source node of the topic, each its own objects (a processor may mutate what it gets).
+	 * Undefined: the deserialization handler answered 'continue' (the record is skipped).
+	 */
 	private decode(message: Message<Buffer, Buffer>): Decoded | undefined {
 		const { sources } = this
 		let source = sources[0]!
 		try {
 			const key = decode(message.key, source.keyCodec)
 			const value = decode(message.value, source.valueCodec)
-			if (this.sameCodecs) {
-				return {
-					key,
-					value,
-					more: sources.length > 1 ? sources.slice(1).map(() => ({ key, value })) : undefined,
-				}
+			if (sources.length === 1) {
+				return { key, value }
 			}
 			const more: { key: unknown; value: unknown }[] = []
 			for (let i = 1; i < sources.length; i++) {
