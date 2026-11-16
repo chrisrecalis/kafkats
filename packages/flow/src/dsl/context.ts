@@ -26,7 +26,11 @@ export class DslContext {
 	 * The stream of a topic's records (`app.stream()`, and the read-back of repartition and through topics). Missing
 	 * codecs read raw Buffers.
 	 */
-	stream<K, V>(topic: string, consumed: Consumed<K, V> = {}, internal: SourceDef['internal'] = false): KStreamImpl<K, V> {
+	stream<K, V>(
+		topic: string,
+		consumed: Consumed<K, V> = {},
+		internal: SourceDef['internal'] = false
+	): KStreamImpl<K, V> {
 		return new KStreamImpl(this, this.source(topic, consumed, internal), sourceFormat(consumed), false)
 	}
 

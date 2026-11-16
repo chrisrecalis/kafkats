@@ -49,7 +49,9 @@ export function resolveConfig(config: FlowConfig): AppSettings {
 	const consumer = config.consumer ?? {}
 	for (const key of OWNED_CONSUMER_KEYS) {
 		if (key in consumer) {
-			throw new FlowConfigError(`consumer.${key} cannot be set: flow uses the application id as the group and handles rebalances`)
+			throw new FlowConfigError(
+				`consumer.${key} cannot be set: flow uses the application id as the group and handles rebalances`
+			)
 		}
 	}
 	if (consumer.partitionAssignmentStrategy !== undefined && consumer.partitionAssignmentStrategy !== 'range') {
@@ -82,9 +84,17 @@ export function resolveConfig(config: FlowConfig): AppSettings {
 		taskTimeoutMs: integer('taskTimeoutMs', config.taskTimeoutMs ?? 300_000, 0),
 		startTimeoutMs: integer('startTimeoutMs', config.startTimeoutMs ?? 120_000, 1),
 		maxTaskIdleMs: integer('maxTaskIdleMs', config.maxTaskIdleMs ?? 0, -1),
-		bufferedRecordsPerPartition: integer('bufferedRecordsPerPartition', config.bufferedRecordsPerPartition ?? 1000, 1),
+		bufferedRecordsPerPartition: integer(
+			'bufferedRecordsPerPartition',
+			config.bufferedRecordsPerPartition ?? 1000,
+			1
+		),
 		emitIntervalMs: EMIT_INTERVAL_MS,
-		repartitionPurgeIntervalMs: integer('repartitionPurgeIntervalMs', config.repartitionPurgeIntervalMs ?? 30_000, 0),
+		repartitionPurgeIntervalMs: integer(
+			'repartitionPurgeIntervalMs',
+			config.repartitionPurgeIntervalMs ?? 30_000,
+			0
+		),
 		transactionTimeoutMs,
 		rebalanceTimeoutMs: integer(
 			'consumer.rebalanceTimeoutMs',
@@ -150,7 +160,9 @@ function uncaughtHandler(option: FlowConfig['uncaughtExceptionHandler']): Resolv
 	}
 	const response: UncaughtExceptionResponse = option ?? 'shutdown'
 	if (response !== 'shutdown' && response !== 'restart') {
-		throw new FlowConfigError(`uncaughtExceptionHandler must be 'shutdown', 'restart' or a function, got ${String(response)}`)
+		throw new FlowConfigError(
+			`uncaughtExceptionHandler must be 'shutdown', 'restart' or a function, got ${String(response)}`
+		)
 	}
 	return () => response
 }
@@ -167,7 +179,9 @@ function guarantee(option: FlowConfig['processingGuarantee']): 'at_least_once' |
 function resetPolicy(option: unknown): ResetPolicy {
 	const value = option ?? 'earliest'
 	if (value !== 'earliest' && value !== 'latest' && value !== 'none') {
-		throw new FlowConfigError(`consumer.autoOffsetReset must be 'earliest', 'latest' or 'none', got ${String(value)}`)
+		throw new FlowConfigError(
+			`consumer.autoOffsetReset must be 'earliest', 'latest' or 'none', got ${String(value)}`
+		)
 	}
 	return value
 }

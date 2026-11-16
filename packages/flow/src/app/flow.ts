@@ -55,7 +55,10 @@ class FlowAppImpl implements FlowApp {
 		return table(this.dsl, ...resolveSource(source, options))
 	}
 
-	globalTable<K = Buffer, V = Buffer>(source: string | Topic<K, V>, options?: TableConsumed<K, V>): GlobalKTable<K, V> {
+	globalTable<K = Buffer, V = Buffer>(
+		source: string | Topic<K, V>,
+		options?: TableConsumed<K, V>
+	): GlobalKTable<K, V> {
 		return globalTable(this.dsl, ...resolveSource(source, options))
 	}
 
@@ -89,7 +92,10 @@ class FlowAppImpl implements FlowApp {
 }
 
 /** The topic name and its codecs: the options' first, then the Topic's. */
-function resolveSource<K, V, C extends Consumed<K, V>>(source: string | Topic<K, V>, options: C | undefined): [string, C] {
+function resolveSource<K, V, C extends Consumed<K, V>>(
+	source: string | Topic<K, V>,
+	options: C | undefined
+): [string, C] {
 	if (typeof source === 'string') {
 		return [source, options ?? ({} as C)]
 	}

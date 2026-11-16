@@ -13,7 +13,9 @@ const UNIT_MS: Readonly<Record<string, number>> = { ms: 1, s: 1000, m: 60_000, h
 export function durationMs(duration: WindowDuration): number {
 	const ms = typeof duration === 'number' ? duration : parseDuration(duration)
 	if (!Number.isSafeInteger(ms) || ms < 0) {
-		throw new TopologyError(`A duration must be a non-negative whole number of milliseconds, got ${String(duration)}`)
+		throw new TopologyError(
+			`A duration must be a non-negative whole number of milliseconds, got ${String(duration)}`
+		)
 	}
 	return ms
 }
@@ -21,7 +23,9 @@ export function durationMs(duration: WindowDuration): number {
 function parseDuration(duration: string): number {
 	const match = /^(\d+(?:\.\d+)?)(ms|s|m|h|d)$/.exec(duration)
 	if (!match) {
-		throw new TopologyError(`Invalid duration '${duration}': use milliseconds or a number with a unit (ms, s, m, h, d)`)
+		throw new TopologyError(
+			`Invalid duration '${duration}': use milliseconds or a number with a unit (ms, s, m, h, d)`
+		)
 	}
 	const ms = Number(match[1]) * UNIT_MS[match[2]!]!
 	// '1.1s' is 1100.0000000000002 in floating point.

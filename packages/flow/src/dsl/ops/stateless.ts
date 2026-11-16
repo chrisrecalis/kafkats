@@ -41,7 +41,11 @@ function add<K, V>(
 	return stream.ctx.processor(prefix, options?.name, [stream.node], supplier)
 }
 
-export function filter<K, V>(stream: KStreamImpl<K, V>, predicate: Predicate<K, V>, options?: NamedOptions): KStream<K, V> {
+export function filter<K, V>(
+	stream: KStreamImpl<K, V>,
+	predicate: Predicate<K, V>,
+	options?: NamedOptions
+): KStream<K, V> {
 	const node = add(stream, NodePrefix.FILTER, options, filterProcessor(predicate, false))
 	return new KStreamImpl<K, V>(stream.ctx, node, stream.format, stream.repartitionRequired)
 }
@@ -165,7 +169,8 @@ export function toStream<K, V, KR>(
 	mapperOrOptions?: ((key: K, value: V | null) => KR) | NamedOptions,
 	options?: NamedOptions
 ): KStream<K | KR, V> {
-	const mapper = typeof mapperOrOptions === 'function' ? (mapperOrOptions as (key: K, value: V | null) => KR) : undefined
+	const mapper =
+		typeof mapperOrOptions === 'function' ? (mapperOrOptions as (key: K, value: V | null) => KR) : undefined
 	const named = mapper === undefined ? (mapperOrOptions as NamedOptions | undefined) : options
 	const { ctx } = table
 	const node = ctx.processor(NodePrefix.TABLE_TO_STREAM, named?.name, [table.node], toStreamProcessor(mapper))

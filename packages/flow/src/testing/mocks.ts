@@ -4,7 +4,13 @@
  */
 import type { SendResult } from '@kafkats/client'
 import type { RecordHeaders } from '@/processor/record.js'
-import type { CommittedOffset, OffsetAndMetadata, ProducedMessage, ProducerPort, TransactionPort } from '@/runtime/io.js'
+import type {
+	CommittedOffset,
+	OffsetAndMetadata,
+	ProducedMessage,
+	ProducerPort,
+	TransactionPort,
+} from '@/runtime/io.js'
 import { tpKey } from '@/runtime/task-id.js'
 
 export interface TestRecord<K = unknown, V = unknown> {
@@ -100,23 +106,24 @@ export class MockProducer implements ProducerPort {
 	}
 }
 
-/** Sends records to the topology like a consumer would deliver them. */
-export interface MockConsumerOptions {
+/** A delivered record's key, partition (default 0), timestamp (default: the mock wall clock) and headers. */
+export interface SendOptions {
 	key?: Buffer | null
 	partition?: number
 	timestamp?: bigint | number
 	headers?: RecordHeaders
 }
 
+/** Sends records to the topology like a consumer would deliver them. */
 export class MockConsumer {
 	constructor(
-		private readonly deliver: (topic: string, value: Buffer | null, options: MockConsumerOptions) => Promise<void>,
+		private readonly deliver: (topic: string, value: Buffer | null, options: SendOptions) => Promise<void>,
 		/** The group's committed offsets by `topic:partition`. */
 		readonly committed: ReadonlyMap<string, CommittedOffset>
 	) {}
 
 	/** Delivers one record and processes everything it leads to. */
-	sendMessage(topic: string, value: Buffer | null, options: MockConsumerOptions = {}): Promise<void> {
+	sendMessage(topic: string, value: Buffer | null, options: SendOptions = {}): Promise<void> {
 		return this.deliver(topic, value, options)
 	}
 }

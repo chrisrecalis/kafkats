@@ -91,7 +91,10 @@ export class GlobalStores {
 			key = message.key === null ? null : (def.keyCodec?.decode(message.key) ?? message.key)
 			value = message.value === null ? null : (def.valueCodec?.decode(message.value) ?? message.value)
 		} catch (error) {
-			const ctx = { ...errorHandlerContext({ processorName: def.sourceName, taskId: GLOBAL_TASK }, null), topic: message.topic }
+			const ctx = {
+				...errorHandlerContext({ processorName: def.sourceName, taskId: GLOBAL_TASK }, null),
+				topic: message.topic,
+			}
 			const failure = `deserialization of a record of global topic '${message.topic}' failed`
 			applyHandler(() => handlers.deserialization(ctx, message, error), error, failure, GLOBAL_TASK)
 			return
@@ -138,7 +141,9 @@ async function open(def: GlobalStoreDef, deps: GlobalStoresDeps): Promise<Global
 /** Reads pass through; writes and lifecycle calls reject. */
 function readOnly(store: KeyValueStore<unknown, unknown>): KeyValueStore<unknown, unknown> {
 	const reject = (method: string) => () =>
-		Promise.reject(new IllegalStateError(`${method}() of global store '${store.name}': processors may only read it`))
+		Promise.reject(
+			new IllegalStateError(`${method}() of global store '${store.name}': processors may only read it`)
+		)
 	return {
 		name: store.name,
 		get: key => store.get(key),

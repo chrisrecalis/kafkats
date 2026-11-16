@@ -54,7 +54,10 @@ function* mapped<KIn, VIn, KOut, VOut>(
 	}
 }
 
-function* withValues<K, VIn, VOut>(record: StreamRecord<K, VIn>, values: Iterable<VOut>): Generator<StreamRecord<K, VOut>> {
+function* withValues<K, VIn, VOut>(
+	record: StreamRecord<K, VIn>,
+	values: Iterable<VOut>
+): Generator<StreamRecord<K, VOut>> {
 	for (const value of values) {
 		yield record.withValue(value)
 	}

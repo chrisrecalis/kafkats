@@ -27,7 +27,10 @@ export function table<K, V>(ctx: DslContext, topic: string, options: TableConsum
 }
 
 /** `KStream.toTable()`: repartitions first if the stream's keys changed upstream (6.0). */
-export function toTable<K, V>(stream: KStreamImpl<K, V>, options: Materialized<K, V> & NamedOptions = {}): KTable<K, V> {
+export function toTable<K, V>(
+	stream: KStreamImpl<K, V>,
+	options: Materialized<K, V> & NamedOptions = {}
+): KTable<K, V> {
 	const operator = 'toTable()'
 	const codecs = {
 		key: requireCodec(options.key, stream.format.keyCodec, 'key', operator),
