@@ -1,9 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { WindowedReduceNode, SessionReduceNode, SessionAggregateNode } from '../../src/processors/aggregation.js'
+import { WindowedReduceNode, SessionReduceNode, SessionAggregateNode } from '../../src/legacy/processors/aggregation.js'
 import type { SessionStore, WindowStore, WindowedKey } from '../../src/state.js'
 import { InMemorySessionStore } from '../../src/state/memory.js'
-import { ChangelogBackedSessionStore } from '../../src/state/changelog.js'
+import { ChangelogBackedSessionStore } from '../../src/legacy/state/changelog.js'
 import type { ChangelogWriter } from '../../src/changelog.js'
 
 const stringCodec = {

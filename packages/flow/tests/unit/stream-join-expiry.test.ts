@@ -4,8 +4,8 @@ import {
 	StreamStreamJoinNode,
 	StreamStreamLeftJoinNode,
 	StreamStreamOuterJoinNode,
-} from '@/processors/joins/stream-stream.js'
-import type { StreamRecord } from '@/processors/base.js'
+} from '@/legacy/processors/joins/stream-stream.js'
+import type { StreamRecord } from '@/legacy/processors/base.js'
 import type { WindowStore, WindowedKey } from '@/state.js'
 import { InMemoryWindowStore, codec } from '../../src/index.js'
 

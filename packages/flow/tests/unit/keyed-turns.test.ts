@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { KeyedTurns } from '../../src/runtime/keyed-turns.js'
+import { KeyedTurns } from '../../src/legacy/runtime/keyed-turns.js'
 
 const tick = () => new Promise<void>(resolve => setImmediate(resolve))
 

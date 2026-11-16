@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
 
-import { TableGroupByNode } from '@/processors/table.js'
+import { TableGroupByNode } from '@/legacy/processors/table.js'
 
 const DELTA_OP_HEADER = '__kafkats_delta_op'
 const DELTA_SUB_VALUE = 'sub'

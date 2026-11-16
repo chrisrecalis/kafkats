@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
 
-import { TableDeltaReduceNode, TableDeltaAggregateNode } from '@/processors/table.js'
-import type { StreamRecord } from '@/processors/base.js'
+import { TableDeltaReduceNode, TableDeltaAggregateNode } from '@/legacy/processors/table.js'
+import type { StreamRecord } from '@/legacy/processors/base.js'
 import type { KeyValueStore } from '@/state.js'
 
 const DELTA_OP_HEADER = '__kafkats_delta_op'

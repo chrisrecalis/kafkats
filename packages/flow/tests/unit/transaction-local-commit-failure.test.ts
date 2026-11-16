@@ -1,12 +1,12 @@
 import { describe, expect, it } from 'vitest'
 import type { ConsumeContext, Message, Producer } from '@kafkats/client'
 import { codec } from '../../src/index.js'
-import type { WorkerContext } from '../../src/processors/base.js'
-import { PendingCheckpoints, type Checkpoints } from '../../src/runtime/checkpoints.js'
-import { recordContextStorage } from '../../src/runtime/context.js'
+import type { WorkerContext } from '../../src/legacy/processors/base.js'
+import { PendingCheckpoints, type Checkpoints } from '../../src/legacy/runtime/checkpoints.js'
+import { recordContextStorage } from '../../src/legacy/runtime/context.js'
 import { PendingSends } from '../../src/runtime/pending-sends.js'
-import { WorkerTransactions } from '../../src/runtime/transactions.js'
-import { BufferedKeyValueStore } from '../../src/state/buffered.js'
+import { WorkerTransactions } from '../../src/legacy/runtime/transactions.js'
+import { BufferedKeyValueStore } from '../../src/legacy/state/buffered.js'
 import { InMemoryKeyValueStore } from '../../src/state/memory.js'
 
 const str = codec.string()

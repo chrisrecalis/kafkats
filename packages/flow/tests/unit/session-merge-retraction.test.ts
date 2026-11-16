@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest'
 
-import { SessionReduceNode, SessionAggregateNode } from '../../src/processors/aggregation.js'
-import { Processor, type StreamRecord } from '../../src/processors/base.js'
-import type { Windowed } from '../../src/types.js'
+import { SessionReduceNode, SessionAggregateNode } from '../../src/legacy/processors/aggregation.js'
+import { Processor, type StreamRecord } from '../../src/legacy/processors/base.js'
+import type { Windowed } from '../../src/legacy/types.js'
 import { InMemorySessionStore } from '../../src/state/memory.js'
 
 const stringCodec = {

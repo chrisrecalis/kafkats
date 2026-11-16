@@ -13,7 +13,7 @@ import {
 	ChangelogBackedKeyValueStore,
 	ChangelogBackedWindowStore,
 	ChangelogBackedSessionStore,
-} from '@/state/changelog.js'
+} from '@/legacy/state/changelog.js'
 import { InMemoryKeyValueStore, InMemoryWindowStore, InMemorySessionStore } from '@/state/memory.js'
 import { codec } from '@/codec.js'
 import type { WindowedKey } from '@/state.js'

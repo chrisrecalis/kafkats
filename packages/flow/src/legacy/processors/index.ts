@@ -1,0 +1,7 @@
+export * from '@/legacy/processors/base.js'
+export * from '@/legacy/processors/transform.js'
+export * from '@/legacy/processors/source-sink.js'
+export * from '@/legacy/processors/stream-time.js'
+export * from '@/legacy/processors/aggregation.js'
+export * from '@/legacy/processors/table.js'
+export * from '@/legacy/processors/joins/index.js'

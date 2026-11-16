@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
 
-import { WindowedAggregateNode, WindowedReduceNode } from '@/processors/aggregation.js'
+import { WindowedAggregateNode, WindowedReduceNode } from '@/legacy/processors/aggregation.js'
 import type { WindowStore, WindowedKey } from '@/state.js'
 
 function makeStubStore<K, A>() {

@@ -2,8 +2,8 @@ import { describe, expect, it, vi } from 'vitest'
 import { codec } from '../../src/index.js'
 import { windowedKeyCodec } from '../../src/changelog.js'
 import { InMemoryKeyValueStore, InMemorySessionStore, InMemoryWindowStore } from '../../src/state/memory.js'
-import { BufferedKeyValueStore, BufferedSessionStore, BufferedWindowStore } from '../../src/state/buffered.js'
-import { recordContextStorage, type RecordContext } from '../../src/runtime/context.js'
+import { BufferedKeyValueStore, BufferedSessionStore, BufferedWindowStore } from '../../src/legacy/state/buffered.js'
+import { recordContextStorage, type RecordContext } from '../../src/legacy/runtime/context.js'
 
 const str = codec.string()
 

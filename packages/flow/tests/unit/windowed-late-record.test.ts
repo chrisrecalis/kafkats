@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest'
 
-import { WindowedAggregateNode, SessionAggregateNode } from '@/processors/aggregation.js'
-import type { StreamRecord } from '@/processors/base.js'
+import { WindowedAggregateNode, SessionAggregateNode } from '@/legacy/processors/aggregation.js'
+import type { StreamRecord } from '@/legacy/processors/base.js'
 import type { SessionStore, WindowStore, WindowedKey } from '@/state.js'
 
 function rec(key: string, value: number, ts: number): StreamRecord<string, number> {

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
 
-import { WindowedAggregateNode } from '@/processors/aggregation.js'
+import { WindowedAggregateNode } from '@/legacy/processors/aggregation.js'
 import type { WindowStore, WindowedKey } from '@/state.js'
 
 describe('WindowedAggregateNode stream-time cleanup', () => {

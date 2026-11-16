@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { codec } from '../../src/index.js'
-import { WindowedAggregateNode } from '../../src/processors/aggregation.js'
-import type { StreamRecord, WorkerContext } from '../../src/processors/base.js'
+import { WindowedAggregateNode } from '../../src/legacy/processors/aggregation.js'
+import type { StreamRecord, WorkerContext } from '../../src/legacy/processors/base.js'
 import { InMemoryWindowStore } from '../../src/state/memory.js'
 
 const WINDOW_MS = 1_000
