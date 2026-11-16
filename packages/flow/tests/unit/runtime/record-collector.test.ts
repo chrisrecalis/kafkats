@@ -468,6 +468,24 @@ describe('RecordCollector exactly-once', () => {
 		expect(h.producer.transactions[1]!.sent).toHaveLength(1)
 	})
 
+	it('a commit that an abort took over meanwhile leaves the transaction opened after the abort', async () => {
+		const h = new TaskHarness({ build: b => pipe(b, { processor: passThrough }), eos: true })
+		await h.collector.ensureTransaction(signal())
+		const [first] = h.producer.transactions
+		let committed!: () => void
+		const commitCalled = new Promise<void>(called => {
+			first!.commit = () => (called(), new Promise<void>(resolve => (committed = resolve)))
+		})
+		const committing = h.collector.commitTransaction([], h.assignment!, signal())
+		await commitCalled
+		await h.collector.abortTransaction(signal())
+		await h.collector.ensureTransaction(signal())
+		committed()
+		await committing
+		expect(h.collector.transactionOpen).toBe(true)
+		expect(h.producer.transactions[1]!.state).toBe('open')
+	})
+
 	for (const [name, error, expected] of [
 		['a retriable failure', new ConnectionError('broker', 9092), TaskMigratedError],
 		['a fenced producer', new KafkaProtocolError(ErrorCode.InvalidProducerEpoch), TaskMigratedError],

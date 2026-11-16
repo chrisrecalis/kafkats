@@ -143,7 +143,10 @@ export class RecordCollector {
 			await raceSignal(transaction.sendOffsets({ consumerGroupMetadata: group, offsets }), signal)
 		}
 		await transaction.commit({ signal })
-		this.transaction = undefined
+		// An abort that took it over meanwhile may have let a new one open: that one stays.
+		if (this.transaction === transaction) {
+			this.transaction = undefined
+		}
 	}
 
 	/**
