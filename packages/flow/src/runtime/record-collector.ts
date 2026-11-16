@@ -4,12 +4,12 @@
  */
 import type { ConsumerGroupMetadata, Logger, SendResult } from '@kafkats/client'
 import { TransactionAbortedError } from '@kafkats/client'
-import { FailedProcessingError, IllegalStateError, TaskMigratedError } from '@/api/errors.js'
+import { FailedProcessingError, IllegalStateError, StreamsError, TaskMigratedError } from '@/api/errors.js'
 import type { ErrorHandlerContext } from '@/api/handlers.js'
 import { applyHandler } from '@/processor/node.js'
 import type { CollectedRecord, SendKind, TaskOutput } from '@/processor/output.js'
 import type { PartitionCountCache, ResolvedHandlers } from '@/runtime/config.js'
-import { errorMessage, isFencedError, isRetriableError } from '@/runtime/errors.js'
+import { errorMessage, isFatalSendError, isFencedError, isRetriableError } from '@/runtime/errors.js'
 import type { OffsetAndMetadata, ProducedMessage, ProducerPort, TransactionPort } from '@/runtime/io.js'
 import { raceSignal } from '@/runtime/signals.js'
 import { tpKey } from '@/runtime/task-id.js'
@@ -257,6 +257,12 @@ export class RecordCollector {
 	 */
 	private sendFailed(task: StreamTask, input: Input, kind: SendKind, record: CollectedRecord, error: unknown): void {
 		const { eos } = this.options
+		if (isFatalSendError(error)) {
+			throw new StreamsError(`sending to '${record.topic}' failed: no handler can make this send succeed`, {
+				cause: error,
+				taskId: task.id,
+			})
+		}
 		if (isFencedError(error)) {
 			throw new TaskMigratedError(`the producer was fenced while sending to '${record.topic}'`, { cause: error })
 		}

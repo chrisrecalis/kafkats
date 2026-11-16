@@ -452,10 +452,13 @@ describe('processing', () => {
 		const result = task.processOne(h.clock.now())
 		expect(result).toBeInstanceOf(Promise)
 		expect(task.needsCommit(() => undefined)).toBe(false)
+		expect(task.input).toMatchObject({ topic: 'input', partition: 0, offset: 0n })
 		release()
 		expect(await result).toBe(true)
 		expect(task.queueDrained).toBe(true)
 		expect(task.needsCommit(() => undefined)).toBe(true)
+		// The record context ends with the record (4.5.6): a later send is not reported with it.
+		expect(task.input).toBeNull()
 	})
 
 	it('every source node of the topic gets the record, in registration order', async () => {

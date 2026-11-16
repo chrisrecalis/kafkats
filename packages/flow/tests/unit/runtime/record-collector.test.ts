@@ -14,6 +14,7 @@ import type { ErrorHandlerContext, HandlerResponse, ProductionExceptionHandler }
 import { string } from '@/codec.js'
 import type { InternalProcessorContext, ProcessorContext } from '@/processor/api.js'
 import type { CollectedRecord, SendKind } from '@/processor/output.js'
+import { classify } from '@/runtime/errors.js'
 import { RecordCollector } from '@/runtime/record-collector.js'
 import type { StreamTask } from '@/runtime/task.js'
 import type { KeyValueStore } from '@/state.js'
@@ -207,6 +208,25 @@ describe('RecordCollector at-least-once', () => {
 		})
 	}
 
+	for (const code of [ErrorCode.TopicAuthorizationFailed, ErrorCode.InvalidTopicException]) {
+		it(`${ErrorCode[code]} is fatal whatever the production handler says (KS)`, async () => {
+			let handled = 0
+			const h = new TaskHarness({
+				build: b => pipe(b, { processor: passThrough }),
+				handlers: { production: () => (handled++, 'continue') },
+			})
+			const error = new KafkaProtocolError(code)
+			h.producer.answer = () => Promise.reject(error)
+			const task = await running(h)
+			send(h, task, 'sink')
+			const failure = await h.collector.flush(signal()).catch((e: unknown) => e)
+			expect(failure).toBeInstanceOf(StreamsError)
+			expect(classify(failure, 'commit')).toBe('fatal')
+			expect((failure as Error).cause).toBe(error)
+			expect(handled).toBe(0)
+		})
+	}
+
 	it('a fenced producer migrates the run', async () => {
 		const h = new TaskHarness({ build: b => pipe(b, { processor: passThrough }) })
 		h.producer.answer = () => Promise.reject(new ProducerFencedError(1n, 2))
@@ -395,6 +415,7 @@ describe('RecordCollector exactly-once', () => {
 			new RecordTooLargeError('output', 0, 2, 1),
 			FailedProcessingError,
 		],
+		['an authorization failure', new KafkaProtocolError(ErrorCode.TopicAuthorizationFailed), StreamsError],
 		['an aborted transaction', new TransactionAbortedError('tx'), TransactionAbortedError],
 	] as const) {
 		it(`${name} fails the run: ${expected.name}`, async () => {

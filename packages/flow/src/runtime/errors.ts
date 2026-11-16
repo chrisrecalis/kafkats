@@ -63,6 +63,22 @@ const FENCED_CODES: ReadonlySet<number> = new Set([
 	ErrorCode.InvalidProducerIdMapping,
 ])
 
+/**
+ * Send failures Kafka Streams never hands to the production handler (`RecordCollectorImpl.isFatalException`):
+ * authentication, authorization, an invalid topic, oversized commit metadata. No answer of the handler makes them
+ * succeed, and dropping every record that meets them would hide a misconfiguration behind a healthy-looking app.
+ */
+const FATAL_SEND_CODES: ReadonlySet<number> = new Set([
+	ErrorCode.TopicAuthorizationFailed,
+	ErrorCode.GroupAuthorizationFailed,
+	ErrorCode.ClusterAuthorizationFailed,
+	ErrorCode.TransactionalIdAuthorizationFailed,
+	ErrorCode.SaslAuthenticationFailed,
+	ErrorCode.SecurityDisabled,
+	ErrorCode.InvalidTopicException,
+	ErrorCode.OffsetMetadataTooLarge,
+])
+
 /** Errors no restart can fix: configuration, authorization, topology and user-code failures, bugs. */
 const FATAL_CLASSES = [
 	AssignmentError,
@@ -82,6 +98,10 @@ export function isFatalKafkaError(error: unknown): boolean {
 
 export function isFencedError(error: unknown): boolean {
 	return error instanceof KafkaError && FENCED_CODES.has(error.errorCode)
+}
+
+export function isFatalSendError(error: unknown): boolean {
+	return error instanceof KafkaError && FATAL_SEND_CODES.has(error.errorCode)
 }
 
 /** Failures that persisted through the producer's retries but may succeed later (connection, timeout, retriable). */

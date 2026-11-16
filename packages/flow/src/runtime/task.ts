@@ -143,7 +143,10 @@ export class StreamTask {
 		return this.group.streamTime
 	}
 
-	/** The input record being processed (what a send failure is reported with); null in init() and punctuators. */
+	/**
+	 * The input record being processed (what a send failure is reported with); null in init(), punctuators and between
+	 * records.
+	 */
 	get input(): Message<Buffer | null, Buffer> | null {
 		return this.topology?.context.input ?? null
 	}
@@ -552,7 +555,11 @@ export class StreamTask {
 		return position !== undefined && position > last!
 	}
 
+	/** The record (or the skipped ones) settled: its offset is consumed and its record context cleared. */
 	private processed(queue: RecordQueue, offset: bigint): void {
+		if (this.topology) {
+			this.topology.context.input = null
+		}
 		this.consumedOffsets.set(queue, offset)
 		this.commitNeeded = true
 		if (queue.size === 0) {

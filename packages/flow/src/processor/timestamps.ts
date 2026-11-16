@@ -1,3 +1,7 @@
+/**
+ * Timestamp extraction (KS `TimestampExtractor`): the extractor type and Kafka Streams' built-in extractors, which the
+ * record queue recognizes by identity and runs on the raw message.
+ */
 import { InvalidTimestampError } from '@/api/errors.js'
 import type { RecordHeaders } from '@/processor/record.js'
 

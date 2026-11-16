@@ -8,6 +8,7 @@ import {
 	NoOffsetForPartitionError,
 	ProducerFencedError,
 	RebalanceInProgressError,
+	RecordTooLargeError,
 	TimeoutError,
 	TransactionAbortedError,
 } from '@kafkats/client'
@@ -23,7 +24,14 @@ import {
 	TopologyError,
 } from '@/api/errors.js'
 import { ChangelogPartitionMismatchError, CoPartitioningError } from '@/changelog/errors.js'
-import { classify, isFatalKafkaError, isFencedError, isRetriableError, type FailureSite } from '@/runtime/errors.js'
+import {
+	classify,
+	isFatalKafkaError,
+	isFatalSendError,
+	isFencedError,
+	isRetriableError,
+	type FailureSite,
+} from '@/runtime/errors.js'
 
 const SITES: readonly FailureSite[] = [
 	'processing',
@@ -107,6 +115,15 @@ describe('send failure classes', () => {
 		expect(isFatalKafkaError(new KafkaProtocolError(ErrorCode.InvalidTopicException))).toBe(true)
 		expect(isFatalKafkaError(new ProducerFencedError(1n, 0))).toBe(false)
 		expect(isFatalKafkaError(new Error('x'))).toBe(false)
+	})
+
+	it('fatal whatever the production handler says (KS isFatalException): security, invalid topic', () => {
+		expect(isFatalSendError(new KafkaProtocolError(ErrorCode.ClusterAuthorizationFailed))).toBe(true)
+		expect(isFatalSendError(new KafkaProtocolError(ErrorCode.SecurityDisabled))).toBe(true)
+		expect(isFatalSendError(new KafkaProtocolError(ErrorCode.InvalidTopicException))).toBe(true)
+		// The production handler's classic case: skipping records that are too large.
+		expect(isFatalSendError(new RecordTooLargeError('t', 0, 2, 1))).toBe(false)
+		expect(isFatalSendError(new Error('x'))).toBe(false)
 	})
 
 	it('retriable: connections, timeouts and retriable Kafka errors', () => {
