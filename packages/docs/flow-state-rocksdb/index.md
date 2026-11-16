@@ -36,7 +36,7 @@ await app.start()
 | Reads                    | Memory, then sorted files                   | Memory-mapped B-tree, fastest        |
 | State size               | Larger than memory, compressed              | Bounded by `mapSize`                 |
 | Processes per `stateDir` | One                                         | One writer                           |
-| Node.js                  | 22.18 or later                              | 18 or later                          |
+| Node.js                  | 22.18 or later                              | 22 or later                          |
 
 Prefer RocksDB for write-heavy topologies, aggregations under `at_least_once` in particular, and for state that outgrows memory. Prefer LMDB for read-heavy lookups on state that fits in memory.
 

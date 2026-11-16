@@ -98,6 +98,37 @@ describe('global tables and worker lifecycle', () => {
 		}
 	}, 80_000)
 
+	it('global table: a row that cannot be decoded after startup stops the app instead of serving a stale table', async () => {
+		const table = uniqueTopicName('r2-gt-bad-table')
+		const events = uniqueTopicName('r2-gt-bad-events')
+		const output = uniqueTopicName('r2-gt-bad-out')
+		await createTopics(admin, [{ name: table }, { name: events }, { name: output }])
+		await producer.send(table, { key: 'k', value: Buffer.from('1') })
+
+		const app = flow({
+			applicationId: uniqueTopicName('r2-gt-bad-app'),
+			client: newClient('r2-gt-bad-app'),
+			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 50 },
+			producer: { lingerMs: 0 },
+		})
+		const rows = app.globalTable(table, { key: stringCodec, value: numberCodec })
+		app.stream(events, { key: stringCodec, value: stringCodec })
+			.join(rows, (event, row) => `${event}+${row}`)
+			.to(output, { key: stringCodec, value: stringCodec })
+		try {
+			await app.start()
+			await producer.send(table, { key: 'k', value: Buffer.from('not json') })
+
+			for (const deadline = Date.now() + 10_000; app.state() !== 'ERROR' && Date.now() < deadline;) {
+				await sleep(100)
+			}
+			expect(app.state()).toBe('ERROR')
+			expect(app.getError()).toBeInstanceOf(SyntaxError)
+		} finally {
+			await app.close().catch(() => {})
+		}
+	}, 40_000)
+
 	it('close() while a worker is in restart backoff returns promptly and leaves no extra handles', async () => {
 		const input = uniqueTopicName('r2-lc-in')
 		const output = uniqueTopicName('r2-lc-out')

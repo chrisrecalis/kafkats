@@ -105,6 +105,31 @@ describe('Producer: batches queued behind an in-flight request are merged', () =
 		await slow.catch(() => {})
 	})
 
+	it('fails the sends waiting for a topic that is not found together, not one lookup after another', async () => {
+		const found = await mockCluster.refreshMetadata(['test-topic'])
+		let exists = false
+		mockCluster.refreshMetadata.mockImplementation(async () => (exists ? found : { ...found, topics: new Map() }))
+		mockCluster.refreshMetadata.mockClear()
+		const producer = new Producer(mockCluster, { retries: 0 })
+
+		const sends = Array.from({ length: 5 }, (_, i) =>
+			producer.send('test-topic', { value: Buffer.from(String(i)), partition: 0 })
+		)
+		const outcomes = await Promise.allSettled(sends)
+
+		expect(outcomes.map(o => (o.status === 'rejected' ? (o.reason as Error).message : 'sent'))).toEqual(
+			Array.from({ length: 5 }, () => 'Topic test-topic not found')
+		)
+		// One lookup (five attempts) answered all of them.
+		expect(mockCluster.refreshMetadata).toHaveBeenCalledTimes(5)
+
+		// A send issued after that lookup looks again, so a topic created since is found.
+		exists = true
+		expect((await producer.send('test-topic', { value: Buffer.from('later'), partition: 0 })).offset).toBe(0n)
+
+		await producer.disconnect()
+	})
+
 	it('does not merge anything into a batch that is already at the limit', async () => {
 		const maxBatchBytes = 1000
 		const producer = new Producer(mockCluster, { maxBatchBytes, retries: 0 })

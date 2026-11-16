@@ -56,7 +56,7 @@
 		"@harperfast/rocksdb-js": "^2.14.0"
 	},
 	"peerDependencies": {
-		"@kafkats/flow": "workspace:^"
+		"@kafkats/flow": "workspace:>=0.14.0"
 	},
 	"devDependencies": {
 		"@kafkats/flow": "workspace:^",

@@ -38,8 +38,11 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 		readonly builder: TopologyBuilder,
 		readonly node: OutputProcessor<K, V>,
 		readonly format: StreamFormat<K, V>,
-		/** Source topics that feed into this stream. Used for changelog partition inference. */
-		readonly sourceTopics: Set<string> = new Set(),
+		/**
+		 * Source topics that feed into this stream. State derived from the stream is partitioned
+		 * like them (and its changelog gets their partition count).
+		 */
+		readonly sourceTopics: Set<string>,
 		/**
 		 * True when the key may have changed since the records were read, i.e. records are no
 		 * longer guaranteed to sit in the partition their key belongs to. Key-based stateful

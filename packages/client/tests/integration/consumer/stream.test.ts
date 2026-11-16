@@ -4,7 +4,7 @@ import { string } from '@/codec.js'
 import { topic } from '@/topic.js'
 
 import { createClient } from '../helpers/kafka.js'
-import { uniqueName } from '../helpers/testkit.js'
+import { sleep, uniqueName } from '../helpers/testkit.js'
 
 describe.concurrent('Consumer (integration) - stream', () => {
 	it('streams messages via async iterator', async () => {
@@ -128,4 +128,39 @@ describe.concurrent('Consumer (integration) - stream', () => {
 		await producer.disconnect()
 		await client.disconnect()
 	})
+
+	it('keeps its group membership while the loop body finishes after stop()', async () => {
+		const client = createClient('it-stream-stop-slow-body')
+		await client.connect()
+
+		const topicName = uniqueName('it-stream-stop-slow-body')
+		const testTopic = topic<string>(topicName, { value: string() })
+		await client.createTopics([{ name: topicName, numPartitions: 1, replicationFactor: 1 }])
+
+		const producer = client.producer()
+		await producer.send(testTopic, { value: 'first' })
+
+		const groupId = uniqueName('it-group')
+		// The session outlives the test, so only a LeaveGroup can empty the group in time.
+		const consumer = client.consumer({ groupId, autoOffsetReset: 'earliest', sessionTimeoutMs: 45_000 })
+		for await (const _ of consumer.stream(testTopic)) {
+			consumer.stop()
+			// Longer than the consumer's shutdown deadline for an unresponsive broker (5s).
+			await sleep(7_000)
+		}
+
+		const [group] = await client.admin().describeGroups([groupId])
+		expect(group!.state).toBe('Empty')
+
+		// The record the loop body finished was committed: the next member starts after it.
+		await producer.send(testTopic, { value: 'second' })
+		const next = client.consumer({ groupId, autoOffsetReset: 'earliest' })
+		for await (const { message } of next.stream(testTopic)) {
+			expect(message.value).toBe('second')
+			break
+		}
+
+		await producer.disconnect()
+		await client.disconnect()
+	}, 60_000)
 })

@@ -1,7 +1,7 @@
 import { ErrorCode, KafkaError, type KafkaClient, type Logger } from '@kafkats/client'
 import { ChangelogRestorer } from '@/changelog.js'
 import type { KeyValueStore } from '@/state.js'
-import { clearStore } from '@/state/partitioned.js'
+import { clearStore } from '@/state/bulk.js'
 import type { FlowConfig } from '@/types.js'
 import type { Checkpoints } from '@/runtime/checkpoints.js'
 import { toError } from '@/runtime/errors.js'

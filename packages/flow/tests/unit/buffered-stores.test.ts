@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { codec } from '../../src/index.js'
 import { windowedKeyCodec } from '../../src/changelog.js'
 import { InMemoryKeyValueStore, InMemorySessionStore, InMemoryWindowStore } from '../../src/state/memory.js'
@@ -81,6 +81,46 @@ describe('Buffered stores - expiry must be transactional', () => {
 		})
 		await commit(c)
 		expect(await raw.get({ key: 'a', windowStart: 0, windowEnd: 100 })).toBeUndefined()
+	})
+})
+
+describe('Buffered stores - expiry reads only what can have expired', () => {
+	it('window expiry inside a transaction does not read the windows still in use', async () => {
+		const { raw, buf } = windowStore()
+		await raw.put({ key: 'old', windowStart: 0, windowEnd: 100 }, 'expired')
+		for (let i = 0; i < 50; i++) {
+			await raw.put({ key: `k${i}`, windowStart: 49_500, windowEnd: 49_600 }, 'live')
+		}
+		const scans = [vi.spyOn(raw, 'all'), vi.spyOn(raw, 'fetchAll')]
+		const c = ctx()
+		await inTx(c, async () => {
+			// Written and expired within the same transaction.
+			await buf.put({ key: 'late', windowStart: 10, windowEnd: 110 }, 'expired too')
+			expect(await buf.expireOldWindows(50_000)).toBe(2)
+		})
+		await commit(c)
+
+		expect(scans[0]).not.toHaveBeenCalled()
+		// Retention is 1s: only windows that started before 49_000 can have ended before it.
+		expect(scans[1]).toHaveBeenCalledWith(Number.MIN_SAFE_INTEGER, 48_999)
+		expect(await raw.approximateNumEntries()).toBe(50)
+	})
+
+	it('removing the sessions of a key inside a transaction reads only that key', async () => {
+		const { raw, buf } = sessionStore()
+		await raw.put({ key: 'a', windowStart: 0, windowEnd: 100 }, 'a1')
+		await raw.put({ key: 'b', windowStart: 0, windowEnd: 100 }, 'b1')
+		const all = vi.spyOn(raw, 'all')
+		const c = ctx()
+		await inTx(c, async () => {
+			await buf.put({ key: 'a', windowStart: 200, windowEnd: 300 }, 'a2')
+			await buf.remove('a')
+		})
+		await commit(c)
+
+		expect(all).not.toHaveBeenCalled()
+		expect(await raw.approximateNumEntries()).toBe(1)
+		expect(await raw.get({ key: 'b', windowStart: 0, windowEnd: 100 })).toBe('b1')
 	})
 })
 

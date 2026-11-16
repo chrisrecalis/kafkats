@@ -3,6 +3,8 @@
 '@kafkats/flow': minor
 '@kafkats/codec-zod': minor
 '@kafkats/flow-state-lmdb': minor
+'@kafkats/flow-state-rocksdb': minor
+'@kafkats/opentelemetry': minor
 ---
 
 Redesign the `@kafkats/flow` runtime for correctness: partitioned state, repartitioning, a real `globalTable()`, transactional state under exactly-once, and workers that never continue past a failure.

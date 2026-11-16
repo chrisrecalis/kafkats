@@ -3,6 +3,8 @@
 '@kafkats/flow': minor
 '@kafkats/codec-zod': minor
 '@kafkats/flow-state-lmdb': minor
+'@kafkats/flow-state-rocksdb': minor
+'@kafkats/opentelemetry': minor
 ---
 
 Raise `@kafkats/flow` throughput by roughly an order of magnitude without changing its guarantees.
@@ -22,4 +24,4 @@ Raise `@kafkats/flow` throughput by roughly an order of magnitude without changi
 - Producer: records are appended in the order `send()` was called, also for sends that are not awaited one by one.
 - Consumer: every consumer fetches on its own connections. Consumers sharing a `KafkaClient` no longer wait for each other's long polls.
 - Consumer: `runBatch` handlers get `ctx.resolveOffset(offset)` to make progress within a batch committable before the handler returns.
-- Consumer: new `commitPosition(partitions)` commits the current position of partitions, and `position(topic, partition)` returns it.
+- Consumer: new `commitStartPosition(partitions)` commits the position partitions start reading from, before any of their records has been fetched, and `position(topic, partition)` returns the current position.

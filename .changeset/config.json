@@ -9,7 +9,8 @@
 	"access": "public",
 	"baseBranch": "main",
 	"updateInternalDependencies": "patch",
-	"ignore": ["@kafkats/benchmark", "@kafkats/docs", "@kafkats/flow-examples", "@kafkats/flow-state-testkit"],
+	"privatePackages": { "version": false, "tag": false },
+	"ignore": ["@kafkats/benchmark", "@kafkats/docs", "@kafkats/flow-examples"],
 	"___experimentalUnsafeOptions_WILL_CHANGE_IN_PATCH": {
 		"onlyUpdatePeerDependentsWhenOutOfRange": true
 	}

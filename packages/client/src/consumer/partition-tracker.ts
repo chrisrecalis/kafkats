@@ -268,6 +268,11 @@ export class PartitionTracker {
 		return true
 	}
 
+	/** Whether application code is working on records of any partition right now. */
+	get hasInFlightProcessing(): boolean {
+		return this.inFlight.size > 0
+	}
+
 	/**
 	 * Mark that a handler has finished processing a batch from this partition.
 	 * Called by Consumer after the user's handler completes (success or error).
