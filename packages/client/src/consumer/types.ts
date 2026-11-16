@@ -177,6 +177,9 @@ export interface BatchContext extends ConsumeContext {
 	 * Mark the records of this batch up to and including `offset` as processed, so their offsets
 	 * can be committed before the handler returns. A handler that works through a large batch
 	 * calls this as it goes; otherwise nothing of the batch is committed until it has finished.
+	 *
+	 * A handler that returns normally has its whole batch marked, unless the run was stopped meanwhile
+	 * (`signal` aborted): it may have returned early, so only what it resolved itself is marked.
 	 */
 	resolveOffset(offset: bigint): void
 }
@@ -252,6 +255,9 @@ export interface StreamOptions<T extends string = string> {
  */
 export type AutoOffsetReset = 'earliest' | 'latest' | 'none'
 
+/** Where partitions without a valid position restart: one policy, or a function giving each partition's. */
+export type OffsetResetPolicy = AutoOffsetReset | ((topic: string, partition: number) => AutoOffsetReset)
+
 /**
  * Isolation level for fetch requests
  * - 'read_uncommitted': Read all messages including uncommitted transactional messages
@@ -284,13 +290,16 @@ export interface ConsumerConfig {
 	minBytes?: number
 	maxWaitMs?: number
 	/**
-	 * What to do when there is no committed offset (group first initialized)
-	 * or when the offset is out of range:
-	 * - 'earliest': Reset to earliest available offset
-	 * - 'latest': Reset to latest offset (default)
-	 * - 'none': Throw an error if no committed offset exists
+	 * Where a partition starts when it has no committed offset, and where it goes on when its position is out of
+	 * range (the records were deleted). A policy, or a function returning each partition's policy:
+	 * - 'earliest': the earliest available offset;
+	 * - 'latest' (default): the end of the partition, the last stable offset under 'read_committed';
+	 * - 'none': without a committed offset the run fails with `NoOffsetForPartitionError`; out of range, the
+	 *   partition is paused and `offsetOutOfRange` is emitted: `seek()` it, then `resume()` it.
+	 *
+	 * 'earliest' and 'latest' emit `offsetReset`.
 	 */
-	autoOffsetReset?: AutoOffsetReset
+	autoOffsetReset?: OffsetResetPolicy
 	/**
 	 * Controls which messages are visible to the consumer:
 	 * - 'read_uncommitted': Read all messages including uncommitted transactional messages
@@ -329,6 +338,28 @@ export interface ConsumerConfig {
 	 */
 	onBeforeRebalance?: () => Promise<void>
 	/**
+	 * Awaited when partitions are taken away by a rebalance, after their handlers returned and before the
+	 * consumer commits their offsets (if it commits offsets) and stops fetching them. Their offsets can still be
+	 * committed here (`commit()`), under the generation that owned them. Under the eager protocol it runs for
+	 * every partition before the member rejoins; under the cooperative protocol, for the revoked ones after it.
+	 * Not called for partitions reported to `onPartitionsLost`. Throwing fails the rebalance and the run.
+	 */
+	onPartitionsRevoked?: (partitions: TopicPartition[]) => Promise<void>
+	/**
+	 * Awaited when partitions are assigned (on the first join, and by each rebalance: every partition under the
+	 * eager protocol, the added ones under the cooperative protocol), before any of them is fetched: `pause()` and
+	 * `seek()` here take effect before their first record. Partitions paused here stay paused. Throwing fails the
+	 * assignment and the run.
+	 */
+	onPartitionsAssigned?: (partitions: AssignedPartition[]) => Promise<void>
+	/**
+	 * Called when this member lost its partitions with its session (the group expired it or fenced it): their
+	 * offsets can no longer be committed. It is invoked synchronously as the loss is detected, so its synchronous
+	 * part runs before any other code (handlers of these partitions may still be running); the member rejoins
+	 * only once it resolved. Throwing fails the rejoin and the run.
+	 */
+	onPartitionsLost?: (partitions: TopicPartition[]) => Promise<void>
+	/**
 	 * Maximum time in ms to retry coordinator-related offset fetch and commit operations before
 	 * failing (default: 60000).
 	 */
@@ -348,12 +379,15 @@ export interface ResolvedConsumerConfig {
 	maxBytesPerPartition: number
 	minBytes: number
 	maxWaitMs: number
-	autoOffsetReset: AutoOffsetReset
+	autoOffsetReset: OffsetResetPolicy
 	isolationLevel: IsolationLevel
 	checkCrcs: boolean
 	partitionAssignmentStrategy: PartitionAssignmentStrategy
 	defaultApiTimeoutMs: number
 	onBeforeRebalance?: () => Promise<void>
+	onPartitionsRevoked?: (partitions: TopicPartition[]) => Promise<void>
+	onPartitionsAssigned?: (partitions: AssignedPartition[]) => Promise<void>
+	onPartitionsLost?: (partitions: TopicPartition[]) => Promise<void>
 }
 
 export type ConsumerTraceStage = 'fetch_request' | 'decode_records' | 'handler'
@@ -440,6 +474,23 @@ export interface CommittedOffset {
 	leaderEpoch?: number
 }
 
+/** A partition assigned to this consumer, with where it starts. */
+export interface AssignedPartition extends TopicPartition {
+	/** The offset its first fetch starts at: the committed offset, or where the reset policy put it. */
+	offset: bigint
+	/** Its committed offset, `null` when it has none. */
+	committed: CommittedOffset | null
+}
+
+/** A partition's position moved by its offset reset policy (see `ConsumerConfig.autoOffsetReset`). */
+export interface OffsetResetEvent extends TopicPartition {
+	/** The position that was out of range; `null` when the partition had no committed offset. */
+	from: bigint | null
+	/** The position it restarts at. */
+	to: bigint
+	reason: 'no-commit' | 'out-of-range'
+}
+
 /**
  * A batch of records from a single partition
  */
@@ -513,14 +564,27 @@ export interface ConsumerEvents {
 	running: []
 	stopped: []
 	error: [error: Error]
+	/** Emitted when a rebalance starts, after `onBeforeRebalance` returned. */
 	rebalance: []
-	partitionsAssigned: [partitions: TopicPartition[]]
+	/** Emitted when the group asks for a rebalance, before the running handlers have returned (see `rebalancePending`). */
+	rebalancePending: []
+	/** Emitted when a rebalance finished (the member rejoined and took its new partitions), unless another one is pending. */
+	rebalanceComplete: []
+	/** Emitted when partitions were assigned, once `onPartitionsAssigned` returned. */
+	partitionsAssigned: [partitions: AssignedPartition[]]
 	/** Emitted when partitions are revoked during rebalance (offsets can still be committed) */
 	partitionsRevoked: [partitions: TopicPartition[]]
 	/** Emitted on fatal session loss - offsets cannot be committed for these partitions */
 	partitionsLost: [partitions: TopicPartition[]]
 	/** Emitted when fetching advances; offset is the next fetch position after this range. */
 	fetchPosition: [position: TopicPartitionOffset, recordCount: number]
+	/**
+	 * Emitted when a partition's position is out of range and its reset policy is 'none': the partition is paused.
+	 * `seek()` it to where it goes on, then `resume()` it.
+	 */
+	offsetOutOfRange: [position: TopicPartitionOffset]
+	/** Emitted when a partition's position was set by its reset policy ('earliest' or 'latest'). */
+	offsetReset: [reset: OffsetResetEvent]
 }
 
 export interface InternalConsumerContext {

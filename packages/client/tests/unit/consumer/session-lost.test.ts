@@ -15,25 +15,27 @@ describe('Consumer', () => {
 
 		consumerAny.fetchManager = {
 			addPartitions: vi.fn(),
+			releaseHeld: vi.fn(),
 			removePartitions: vi.fn(),
 		}
 		consumerAny.offsetManager = {
 			addAssignedPartitions: vi.fn(),
 			removeAssignedPartitions: vi.fn(),
+			isPartitionAssigned: vi.fn().mockReturnValue(true),
 			commitPendingOffsets: vi.fn(),
 			clearPartitions: vi.fn(),
 		}
 		consumerAny.partitionTracker = {
 			assign: vi.fn(),
 			revoke: vi.fn().mockResolvedValue(undefined),
-			endProcessing: vi.fn(),
+			release: vi.fn(),
 		}
 
 		const callbacks = consumerAny.createProviderCallbacks()
 		const partitions = [{ topic: 't', partition: 0 }]
-		const partitionsWithOffsets = [{ topic: 't', partition: 0, offset: 0n }]
+		const partitionsWithOffsets = [{ topic: 't', partition: 0, offset: 0n, committed: null }]
 
-		callbacks.onPartitionsLost(partitions)
+		await callbacks.onPartitionsLost(partitions)
 		expect(consumerAny.sessionLost).toBe(true)
 
 		await callbacks.onPartitionsAssigned(partitionsWithOffsets)

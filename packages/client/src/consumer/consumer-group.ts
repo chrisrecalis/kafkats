@@ -16,6 +16,7 @@ import { KafkaProtocolError, CoordinatorNotAvailableError, isConnectionFailure }
 import type {
 	TopicPartition,
 	ConsumerGroupEvents,
+	ConsumerGroupMetadata,
 	ConsumerConfig,
 	ResolvedConsumerConfig,
 	PartitionAssignmentStrategy,
@@ -68,6 +69,8 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 	private generationId: number = -1
 	private state: ConsumerGroupState = ConsumerGroupState.UNJOINED
 	private assignment: TopicPartition[] = []
+	/** The group metadata of the last completed join; cleared when the coordinator rejects the member or generation. */
+	private joined: ConsumerGroupMetadata | undefined
 	private heartbeatTimer: ReturnType<typeof setTimeout> | null = null
 	private abortController: AbortController | null = null
 
@@ -188,6 +191,15 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 	}
 
 	/**
+	 * The group metadata of this member's last completed join (JoinGroup and SyncGroup): what offsets committed for
+	 * its assignment must carry. Undefined before the first join, and from the moment the coordinator rejects the
+	 * member or its generation (session lost, fenced, illegal generation) until the next join completes.
+	 */
+	get groupMetadata(): ConsumerGroupMetadata | undefined {
+		return this.joined
+	}
+
+	/**
 	 * Get current partition assignment
 	 */
 	get currentAssignment(): TopicPartition[] {
@@ -232,6 +244,12 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 
 			const result = this.syncGroupResult!
 			this.syncGroupResult = null
+			this.joined = {
+				groupId: this.config.groupId,
+				generationId: this.generationId,
+				memberId: this.memberId,
+				groupInstanceId: this.config.groupInstanceId ?? null,
+			}
 
 			// For cooperative protocol, check for NEWLY revoked partitions
 			// (partitions in result.revoked but not already in pendingRevocation)
@@ -377,8 +395,7 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 			this.emitError(error as Error)
 		} finally {
 			this.state = ConsumerGroupState.UNJOINED
-			this.memberId = ''
-			this.generationId = -1
+			this.resetMember()
 			this.assignment = []
 			this.ownedPartitions = []
 			this.pendingRevocation = []
@@ -601,9 +618,7 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 
 			case ErrorCode.UnknownMemberId:
 			case ErrorCode.IllegalGeneration:
-				// Clear member ID and rejoin
-				this.memberId = ''
-				this.generationId = -1
+				this.resetMember()
 				await this.joinGroup(topics)
 				break
 
@@ -798,9 +813,7 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 
 			case ErrorCode.UnknownMemberId:
 			case ErrorCode.IllegalGeneration:
-				// Clear member ID and rejoin
-				this.memberId = ''
-				this.generationId = -1
+				this.resetMember()
 				this.state = ConsumerGroupState.UNJOINED
 				await this.joinGroup(topics)
 				await this.syncGroup(topics)
@@ -911,18 +924,9 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 				break
 
 			case ErrorCode.UnknownMemberId: {
-				// Fatal session loss - lost generation without ability to commit
-				// Emit sessionLost with the partitions we lost (can't commit them anymore)
 				this.logger.warn('session lost - unknown member id', { memberId: this.memberId })
-				const lostPartitions = [...this.ownedPartitions]
-				this.memberId = ''
-				this.generationId = -1
-				this.ownedPartitions = []
-				this.pendingRevocation = []
-				// Emit sessionLost first (Consumer translates to partitionsLost)
-				if (lostPartitions.length > 0) {
-					this.emit('sessionLost', lostPartitions)
-				}
+				this.resetMember()
+				this.loseAssignment()
 
 				// For static members, UNKNOWN_MEMBER_ID after being replaced is a fencing scenario.
 				// Surface this as FENCED_INSTANCE_ID and stop instead of trying to transparently rejoin.
@@ -941,6 +945,7 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 				// Common during cooperative rebalances
 				this.logger.debug('illegal generation', { generationId: this.generationId })
 				this.generationId = -1
+				this.joined = undefined
 				this.emit('rebalance')
 				break
 
@@ -952,19 +957,35 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 			case ErrorCode.FencedInstanceId: {
 				// Fatal error - another instance with same groupInstanceId is active
 				this.logger.warn('session lost - instance fenced', { groupInstanceId: this.config.groupInstanceId })
-				const fencedPartitions = [...this.ownedPartitions]
-				this.ownedPartitions = []
-				this.pendingRevocation = []
-				// Emit sessionLost first (Consumer translates to partitionsLost)
-				if (fencedPartitions.length > 0) {
-					this.emit('sessionLost', fencedPartitions)
-				}
+				this.joined = undefined
+				this.loseAssignment()
 				this.emitError(new KafkaProtocolError(errorCode, 'Static member instance is fenced'))
 				break
 			}
 
 			default:
 				this.emitError(new KafkaProtocolError(errorCode, 'Heartbeat failed'))
+		}
+	}
+
+	/** Forget the member id and generation the coordinator rejected: the member joins as a new one next. */
+	private resetMember(): void {
+		this.memberId = ''
+		this.generationId = -1
+		this.joined = undefined
+	}
+
+	/**
+	 * After the session was lost, every partition is lost rather than revoked: its offsets can no longer be
+	 * committed. The assignment goes too, so the next rebalance does not revoke the lost partitions again.
+	 */
+	private loseAssignment(): void {
+		const lost = this.ownedPartitions
+		this.ownedPartitions = []
+		this.pendingRevocation = []
+		this.assignment = []
+		if (lost.length > 0) {
+			this.emit('sessionLost', lost)
 		}
 	}
 

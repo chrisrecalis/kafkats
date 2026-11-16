@@ -7,7 +7,7 @@
 
 import { EventEmitter } from 'node:events'
 import type { Cluster } from '@/client/cluster.js'
-import { KafkaProtocolError } from '@/client/errors.js'
+import { CommitFailedError, KafkaProtocolError } from '@/client/errors.js'
 import { ErrorCode, isGenerationLostErrorCode } from '@/protocol/messages/error-codes.js'
 import type { DecodedRecord } from '@/protocol/records/index.js'
 import { buildDecoderMaps, decodeRecord } from './message-decoder.js'
@@ -38,6 +38,9 @@ import type {
 	ManualAssignment,
 	PartitionBatch,
 	ConsumerMetrics,
+	CommitOffset,
+	CommittedOffset,
+	ConsumerGroupMetadata,
 } from './types.js'
 import { ProcessOperation, diagnostics, register, trace } from '@/diagnostics.js'
 import {
@@ -48,11 +51,12 @@ import {
 	type SubscriptionLike,
 } from './types.js'
 import { ConsumerGroup } from './consumer-group.js'
-import { OffsetManager } from './offset-manager.js'
+import { OffsetManager, type OffsetRequestOptions } from './offset-manager.js'
 import { FetchManager } from './fetch-manager.js'
 import { SHUTDOWN_DEADLINE_MS, withTimeout, DeadlineExceededError } from '@/utils/timeout.js'
 import { PartitionTracker } from './partition-tracker.js'
 import { noopLogger, type Logger } from '@/logger.js'
+import { tpKey } from '@/utils/topic-partition.js'
 import { validatePriorityStrategy, type PriorityStrategy } from './priority.js'
 
 type ConsumerState = 'idle' | 'running' | 'stopping'
@@ -79,6 +83,12 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	private partitionTracker: PartitionTracker | null = null
 	private partitionProvider: PartitionProvider | null = null
 	private fetchLoopPromise: Promise<void> | null = null
+	/**
+	 * Batches the run loop drained from the fetch buffer and has not handed to a handler yet. A batch leaves this
+	 * list just before its handler is invoked; the FetchManager counts these as not delivered (see
+	 * FetchManagerConfig.undelivered).
+	 */
+	private undelivered: PartitionBatch[] = []
 	private abortController: AbortController | null = null
 	private runPromiseResolve: (() => void) | null = null
 	private runPromiseReject: ((error: Error) => void) | null = null
@@ -105,6 +115,9 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 				config.partitionAssignmentStrategy ?? DEFAULT_CONSUMER_CONFIG.partitionAssignmentStrategy,
 			defaultApiTimeoutMs: config.defaultApiTimeoutMs ?? DEFAULT_CONSUMER_CONFIG.defaultApiTimeoutMs,
 			onBeforeRebalance: config.onBeforeRebalance,
+			onPartitionsRevoked: config.onPartitionsRevoked,
+			onPartitionsAssigned: config.onPartitionsAssigned,
+			onPartitionsLost: config.onPartitionsLost,
 		}
 		if (!Number.isInteger(this.config.maxBytesPerPartition) || this.config.maxBytesPerPartition <= 0) {
 			throw new Error('maxBytesPerPartition must be a positive integer')
@@ -120,6 +133,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		this.abortController = new AbortController()
 		this.commitOffsets = commitOffsets
 		this.sessionLost = false
+		this.undelivered = []
 
 		// Set up external abort signal
 		if (externalSignal) {
@@ -234,13 +248,24 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 				onFetchPosition: (position, recordCount) => {
 					this.emit('fetchPosition', position, recordCount)
 				},
+				onOffsetOutOfRange: position => this.emit('offsetOutOfRange', position),
+				onOffsetReset: reset => this.emit('offsetReset', reset),
+				undelivered: () => this.undelivered,
 			},
 			logger
 		)
 	}
 
 	private createProviderCallbacks(): PartitionProviderCallbacks {
+		const offsetManager = this.offsetManager!
+		const fetchManager = this.fetchManager!
+		const partitionTracker = this.partitionTracker!
+		// Partitions reported lost (or revoked) already are not revoked (again).
+		const stillAssigned = (partitions: TopicPartition[]) =>
+			partitions.filter(tp => offsetManager.isPartitionAssigned(tp.topic, tp.partition))
+
 		return {
+			onRebalancePending: () => this.emit('rebalancePending'),
 			onRebalance: async () => {
 				// User hook awaited inside the rebalance protocol so transactional pipelines
 				// can commit before partitions are revoked. Synchronous notification fires
@@ -250,19 +275,25 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 				}
 				this.emit('rebalance')
 			},
-			// eslint-disable-next-line @typescript-eslint/require-await
-			onPartitionsAssigned: async partitionsWithOffsets => {
+			onPartitionsAssigned: async assigned => {
 				this.sessionLost = false
-				const partitions = partitionsWithOffsets.map(p => ({ topic: p.topic, partition: p.partition }))
-				this.offsetManager!.addAssignedPartitions(partitions)
-				this.partitionTracker!.assign(partitions)
-				this.fetchManager!.addPartitions(partitionsWithOffsets)
-				this.emit('partitionsAssigned', partitions)
+				const partitions = assigned.map(({ topic, partition }) => ({ topic, partition }))
+				offsetManager.addAssignedPartitions(partitions)
+				partitionTracker.assign(partitions)
+				// Held, not fetched, until the hook returned: what it pauses or seeks takes effect before any fetch.
+				fetchManager.addPartitions(assigned, { held: true })
+				await this.config.onPartitionsAssigned?.(assigned)
+				fetchManager.releaseHeld(partitions)
+				this.emit('partitionsAssigned', assigned)
 			},
-			onPartitionsRevoked: async partitions => {
-				if (this.partitionTracker) {
-					await this.partitionTracker.revoke(partitions)
-				}
+			onPartitionsRevoked: async revoked => {
+				await partitionTracker.revoke(revoked)
+				let partitions = stillAssigned(revoked)
+				if (partitions.length === 0) return
+				await this.config.onPartitionsRevoked?.(partitions)
+				// Lost while the hook ran (the session expired meanwhile): reported lost, not revoked as well.
+				partitions = stillAssigned(partitions)
+				if (partitions.length === 0) return
 				// Commit the final positions BEFORE removing the partitions from the
 				// assigned set. commitPendingOffsets() skips offsets for unassigned
 				// partitions, so removing first would silently drop the last-consumed
@@ -270,7 +301,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 				// reprocess them.
 				if (this.commitOffsets && !this.sessionLost) {
 					try {
-						await this.offsetManager!.commitPendingOffsets()
+						await offsetManager.commitPendingOffsets()
 					} catch (error) {
 						// The broker may already be past the commit window (RebalanceInProgress
 						// once the group left PreparingRebalance) or the generation may be gone.
@@ -288,21 +319,26 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 						})
 					}
 				}
-				this.offsetManager!.removeAssignedPartitions(partitions)
-				this.fetchManager!.removePartitions(partitions)
-				this.offsetManager!.clearPartitions(partitions)
+				offsetManager.removeAssignedPartitions(partitions)
+				fetchManager.removePartitions(partitions)
+				offsetManager.clearPartitions(partitions)
 				this.emit('partitionsRevoked', partitions)
 			},
 			onPartitionsLost: partitions => {
 				this.sessionLost = true
-				this.offsetManager!.removeAssignedPartitions(partitions)
-				for (const tp of partitions) {
-					this.partitionTracker?.endProcessing(tp.topic, tp.partition)
-				}
-				this.offsetManager!.clearPartitions(partitions)
-				this.fetchManager!.removePartitions(partitions)
+				offsetManager.removeAssignedPartitions(partitions)
+				partitionTracker.release(partitions)
+				offsetManager.clearPartitions(partitions)
+				fetchManager.removePartitions(partitions)
+				// Invoked synchronously, so its synchronous part runs before any other code learns of the loss.
+				const handled = (async () => {
+					await this.config.onPartitionsLost?.(partitions)
+				})()
 				this.emit('partitionsLost', partitions)
+				return handled
 			},
+			onRebalanceComplete: () => this.emit('rebalanceComplete'),
+			onOffsetReset: reset => this.emit('offsetReset', reset),
 			onError: error => {
 				this.emitError(error)
 				if (error instanceof KafkaProtocolError && error.errorCode === ErrorCode.FencedInstanceId) {
@@ -351,10 +387,83 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	}
 
 	/**
+	 * Whether the group is rebalancing: from the moment it asked for a rebalance (`rebalancePending` event), while
+	 * the running handlers finish and partitions move, until the rebalance finished (`rebalanceComplete` event).
+	 */
+	get rebalancePending(): boolean {
+		return this.partitionProvider?.isRebalancing() ?? false
+	}
+
+	/**
+	 * The group metadata of the consumer's last completed join: what offsets committed in a transaction for its
+	 * assignment must carry (`producer` `sendOffsets({ consumerGroupMetadata })`). In `onPartitionsAssigned` it is
+	 * already that of the assignment.
+	 *
+	 * Undefined with a manual assignment, before the first join, and from the moment the group rejected this
+	 * member's session or generation until the next join completed.
+	 */
+	groupMetadata(): ConsumerGroupMetadata | undefined {
+		return this.consumerGroup?.groupMetadata
+	}
+
+	/**
+	 * Commit offsets of partitions assigned to this consumer, with optional metadata, for example from outside a
+	 * handler or in `onPartitionsRevoked`. Each offset is the next one to read (the last processed offset + 1).
+	 * Works with `commitOffsets: false`; offsets of partitions not assigned to this consumer are skipped.
+	 *
+	 * A moved, loading or slow coordinator is retried until `timeoutMs` (default `defaultApiTimeoutMs`) passed,
+	 * then it rejects with `TimeoutError`. It rejects with `RebalanceInProgressError` while the group rebalances
+	 * (commit again once it is done), and with `CommitFailedError` when this member's generation is gone; then the
+	 * consumer rejoins the group. Aborting `signal` rejects with its reason.
+	 *
+	 * @throws If the consumer is not running
+	 */
+	async commit(offsets: readonly CommitOffset[], options?: OffsetRequestOptions): Promise<void> {
+		try {
+			await this.runningOffsetManager().commitExplicit(offsets, options)
+		} catch (error) {
+			if (error instanceof CommitFailedError) this.consumerGroup?.emit('rebalance')
+			throw error
+		}
+	}
+
+	/**
+	 * The committed offsets of partitions, with the metadata committed with them, keyed by `topic:partition`;
+	 * `null` for a partition without one. Offsets of an open transaction are waited for, up to `timeoutMs`
+	 * (default `defaultApiTimeoutMs`). Aborting `signal` rejects with its reason.
+	 *
+	 * @throws If the consumer is not running
+	 */
+	async committed(
+		partitions: readonly TopicPartition[],
+		options?: OffsetRequestOptions
+	): Promise<Map<string, CommittedOffset | null>> {
+		const committed = await this.runningOffsetManager().fetchCommittedOffsets(partitions, options)
+		return new Map(
+			partitions.map(({ topic, partition }) => {
+				const key = tpKey(topic, partition)
+				return [key, committed.get(key) ?? null]
+			})
+		)
+	}
+
+	private runningOffsetManager(): OffsetManager {
+		if (this.state !== 'running' || !this.offsetManager) {
+			throw new Error('Consumer is not running')
+		}
+		return this.offsetManager
+	}
+
+	/**
 	 * Pause fetching from specific partitions.
 	 *
 	 * Useful for backpressure control when processing cannot keep up with incoming messages.
 	 * The consumer remains in the group and continues heartbeating while paused.
+	 *
+	 * Once it returns, no record of these partitions fetched before is delivered, except to a handler of
+	 * the partition that already runs; resuming delivers them again. A pause does not outlive the
+	 * partition's assignment: under the eager protocol every rebalance assigns partitions anew, unpaused
+	 * (pause them again in `onPartitionsAssigned`).
 	 *
 	 * @param partitions - The partitions to pause
 	 * @throws If the consumer is not running
@@ -400,6 +509,26 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			() => new ProcessOperation(this.cluster.clientId, this.config.groupId, topic, partition, messages, batch),
 			processing => (processing ? processing.run(handle) : handle())
 		)
+	}
+
+	/**
+	 * The offset of the next record of an assigned partition to be delivered to a handler: the earliest
+	 * record fetched but not handed to a handler yet, else the fetch position (which moves past transaction
+	 * markers and aborted records). This is the offset to commit once everything delivered is processed.
+	 * Undefined when the partition is not assigned to this consumer.
+	 */
+	nextOffset(topic: string, partition: number): bigint | undefined {
+		return this.fetchManager?.nextOffset(topic, partition)
+	}
+
+	/**
+	 * How many records of an assigned partition can be read beyond {@link nextOffset}: the partition's end as of
+	 * its last fetch response (the last stable offset under 'read_committed', else the high watermark) minus
+	 * `nextOffset`, at least 0. Undefined when the partition is not assigned, before its first fetch response,
+	 * and while it is paused (its end is not followed then).
+	 */
+	currentLag(topic: string, partition: number): bigint | undefined {
+		return this.fetchManager?.currentLag(topic, partition)
 	}
 
 	/**
@@ -451,6 +580,9 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	 * - Skipping ahead: seek to a later offset
 	 * - Resetting to a known position after handling errors
 	 *
+	 * Records of the partition fetched but not delivered yet are dropped: once it returns, no record from
+	 * before the seek is delivered, except to a handler of the partition that already runs.
+	 *
 	 * Note: This only affects the fetch position, not the committed offset.
 	 * If you want to persist the position, you'll need to commit after seeking.
 	 *
@@ -492,7 +624,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		// One handler per partition, keyed by topic:partition. FetchBuffer keeps records for
 		// these partitions buffered so a slow partition cannot occupy a free slot.
 		const active = new Map<string, Promise<void>>()
-		let pending: PartitionBatch[] = []
+		const pending = this.undelivered
 		let handlerError: Error | null = null
 
 		const runHandler = async (batch: PartitionBatch, key: string): Promise<void> => {
@@ -507,18 +639,27 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			}
 		}
 
-		// Start handlers for pending batches whose partition is idle, up to maxConcurrency.
-		// Batches from revoked partitions or a stale assignment epoch are dropped.
+		// Start handlers for pending batches whose partition is idle, up to maxConcurrency. A batch leaves
+		// `pending` before its handler is invoked, so the handler's own pause() or nextOffset() treats it as
+		// delivered. Batches voided since they were drained are dropped: their partition was revoked, sought,
+		// or paused (the pause rewound the partition to them, so they are fetched again once it is resumed).
 		const admitPending = (): void => {
-			pending = pending.filter(batch => {
-				if (active.size >= maxConcurrency || partitionProvider.hasPendingRebalance()) return true
-				const key = `${batch.topic}:${batch.partition}`
-				if (active.has(key)) return true
-				if (!fetchManager.isBatchAssigned(batch)) return false
-				if (!partitionTracker.startProcessing(batch.topic, batch.partition)) return false
-				active.set(key, runHandler(batch, key))
-				return false
-			})
+			for (let index = 0; index < pending.length;) {
+				if (active.size >= maxConcurrency || partitionProvider.hasPendingRebalance()) return
+				const batch = pending[index]!
+				const key = tpKey(batch.topic, batch.partition)
+				if (active.has(key)) {
+					index++
+					continue
+				}
+				pending.splice(index, 1)
+				if (
+					fetchManager.isBatchAssigned(batch) &&
+					partitionTracker.startProcessing(batch.topic, batch.partition)
+				) {
+					active.set(key, runHandler(batch, key))
+				}
+			}
 		}
 
 		const waitForAllHandlers = () => Promise.all(active.values())
@@ -724,7 +865,8 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 					handler(messages as Message<MsgOf<S>, KeyOf<S>>[], batchCtx)
 				)
 
-				resolveOffset(lastRecord.offset)
+				// A handler of a stopped run may have returned early: only what it resolved itself is marked.
+				if (!ctx.signal.aborted) resolveOffset(lastRecord.offset)
 			},
 			opts.autoCommitIntervalMs ?? DEFAULT_RUN_BATCH_OPTIONS.autoCommitIntervalMs,
 			opts.autoCommit !== false
@@ -811,23 +953,20 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			const partitionTracker = this.partitionTracker!
 			const partitionProvider = this.partitionProvider
 
+			const pending = this.undelivered
 			while (this.state === 'running' && !signal.aborted) {
-				const batches = await fetchManager.poll()
+				pending.push(...(await fetchManager.poll()))
 
 				// Handle any pending rebalance after poll returns but before processing
 				// This ensures revoked partitions are removed before we check assignments
 				await partitionProvider.checkAndHandleRebalance()
 				if (this.state !== 'running' || signal.aborted) break
 
-				if (batches.length === 0) {
-					continue
-				}
-
-				for (const batch of batches) {
+				// A batch leaves `pending` when its records are handed out (see runPollLoop). Batches voided
+				// meanwhile are skipped: their partition was revoked (an eager rebalance also voids the batches
+				// of a partition it re-assigns), sought or paused.
+				for (let batch = pending.shift(); batch !== undefined; batch = pending.shift()) {
 					const { topic, partition, records } = batch
-					// Skip batches from partitions that were revoked during rebalance. The
-					// assignment-epoch check also drops batches drained before an eager
-					// rebalance removed and re-added a retained partition (see runPollLoop).
 					if (!fetchManager.isBatchAssigned(batch)) {
 						continue
 					}
@@ -980,6 +1119,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		this.consumerGroup = null
 		this.offsetManager = null
 		this.fetchManager = null
+		this.undelivered = []
 		this.partitionTracker?.clear()
 		this.partitionTracker = null
 		this.partitionProvider = null

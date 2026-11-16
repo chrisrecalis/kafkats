@@ -24,6 +24,7 @@ import type {
 	TopicPartitionOffset,
 	AutoOffsetReset,
 	IsolationLevel,
+	OffsetResetPolicy,
 	PartitionBatch,
 	ConsumerPartitionMetrics,
 } from './types.js'
@@ -79,9 +80,6 @@ function earliest(offset: bigint, ...others: Array<bigint | undefined>): bigint 
 	}
 	return offset
 }
-
-/** What decides where a partition restarts when it has no valid position: one policy, or one per partition. */
-type OffsetResetPolicy = AutoOffsetReset | ((topic: string, partition: number) => AutoOffsetReset)
 
 /**
  * Completed fetch from a single partition

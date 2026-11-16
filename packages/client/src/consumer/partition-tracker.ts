@@ -209,6 +209,19 @@ export class PartitionTracker {
 	}
 
 	/**
+	 * Forget partitions at once, without waiting for their handlers: they were lost with the session, so what
+	 * those handlers still do can no longer be committed. A revoke waiting for those handlers returns.
+	 */
+	release(partitions: TopicPartition[]): void {
+		for (const tp of partitions) {
+			const key = tpKey(tp.topic, tp.partition)
+			this.assigned.delete(key)
+			this.inFlight.get(key)?.deferred.resolve()
+			this.inFlight.delete(key)
+		}
+	}
+
+	/**
 	 * Check if a partition is currently assigned to this consumer.
 	 * FetchManager uses this to know which partitions to fetch from.
 	 * OffsetManager can use this to reject markConsumed for revoked partitions.
@@ -285,10 +298,7 @@ export class PartitionTracker {
 
 		if (entry) {
 			entry.count--
-			// Resolve the revoke wait only once the LAST concurrent batch for this
-			// partition finishes. `<= 0` (not `=== 0`) tolerates the unpaired force-decrement
-			// from onPartitionsLost (consumer.ts), which calls endProcessing without a
-			// matching startProcessing.
+			// Resolve the revoke wait only once the LAST concurrent batch for this partition finishes.
 			if (entry.count <= 0) {
 				entry.deferred.resolve()
 				this.inFlight.delete(key)
