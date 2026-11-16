@@ -87,7 +87,7 @@ export class KGroupedStreamImpl<K, V> implements KGroupedStream<K, V> {
 		private readonly node: OutputProcessor<K, V>,
 		private readonly format: StreamFormat<K, V>,
 		/** Source topics that feed into this grouped stream. Used for changelog partition inference. */
-		private readonly sourceTopics: Set<string> = new Set()
+		private readonly sourceTopics: Set<string>
 	) {}
 
 	private materialize<A>(
@@ -186,7 +186,7 @@ export class WindowedKGroupedStreamImpl<K, V> implements WindowedKGroupedStream<
 		private readonly format: StreamFormat<K, V>,
 		private readonly windows: TimeWindows | SessionWindows | SlidingWindows,
 		/** Source topics that feed into this windowed grouped stream. Used for changelog partition inference. */
-		private readonly sourceTopics: Set<string> = new Set()
+		private readonly sourceTopics: Set<string>
 	) {
 		if (windows instanceof TimeWindows) {
 			this.windowSizeMs = parseWindowDuration(windows.size)
@@ -237,7 +237,14 @@ export class WindowedKGroupedStreamImpl<K, V> implements WindowedKGroupedStream<
 		}
 		this.node.connect(node)
 
-		return new KTableImpl<Windowed<K>, A>(this.builder, node, { keyCodec: windowedKeyCodec(keyCodec), valueCodec })
+		// A window of a key stays in the key's partition, so the table is partitioned like its input.
+		return new KTableImpl<Windowed<K>, A>(
+			this.builder,
+			node,
+			{ keyCodec: windowedKeyCodec(keyCodec), valueCodec },
+			undefined,
+			this.sourceTopics
+		)
 	}
 
 	count(options?: Materialized<Windowed<K>, number>): KTable<Windowed<K>, number> {

@@ -30,6 +30,7 @@ src/
 │   ├── ordered.ts      # Stores over any byte-ordered engine (OrderedByteStore); used by the LMDB and RocksDB providers
 │   ├── ordered-keys.ts # Key layouts of window and session stores in such an engine, and the ranges their queries scan
 │   ├── buffered.ts     # Transactional write buffer (exactly_once)
+│   ├── bulk.ts         # Writing many entries at once (loading a table or changelog, wiping a store)
 │   └── changelog.ts    # Changelog-backed store wrappers
 ├── streams/       # KStream / KTable / grouped stream implementations (the DSL)
 │   └── topology-builder.ts # TopologyBuilder: the only part of the app the DSL may use (stores, topology, output)

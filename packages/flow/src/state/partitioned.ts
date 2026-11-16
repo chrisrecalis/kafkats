@@ -102,17 +102,6 @@ export class StorePartitions<S, R extends { init(): Promise<void> }> {
 	}
 }
 
-/** Remove every entry from a store. */
-export async function clearStore<K, V>(store: KeyValueStore<K, V>): Promise<void> {
-	const keys: K[] = []
-	for await (const [key] of store.all()) {
-		keys.push(key)
-	}
-	for (const key of keys) {
-		await store.delete(key)
-	}
-}
-
 /**
  * Store facade that routes every call to the state partition of the record currently being
  * processed. Reads made outside of record processing see all local partitions.

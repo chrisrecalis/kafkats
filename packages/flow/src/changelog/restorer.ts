@@ -1,7 +1,7 @@
 import type { Admin, Consumer, KafkaClient, Message } from '@kafkats/client'
 import type { Codec } from '@/codec.js'
 import type { ChangelogCheckpointStore, KeyValueStore } from '@/state.js'
-import { clearStore } from '@/state/partitioned.js'
+import { clearStore, latestPerKey, writeChanges, type Change } from '@/state/bulk.js'
 import type { ChangelogRestorationOptions } from '@/changelog/config.js'
 
 /** Resolves the store that holds the state of one changelog partition. */
@@ -143,21 +143,11 @@ export class ChangelogRestorer<K, V> {
 
 	/**
 	 * Phase 3 (per consumed batch): write the changes of one batch into the raw store. They are for
-	 * distinct keys, so the writes are issued together (in order) and awaited together; a store that
-	 * commits asynchronously (LMDB) then commits them as one write transaction instead of one per
-	 * record. The next batch is not applied before these writes have completed.
+	 * distinct keys, so they are written together (see `state/bulk.ts`). The next batch is not
+	 * applied before these writes have completed.
 	 */
 	private readonly applyChanges = async (partition: number, changes: Iterable<Change>): Promise<void> => {
-		const store = await this.storeFor(partition)
-		const write = async ({ key, value }: Change): Promise<void> => {
-			const decodedKey = this.keyCodec.decode(key)
-			if (value === null) {
-				await store.delete(decodedKey)
-			} else {
-				await store.put(decodedKey, this.valueCodec.decode(value))
-			}
-		}
-		await Promise.all(Array.from(changes, write))
+		await writeChanges(await this.storeFor(partition), this.keyCodec, this.valueCodec, changes)
 	}
 
 	/** Phase 4: record the end offset as the checkpoint of every partition now caught up. */
@@ -200,7 +190,6 @@ async function isCheckpointTrusted<K, V>(
 }
 
 /** One changelog record: a key and its new value, or null for a deletion. */
-type Change = { key: Buffer; value: Buffer | null }
 
 type ReplayProgress = {
 	end: bigint
@@ -302,24 +291,16 @@ class Replay {
 		const state = partition === undefined ? undefined : this.progress.get(partition)
 		if (partition === undefined || !state) return
 
-		// Only the last change of each key decides what the store holds after the batch, so earlier
-		// changes of the same key are skipped. Re-inserting moves the key to the end, so the changes
-		// keep the order of their last occurrence.
-		const latest = new Map<string, Change>()
-		let puts = 0
-		for (const message of messages) {
-			// Records past the captured end offset belong to a concurrent writer; the partition's
-			// owner will have them in its own state.
-			if (message.offset >= state.end || message.key === null) continue
-			const id = message.key.toString('latin1')
-			latest.delete(id)
-			latest.set(id, { key: message.key, value: message.value })
-			if (message.value !== null) puts++
-		}
+		// Records past the captured end offset belong to a concurrent writer; the partition's
+		// owner will have them in its own state.
+		const changes = messages.filter(message => message.offset < state.end && message.key !== null)
+		const puts = changes.filter(message => message.value !== null).length
+		// Only the last change of each key decides what the store holds after the batch.
+		const latest = latestPerKey(changes)
 
 		this.inFlight += 1
 		try {
-			if (latest.size > 0) await this.apply(partition, latest.values())
+			if (latest.length > 0) await this.apply(partition, latest)
 			this.restored += puts
 		} catch (err) {
 			this.handlerError = err

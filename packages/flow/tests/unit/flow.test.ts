@@ -1903,4 +1903,26 @@ describe('windowed/session store changelog wiring', () => {
 		expect([...changelogTopics.get('by-key').sourceTopics]).toEqual(['events'])
 		expect([...changelogTopics.get('by-region').sourceTopics]).toEqual(['test-app-repartition-0-repartition'])
 	})
+
+	it('keeps state derived from a windowed table partitioned like its input', () => {
+		const { app } = createTestApp()
+
+		for (const [topic, windows] of [
+			['events', TimeWindows.of('10s')],
+			['visits', SessionWindows.withInactivityGap('10s')],
+		] as const) {
+			app.stream(topic, { key: codec.string(), value: codec.json<{ type: string }>() })
+				.groupByKey()
+				.windowedBy(windows)
+				.count({ storeName: `${topic}-windows` })
+				.toStream()
+				.groupByKey()
+				.count({ storeName: `${topic}-updates` })
+		}
+
+		// Without source topics a store is one app-wide store with a single-partition changelog.
+		const { changelogTopics } = internals(app)
+		expect([...changelogTopics.get('events-updates').sourceTopics]).toEqual(['events'])
+		expect([...changelogTopics.get('visits-updates').sourceTopics]).toEqual(['visits'])
+	})
 })

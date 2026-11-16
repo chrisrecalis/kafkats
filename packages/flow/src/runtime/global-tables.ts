@@ -1,11 +1,12 @@
 import type { Consumer, KafkaClient, Logger } from '@kafkats/client'
 import { SourceTopicNotFoundError } from '@/changelog.js'
-import { clearStore } from '@/state/partitioned.js'
+import { clearStore, latestPerKey, writeChanges } from '@/state/bulk.js'
 import type { FlowConfig } from '@/types.js'
 import {
 	RESTART_INITIAL_BACKOFF_MS,
 	RESTART_MAX_BACKOFF_MS,
 	isInfrastructureRecoverable,
+	isRecoverable,
 	toError,
 } from '@/runtime/errors.js'
 import type { AppStatus } from '@/runtime/status.js'
@@ -114,6 +115,8 @@ export class GlobalTables {
 
 		const run = async () => {
 			let attempt = 0
+			/** What applying rows threw, as opposed to a failure of the consumer itself. */
+			let rowFailure: Error | undefined
 			while (!status.closing) {
 				const consumer = client.consumer({
 					groupId: `${config.applicationId}-global-${table.storeName}-${this.deps.processId}`,
@@ -133,23 +136,21 @@ export class GlobalTables {
 					check(position.partition)
 				})
 				try {
-					await consumer.runEach(
+					await consumer.runBatch(
 						[table.topic],
-						async message => {
+						// A batch holds records of one partition, in offset order.
+						async messages => {
+							const { partition } = messages[0]!
 							try {
-								if (message.key !== null) {
-									const key = table.keyCodec.decode(message.key)
-									if (message.value === null) {
-										await store.delete(key)
-									} else {
-										await store.put(key, table.valueCodec.decode(message.value))
-									}
-								}
-								positions.set(message.partition, message.offset + 1n)
+								await writeChanges(store, table.keyCodec, table.valueCodec, latestPerKey(messages))
+								positions.set(partition, messages.at(-1)!.offset + 1n)
+							} catch (err) {
+								rowFailure = toError(err)
+								throw rowFailure
 							} finally {
-								const state = progress.get(message.partition)
-								if (state) state.handled += 1
-								check(message.partition)
+								const state = progress.get(partition)
+								if (state) state.handled += messages.length
+								check(partition)
 							}
 						},
 						{
@@ -171,7 +172,10 @@ export class GlobalTables {
 						rejectBootstrap(error)
 						return
 					}
-					if (!isInfrastructureRecoverable(error)) {
+					// Applying rows (codecs, the store) is like user code in a stream worker: it would
+					// fail on the same rows again, and retrying forever would serve a stale table.
+					const recoverable = error === rowFailure ? isRecoverable(error) : isInfrastructureRecoverable(error)
+					if (!recoverable) {
 						logger.error('global table consumer failed', { topic: table.topic, error: error.message })
 						status.state = 'ERROR'
 						return

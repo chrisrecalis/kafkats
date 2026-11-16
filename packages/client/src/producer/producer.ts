@@ -213,6 +213,12 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	// Per topic with sends that have not appended yet: the tail of the chain that keeps the
 	// asynchronous part of send() in call order (see inSendOrder).
 	private readonly sendOrder = new Map<string, Promise<unknown>>()
+	// Number of sends that have entered inSendOrder: tells which of them were already waiting
+	// when a partition lookup started.
+	private sendsQueued = 0
+	// Per topic with waiting sends: its last failed partition lookup, which also answers the sends
+	// that were waiting when it started (see inSendOrder).
+	private readonly failedLookups = new Map<string, { asOf: number; error: unknown }>()
 
 	// Transaction state (only used when transactionalId is set)
 	private transactionState: TransactionState = 'idle'
@@ -1281,11 +1287,21 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	 * send to its topic is in here (see partitionCountToAppendNow), so it cannot overtake one.
 	 */
 	private inSendOrder<T>(topic: string, prepareAndAppend: () => Promise<T>): Promise<T> {
-		const run = (this.sendOrder.get(topic) ?? Promise.resolve()).then(prepareAndAppend, prepareAndAppend)
+		const position = ++this.sendsQueued
+		const turn = (): Promise<T> => {
+			// A lookup that started while this send was waiting did not find the topic's partitions.
+			// That answers this send too: looking again for every waiting send would fail them one
+			// lookup (about a second each) after another.
+			const failed = this.failedLookups.get(topic)
+			return failed && position <= failed.asOf ? Promise.reject(failed.error) : prepareAndAppend()
+		}
+		const run = (this.sendOrder.get(topic) ?? Promise.resolve()).then(turn, turn)
 		// The topic stays in the map until its last waiting send has appended (or failed), never
 		// less: that is what keeps a later send from appending right away and overtaking it.
 		const done = () => {
-			if (this.sendOrder.get(topic) === tail) this.sendOrder.delete(topic)
+			if (this.sendOrder.get(topic) !== tail) return
+			this.sendOrder.delete(topic)
+			this.failedLookups.delete(topic)
 		}
 		const tail = run.then(done, done)
 		this.sendOrder.set(topic, tail)
@@ -2099,12 +2115,24 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	/**
 	 * Get partition count for a topic (cached with TTL)
 	 */
+	/** The partition count of a topic. Must run inside {@link inSendOrder}. */
 	private async getPartitionCount(topic: string): Promise<number> {
 		const cached = this.cachedPartitionCount(topic)
 		if (cached !== undefined) {
 			return cached
 		}
 
+		// A failed lookup also answers the sends that are waiting for this topic right now.
+		const asOf = this.sendsQueued
+		try {
+			return await this.lookUpPartitionCount(topic)
+		} catch (error) {
+			this.failedLookups.set(topic, { asOf, error })
+			throw error
+		}
+	}
+
+	private async lookUpPartitionCount(topic: string): Promise<number> {
 		// Topic creation is asynchronous; even after CreateTopics returns successfully, the topic may not be
 		// immediately visible in Metadata. Retry a few times before failing.
 		const maxAttempts = 5

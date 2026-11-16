@@ -207,25 +207,23 @@ abstract class BufferedWindowedStore<K, V, S extends KeyValueStore<WindowedKey<K
 	}
 
 	/**
-	 * Delete, through the buffer, every entry (as seen through the buffer) whose key matches.
+	 * Delete, through the buffer, the `entries` (as seen through the buffer) whose key matches.
 	 *
 	 * Inside a transaction expiry and removal must be buffered like any other delete: applied
 	 * directly, an abort would have removed committed entries that the replay still needs.
 	 */
-	protected async deleteWhere(matches: (key: WindowedKey<K>) => boolean): Promise<WindowedKey<K>[]> {
+	protected async deleteEntries(
+		entries: AsyncIterable<[WindowedKey<K>, V]>,
+		matches: (key: WindowedKey<K>) => boolean = () => true
+	): Promise<WindowedKey<K>[]> {
 		const keys: WindowedKey<K>[] = []
-		for await (const [key] of this.all()) {
+		for await (const [key] of entries) {
 			if (matches(key)) keys.push(key)
 		}
 		for (const key of keys) {
 			await this.delete(key)
 		}
 		return keys
-	}
-
-	protected deleteExpired(currentTime: number): Promise<WindowedKey<K>[]> {
-		const cutoff = currentTime - this.retentionMs
-		return this.deleteWhere(key => key.windowEnd < cutoff)
 	}
 }
 
@@ -265,7 +263,11 @@ export class BufferedWindowStore<K, V>
 		if (!currentTransactionScope()) {
 			return this.inner.expireOldWindows(currentTime)
 		}
-		return (await this.deleteExpired(currentTime)).length
+		const cutoff = currentTime - this.retentionMs
+		// A window that ended before the cutoff also started before it, and windows are ordered by
+		// their start: only that part of the store is read, not the windows still in use.
+		const startedBeforeCutoff = this.fetchAll(Number.MIN_SAFE_INTEGER, cutoff - 1)
+		return (await this.deleteEntries(startedBeforeCutoff, window => window.windowEnd < cutoff)).length
 	}
 }
 
@@ -289,14 +291,15 @@ export class BufferedSessionStore<K, V>
 			await this.inner.remove(key)
 			return
 		}
-		const keyBytes = this.userKeyCodec.encode(key)
-		await this.deleteWhere(windowedKey => this.userKeyCodec.encode(windowedKey.key).equals(keyBytes))
+		await this.deleteEntries(this.findSessions(key, Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER))
 	}
 
 	async expireOldSessions(currentTime: number): Promise<WindowedKey<K>[]> {
 		if (!currentTransactionScope()) {
 			return this.inner.expireOldSessions(currentTime)
 		}
-		return this.deleteExpired(currentTime)
+		const cutoff = currentTime - this.retentionMs
+		// Sessions are ordered by key, not by time: like the store itself, this reads all of them.
+		return this.deleteEntries(this.all(), session => session.windowEnd < cutoff)
 	}
 }

@@ -134,6 +134,8 @@ In-memory state is caught up from in-process checkpoints after a rebalance, so a
 
 A [global table](/flow/tables#global-tables) is fully loaded before any record is processed, and is rebuilt from its topic on every start (it has no changelog). If it makes no progress for `idleTimeoutMs` while loading, `start()` fails.
 
+After startup the table follows its topic. If the connection to Kafka fails, its consumer restarts from the last row it applied. A row that cannot be applied (its codec throws, or the store rejects the write) would fail the same way again, so the app stops with `state()` `'ERROR'` instead of serving a table that no longer advances.
+
 ## Upgrading From Earlier Versions
 
 - **Stop all instances before upgrading.** Consumers now always use the `range` partition assignor (required for [co-partitioning](/flow/state-stores#co-partitioning)), which changes the group protocol, so old and new instances cannot be in the same group at the same time. A rolling upgrade does not work.

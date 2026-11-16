@@ -28,9 +28,12 @@ export class KTableImpl<K, V> implements KTable<K, V> {
 		readonly builder: TopologyBuilder,
 		readonly node: OutputProcessor<K, V>,
 		readonly format: StreamFormat<K, V>,
-		storeRef?: StoreRef<KeyValueStore<K, V>>,
-		/** Source topics the table's state is co-partitioned with. */
-		readonly sourceTopics: Set<string> = new Set(),
+		storeRef: StoreRef<KeyValueStore<K, V>> | undefined,
+		/**
+		 * Source topics the table's state is co-partitioned with. Required: state derived from a
+		 * table without them would not be partitioned (one store for the whole app).
+		 */
+		readonly sourceTopics: Set<string>,
 		/** True for globalTable(): fully replicated, only usable as the lookup side of a stream join. */
 		readonly global: boolean = false
 	) {

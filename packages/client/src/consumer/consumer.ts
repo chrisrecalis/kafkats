@@ -879,11 +879,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		this.state = 'stopping'
 		this.abortController?.abort()
 
-		// If the run loop does not wind down in time (e.g. parked in a JoinGroup at an unresponsive
-		// coordinator), force-close the coordinator connection so shutdown stays bounded.
-		this.clearShutdownTimer()
-		this.shutdownTimer = setTimeout(() => this.partitionProvider?.interrupt?.(), SHUTDOWN_DEADLINE_MS)
-		this.shutdownTimer.unref?.()
+		this.armShutdownDeadline()
 
 		if (this.runPromiseResolve) {
 			this.runPromiseResolve()
@@ -909,6 +905,22 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			byKey.set(key, tp)
 		}
 		return [...byKey.values()]
+	}
+
+	/**
+	 * Keep shutdown bounded when the run loop does not wind down in time because it is parked at an
+	 * unresponsive coordinator (e.g. in a JoinGroup): force-close the coordinator connection.
+	 *
+	 * Application code that is still working on a record is not that case. The member has to keep
+	 * its session until that code returns, or its final commit and LeaveGroup would fail.
+	 */
+	private armShutdownDeadline(): void {
+		this.clearShutdownTimer()
+		this.shutdownTimer = setTimeout(() => {
+			if (this.partitionTracker?.hasInFlightProcessing) this.armShutdownDeadline()
+			else this.partitionProvider?.interrupt?.()
+		}, SHUTDOWN_DEADLINE_MS)
+		this.shutdownTimer.unref?.()
 	}
 
 	private clearShutdownTimer(): void {
