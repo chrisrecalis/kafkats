@@ -448,7 +448,8 @@ export interface PartitionBatch extends TopicPartition {
 	/**
 	 * FetchManager assignment epoch captured when the batch was buffered. Used to detect
 	 * stale batches drained before a rebalance removed (and possibly re-added) the
-	 * partition — such batches must not be delivered. See FetchManager.isBatchAssigned.
+	 * partition, or before a seek or pause of it — such batches must not be delivered.
+	 * See FetchManager.isBatchAssigned.
 	 */
 	assignmentEpoch?: number
 }
@@ -481,6 +482,11 @@ export interface ConsumerPartitionMetrics {
 	/** The next offset this consumer will fetch. */
 	position: bigint
 	/**
+	 * The offset of the next record to be delivered to a handler: the earliest record fetched but not delivered
+	 * yet, else `position`.
+	 */
+	nextOffset?: bigint
+	/**
 	 * How far this consumer could read as of its last fetch response: the high watermark, or the
 	 * last stable offset under `read_committed`. `endOffset - position` is how far its fetching is
 	 * behind. Undefined before the first response and while the partition is paused, because a
@@ -489,6 +495,8 @@ export interface ConsumerPartitionMetrics {
 	endOffset?: bigint
 	/** Bytes fetched for this partition that no handler has received yet. */
 	bufferedBytes: number
+	/** The number of records `bufferedBytes` holds. */
+	bufferedRecords: number
 	paused: boolean
 }
 

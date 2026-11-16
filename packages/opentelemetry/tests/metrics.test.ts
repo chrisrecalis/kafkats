@@ -144,8 +144,16 @@ describe('metrics', () => {
 		}
 		const consumerMetrics: ConsumerMetrics = {
 			partitions: [
-				{ topic: 'orders', partition: 0, position: 90n, endOffset: 100n, bufferedBytes: 512, paused: false },
-				{ topic: 'orders', partition: 1, position: 7n, bufferedBytes: 0, paused: true },
+				{
+					topic: 'orders',
+					partition: 0,
+					position: 90n,
+					endOffset: 100n,
+					bufferedBytes: 512,
+					bufferedRecords: 4,
+					paused: false,
+				},
+				{ topic: 'orders', partition: 1, position: 7n, bufferedBytes: 0, bufferedRecords: 0, paused: true },
 			],
 		}
 		// Created before or after instrumentKafka(): both are found.
