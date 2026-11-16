@@ -84,11 +84,11 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	private partitionProvider: PartitionProvider | null = null
 	private fetchLoopPromise: Promise<void> | null = null
 	/**
-	 * Batches the run loop drained from the fetch buffer and has not handed to a handler yet. A batch leaves this
-	 * list just before its handler is invoked; the FetchManager counts these as not delivered (see
-	 * FetchManagerConfig.undelivered).
+	 * Batches drained from the fetch buffer that the run loop has not handed to a handler yet. The FetchManager
+	 * appends them as it drains them and counts them as not delivered (see FetchManagerConfig.undelivered); a batch
+	 * leaves this list just before its handler is invoked.
 	 */
-	private undelivered: PartitionBatch[] = []
+	private readonly undelivered: PartitionBatch[] = []
 	private abortController: AbortController | null = null
 	private runPromiseResolve: (() => void) | null = null
 	private runPromiseReject: ((error: Error) => void) | null = null
@@ -133,7 +133,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		this.abortController = new AbortController()
 		this.commitOffsets = commitOffsets
 		this.sessionLost = false
-		this.undelivered = []
+		this.undelivered.length = 0
 
 		// Set up external abort signal
 		if (externalSignal) {
@@ -250,7 +250,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 				},
 				onOffsetOutOfRange: position => this.emit('offsetOutOfRange', position),
 				onOffsetReset: reset => this.emit('offsetReset', reset),
-				undelivered: () => this.undelivered,
+				undelivered: this.undelivered,
 			},
 			logger
 		)
@@ -260,8 +260,8 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		const offsetManager = this.offsetManager!
 		const fetchManager = this.fetchManager!
 		const partitionTracker = this.partitionTracker!
-		// Partitions reported lost (or revoked) already are not revoked (again).
-		const stillAssigned = (partitions: TopicPartition[]) =>
+		// Partitions reported lost (or revoked) already are not assigned or revoked (again).
+		const stillAssigned = <T extends TopicPartition>(partitions: T[]) =>
 			partitions.filter(tp => offsetManager.isPartitionAssigned(tp.topic, tp.partition))
 
 		return {
@@ -283,8 +283,11 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 				// Held, not fetched, until the hook returned: what it pauses or seeks takes effect before any fetch.
 				fetchManager.addPartitions(assigned, { held: true })
 				await this.config.onPartitionsAssigned?.(assigned)
-				fetchManager.releaseHeld(partitions)
-				this.emit('partitionsAssigned', assigned)
+				// Lost while the hook ran (the session expired meanwhile): reported lost, not assigned.
+				const kept = stillAssigned(assigned)
+				if (kept.length === 0) return
+				fetchManager.releaseHeld(kept)
+				this.emit('partitionsAssigned', kept)
 			},
 			onPartitionsRevoked: async revoked => {
 				await partitionTracker.revoke(revoked)
@@ -414,15 +417,27 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	 * A moved, loading or slow coordinator is retried until `timeoutMs` (default `defaultApiTimeoutMs`) passed,
 	 * then it rejects with `TimeoutError`. It rejects with `RebalanceInProgressError` while the group rebalances
 	 * (commit again once it is done), and with `CommitFailedError` when this member's generation is gone; then the
-	 * consumer rejoins the group. Aborting `signal` rejects with its reason.
+	 * consumer rejoins the group. It also rejects with `CommitFailedError`, without committing anything, once the
+	 * consumer rejoined or a partition of the call was revoked or lost while it was retried: the offsets were meant
+	 * for an assignment that is gone. Aborting `signal` rejects with its reason.
 	 *
 	 * @throws If the consumer is not running
 	 */
 	async commit(offsets: readonly CommitOffset[], options?: OffsetRequestOptions): Promise<void> {
+		const offsetManager = this.runningOffsetManager()
+		const join = this.consumerGroup?.groupMetadata
 		try {
-			await this.runningOffsetManager().commitExplicit(offsets, options)
+			await offsetManager.commitExplicit(offsets, options)
 		} catch (error) {
-			if (error instanceof CommitFailedError) this.consumerGroup?.emit('rebalance')
+			// The coordinator rejected the generation this member still holds: rejoin. A join that changed meanwhile
+			// (rejoined, or reset by a loss, which rejoins by itself) needs no other rebalance.
+			if (
+				error instanceof CommitFailedError &&
+				join !== undefined &&
+				this.consumerGroup?.groupMetadata === join
+			) {
+				this.consumerGroup.emit('rebalance')
+			}
 			throw error
 		}
 	}
@@ -512,10 +527,14 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 	}
 
 	/**
-	 * The offset of the next record of an assigned partition to be delivered to a handler: the earliest
-	 * record fetched but not handed to a handler yet, else the fetch position (which moves past transaction
-	 * markers and aborted records). This is the offset to commit once everything delivered is processed.
-	 * Undefined when the partition is not assigned to this consumer.
+	 * The first offset of the earliest batch of an assigned partition fetched but not delivered yet, else the
+	 * fetch position (which moves past transaction markers and aborted records). Undefined when the partition is
+	 * not assigned to this consumer.
+	 *
+	 * Delivery counts whole batches: a batch is delivered once its handler is called (`runBatch`) or its first
+	 * record is handed out (`runEach`, `stream`), so while a batch is processed this is past its last record. It
+	 * is an offset to commit only while no batch of the partition is being processed (in `onPartitionsRevoked`,
+	 * for example); with `runEach` and `stream`, commit `ctx.offset + 1n` of the last processed record instead.
 	 */
 	nextOffset(topic: string, partition: number): bigint | undefined {
 		return this.fetchManager?.nextOffset(topic, partition)
@@ -683,7 +702,8 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 					continue
 				}
 
-				pending.push(...(await fetchManager.poll(active)))
+				// The drained batches land in `pending` (this.undelivered).
+				await fetchManager.poll(active)
 			}
 		} finally {
 			await waitForAllHandlers()
@@ -953,9 +973,10 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 			const partitionTracker = this.partitionTracker!
 			const partitionProvider = this.partitionProvider
 
+			// The FetchManager appends the batches it drains to `pending` (this.undelivered).
 			const pending = this.undelivered
 			while (this.state === 'running' && !signal.aborted) {
-				pending.push(...(await fetchManager.poll()))
+				await fetchManager.poll()
 
 				// Handle any pending rebalance after poll returns but before processing
 				// This ensures revoked partitions are removed before we check assignments
@@ -1119,7 +1140,7 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 		this.consumerGroup = null
 		this.offsetManager = null
 		this.fetchManager = null
-		this.undelivered = []
+		this.undelivered.length = 0
 		this.partitionTracker?.clear()
 		this.partitionTracker = null
 		this.partitionProvider = null

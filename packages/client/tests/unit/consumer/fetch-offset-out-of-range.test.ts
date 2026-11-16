@@ -26,14 +26,14 @@ describe('FetchManager OffsetOutOfRange handling', () => {
 		const onOffsetOutOfRange = vi.fn()
 		const { fm, fetch } = await fetchManagerHarness({
 			autoOffsetReset: 'none',
-			config: { onOffsetOutOfRange, undelivered: () => pending, maxBytesPerPartition: 150 },
+			config: { onOffsetOutOfRange, undelivered: pending, maxBytesPerPartition: 150 },
 		})
 		fm.addPartitions([
 			{ ...tp(0), offset: 10n },
 			{ ...tp(1), offset: 0n },
 		])
 		await fetch(fetchResponse({ partition: 0, records: recordBatch(10n, 4), highWatermark: 14n }), 0)
-		pending.push(...(await fm.poll()))
+		await fm.poll()
 
 		// The log was truncated below the fetch position (14) while records 10-13 wait for delivery.
 		await fetch(fetchResponse({ partition: 0, ...OUT_OF_RANGE }), 0)

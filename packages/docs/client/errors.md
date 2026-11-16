@@ -159,8 +159,9 @@ import { IllegalGenerationError } from '@kafkats/client'
 `consumer.commit()` was rejected because this member's generation is gone (the broker answered `IllegalGeneration`,
 `UnknownMemberId` or `FencedInstanceId`, available as `cause`). Nothing was committed and the consumer rejoins the
 group; the partitions may have moved to another member, which will process their records again from the last
-committed offsets. A transaction's `sendOffsets()` raises it too when given the metadata of a member that has not
-joined.
+committed offsets. A commit that was still being retried when the consumer rejoined, or when a partition of it was
+revoked or lost, fails the same way (`cause`: `IllegalGeneration`) without being sent again. A transaction's
+`sendOffsets()` raises it too when given the metadata of a member that has not joined.
 
 ```typescript
 import { CommitFailedError } from '@kafkats/client'

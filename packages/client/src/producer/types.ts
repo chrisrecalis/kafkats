@@ -114,7 +114,8 @@ export interface ProducerConfig {
 	 * 1. **Broker-side**: Passed to InitProducerId; broker aborts transaction if
 	 *    not committed/aborted within this time
 	 * 2. **Client-side**: Used by transaction() to timeout the user callback
-	 *    (a beginTransaction() handle has no client-side timeout unless given a signal)
+	 *    (a beginTransaction() handle has none: its signal bounds it until commit() or abort() is
+	 *    called, and those take their own timeoutMs and signal)
 	 *
 	 * Keep these in sync to avoid surprises. Only used when transactionalId is set.
 	 */
@@ -278,9 +279,10 @@ export interface ProducerEvents {
 export type TransactionState = 'idle' | 'in_transaction' | 'committing' | 'aborting' | 'error'
 
 /**
- * Topic-partition offset for transactional offset commit
+ * An offset committed within a transaction (`sendOffsets`): `offset` is the next offset to read (the last processed
+ * offset + 1)
  */
-export interface TopicPartitionOffset {
+export interface TransactionOffset {
 	/** Topic name */
 	topic: string
 	/** Partition index */
@@ -289,7 +291,7 @@ export interface TopicPartitionOffset {
 	offset: bigint
 	/** Leader epoch (optional) */
 	leaderEpoch?: number
-	/** Metadata (optional) */
+	/** Stored with the offset and read back with it, e.g. by `consumer.committed()` (optional) */
 	metadata?: string
 }
 
@@ -311,7 +313,7 @@ export interface SendOffsetsParams {
 	/** Consumer group metadata (for full EOS with consumer) */
 	consumerGroupMetadata?: GroupMetadata
 	/** Offsets to commit */
-	offsets: TopicPartitionOffset[]
+	offsets: TransactionOffset[]
 }
 
 /**
@@ -337,8 +339,10 @@ export interface ProducerCallOptions {
  */
 export interface BeginTransactionOptions {
 	/**
-	 * Aborting it rejects a call still waiting to begin, and aborts the transaction once it is open. Without it, an
-	 * open transaction has no client-side timeout (the broker's `transactionTimeoutMs` applies).
+	 * Aborting it rejects a call still waiting to begin, and aborts the transaction once it is open, until
+	 * `commit()` or `abort()` is called on the handle; from then on it has no effect, and those calls are bounded
+	 * only by their own `timeoutMs` and `signal`. Without it, an open transaction has no client-side timeout (the
+	 * broker's `transactionTimeoutMs` applies).
 	 */
 	signal?: AbortSignal
 }
@@ -377,7 +381,7 @@ export interface ProducerTransaction {
 	 * not fenced.
 	 */
 	sendOffsets(context: ConsumeContext): Promise<void>
-	sendOffsets(context: ConsumeContext, offsets: TopicPartitionOffset[]): Promise<void>
+	sendOffsets(context: ConsumeContext, offsets: TransactionOffset[]): Promise<void>
 	sendOffsets(params: SendOffsetsParams): Promise<void>
 
 	/**

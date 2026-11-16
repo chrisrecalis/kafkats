@@ -55,8 +55,8 @@ export function fakeBroker(options: { partitions?: number } = {}) {
 	const joinErrors: ErrorCode[] = []
 	/** Answers of the next OffsetCommit requests (for every partition), then None. */
 	const commitErrors: ErrorCode[] = []
-	/** While set, SyncGroup waits for it. */
-	const gates: { syncGroup?: Promise<void> } = {}
+	/** While set, SyncGroup (OffsetCommit) waits for it. */
+	const gates: { syncGroup?: Promise<void>; offsetCommit?: Promise<void> } = {}
 	let generationId = 0
 	let members = 0
 
@@ -142,6 +142,7 @@ export function fakeBroker(options: { partitions?: number } = {}) {
 
 		async offsetCommit(request: OffsetCommitRequest) {
 			calls.push('OffsetCommit')
+			await gates.offsetCommit
 			const injected = commitErrors.shift()
 			const stale = request.generationId !== -1 && request.generationId !== generationId
 			const errorCode = injected ?? (stale ? ErrorCode.IllegalGeneration : ErrorCode.None)

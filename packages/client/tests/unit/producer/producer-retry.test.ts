@@ -3,7 +3,7 @@ import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import { Producer } from '@/producer/producer.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import { ConnectionClosedError, NetworkError } from '@/network/errors.js'
-import { KafkaError, KafkaProtocolError, ProducerFencedError } from '@/client/errors.js'
+import { KafkaError, KafkaProtocolError, LeaderNotAvailableError, ProducerFencedError } from '@/client/errors.js'
 import { createMockBroker, createMockCluster, buildProduceResponse } from './_helpers.js'
 
 describe('Producer retry behavior', () => {
@@ -148,6 +148,50 @@ describe('Producer retry behavior', () => {
 			expect(error).toMatchObject({ retriable: true, errorCode: ErrorCode.NotLeaderOrFollower })
 			expect((error as KafkaError).cause).toBeInstanceOf(KafkaProtocolError)
 			expect(mockBroker.produce).toHaveBeenCalledTimes(3) // Initial + 2 retries
+		})
+	})
+
+	describe('partitions without a leader', () => {
+		it('sends the batches of the other partitions while one has no leader, and retries only that one', async () => {
+			mockCluster = createMockCluster({ partitionCount: 2 })
+			mockCluster.getLeaderForPartition.mockImplementation(async (topic, partition) => {
+				if (partition === 1) throw new LeaderNotAvailableError(topic, partition)
+				return mockBroker
+			})
+			mockBroker.produce.mockImplementation(async request =>
+				buildProduceResponse(
+					request.topics.map(topic => ({
+						name: topic.name,
+						partitions: topic.partitions.map(p => ({
+							partitionIndex: p.partitionIndex,
+							errorCode: ErrorCode.None,
+							baseOffset: 10n,
+						})),
+					}))
+				)
+			)
+			const producer = new Producer(mockCluster, { lingerMs: 0, retries: 2, retryBackoffMs: 1 })
+
+			// One send: one drain holds the batches of both partitions.
+			const error = await producer
+				.send('test-topic', [
+					{ value: Buffer.from('a'), partition: 0 },
+					{ value: Buffer.from('b'), partition: 1 },
+				])
+				.catch((e: unknown) => e)
+
+			// The batch of partition 0 went out at once; only that of partition 1 used up the retries.
+			expect(mockBroker.produce).toHaveBeenCalledOnce()
+			expect(mockBroker.produce.mock.calls[0]![0].topics[0]!.partitions.map(p => p.partitionIndex)).toEqual([0])
+			expect(error).toBeInstanceOf(KafkaError)
+			expect(error).toMatchObject({
+				retriable: true,
+				message: expect.stringContaining('test-topic-1: max retries'),
+			})
+			expect((error as KafkaError).cause).toBeInstanceOf(LeaderNotAvailableError)
+			expect(
+				mockCluster.getLeaderForPartition.mock.calls.filter(([, partition]) => partition === 1)
+			).toHaveLength(3)
 		})
 	})
 

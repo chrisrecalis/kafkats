@@ -39,6 +39,7 @@ export type {
 	BeginTransactionOptions,
 	TransactionState,
 	SendOffsetsParams,
+	TransactionOffset,
 } from '@/producer/index.js'
 
 // Consumer

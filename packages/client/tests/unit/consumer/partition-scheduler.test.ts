@@ -34,9 +34,10 @@ describe('consumer partition scheduler', () => {
 		consumerInternal.abortController = new AbortController()
 		const polls = [[batch(0, 0n)], [batch(1, 0n)], [batch(1, 1n)]]
 		consumerInternal.fetchManager = {
-			poll: vi.fn().mockImplementation((excluded: ReadonlyMap<string, unknown>) => {
+			// Like the FetchManager, it queues what it drains on the consumer's undelivered batches.
+			poll: vi.fn().mockImplementation(async (excluded: ReadonlyMap<string, unknown>) => {
 				pollExclusions.push([...excluded.keys()])
-				return Promise.resolve(polls.shift() ?? [])
+				consumerInternal.undelivered.push(...(polls.shift() ?? []))
 			}),
 			isBatchAssigned: vi.fn().mockReturnValue(true),
 			wakePoll: vi.fn(),

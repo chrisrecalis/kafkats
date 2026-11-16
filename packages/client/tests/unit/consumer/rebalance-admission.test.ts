@@ -8,6 +8,7 @@ describe('consumer rebalance admission', () => {
 		const consumerInternal = consumer as unknown as {
 			state: string
 			abortController: AbortController
+			undelivered: unknown[]
 			fetchManager: {
 				poll: ReturnType<typeof vi.fn>
 				isBatchAssigned: ReturnType<typeof vi.fn>
@@ -44,7 +45,10 @@ describe('consumer rebalance admission', () => {
 		consumerInternal.state = 'running'
 		consumerInternal.abortController = new AbortController()
 		consumerInternal.fetchManager = {
-			poll: vi.fn().mockResolvedValueOnce(batches),
+			// Like the FetchManager, it queues what it drains on the consumer's undelivered batches.
+			poll: vi.fn().mockImplementationOnce(async () => {
+				consumerInternal.undelivered.push(...batches)
+			}),
 			isBatchAssigned: vi.fn().mockReturnValue(true),
 			wakePoll: vi.fn(),
 		}

@@ -22,12 +22,12 @@ describe('FetchManager next delivery offset and lag', () => {
 
 	it('counts a drained batch that is not delivered yet until the caller hands it to a handler', async () => {
 		const pending: PartitionBatch[] = []
-		const { fm, fetch } = await fetchManagerHarness({ config: { undelivered: () => pending } })
+		const { fm, fetch } = await fetchManagerHarness({ config: { undelivered: pending } })
 		fm.addPartitions([{ ...tp(0), offset: 0n }])
 
 		await fetch(fetchResponse({ partition: 0, records: recordBatch(0n, 4), highWatermark: 4n }), 0)
 		// Waiting for a slot (another partition's handler runs) or for a pending rebalance.
-		pending.push(...(await fm.poll()))
+		await fm.poll()
 		expect(fm.nextOffset(TOPIC, 0)).toBe(0n)
 		expect(fm.currentLag(TOPIC, 0)).toBe(4n)
 
@@ -86,10 +86,10 @@ describe('FetchManager next delivery offset and lag', () => {
 
 	it('restarts at the position of a partition removed and re-added, ignoring batches drained before', async () => {
 		const pending: PartitionBatch[] = []
-		const { fm, fetch } = await fetchManagerHarness({ config: { undelivered: () => pending } })
+		const { fm, fetch } = await fetchManagerHarness({ config: { undelivered: pending } })
 		fm.addPartitions([{ ...tp(0), offset: 5n }])
 		await fetch(fetchResponse({ partition: 0, records: recordBatch(5n, 3), highWatermark: 8n }), 0)
-		pending.push(...(await fm.poll()))
+		await fm.poll()
 
 		// Eager rebalance: the partition comes back at its committed offset; the drained batch is stale.
 		fm.removePartitions([tp(0)])
@@ -102,7 +102,7 @@ describe('FetchManager next delivery offset and lag', () => {
 	it('reports the next delivery offset and buffered records in the partition metrics', async () => {
 		const pending: PartitionBatch[] = []
 		const { fm, fetch } = await fetchManagerHarness({
-			config: { undelivered: () => pending, maxBytesPerPartition: 150 },
+			config: { undelivered: pending, maxBytesPerPartition: 150 },
 		})
 		fm.addPartitions([
 			{ ...tp(0), offset: 0n },
@@ -111,7 +111,7 @@ describe('FetchManager next delivery offset and lag', () => {
 		await fetch(fetchResponse({ partition: 0, records: recordBatch(0n, 4), highWatermark: 4n }), 0)
 
 		// A batch takes about 150 bytes: two records, two stay buffered.
-		pending.push(...(await fm.poll()))
+		await fm.poll()
 		expect(offsetsOf(pending[0]!)).toEqual([0n, 1n])
 
 		// Records are estimated at 66 bytes each (2-byte value plus 64).

@@ -261,6 +261,7 @@ await consumer.commit([{ topic: 'events', partition: 0, offset: lastProcessed + 
 - It works with a group or a manual assignment, also with `commitOffsets: false`. Offsets of partitions not assigned to this consumer are skipped. It throws when the consumer is not running.
 - A moved, loading or slow coordinator is retried until `timeoutMs` passed; then it rejects with `TimeoutError`. Aborting `signal` rejects it with the signal's reason.
 - It rejects with `RebalanceInProgressError` while the group rebalances (commit again once it is done, or in `onPartitionsRevoked`), and with `CommitFailedError` when this member's generation is gone: nothing was committed and the consumer rejoins the group.
+- A retried commit stays tied to the assignment it was called for: once the consumer rejoined the group, or a partition of the call was revoked or lost, it rejects with `CommitFailedError` instead of retrying, so offsets meant for the old assignment never overwrite those of a partition's new owner.
 
 ### Reading Committed Offsets
 
@@ -273,13 +274,15 @@ The map is keyed by `topic:partition`. Offsets of an open transaction are waited
 
 ### Position, Next Offset and Lag
 
-| Method                         | Returns                                                                                                                                                                                                                                                                  |
-| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `position(topic, partition)`   | The offset the next fetch starts at. Fetching runs ahead of the handlers, so this is past records still buffered.                                                                                                                                                        |
-| `nextOffset(topic, partition)` | The offset of the next record to be delivered to a handler: the earliest record fetched but not delivered yet, else the fetch position (which moves past transaction markers and aborted records). Once everything delivered is processed, this is the offset to commit. |
-| `currentLag(topic, partition)` | How many records can be read beyond `nextOffset`: the partition's end as of its last fetch response (the last stable offset under `read_committed`, else the high watermark) minus `nextOffset`. `undefined` before the first fetch response and while paused.           |
+| Method                         | Returns                                                                                                                                                                                                                                                        |
+| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `position(topic, partition)`   | The offset the next fetch starts at. Fetching runs ahead of the handlers, so this is past records still buffered.                                                                                                                                              |
+| `nextOffset(topic, partition)` | The first offset of the earliest batch fetched but not delivered yet, else the fetch position (which moves past transaction markers and aborted records). A batch counts as delivered as a whole (see below).                                                  |
+| `currentLag(topic, partition)` | How many records can be read beyond `nextOffset`: the partition's end as of its last fetch response (the last stable offset under `read_committed`, else the high watermark) minus `nextOffset`. `undefined` before the first fetch response and while paused. |
 
 All three return `undefined` for a partition that is not assigned to the consumer. `consumer.metrics()` reports the same per partition (`position`, `nextOffset`, `endOffset`, `bufferedBytes`, `bufferedRecords`, `paused`).
+
+`nextOffset` counts delivery per batch, not per record: a batch is delivered as a whole once its handler is called (`runBatch()`) or once its first record is handed out (`runEach()`, `stream()`). While a `runEach()` handler or a `stream()` loop is still on a batch, `nextOffset` is already past the batch's last record. It is therefore an offset to commit only while no batch of the partition is being processed (in `onPartitionsRevoked`, for example, which runs once the partition's handlers finished). With `runEach()` and `stream()`, commit `ctx.offset + 1n` of the last record processed instead.
 
 `consumer.commitStartPosition([{ topic, partition }])` commits the position a partition starts from. It is for a partition that has no committed offset yet: committing where it starts makes a restart resume from there instead of applying `autoOffsetReset` again (with `'latest'`, that would skip whatever arrived in between). Call it from `onPartitionsAssigned` or a `partitionsAssigned` listener, optionally after `seek()`. It throws once records of the partition have been fetched, because the position is then past records no handler has seen.
 

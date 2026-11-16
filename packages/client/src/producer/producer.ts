@@ -49,7 +49,7 @@ import type {
 	PartitionerFunction,
 	TransactionState,
 	TransactionOptions,
-	TopicPartitionOffset,
+	TransactionOffset,
 	SendOffsetsParams,
 	ProducerTransaction,
 	TransactionHandle,
@@ -315,7 +315,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	// An EndTxn(commit) of the current transaction was sent without an answer: the broker may have committed it.
 	private commitOutcomeUnknown = false
 	private partitionsInTransaction = new Set<string>() // "topic:partition"
-	private offsetsToCommit = new Map<string, { offsets: TopicPartitionOffset[]; groupMetadata?: GroupMetadata }>() // groupId -> { offsets, groupMetadata }
+	private offsetsToCommit = new Map<string, { offsets: TransactionOffset[]; groupMetadata?: GroupMetadata }>() // groupId -> { offsets, groupMetadata }
 
 	// Transaction lane pool (transactionConcurrency > 1 only): each lane is a full
 	// Producer with its own transactional ID, so lane transactions genuinely overlap.
@@ -597,17 +597,11 @@ export class Producer extends EventEmitter<ProducerEvents> {
 
 		// A disconnected producer sends nothing more (see sendPreparedBatchesToBroker).
 		while (this.state !== 'idle' && strategy.shouldReconnect()) {
-			try {
-				const outcome = await this.sendPreparedBatchesOnce(pendingBatches)
-				if (outcome.stop || outcome.retryBatches.length === 0) {
-					return
-				}
-				pendingBatches = outcome.retryBatches
-			} catch (error) {
-				// The leaders could not be looked up: every batch is retried.
-				const failure = toError(error)
-				for (const prepared of pendingBatches) prepared.lastError = failure
+			const outcome = await this.sendPreparedBatchesOnce(pendingBatches)
+			if (outcome.stop || outcome.retryBatches.length === 0) {
+				return
 			}
+			pendingBatches = outcome.retryBatches
 
 			strategy.recordFailure()
 			if (!strategy.shouldReconnect()) {
@@ -619,7 +613,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	}
 
 	private async sendPreparedBatchesOnce(preparedBatches: PreparedProduceBatch[]): Promise<ProduceAttemptOutcome> {
-		const batchesByBroker = await this.groupPreparedBatchesByLeader(preparedBatches)
+		const { batchesByBroker, leaderless } = await this.groupPreparedBatchesByLeader(preparedBatches)
 		const outcomes = await Promise.all(
 			Array.from(batchesByBroker.entries()).map(async ([, { broker, batches }]) => {
 				try {
@@ -637,21 +631,34 @@ export class Producer extends EventEmitter<ProducerEvents> {
 			return { retryBatches: [], stop: true }
 		}
 
-		return { retryBatches: outcomes.flatMap(outcome => outcome.retryBatches), stop: false }
+		return { retryBatches: [...leaderless, ...outcomes.flatMap(outcome => outcome.retryBatches)], stop: false }
 	}
 
-	private async groupPreparedBatchesByLeader(
-		preparedBatches: PreparedProduceBatch[]
-	): Promise<Map<number, { broker: Broker; batches: PreparedProduceBatch[] }>> {
+	/**
+	 * The batches per partition leader. Those whose leader cannot be looked up (none elected, broker unknown) are
+	 * `leaderless`, with the failure as their `lastError`: they are retried while the others are sent.
+	 */
+	private async groupPreparedBatchesByLeader(preparedBatches: PreparedProduceBatch[]): Promise<{
+		batchesByBroker: Map<number, { broker: Broker; batches: PreparedProduceBatch[] }>
+		leaderless: PreparedProduceBatch[]
+	}> {
 		const batchesByBroker = new Map<number, { broker: Broker; batches: PreparedProduceBatch[] }>()
+		const leaderless: PreparedProduceBatch[] = []
 		for (const prepared of preparedBatches) {
 			const { batch } = prepared
-			const broker = await this.cluster.getLeaderForPartition(batch.topic, batch.partition)
+			let broker: Broker
+			try {
+				broker = await this.cluster.getLeaderForPartition(batch.topic, batch.partition)
+			} catch (error) {
+				prepared.lastError = toError(error)
+				leaderless.push(prepared)
+				continue
+			}
 			const existing = batchesByBroker.get(broker.nodeId) ?? { broker, batches: [] }
 			existing.batches.push(prepared)
 			batchesByBroker.set(broker.nodeId, existing)
 		}
-		return batchesByBroker
+		return { batchesByBroker, leaderless }
 	}
 
 	private async sendPreparedBatchesToBroker(
@@ -1533,7 +1540,8 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	 * initializes the producer (InitProducerId), which fences older producers with the same transactional ID.
 	 *
 	 * Without `signal`, an open transaction has no client-side timeout; the broker aborts it after
-	 * `transactionTimeoutMs`. Aborting `signal` rejects the call while it waits, and aborts the transaction once open.
+	 * `transactionTimeoutMs`. Aborting `signal` rejects the call while it waits, and aborts the transaction once open
+	 * until the handle's `commit()` or `abort()` is called; those are bounded by their own `timeoutMs` and `signal`.
 	 *
 	 * @throws InvalidTxnStateError when the producer is in the 'error' state
 	 *
@@ -1821,7 +1829,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 
 			sendOffsets: async (
 				contextOrParams: ConsumeContext | SendOffsetsParams,
-				offsets?: TopicPartitionOffset[]
+				offsets?: TransactionOffset[]
 			): Promise<void> => {
 				assertOpen()
 				await this.prepareOffsetsForCommit(this.resolveSendOffsetsParams(contextOrParams, offsets))
@@ -1968,7 +1976,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	 */
 	private resolveSendOffsetsParams(
 		contextOrParams: ConsumeContext | SendOffsetsParams,
-		offsets?: TopicPartitionOffset[]
+		offsets?: TransactionOffset[]
 	): SendOffsetsParams {
 		if ('offsets' in contextOrParams) {
 			if (offsets !== undefined) {
@@ -2240,12 +2248,12 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	 */
 	private async commitTransactionOffsets(
 		groupId: string,
-		offsets: TopicPartitionOffset[],
+		offsets: TransactionOffset[],
 		groupMetadata: GroupMetadata | undefined,
 		stop: AbortSignal | undefined
 	): Promise<void> {
 		// One offset per (topic, partition): the highest, and the last one given for it (its metadata is the latest).
-		const deduped = new Map<string, TopicPartitionOffset>()
+		const deduped = new Map<string, TransactionOffset>()
 		for (const offset of offsets) {
 			const key = `${offset.topic}:${offset.partition}`
 			const existing = deduped.get(key)

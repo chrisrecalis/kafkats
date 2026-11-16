@@ -68,7 +68,7 @@ await tx.commit()
 ```
 
 - `beginTransaction()` waits its turn first in first out together with `transaction()` calls (one open transaction per transactional ID, see [Concurrent Transactions](#concurrent-transactions)). The first transaction of a producer initializes it, which fences older producers with the same transactional ID.
-- A handle has no client-side timeout: the broker aborts a transaction left open longer than `transactionTimeoutMs`. Pass `beginTransaction({ signal })` to bound it yourself: aborting the signal rejects a call still waiting for its turn, and aborts the transaction once it is open.
+- A handle has no client-side timeout: the broker aborts a transaction left open longer than `transactionTimeoutMs`. Pass `beginTransaction({ signal })` to bound it yourself: aborting the signal rejects a call still waiting for its turn, and aborts the transaction once it is open, until `commit()` or `abort()` is called. From then on it has no effect: those calls take their own `{ timeoutMs, signal }`, and without them a commit or abort can take as long as the producer's coordinator retries (up to `maxBlockMs` for each request, plus the flush).
 - `tx.commit({ timeoutMs, signal })` flushes the transaction's sends, commits its offsets and ends it. It rejects with `TransactionAbortedError` when the transaction did not commit (see [Error Handling](#error-handling)).
 - `tx.abort({ timeoutMs, signal })` rejects the queued sends, waits for those in flight and ends the transaction. If that does not finish in time, the producer enters the `'error'` state and the call rejects.
 - `tx.signal` is aborted once the transaction ends without committing. Calling `send()`, `sendOffsets()` or `commit()` on a transaction that ended rejects with `InvalidTxnStateError`.
@@ -233,7 +233,7 @@ interface ProducerTransaction {
 
 	// Commit consumer offsets (for exactly-once)
 	sendOffsets(ctx: ConsumeContext): Promise<void>
-	sendOffsets(ctx: ConsumeContext, offsets: TopicPartitionOffset[]): Promise<void>
+	sendOffsets(ctx: ConsumeContext, offsets: TransactionOffset[]): Promise<void>
 	sendOffsets(params: SendOffsetsParams): Promise<void>
 
 	// Abort signal (fires on timeout or error)
@@ -270,12 +270,16 @@ interface SendOffsetsParams {
 	}
 
 	// Offsets to commit
-	offsets: Array<{
-		topic: string
-		partition: number
-		offset: bigint
-		metadata?: string // committed with the offset
-	}>
+	offsets: TransactionOffset[]
+}
+
+// The offset of one partition, as `sendOffsets()` takes it (exported as `TransactionOffset`)
+interface TransactionOffset {
+	topic: string
+	partition: number
+	offset: bigint // the next offset to read: the last processed offset + 1
+	leaderEpoch?: number
+	metadata?: string // committed with the offset
 }
 ```
 

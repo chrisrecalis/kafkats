@@ -182,6 +182,33 @@ describe('Producer.beginTransaction()', () => {
 			expect(mocks.txnCoordinator.endTxn).toHaveBeenLastCalledWith(expect.objectContaining({ committed: true }))
 		})
 
+		it('is not triggered by the begin signal once commit() was called: the commit bounds itself', async () => {
+			let answer!: () => void
+			mocks.txnCoordinator.endTxn.mockImplementationOnce(
+				() =>
+					new Promise(resolve => {
+						answer = () => resolve({ throttleTimeMs: 0, errorCode: ErrorCode.None })
+					})
+			)
+			const producer = makeProducer()
+			const controller = new AbortController()
+			const tx = await producer.beginTransaction({ signal: controller.signal })
+			await tx.send(TOPIC, { value })
+
+			const committed = tx.commit()
+			await vi.waitFor(() => expect(mocks.txnCoordinator.endTxn).toHaveBeenCalledTimes(1))
+			controller.abort()
+			await tick()
+			answer()
+
+			await expect(committed).resolves.toBeUndefined()
+			expect(tx.signal.aborted).toBe(false)
+			expect(mocks.txnCoordinator.endTxn).toHaveBeenCalledExactlyOnceWith(
+				expect.objectContaining({ committed: true })
+			)
+			expect(producer.transactionState).toBe('idle')
+		})
+
 		it('enters the error state when it does not finish within timeoutMs', async () => {
 			mocks.txnCoordinator.endTxn.mockImplementation(() => never())
 			const producer = makeProducer()

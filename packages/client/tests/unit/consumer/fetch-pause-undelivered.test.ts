@@ -4,7 +4,7 @@ import type { PartitionBatch } from '@/consumer/types.js'
 import { fetchManagerHarness, fetchResponse, offsetsOf, recordBatch, TOPIC, tp } from './fetch-harness.js'
 
 /**
- * A run loop's queue of drained batches, reported to the FetchManager as undelivered. `deliver` hands the
+ * A run loop's queue of drained batches, which the FetchManager fills as it drains them. `deliver` hands the
  * oldest batch to its "handler" the way the consumer's run loop does: dropped unless still deliverable.
  */
 function runLoopQueue() {
@@ -13,7 +13,7 @@ function runLoopQueue() {
 	return {
 		pending,
 		delivered,
-		undelivered: () => pending,
+		undelivered: pending,
 		deliver(isBatchAssigned: (batch: PartitionBatch) => boolean): void {
 			const batch = pending.shift()!
 			if (!isBatchAssigned(batch)) return
@@ -38,7 +38,7 @@ describe('FetchManager pause and seek with drained, undelivered batches', () => 
 			0,
 			1
 		)
-		queue.pending.push(...(await fm.poll()))
+		await fm.poll()
 		expect(queue.pending.map(batch => batch.partition)).toEqual([0, 1])
 
 		// The handler of partition 0 runs first and pauses partition 1, whose batch still waits for a slot.
@@ -54,7 +54,7 @@ describe('FetchManager pause and seek with drained, undelivered batches', () => 
 		fm.resumePartitions([tp(1)])
 		await fetch(fetchResponse({ partition: 1, records: recordBatch(0n, 4), highWatermark: 4n }), 1)
 		expect(requestedOffset(1)).toBe(0n)
-		queue.pending.push(...(await fm.poll()))
+		await fm.poll()
 		queue.deliver(isBatchAssigned)
 		expect(queue.delivered).toEqual(['0:0', '0:1', '1:0', '1:1', '1:2', '1:3'])
 	})
@@ -66,7 +66,7 @@ describe('FetchManager pause and seek with drained, undelivered batches', () => 
 		})
 		fm.addPartitions([{ ...tp(0), offset: 10n }])
 		await fetch(fetchResponse({ partition: 0, records: recordBatch(10n, 4), highWatermark: 14n }), 0)
-		queue.pending.push(...(await fm.poll()))
+		await fm.poll()
 		expect(offsetsOf(queue.pending[0]!)).toEqual([10n, 11n])
 
 		fm.pausePartitions([tp(0)])
@@ -81,7 +81,7 @@ describe('FetchManager pause and seek with drained, undelivered batches', () => 
 		const { fm, fetch } = await fetchManagerHarness({ config: { undelivered: queue.undelivered } })
 		fm.addPartitions([{ ...tp(0), offset: 0n }])
 		await fetch(fetchResponse({ partition: 0, records: recordBatch(0n, 2), highWatermark: 2n }), 0)
-		queue.pending.push(...(await fm.poll()))
+		await fm.poll()
 
 		fm.pausePartitions([tp(0)])
 		fm.resumePartitions([tp(0)])
@@ -107,7 +107,7 @@ describe('FetchManager pause and seek with drained, undelivered batches', () => 
 			0,
 			1
 		)
-		queue.pending.push(...(await fm.poll()))
+		await fm.poll()
 
 		fm.pausePartitions([tp(1)])
 
@@ -121,7 +121,7 @@ describe('FetchManager pause and seek with drained, undelivered batches', () => 
 		const { fm, fetch, requestedOffset } = await fetchManagerHarness({ config: { undelivered: queue.undelivered } })
 		fm.addPartitions([{ ...tp(0), offset: 0n }])
 		await fetch(fetchResponse({ partition: 0, records: recordBatch(0n, 3), highWatermark: 20n }), 0)
-		queue.pending.push(...(await fm.poll()))
+		await fm.poll()
 
 		fm.seekPartition(TOPIC, 0, 10n)
 
@@ -130,9 +130,28 @@ describe('FetchManager pause and seek with drained, undelivered batches', () => 
 		queue.deliver(batch => fm.isBatchAssigned(batch))
 		await fetch(fetchResponse({ partition: 0, records: recordBatch(10n, 2), highWatermark: 20n }), 0)
 		expect(requestedOffset(0)).toBe(10n)
-		queue.pending.push(...(await fm.poll()))
+		await fm.poll()
 		queue.deliver(batch => fm.isBatchAssigned(batch))
 		expect(queue.delivered).toEqual(['0:10', '0:11'])
+	})
+
+	it('queues the batches it drains before poll() resolves, so a pause meanwhile withholds them', async () => {
+		const queue = runLoopQueue()
+		const { fm, fetch } = await fetchManagerHarness({ config: { undelivered: queue.undelivered } })
+		fm.addPartitions([{ ...tp(0), offset: 0n }])
+		await fetch(fetchResponse({ partition: 0, records: recordBatch(0n, 2), highWatermark: 2n }), 0)
+
+		// The buffer is drained now; the caller resumes later, and other code (a handler) may run in between.
+		const polled = fm.poll()
+		expect(queue.pending.map(batch => batch.partition)).toEqual([0])
+		expect(fm.nextOffset(TOPIC, 0)).toBe(0n)
+		expect(fm.partitionMetrics()[0]!.nextOffset).toBe(0n)
+		fm.pausePartitions([tp(0)])
+
+		expect(await polled).toEqual(queue.pending)
+		expect(fm.getFetchPosition(TOPIC, 0)).toBe(0n)
+		queue.deliver(batch => fm.isBatchAssigned(batch))
+		expect(queue.delivered).toEqual([])
 	})
 
 	it('leaves a drained batch deliverable when the caller reports no undelivered batches', async () => {

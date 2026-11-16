@@ -4,7 +4,7 @@ import { CommitFailedError, RebalanceInProgressError } from '@/client/errors.js'
 import type { Consumer } from '@/consumer/consumer.js'
 import type { AssignedPartition } from '@/consumer/types.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
-import { fakeBroker, groupConsumer, TOPIC, tp, until } from './group-harness.js'
+import { deferred, fakeBroker, groupConsumer, sleep, TOPIC, tp, until } from './group-harness.js'
 
 /** Start a run that commits nothing by itself, and wait for its first assignment. */
 async function running(consumer: Consumer) {
@@ -83,6 +83,34 @@ describe('Consumer.commit() and committed()', () => {
 		expect(consumer.rebalancePending).toBe(true)
 		await rebalanceComplete
 		expect(consumer.groupMetadata()?.generationId).toBe(2)
+
+		consumer.stop()
+		await run
+	})
+
+	it('fails a commit still retried after a rebalance, without committing under the new generation', async () => {
+		const broker = fakeBroker()
+		const consumer = groupConsumer(broker)
+		const { run } = await running(consumer)
+		const answer = deferred()
+		broker.gates.offsetCommit = answer.promise
+		broker.commitErrors.push(ErrorCode.NotCoordinator)
+
+		const commit = consumer.commit([{ ...tp(0), offset: 100n, metadata: 'stale' }]).catch(e => e)
+		await until(() => broker.calls.includes('OffsetCommit'), 'the first attempt')
+		// While the coordinator is slow to answer, the group rebalances: the partition may have another owner now.
+		const rebalanced = new Promise<void>(resolve => consumer.once('rebalanceComplete', () => resolve()))
+		broker.heartbeatErrors.push(ErrorCode.RebalanceInProgress)
+		await rebalanced
+		answer.resolve()
+
+		expect(await commit).toBeInstanceOf(CommitFailedError)
+		expect(broker.commits).toEqual([{ generationId: 1, partition: 0, offset: 100n, metadata: 'stale' }])
+		expect(broker.committed.size).toBe(0)
+		// The member is in the new generation already: no other rebalance.
+		await sleep(50)
+		expect(broker.calls.filter(call => call === 'JoinGroup')).toHaveLength(2)
+		expect(consumer.rebalancePending).toBe(false)
 
 		consumer.stop()
 		await run

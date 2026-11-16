@@ -34,6 +34,7 @@ export type {
 	BeginTransactionOptions,
 	TransactionState,
 	SendOffsetsParams,
+	TransactionOffset,
 	ResolvedProducerConfig,
 	QueuedMessage,
 	PartitionBatch,

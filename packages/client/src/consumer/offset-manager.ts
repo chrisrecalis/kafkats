@@ -41,6 +41,12 @@ export interface OffsetRequestOptions {
 	signal?: AbortSignal
 }
 
+/** The membership a commit is made under: the member id and generation of a join (`''` and -1 without a group). */
+interface GroupMember {
+	memberId: string
+	generationId: number
+}
+
 /** Backoff between attempts of an explicit commit: 100 ms, doubling up to 1 s. */
 const COMMIT_RETRY_INITIAL_DELAY_MS = 100
 const COMMIT_RETRY_MAX_DELAY_MS = 1_000
@@ -331,6 +337,11 @@ export class OffsetManager {
 	 * are not retried: `RebalanceInProgressError` while the group rebalances, `CommitFailedError` when this member's
 	 * generation is gone, `KafkaProtocolError` otherwise. Aborting `signal` rejects with its reason.
 	 *
+	 * Every attempt is made under the member and generation of the call. Once the member rejoined, or a partition of
+	 * the call left its assignment (revoked or lost), the call rejects with `CommitFailedError` instead of retrying:
+	 * the offsets were chosen for an assignment that is gone, and committing them would overwrite the commits of the
+	 * partitions' new owners.
+	 *
 	 * Once committed, the consumed offsets the commit covers are dropped, so no later commit moves the partition back.
 	 */
 	async commitExplicit(offsets: readonly CommitOffset[], options: OffsetRequestOptions = {}): Promise<void> {
@@ -343,18 +354,27 @@ export class OffsetManager {
 		if (topics.length === 0) {
 			return
 		}
+		const member: GroupMember = { memberId: this.memberId, generationId: this.generationId }
 
 		await trace(
 			diagnostics.commit,
 			() => this.commitDiagnostics(topics),
-			() => this.commitUntilDone(coordinator, topics, options.timeoutMs ?? this.apiTimeoutMs, options.signal)
+			() =>
+				this.commitUntilDone(
+					coordinator,
+					topics,
+					member,
+					options.timeoutMs ?? this.apiTimeoutMs,
+					options.signal
+				)
 		)
 	}
 
-	/** The retry loop of {@link commitExplicit}. */
+	/** The retry loop of {@link commitExplicit}: every attempt under `member`, for partitions still assigned. */
 	private async commitUntilDone(
 		coordinator: Broker,
 		topics: OffsetCommitTopic[],
+		member: GroupMember,
 		timeoutMs: number,
 		signal: AbortSignal | undefined
 	): Promise<void> {
@@ -368,8 +388,12 @@ export class OffsetManager {
 			let delayMs = COMMIT_RETRY_INITIAL_DELAY_MS
 			for (;;) {
 				try {
+					this.assertUnchanged(topics, member)
 					// The current coordinator: sendOffsetCommit re-discovers a moved one before it throws.
-					return await abortable(this.sendOffsetCommit(this.coordinator ?? coordinator, topics), stop.signal)
+					return await abortable(
+						this.sendOffsetCommit(this.coordinator ?? coordinator, topics, member),
+						stop.signal
+					)
 				} catch (error) {
 					if (stop.signal.aborted || !isRetriableCommitError(error)) throw error
 					lastError = error
@@ -389,6 +413,30 @@ export class OffsetManager {
 		} finally {
 			clearTimeout(timer)
 			signal?.removeEventListener('abort', onAbort)
+		}
+	}
+
+	/**
+	 * Throw `CommitFailedError` once `member` is not this member's current membership any more (it rejoined), or a
+	 * partition of `topics` left its assignment (revoked or lost): an attempt now would commit offsets chosen for an
+	 * assignment that is gone. The broker cannot tell: it accepts a commit under a generation still current, for any
+	 * partition, so the commit would overwrite those of the partitions' new owners.
+	 */
+	private assertUnchanged(topics: OffsetCommitTopic[], member: GroupMember): void {
+		const rejoined = member.memberId !== this.memberId || member.generationId !== this.generationId
+		const moved = topics.some(topic =>
+			topic.partitions.some(p => !this.assignedPartitions.has(tpKey(topic.name, p.partitionIndex)))
+		)
+		if (rejoined || moved) {
+			throw new CommitFailedError(
+				this.groupId,
+				new KafkaProtocolError(
+					ErrorCode.IllegalGeneration,
+					rejoined
+						? `the member left generation ${member.generationId} while the commit was retried`
+						: 'a partition of the commit left the assignment while the commit was retried'
+				)
+			)
 		}
 	}
 
@@ -431,16 +479,21 @@ export class OffsetManager {
 	}
 
 	/**
-	 * Send one OffsetCommit request and settle the pending offsets by its per-partition results: a committed
-	 * partition's consumed offset is dropped unless it moved past the committed offset meanwhile.
+	 * Send one OffsetCommit request under `member` (default: the current membership) and settle the pending offsets by
+	 * its per-partition results: a committed partition's consumed offset is dropped unless it moved past the
+	 * committed offset meanwhile.
 	 */
-	private async sendOffsetCommit(coordinator: Broker, topics: OffsetCommitTopic[]): Promise<void> {
+	private async sendOffsetCommit(
+		coordinator: Broker,
+		topics: OffsetCommitTopic[],
+		member: GroupMember = { memberId: this.memberId, generationId: this.generationId }
+	): Promise<void> {
 		let response: Awaited<ReturnType<Broker['offsetCommit']>>
 		try {
 			response = await coordinator.offsetCommit({
 				groupId: this.groupId,
-				generationId: this.generationId,
-				memberId: this.memberId,
+				generationId: member.generationId,
+				memberId: member.memberId,
 				groupInstanceId: this.groupInstanceId ?? null,
 				topics,
 			})

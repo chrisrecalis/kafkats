@@ -21,9 +21,11 @@ import type {
 	ProducerCallOptions,
 	ProducerTransaction,
 	RecordsToDelete,
+	SendOffsetsParams,
 	TopicPartition,
 	TopicPartitionOffset,
 	TransactionHandle,
+	TransactionOffset,
 	TransactionOptions,
 	TransactionState,
 } from '@/index.js'
@@ -66,6 +68,13 @@ describe('package root exports', () => {
 		expectTypeOf<TransactionHandle>().toExtend<ProducerTransaction>()
 		expectTypeOf<TransactionHandle['commit']>().toEqualTypeOf<(options?: ProducerCallOptions) => Promise<void>>()
 		expectTypeOf<Producer['transactionState']>().toEqualTypeOf<TransactionState>()
+		// The offsets of a transaction carry metadata; the consumer's TopicPartitionOffset does not.
+		expectTypeOf<SendOffsetsParams['offsets']>().toEqualTypeOf<TransactionOffset[]>()
+		expectTypeOf<TransactionOffset>().toHaveProperty('metadata').toEqualTypeOf<string | undefined>()
+		expectTypeOf<ProducerTransaction['sendOffsets']>().toBeCallableWith({
+			consumerGroupMetadata: { groupId: 'g', generationId: 1, memberId: 'm' },
+			offsets: [{ topic: 't', partition: 0, offset: 1n, metadata: 'm' }],
+		})
 		expectTypeOf<Producer['disconnect']>().toEqualTypeOf<(options?: DisconnectOptions) => Promise<void>>()
 		expectTypeOf<Producer['partitionCount']>().toEqualTypeOf<
 			(topic: string, options?: ProducerCallOptions) => Promise<number>

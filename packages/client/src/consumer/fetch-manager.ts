@@ -544,13 +544,14 @@ export interface FetchManagerConfig {
 		reason: 'out-of-range'
 	}) => void
 	/**
-	 * The batches poll() returned that the caller still holds without having delivered them (a batch is
-	 * delivered once its handler is invoked). A pause rewinds the fetch position to the earliest of them and
-	 * voids them (isBatchAssigned turns false, and the caller drops them); nextOffset, currentLag and
-	 * partitionMetrics count them as not delivered. Without it, a pause leaves such batches deliverable and
-	 * nextOffset can be past their records.
+	 * The caller's queue of drained batches it has not delivered yet (a batch is delivered once its handler is
+	 * invoked). poll() appends the batches it drains to it in the same synchronous step that takes them out of the
+	 * buffer, so until delivered a record is always in one of the two; the caller removes a batch when it delivers
+	 * or drops it. A pause rewinds the fetch position to the earliest of them and voids them (isBatchAssigned turns
+	 * false, and the caller drops them); nextOffset, currentLag and partitionMetrics count them as not delivered.
+	 * Without it, a pause leaves drained batches deliverable and nextOffset can be past their records.
 	 */
-	undelivered?: () => Iterable<PartitionBatch>
+	undelivered?: PartitionBatch[]
 	priority?: PriorityStrategy
 }
 
@@ -920,7 +921,7 @@ export class FetchManager {
 	/** First offset of the earliest of the caller's undelivered batches, per partition, for deliverable batches. */
 	private undeliveredFrom(): Map<string, bigint> {
 		const firstOffsets = new Map<string, bigint>()
-		for (const batch of this.config.undelivered?.() ?? []) {
+		for (const batch of this.config.undelivered ?? []) {
 			const first = batch.records[0]?.offset
 			if (first === undefined || !this.isBatchAssigned(batch)) continue
 			const key = tpKey(batch.topic, batch.partition)
@@ -1394,7 +1395,8 @@ export class FetchManager {
 	 * The background loop is started lazily on first call.
 	 *
 	 * Returns records grouped by topic/partition. Internal offsets are advanced
-	 * so subsequent polls return new records.
+	 * so subsequent polls return new records. With `undelivered` configured, the
+	 * batches are in that queue already when poll() returns them: take them from there.
 	 */
 	async poll(excludedPartitions?: PartitionKeys): Promise<PartitionBatch[]> {
 		// Surface a fatal fetch error (e.g. CORRUPT_MESSAGE) recorded by the background loop.
@@ -1463,16 +1465,21 @@ export class FetchManager {
 	}
 
 	/**
-	 * Drain buffer and return completed fetches directly
+	 * Drain buffer and return completed fetches directly. They go into the caller's `undelivered` queue in the same
+	 * step: poll() resolves them to the caller only later, and in between nothing else would hold them.
 	 */
 	private drainBuffer(excludedPartitions?: PartitionKeys): PartitionBatch[] {
 		const fetchBuffer = this.fetchBuffer
 		if (!fetchBuffer) return []
-		const { maxBytesPerPartition, priority } = this.config
-		if (!priority) return fetchBuffer.drain(maxBytesPerPartition, excludedPartitions)
-		this.lastExcluded = excludedPartitions
-		const decision = priority.schedule(this.buildSchedulerState(fetchBuffer, excludedPartitions))
-		return fetchBuffer.drain(maxBytesPerPartition, excludedPartitions, decision.drain)
+		const { maxBytesPerPartition, priority, undelivered } = this.config
+		let plan: ScheduleDecision['drain'] | undefined
+		if (priority) {
+			this.lastExcluded = excludedPartitions
+			plan = priority.schedule(this.buildSchedulerState(fetchBuffer, excludedPartitions)).drain
+		}
+		const batches = fetchBuffer.drain(maxBytesPerPartition, excludedPartitions, plan)
+		undelivered?.push(...batches)
+		return batches
 	}
 
 	/** Buffered partitions first (in buffer order), then idle assigned partitions with zero buffered. */

@@ -533,8 +533,9 @@ export interface ConsumerPartitionMetrics {
 	/** The next offset this consumer will fetch. */
 	position: bigint
 	/**
-	 * The offset of the next record to be delivered to a handler: the earliest record fetched but not delivered
-	 * yet, else `position`.
+	 * The first offset of the earliest batch fetched but not delivered yet, else `position`. A batch is delivered
+	 * as a whole, once its handler is called (`runBatch`) or its first record is handed out (`runEach`,
+	 * `stream`): see `Consumer.nextOffset()` for when this is an offset to commit.
 	 */
 	nextOffset?: bigint
 	/**

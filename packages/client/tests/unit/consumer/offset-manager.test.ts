@@ -59,6 +59,8 @@ function makeManager(coordinator: FakeCoordinator, rediscovered: FakeCoordinator
 	return { manager, cluster }
 }
 
+const tp0 = { topic: 't', partition: 0 }
+
 afterEach(() => {
 	vi.useRealTimers()
 })
@@ -246,6 +248,31 @@ describe('OffsetManager.commitExplicit', () => {
 		await commit
 
 		expect(coordinator.offsetCommit).toHaveBeenCalledTimes(3)
+	})
+
+	it.each([
+		[
+			'the member rejoined',
+			(manager: OffsetManager, broker: Broker) => manager.updateGroupState('member-1', 8, broker),
+		],
+		['the partition was revoked or lost', (manager: OffsetManager) => manager.removeAssignedPartitions([tp0])],
+	])('stops retrying with CommitFailedError once %s, sending nothing more', async (_, change) => {
+		vi.useFakeTimers()
+		const coordinator = fakeCoordinator(ErrorCode.NotCoordinator, ErrorCode.None)
+		const { manager } = makeManager(coordinator)
+
+		const commit = manager.commitExplicit([{ topic: 't', partition: 0, offset: 100n, metadata: 'm' }])
+		const settled = commit.catch(e => e)
+		await vi.advanceTimersByTimeAsync(0)
+		expect(coordinator.requests).toHaveLength(1)
+		// While it backs off, the group rebalances: the partition may belong to another member now.
+		change(manager, coordinator as unknown as Broker)
+		await vi.advanceTimersByTimeAsync(100)
+
+		const error = await settled
+		expect(error).toBeInstanceOf(CommitFailedError)
+		expect(error.errorCode).toBe(ErrorCode.IllegalGeneration)
+		expect(coordinator.requests).toHaveLength(1)
 	})
 
 	it('rejects RebalanceInProgress with RebalanceInProgressError without retrying', async () => {

@@ -186,17 +186,65 @@ describe('Consumer rebalance hooks', () => {
 		await run
 	})
 
+	it('does not report partitions lost while onPartitionsAssigned ran as assigned', async () => {
+		const broker = fakeBroker()
+		const assignedGate = deferred()
+		let joins = 0
+		const consumer: Consumer = groupConsumer(broker, {
+			onPartitionsAssigned: async partitions => {
+				broker.calls.push(`assigned ${partitionsOf(partitions)}`)
+				if (++joins === 1) await assignedGate.promise
+			},
+		})
+		recordEvents(consumer, broker)
+		const positions: Array<bigint | undefined> = []
+		consumer.on('partitionsAssigned', partitions => {
+			positions.push(...partitions.map(tp => consumer.position(tp.topic, tp.partition)))
+		})
+		const run = consumer.runBatch(TOPIC, async () => {}, { commitOffsets: false })
+
+		await until(() => broker.calls.includes('assigned 0,1'), 'the assignment hook')
+		broker.heartbeatErrors.push(ErrorCode.UnknownMemberId)
+		await until(() => broker.calls.includes('partitionsLost'), 'the loss')
+		assignedGate.resolve()
+		await until(() => broker.calls.includes('rebalanceComplete'), 'the rejoin')
+
+		expect(broker.calls.filter(notFetch)).toEqual([
+			'JoinGroup',
+			'SyncGroup',
+			'OffsetFetch',
+			'assigned 0,1',
+			'partitionsLost',
+			'rebalancePending',
+			'rebalance',
+			'JoinGroup',
+			'SyncGroup',
+			'OffsetFetch',
+			'assigned 0,1',
+			'partitionsAssigned',
+			'rebalanceComplete',
+		])
+		expect(positions).toEqual([0n, 0n])
+
+		consumer.stop()
+		await run
+	})
+
 	it('completes one rebalance while heartbeats keep reporting it during a slow revocation', async () => {
 		const broker = fakeBroker()
 		broker.produce(0, 1)
+		const revocation = deferred()
 		const consumer = groupConsumer(broker, {
-			onPartitionsRevoked: () => sleep(100),
+			onPartitionsRevoked: () => revocation.promise,
 		})
 		recordEvents(consumer, broker)
 		const { run } = await started(consumer, 1)
 
 		broker.calls.length = 0
 		broker.heartbeatErrors.push(...Array<ErrorCode>(5).fill(ErrorCode.RebalanceInProgress))
+		// The revocation lasts until every heartbeat answer reporting the rebalance was read.
+		await until(() => broker.heartbeatErrors.length === 0, 'the heartbeats')
+		revocation.resolve()
 		await until(() => broker.calls.includes('rebalanceComplete'), 'the end of the rebalance')
 		await sleep(100)
 
