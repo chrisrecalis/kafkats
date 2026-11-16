@@ -1,12 +1,37 @@
 import { describe, expect, it } from 'vitest'
 
-import { murmur2, murmur2Partitioner } from '@/producer/partitioners/murmur2.js'
+import { murmur2, murmur2Partitioner, toPositive } from '@/producer/partitioners/murmur2.js'
 import { createRoundRobinPartitioner, nextRoundRobinPartition } from '@/producer/partitioners/round-robin.js'
 
 describe('murmur2 partitioner', () => {
 	it('computes deterministic hashes', () => {
 		expect(murmur2(Buffer.from('test'))).toBe(716234879)
 		expect(murmur2(Buffer.from('hello'))).toBe(2132663229)
+	})
+
+	it('matches the Java client (org.apache.kafka.common.utils.UtilsTest.testMurmur2)', () => {
+		const vectors: Array<[string, number]> = [
+			['21', -973932308],
+			['foobar', -790332482],
+			['a-little-bit-long-string', -985981536],
+			['a-little-bit-longer-string', -1486304829],
+			['lkjh234lh9fiuh90y23oiuhsafujhadof229phr9h19h89h8', -58897971],
+			['abc', 479470107],
+		]
+		for (const [key, hash] of vectors) {
+			expect(murmur2(Buffer.from(key)), key).toBe(hash)
+		}
+	})
+
+	it('toPositive clears only the sign bit (Utils.toPositive)', () => {
+		expect(toPositive(0)).toBe(0)
+		expect(toPositive(42)).toBe(42)
+		expect(toPositive(-1)).toBe(0x7fffffff)
+		expect(toPositive(-2147483648)).toBe(0)
+		expect(toPositive(-973932308)).toBe(-973932308 & 0x7fffffff)
+		expect(toPositive(murmur2(Buffer.from('foobar'))) % 6).toBe(
+			murmur2Partitioner('t', Buffer.from('foobar'), Buffer.alloc(0), 6)
+		)
 	})
 
 	it('returns -1 when key is null', () => {

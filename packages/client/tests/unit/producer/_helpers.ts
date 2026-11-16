@@ -40,6 +40,46 @@ export function createMockBroker(nodeId: number): MockBroker {
 	return broker
 }
 
+/**
+ * A cluster whose transaction coordinator, group coordinator and partition leader answer every transactional request
+ * of `topic` partition 0 with success (producer id 1, epoch 0).
+ */
+export function createTransactionalMocks(topic = 'test-topic') {
+	const cluster = createMockCluster()
+	const txnCoordinator = createMockBroker(1)
+	const groupCoordinator = createMockBroker(2)
+	const leader = createMockBroker(3)
+
+	cluster.getCoordinator.mockImplementation(async type =>
+		type === 'TRANSACTION' ? txnCoordinator : groupCoordinator
+	)
+	cluster.getAnyBroker.mockResolvedValue(txnCoordinator)
+	cluster.getLeaderForPartition.mockResolvedValue(leader)
+
+	txnCoordinator.initProducerId.mockResolvedValue({
+		throttleTimeMs: 0,
+		errorCode: ErrorCode.None,
+		producerId: 1n,
+		producerEpoch: 0,
+	})
+	txnCoordinator.addPartitionsToTxn.mockResolvedValue({
+		throttleTimeMs: 0,
+		errorCode: ErrorCode.None,
+		results: [{ name: topic, resultsByPartition: [{ partitionIndex: 0, errorCode: ErrorCode.None }] }],
+	})
+	txnCoordinator.addOffsetsToTxn.mockResolvedValue({ throttleTimeMs: 0, errorCode: ErrorCode.None })
+	txnCoordinator.endTxn.mockResolvedValue({ throttleTimeMs: 0, errorCode: ErrorCode.None })
+	groupCoordinator.txnOffsetCommit.mockResolvedValue({
+		throttleTimeMs: 0,
+		topics: [{ name: topic, partitions: [{ partitionIndex: 0, errorCode: ErrorCode.None }] }],
+	})
+	leader.produce.mockResolvedValue(
+		buildProduceResponse([{ name: topic, partitions: [{ partitionIndex: 0, errorCode: ErrorCode.None }] }])
+	)
+
+	return { cluster, txnCoordinator, groupCoordinator, leader }
+}
+
 export function buildProduceResponse(
 	topics: Array<{
 		name: string

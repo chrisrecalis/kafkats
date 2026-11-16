@@ -3,7 +3,7 @@ import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import { Producer } from '@/producer/producer.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import { ConnectionClosedError, NetworkError } from '@/network/errors.js'
-import { ProducerFencedError } from '@/client/errors.js'
+import { KafkaError, KafkaProtocolError, ProducerFencedError } from '@/client/errors.js'
 import { createMockBroker, createMockCluster, buildProduceResponse } from './_helpers.js'
 
 describe('Producer retry behavior', () => {
@@ -140,9 +140,13 @@ describe('Producer retry behavior', () => {
 				])
 			)
 
-			await expect(producer.send('test-topic', { value: Buffer.from('test') })).rejects.toThrow(
-				'max retries exceeded'
-			)
+			const sent = producer.send('test-topic', { value: Buffer.from('test') })
+			await expect(sent).rejects.toThrow('max retries exceeded')
+			// Retriable, with the last broker answer as the cause.
+			const error = await sent.catch((e: unknown) => e)
+			expect(error).toBeInstanceOf(KafkaError)
+			expect(error).toMatchObject({ retriable: true, errorCode: ErrorCode.NotLeaderOrFollower })
+			expect((error as KafkaError).cause).toBeInstanceOf(KafkaProtocolError)
 			expect(mockBroker.produce).toHaveBeenCalledTimes(3) // Initial + 2 retries
 		})
 	})
@@ -163,7 +167,10 @@ describe('Producer retry behavior', () => {
 				])
 			)
 
-			await expect(producer.send('test-topic', { value: Buffer.from('test') })).rejects.toThrow('MessageTooLarge')
+			const error = await producer.send('test-topic', { value: Buffer.from('test') }).catch((e: unknown) => e)
+			expect(error).toBeInstanceOf(KafkaProtocolError)
+			expect(error).toMatchObject({ errorCode: ErrorCode.MessageTooLarge, retriable: false })
+			expect((error as Error).message).toContain('MessageTooLarge')
 			expect(mockBroker.produce).toHaveBeenCalledTimes(1)
 		})
 
@@ -272,9 +279,10 @@ describe('Producer retry behavior', () => {
 
 			mockBroker.produce.mockRejectedValue(new ConnectionClosedError('Connection lost'))
 
-			await expect(producer.send('test-topic', { value: Buffer.from('test') })).rejects.toThrow(
-				ConnectionClosedError
-			)
+			const error = await producer.send('test-topic', { value: Buffer.from('test') }).catch((e: unknown) => e)
+			expect(error).toBeInstanceOf(KafkaError)
+			expect(error).toMatchObject({ retriable: true })
+			expect((error as KafkaError).cause).toBeInstanceOf(ConnectionClosedError)
 			expect(mockBroker.produce).toHaveBeenCalledTimes(3)
 		})
 	})

@@ -1,12 +1,32 @@
 import { describe, expect, it } from 'vitest'
 
 import { string } from '@/codec.js'
+import { KafkaProtocolError } from '@/client/errors.js'
+import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import { topic } from '@/topic.js'
 
 import { createClient } from '../helpers/kafka.js'
 import { uniqueName } from '../helpers/testkit.js'
 
 describe.concurrent('Producer (integration) - errors', () => {
+	it('rejects a record larger than the broker accepts with KafkaProtocolError(MessageTooLarge)', async () => {
+		const client = createClient('it-record-too-large')
+		await client.connect()
+
+		const topicName = uniqueName('it-record-too-large')
+		await client.createTopics([{ name: topicName, numPartitions: 1, replicationFactor: 1 }])
+
+		const producer = client.producer({ lingerMs: 0 })
+		// Above the broker default message.max.bytes (~1 MiB): a definitive rejection, not retried.
+		const error = await producer.send(topicName, { value: Buffer.alloc(2 * 1024 * 1024) }).catch((e: unknown) => e)
+
+		expect(error).toBeInstanceOf(KafkaProtocolError)
+		expect(error).toMatchObject({ errorCode: ErrorCode.MessageTooLarge, retriable: false })
+
+		await producer.disconnect()
+		await client.disconnect()
+	})
+
 	it('throws error when sending to non-existent topic without auto-create', async () => {
 		const client = createClient('it-no-topic')
 		await client.connect()

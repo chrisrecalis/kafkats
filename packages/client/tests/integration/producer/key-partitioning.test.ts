@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { string } from '@/codec.js'
+import { murmur2, toPositive } from '@/producer/partitioners/murmur2.js'
 import { topic } from '@/topic.js'
 
 import { createClient } from '../helpers/kafka.js'
@@ -63,6 +64,31 @@ describe.concurrent('Producer (integration) - key partitioning', () => {
 		// With 8 different keys and 4 partitions, we should use multiple partitions
 		// (statistically very unlikely all 8 keys hash to same partition)
 		expect(partitionsUsed.size).toBeGreaterThan(1)
+
+		await producer.disconnect()
+		await client.disconnect()
+	})
+
+	it('reports the partition count and places keys where the Java partitioner does', async () => {
+		const client = createClient('it-key-java-parity')
+		await client.connect()
+
+		const topicName = uniqueName('it-key-java-parity')
+		const testTopic = topic<string, string>(topicName, { key: string(), value: string() })
+		await client.createTopics([{ name: topicName, numPartitions: 6, replicationFactor: 1 }])
+
+		const producer = client.producer({ lingerMs: 0 })
+		const partitionCount = await producer.partitionCount(topicName, { timeoutMs: 10_000 })
+		expect(partitionCount).toBe(6)
+
+		const keys = ['a', 'b', 'user-2', 'session-9', 'foobar', '21']
+		const results = await producer.send(
+			testTopic,
+			keys.map(key => ({ key, value: key }))
+		)
+		expect(results.map(r => r.partition)).toEqual(
+			keys.map(key => toPositive(murmur2(Buffer.from(key))) % partitionCount)
+		)
 
 		await producer.disconnect()
 		await client.disconnect()
