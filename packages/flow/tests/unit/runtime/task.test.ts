@@ -14,6 +14,7 @@ import { ObservedStreamTime } from '@/processor/time-tracker.js'
 import type { PartitionStart, StreamTask, TaskState } from '@/runtime/task.js'
 import type { KeyValueStore, StateStore } from '@/state.js'
 import type { RegisteredStore } from '@/state/state-manager.js'
+import type { StoreClock } from '@/state/time-clipping.js'
 import type { InternalTopologyBuilder } from '@/topology/builder.js'
 import { kvStore, passThrough, pipe, TaskHarness } from '../support/task-harness.js'
 
@@ -108,16 +109,23 @@ async function inState(h: TaskHarness, state: TaskState): Promise<StreamTask> {
 }
 
 /** Store clocks come with the clipping layer (state/time-clipping.ts): until then the test gives store `w` one. */
-function giveClock(task: StreamTask): { time: number } {
-	const clock = {
-		time: -1,
-		seed(time: number) {
-			clock.time = Math.max(clock.time, time)
+function giveClock(task: StreamTask): StoreClock {
+	let time = -1
+	const raise = (to: number) => {
+		time = Math.max(time, to)
+	}
+	const clock: StoreClock = {
+		get time() {
+			return time
 		},
+		advance: raise,
+		seed: raise,
+		readFloor: Number.MIN_SAFE_INTEGER,
+		expiryCutoff: Number.MIN_SAFE_INTEGER,
 	}
 	const stores = task.stores as RegisteredStore[]
 	const index = stores.findIndex(store => store.builder.name === 'w')
-	stores[index] = { ...stores[index]!, clock } as RegisteredStore
+	stores[index] = { ...stores[index]!, clock }
 	return clock
 }
 

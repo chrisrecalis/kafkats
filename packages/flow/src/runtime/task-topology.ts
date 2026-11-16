@@ -71,9 +71,6 @@ export class TaskTopology {
 			streamTime: () => task.streamTime,
 			store: name => topology!.store(name),
 			requestCommit: deps.onCommitRequested,
-			// Schedules are made in init(), process() and punctuators: the scheduler looks at the task's punctuation
-			// after each of them (the task turned RUNNING, its slice ended), so there is nothing to signal.
-			onScheduled: () => {},
 		})
 		const { processing, production } = deps.handlers
 		const { globalStores } = task.subtopology

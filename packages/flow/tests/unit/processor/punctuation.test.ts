@@ -86,7 +86,6 @@ describe('context.schedule', () => {
 	it('stream time: first due 0, fires once stream time is known, with the stream time', async () => {
 		const calls: number[] = []
 		const { harness } = await scheduling(ctx => void ctx.schedule(10, 'stream-time', time => void calls.push(time)))
-		expect(harness.scheduled).toBe(1)
 		expect(await harness.punctuateStreamTime()).toBe(false)
 		await harness.process('in', { key: 'k', value: 1, timestamp: 5 })
 		expect(await harness.punctuateStreamTime()).toBe(true)

@@ -98,8 +98,10 @@ export function createBuiltTopology(parts: TopologyParts): BuiltTopology {
 }
 
 /**
- * Configs hold only what the topology knows; the creation path layers the defaults and
- * `FlowConfig.changelog` (replication factor, topic configs, autoCreate) around them (4.1.5, 5.4).
+ * Changelog configs are the store's `logging.configs`, which the store builders resolve completely (defaults <-
+ * `FlowConfig.changelog.topicConfigs` <- the store's own, 5.4). Repartition configs are empty: the creation path
+ * applies `DEFAULT_REPARTITION_CONFIGS` <- `FlowConfig.changelog.topicConfigs` to them, and the default replication
+ * factor and `autoCreate` to both kinds (4.1.5).
  */
 function internalTopics(
 	subtopologies: readonly Subtopology[],

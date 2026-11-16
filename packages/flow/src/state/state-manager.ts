@@ -12,6 +12,7 @@ import {
 	ChangelogBackedWindowStore,
 } from '@/state/logging.js'
 import type { StateDirectory } from '@/state/state-directory.js'
+import type { StoreClock } from '@/state/time-clipping.js'
 import {
 	TransactionalKeyValueStore,
 	TransactionalSessionStore,
@@ -29,6 +30,8 @@ export interface RegisteredStore {
 	readonly top: StateStore
 	/** The exactly-once write buffer. */
 	readonly buffer?: TransactionalLayer
+	/** Window and session(-layout) stores with a clipping layer. */
+	readonly clock?: StoreClock
 	readonly changelog?: { readonly topic: string; readonly partition: number; readonly skipRestoration: boolean }
 }
 

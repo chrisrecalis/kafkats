@@ -103,7 +103,6 @@ export class ProcessorHarness {
 	readonly sent: Sent[] = []
 	readonly task: TaskContext
 	commitRequests = 0
-	scheduled = 0
 	/** Max timestamp processed, -1 unknown (settable to drive stream-time punctuation). */
 	streamTime = -1
 	wallClock: number
@@ -135,7 +134,6 @@ export class ProcessorHarness {
 			streamTime: () => this.streamTime,
 			store: name => this.store(name),
 			requestCommit: () => void this.commitRequests++,
-			onScheduled: () => void this.scheduled++,
 		})
 		const seed = new Map(Object.entries(options.metadata ?? {}))
 		this.metadata.replaceAll([seed], new Set(seed.keys()))

@@ -56,9 +56,6 @@ export interface TaskDeps {
 	readonly onCommitRequested: () => void
 }
 
-/** The store clock of a window or session store (state/time-clipping.ts), seeded when the task starts running. */
-type ClockedStore = RegisteredStore & { readonly clock?: { seed(time: number): void } }
-
 type Lag = (tp: TopicPartition) => bigint | undefined
 
 export class StreamTask {
@@ -554,7 +551,7 @@ export class StreamTask {
 			}
 		}
 		this.metadata.replaceAll(committed, this.subtopology.metadataKeys)
-		for (const { builder, clock } of this.stateManager.stores as readonly ClockedStore[]) {
+		for (const { builder, clock } of this.stateManager.stores) {
 			if (clock) {
 				const observed = this.metadata.get(`${builder.name}.observed`) ?? -1
 				clock.seed(Math.max(observed, restoredStoreTimes.get(builder.name) ?? -1))

@@ -48,8 +48,6 @@ export interface TaskContextOptions {
 	readonly store: (name: string) => StateStore
 	/** `context.commit()`: a commit of all tasks at the next commit barrier. */
 	readonly requestCommit: () => void
-	/** A punctuation was scheduled: the task has work. */
-	readonly onScheduled: () => void
 }
 
 export class TaskContext {
@@ -255,16 +253,13 @@ export class ProcessorContextImpl<KOut = never, VOut = never> implements Interna
 		const node = this.node!
 		const punctuate = (timestamp: number) => node.punctuate(timestamp, punctuator)
 		const { task } = this
-		let schedule: Cancellable
 		if (type === 'stream-time') {
-			schedule = task.streamPunctuation.schedule(0, intervalMs, punctuate)
-		} else if (type === 'wall-clock') {
-			schedule = task.wallClockPunctuation.schedule(task.options.clock.now() + intervalMs, intervalMs, punctuate)
-		} else {
-			throw new TypeError(`unknown punctuation type '${String(type)}'`)
+			return task.streamPunctuation.schedule(0, intervalMs, punctuate)
 		}
-		task.options.onScheduled()
-		return schedule
+		if (type === 'wall-clock') {
+			return task.wallClockPunctuation.schedule(task.options.clock.now() + intervalMs, intervalMs, punctuate)
+		}
+		throw new TypeError(`unknown punctuation type '${String(type)}'`)
 	}
 
 	commit(): void {
