@@ -44,15 +44,16 @@ export function groupByKey<K, V>(stream: KStreamImpl<K, V>, options?: Grouped<K,
  * it (KF6); an unnamed one once per aggregation, as in Kafka Streams.
  */
 export function aggregationInput<K, V>(grouped: KGroupedStreamImpl<K, V>, keyCodec: Codec<K>): KStreamImpl<K, V> {
+	const { stream, name } = grouped
 	const input =
 		grouped.repartitioned ??
-		repartitionIfRequired(grouped.stream, {
-			name: grouped.name,
+		repartitionIfRequired(stream, {
+			name,
 			owner: grouped,
-			codecs: { key: keyCodec },
+			codecs: { key: (stream.format.keyCodec as Codec<K> | undefined) ?? keyCodec },
 			operator: 'groupBy()/groupByKey()',
 		})
-	if (grouped.name !== undefined) {
+	if (name !== undefined) {
 		grouped.repartitioned = input
 	}
 	return input

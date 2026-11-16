@@ -541,6 +541,22 @@ describe('aggregations (copied from operator-semantics*.test.ts)', () => {
 		})
 		expect(results).toContainEqual({ s: 5000, v: 1 })
 	})
+
+	it('sanity: partition-1 record alone is counted', async () => {
+		const driver = new TestDriver()
+		const results: Array<{ s: number; v: number | null }> = []
+		driver
+			.input('in', S)
+			.groupByKey()
+			.windowedBy(TimeWindows.of(1000))
+			.count()
+			.toStream()
+			.peek((k, v) => results.push({ s: k!.window.start, v }))
+		await driver.run(async ({ send }) => {
+			await send('in', 'x', at('b', 5_000, 1))
+		})
+		expect(results).toEqual([{ s: 5000, v: 1 }])
+	})
 })
 
 describe('aggregations', () => {
@@ -659,6 +675,24 @@ describe('aggregations', () => {
 				.mapValues(v => v)
 				.groupByKey({ key: str })
 			expect(() => grouped.count()).toThrow('groupBy()/groupByKey() needs a value codec')
+		})
+
+		it('a grouping is repartitioned with its Grouped key codec; Materialized.key keys the store (Kafka Streams)', async () => {
+			const driver = new TestDriver()
+			const upper: Codec<string> = {
+				encode: s => Buffer.from(s.toUpperCase()),
+				decode: b => b.toString().toLowerCase(),
+			}
+			driver
+				.input('in', { key: str, value: str })
+				.groupBy((_k, v) => v, { key: str, value: str, name: 'by-value' })
+				.count({ key: upper, storeName: 'counts' })
+			await driver.run(async ({ send, producer }) => {
+				await send('in', 'x', at('k', 1))
+				const keys = (topic: string) => producer.messagesFor(topic).map(m => m.key?.toString())
+				expect(keys('test-app-by-value-repartition')).toEqual(['x'])
+				expect(keys('test-app-counts-changelog')).toEqual(['X'])
+			})
 		})
 
 		it('aggregate() needs a codec for its aggregates', () => {
