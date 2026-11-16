@@ -1,12 +1,16 @@
 import { describe, expect, it } from 'vitest'
 import { TopologyError } from '@/api/errors.js'
+import type { KStream } from '@/api/kstream.js'
 import { flow } from '@/app/flow.js'
 import { internals } from '@/app/internal.js'
 import { codec } from '@/codec.js'
+import { DslContext } from '@/dsl/context.js'
 import { JoinWindows, SessionWindows, SlidingWindows, TimeWindows } from '@/dsl/windows.js'
 import { decodeCommitMetadata } from '@/processor/metadata.js'
 import type { WindowStore } from '@/state.js'
+import type { TaskStateManager } from '@/state/state-manager.js'
 import { TestDriver, type TestContextApi, type TestDriverConfig } from '@/testing/driver.js'
+import { APP, TaskHarness } from '../support/task-harness.js'
 
 const str = codec.string()
 const S = { key: str, value: str }
@@ -607,6 +611,45 @@ describe('stream-stream joins', () => {
 			expect(await entries('stream-join-right-1')).toBe(1)
 		})
 	})
+
+	for (const eos of [false, true]) {
+		it(`${eos ? 'exactly-once' : 'at-least-once'}: a task re-created from its commits keeps its buffers and seeds the clock`, async () => {
+			const base = 1_000_000_000
+			const h = new TaskHarness({
+				eos,
+				build: builder => {
+					const ctx = new DslContext(builder, { applicationId: APP })
+					const left: KStream<string, string> = ctx.stream('l', S)
+					const right: KStream<string, string> = ctx.stream('r', S)
+					left.join(right, (a, b) => `${a}+${b}`, JoinWindows.of(1000)).to('out', S)
+				},
+			})
+			const first = await h.start(h.task())
+			h.enqueue(first, 'l', [
+				{ key: 'k', value: 'L', timestamp: base },
+				{ key: 'z', value: 'Z', timestamp: base + 50_000 },
+			])
+			h.enqueue(first, 'r', [{ key: 'y', value: 'Y', timestamp: base }])
+			await h.process(first)
+			expect(await h.commit('revocation')).toBe('committed')
+			await first.suspend()
+			expect(await first.close('clean')).toBe('clean')
+
+			const restarted = await h.restart()
+			h.enqueue(restarted, 'r', [{ key: 'k', value: 'R', timestamp: base + 500 }])
+			await h.process(restarted)
+			await h.commit()
+			// R joins L, which was buffered before the restart.
+			expect(h.output('out').map(o => o.value)).toEqual(['L+R'])
+			// The right side's first expiry then runs by the clock seeded from the commits (base + 50 s), not by R's
+			// timestamp: only Z, the newest record, is left.
+			const { stateManager } = restarted as unknown as { stateManager: TaskStateManager }
+			const entries = (store: string) =>
+				(stateManager.store(store) as WindowStore<string, string>).approximateNumEntries()
+			expect(await entries('stream-join-left-0')).toBe(1)
+			expect(await entries('stream-join-right-1')).toBe(0)
+		})
+	}
 })
 
 describe('stream-table joins', () => {
