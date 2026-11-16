@@ -25,6 +25,7 @@ import { createRecordBatch, encodeRecordBatch, encodeRecordBatchSync } from '@/p
 import { CompressionType } from '@/protocol/records/compression.js'
 import { ReconnectionStrategy } from '@/network/reconnection.js'
 import { noopLogger, type Logger } from '@/logger.js'
+import { abortable } from '@/utils/abortable.js'
 import { sleep as sleepMs } from '@/utils/sleep.js'
 import { createRetryStrategyOptions, retry, type RetryOptions } from '@/utils/retry.js'
 import type { ConsumeContext } from '@/consumer/types.js'
@@ -143,17 +144,6 @@ function retriableFailure(message: string, cause: Error | undefined): KafkaError
 	)
 	if (cause) error.cause = cause
 	return error
-}
-
-/** Settle as `promise` does, or reject with the reason of `signal` once it aborts (the promise then runs on unobserved). */
-function abortable<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
-	if (!signal) return promise
-	return new Promise<T>((resolve, reject) => {
-		const onAbort = () => reject(signal.reason)
-		if (signal.aborted) onAbort()
-		else signal.addEventListener('abort', onAbort, { once: true })
-		void promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort))
-	})
 }
 
 /**

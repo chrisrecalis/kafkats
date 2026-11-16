@@ -52,6 +52,7 @@ import {
 } from '@/client/errors.js'
 import type { Logger } from '@/logger.js'
 import { noopLogger } from '@/logger.js'
+import { abortable } from '@/utils/abortable.js'
 import { sleep } from '@/utils/sleep.js'
 import { tpKey } from '@/utils/topic-partition.js'
 import { DEFAULT_REQUEST_TIMEOUT_MS } from '@/network/types.js'
@@ -111,16 +112,6 @@ function deletionOutcome(record: RecordsToDelete, answer: DeleteRecordsPartition
 		return { error: new KafkaProtocolError(answer.errorCode, context) }
 	}
 	return { lowWatermark: answer.lowWatermark }
-}
-
-/** Settle as `promise` does, or reject with the reason of `signal` once it aborts; the promise then runs on unobserved. */
-function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
-	return new Promise<T>((resolve, reject) => {
-		const onAbort = () => reject(signal.reason)
-		if (signal.aborted) onAbort()
-		else signal.addEventListener('abort', onAbort, { once: true })
-		void promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort))
-	})
 }
 
 /**

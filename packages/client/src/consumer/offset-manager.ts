@@ -29,6 +29,7 @@ import type { AutoOffsetReset, CommitOffset, CommittedOffset, IsolationLevel, To
 import { diagnostics, trace, type CommitDiagnostics } from '@/diagnostics.js'
 import { noopLogger, type Logger } from '@/logger.js'
 import { parseKey, tpKey } from '@/utils/topic-partition.js'
+import { abortable } from '@/utils/abortable.js'
 import { retry } from '@/utils/retry.js'
 import { sleep } from '@/utils/sleep.js'
 
@@ -591,7 +592,7 @@ export class OffsetManager {
 				},
 			}
 		)
-		const response = await (options.signal ? abortable(fetching, options.signal) : fetching)
+		const response = await abortable(fetching, options.signal)
 
 		// Build result map (partition-level errors were rejected above)
 		const result = new Map<string, CommittedOffset>()
@@ -754,14 +755,4 @@ function commitTopics(offsets: Iterable<CommitOffset>): OffsetCommitTopic[] {
 		})
 	}
 	return Array.from(topics, ([name, partitions]) => ({ name, partitions: Array.from(partitions.values()) }))
-}
-
-/** Settle as `promise` does, or reject with the reason of `signal` once it aborts; the promise then runs on unobserved. */
-function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
-	return new Promise<T>((resolve, reject) => {
-		const onAbort = () => reject(signal.reason)
-		if (signal.aborted) onAbort()
-		else signal.addEventListener('abort', onAbort, { once: true })
-		void promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort))
-	})
 }
