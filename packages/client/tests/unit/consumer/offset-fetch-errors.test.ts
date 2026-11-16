@@ -55,7 +55,7 @@ describe('OffsetManager.fetchCommittedOffsets partition-level errors', () => {
 				requireStable: true,
 			})
 		)
-		expect(result.get('t:0')).toBe(42n)
+		expect(result.get('t:0')?.offset).toBe(42n)
 	})
 
 	it('still maps a clean -1 committedOffset to "no committed offset"', async () => {
