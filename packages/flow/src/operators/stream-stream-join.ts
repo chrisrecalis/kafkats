@@ -1,77 +1,158 @@
 /**
- * One side of a windowed stream-stream join (KS KStreamKStreamJoin, eager variant): a record is joined with every
- * record of the other side's buffer within the join window, then added to its own side's buffer. A record of an
- * outer side (the left side of a left join, both sides of an outer join) that matched nothing is joined with null at
- * once, as KS does for the deprecated JoinWindows.of; deferring those results is Stage 3 (6.10). Results keep the
- * key, timestamp and headers of the record. The two sides share one processor clock, and each expires both buffers
- * by it (runtime§6.21).
+ * One side of a windowed stream-stream join (6.10; KS `KStreamKStreamJoin`, ksdsl§7.2-7.4). A record joins every record
+ * of the other side's buffer within its window `[ts - before, ts + after]` (inclusive, clipped by that buffer's store
+ * clock), each result at `max(ts, otherTs)`, then is added to its own side's buffer, so it never joins itself on its own
+ * side. A record of an outer side (the left side of a left join, both sides of an outer join) that matched nothing is
+ * joined with null: at once without an outer-join store (the deprecated JoinWindows.of) or when its window cannot
+ * receive a match any more; otherwise it waits in the shared outer-join store until its window and grace closed, unless
+ * a match removes it first. Both sides share one processor clock; each expires both buffers on its cadence.
  */
+import type { Codec } from '@/codec.js'
 import { JoinBuffer } from '@/operators/join-buffer.js'
+import { OuterJoinStore, type JoinSide } from '@/operators/outer-join-store.js'
 import type { InternalProcessorContext, Processor, ProcessorContext, ProcessorSupplier } from '@/processor/api.js'
 import type { StreamRecord } from '@/processor/record.js'
 import { ObservedStreamTime } from '@/processor/time-tracker.js'
+import type { ClockedSessionStore } from '@/state/time-clipping.js'
 
-export interface JoinSide<V, VO, VR> {
+export interface JoinSideSpec<K, V, VO, VR> {
+	readonly side: JoinSide
 	/** This side's buffer, written. */
 	readonly thisStore: string
 	/** The other side's buffer, probed. */
 	readonly otherStore: string
-	/** Metadata key of the clock both sides share: the left buffer's store name. */
+	/** Metadata key of the processor clock both sides share: the left buffer's store name. */
 	readonly clock: string
-	/** A record at `ts` matches other-side records in `[ts - beforeMs, ts + afterMs]` (swapped for the right side). */
+	/** A record at `ts` matches other-side records in `[ts - beforeMs, ts + afterMs]`: the right side's are swapped. */
 	readonly beforeMs: number
 	readonly afterMs: number
-	/** The window of the buffers' layout (`joinBufferWindow`). */
-	readonly windowMs: number
-	/** Takes this side's value first; the other value is null for an unmatched record of an outer side. */
-	readonly joiner: (value: V, otherValue: VO | null) => VR
+	readonly graceMs: number
+	/** This side's value first; null for the missing side of a left or outer result. */
+	readonly joiner: (value: V | null, otherValue: VO | null) => VR
+	/** Whether unmatched records of this side are joined with null. */
 	readonly outer: boolean
+	/** The outer-join store of the join and the codecs of its entries; absent for inner and legacy joins. */
+	readonly outerStore?: {
+		readonly name: string
+		readonly key: Codec<K>
+		readonly value: Codec<V>
+		readonly otherValue: Codec<VO>
+	}
 }
 
 export function streamStreamJoinProcessor<K, V, VO, VR>(
-	side: JoinSide<V, VO, VR>
-): ProcessorSupplier<K | null, V | null, K, VR> {
-	return () => new StreamStreamJoinProcessor<K, V, VO, VR>(side)
+	spec: JoinSideSpec<K, V, VO, VR>
+): ProcessorSupplier<K | null, V | null, K | null, VR> {
+	return () => new StreamStreamJoinProcessor<K, V, VO, VR>(spec)
 }
 
-class StreamStreamJoinProcessor<K, V, VO, VR> implements Processor<K | null, V | null, K, VR> {
-	private context!: InternalProcessorContext<K, VR>
+class StreamStreamJoinProcessor<K, V, VO, VR> implements Processor<K | null, V | null, K | null, VR> {
+	private context!: InternalProcessorContext<K | null, VR>
 	private buffer!: JoinBuffer<K, V>
 	private other!: JoinBuffer<K, VO>
 	private clock!: ObservedStreamTime
+	private outerStore: OuterJoinStore<K, V, VO> | undefined
 
-	constructor(private readonly side: JoinSide<V, VO, VR>) {}
+	constructor(private readonly spec: JoinSideSpec<K, V, VO, VR>) {}
 
-	init(context: ProcessorContext<K, VR>): void {
-		const { thisStore, otherStore, windowMs } = this.side
-		this.context = context as InternalProcessorContext<K, VR>
-		this.buffer = new JoinBuffer(context.getStateStore(thisStore), windowMs)
-		this.other = new JoinBuffer(context.getStateStore(otherStore), windowMs)
-		this.clock = new ObservedStreamTime(this.context, this.side.clock)
+	async init(context: ProcessorContext<K | null, VR>): Promise<void> {
+		const { thisStore, otherStore, outerStore, side } = this.spec
+		this.context = context as InternalProcessorContext<K | null, VR>
+		this.buffer = new JoinBuffer(context.getStateStore<ClockedSessionStore<K, V[]>>(thisStore))
+		this.other = new JoinBuffer(context.getStateStore<ClockedSessionStore<K, VO[]>>(otherStore))
+		this.clock = new ObservedStreamTime(this.context, this.spec.clock)
+		if (outerStore !== undefined) {
+			this.outerStore = new OuterJoinStore(context.getStateStore(outerStore.name), side, outerStore)
+			await this.outerStore.init()
+		}
 	}
 
 	async process(record: StreamRecord<K | null, V | null>): Promise<void> {
 		const { key, value, timestamp } = record
-		this.clock.advance(timestamp)
+		const streamTime = this.clock.advance(timestamp)
+		const { beforeMs, afterMs, joiner, outer } = this.spec
 		if (key === null || value === null) {
-			this.context.recordDropped(key === null ? 'null-key' : 'null-value')
+			// KIP-962: an outer side joins a null-key record with null at once, without storing it.
+			if (outer && value !== null) {
+				await this.context.forward(record.withValue(joiner(value, null)))
+			} else {
+				this.context.recordDropped(key === null ? 'null-key' : 'null-value')
+			}
 			return
 		}
-		const { beforeMs, afterMs, joiner, outer } = this.side
 		const keyed = record as StreamRecord<K, V>
-		let matched = false
-		for await (const otherValue of this.other.fetch(key, timestamp - beforeMs, timestamp + afterMs)) {
-			matched = true
-			await this.context.forward(keyed.withValue(joiner(value, otherValue)))
+		if (this.outerStore !== undefined && timestamp === streamTime) {
+			await this.emitClosed(this.outerStore, keyed, streamTime)
 		}
-		if (!matched && outer) {
-			await this.context.forward(keyed.withValue(joiner(value, null)))
+		let matched = false
+		const window = this.other.fetch(key, Math.max(0, timestamp - beforeMs), Math.max(0, timestamp + afterMs))
+		for await (const [otherTimestamp, otherValues] of window) {
+			matched = true
+			await this.outerStore?.removeOther(key, otherTimestamp)
+			const result = keyed.withTimestamp(Math.max(timestamp, otherTimestamp))
+			for (const otherValue of otherValues) {
+				await this.context.forward(result.withValue(joiner(value, otherValue)))
+			}
+		}
+		if (outer && !matched) {
+			await this.unmatched(keyed, streamTime)
 		}
 		await this.buffer.put(key, timestamp, value)
 		if (this.clock.expiryDue()) {
-			const streamTime = this.clock.get()
-			await this.buffer.expire(streamTime)
-			await this.other.expire(streamTime)
+			await this.buffer.expire()
+			await this.other.expire()
+		}
+	}
+
+	/**
+	 * Joined with null at once without an outer-join store, or when no record can match it any more: its window ended
+	 * before the stream time (an out-of-order record, KS `testLowerWindowBound`). Otherwise it waits.
+	 */
+	private async unmatched(record: StreamRecord<K, V>, streamTime: number): Promise<void> {
+		const outerStore = this.outerStore
+		if (outerStore === undefined || Math.max(0, record.timestamp + this.spec.afterMs) < streamTime) {
+			await this.context.forward(record.withValue(this.spec.joiner(record.value, null)))
+			return
+		}
+		outerStore.emitState.minTime = Math.min(outerStore.emitState.minTime, record.timestamp)
+		await outerStore.add(record.key, record.timestamp, record.value)
+	}
+
+	/**
+	 * Joins the pending records whose window and grace closed with null, oldest first, each at its own timestamp with the
+	 * headers of the record that triggered the scan (KS `emitNonJoinedOuterRecords`, ksdsl§7.4, KF11), and deletes each
+	 * entry once all its values were forwarded. A record of this side waits `after` past its timestamp, one of the other
+	 * side `before` (this side's view). Skipped while the oldest pending record cannot have closed, and throttled to one
+	 * scan per `emitIntervalMs` of wall clock per task.
+	 */
+	private async emitClosed(
+		outerStore: OuterJoinStore<K, V, VO>,
+		trigger: StreamRecord<K, V>,
+		streamTime: number
+	): Promise<void> {
+		const { beforeMs, afterMs, graceMs, joiner } = this.spec
+		const state = outerStore.emitState
+		if (state.minTime + afterMs + graceMs >= streamTime) return
+		const now = this.context.currentSystemTimeMs()
+		if (now < state.nextEmit) return
+		state.nextEmit = now + this.context.config.emitIntervalMs
+		// The oldest entry left (Kafka Streams keeps the last one it looked at, which can delay the next scan).
+		state.minTime = Number.POSITIVE_INFINITY
+		const open = { own: false, other: false }
+		for await (const entry of outerStore.pending()) {
+			if (entry.timestamp + (entry.own ? afterMs : beforeMs) + graceMs >= streamTime) {
+				// Later entries of the same side are newer: open too.
+				state.minTime = Math.min(state.minTime, entry.timestamp)
+				open[entry.own ? 'own' : 'other'] = true
+				if (open.own && open.other) break
+				continue
+			}
+			const results = entry.own ? entry.values.map(v => joiner(v, null)) : entry.values.map(v => joiner(null, v))
+			const result = trigger.withKey(entry.key).withTimestamp(entry.timestamp)
+			for (const joined of results) {
+				await this.context.forward(result.withValue(joined))
+			}
+			await outerStore.delete(entry)
 		}
 	}
 }

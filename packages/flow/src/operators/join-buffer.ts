@@ -1,40 +1,44 @@
 /**
- * The buffer of one side of a stream-stream join (KS's join window store, which retains duplicates): the side's
- * records in a window store, each in the window `[ts, ts + windowMs]` that starts at its timestamp. Records with the
- * same key and timestamp are all kept: a later one's window end moves to the first free slot (the Stage 1 layout,
- * unchanged from the legacy runtime; Stage 3 replaces it with list values in a session-layout store, 6.10).
+ * The buffer of one side of a stream-stream join (6.10; KS's join window store, which retains duplicates, ksdsl§7.1):
+ * a clocked session-layout store with one entry `[ts, ts]` per key and timestamp, whose value is the list of the side's
+ * values with that key and timestamp in arrival order (B8: no more window-end bumping). The key comes first in the
+ * layout, so a probe reads the entries of one key only (B15). Reads are clipped by the buffer's own store clock, the
+ * newest timestamp written to it, at its retention `before + after + grace` (6.2), so expiry never changes a result.
  */
-import type { WindowStore } from '@/state.js'
+import type { ChangelogDefaults } from '@/changelog/config.js'
+import { listCodec } from '@/operators/list-value.js'
+import type { SessionStore } from '@/state.js'
+import { sessionStoreBuilder, type SessionStoreBuilderOptions } from '@/state/store-builders.js'
+import type { ClockedSessionStore } from '@/state/time-clipping.js'
+import type { StoreBuilder } from '@/topology/nodes.js'
 
-/** The window store of a join buffer for a join window of `windowMs`: records are kept for twice the window. */
-export function joinBufferWindow(windowMs: number): { readonly retentionMs: number; readonly windowSizeMs: number } {
-	return { retentionMs: 2 * windowMs, windowSizeMs: windowMs }
+/** The store of a join buffer of `valueCodec` values. */
+export function joinBufferBuilder<K, V>(
+	defaults: ChangelogDefaults,
+	options: Omit<SessionStoreBuilderOptions<K, V>, 'clock'>
+): StoreBuilder<SessionStore<K, V[]>> {
+	return sessionStoreBuilder(defaults, { ...options, valueCodec: listCodec(options.valueCodec), clock: {} })
 }
 
 export class JoinBuffer<K, V> {
-	constructor(
-		private readonly store: WindowStore<K, V>,
-		private readonly windowMs: number
-	) {}
+	constructor(private readonly store: ClockedSessionStore<K, V[]>) {}
 
-	/** Adds a record; records with the same key and timestamp stay. */
+	/** Adds a record after the values with the same key and timestamp. */
 	async put(key: K, timestamp: number, value: V): Promise<void> {
-		let windowEnd = timestamp + this.windowMs
-		while ((await this.store.get({ key, windowStart: timestamp, windowEnd })) !== undefined) {
-			windowEnd++
-		}
-		await this.store.put({ key, windowStart: timestamp, windowEnd }, value)
+		const entry = { key, windowStart: timestamp, windowEnd: timestamp }
+		const values = (await this.store.get(entry)) ?? []
+		await this.store.put(entry, [...values, value])
 	}
 
-	/** The values of `key` with a timestamp in `[from, to]`, in timestamp order. */
-	async *fetch(key: K, from: number, to: number): AsyncGenerator<V> {
-		for await (const [, value] of this.store.fetch(key, from, to)) {
-			yield value
+	/** The timestamps and values of `key` in `[from, to]` within the retention, in timestamp order. */
+	async *fetch(key: K, from: number, to: number): AsyncGenerator<[timestamp: number, values: V[]]> {
+		for await (const [entry, values] of this.store.findSessions(key, from, to)) {
+			yield [entry.windowStart, values]
 		}
 	}
 
-	/** Deletes the records past the retention at stream time `streamTime`. */
-	expire(streamTime: number): Promise<number> {
-		return this.store.expireOldWindows(streamTime)
+	/** Deletes the entries past the retention by the buffer's own store clock, locally (5.3). */
+	expire(): Promise<void> {
+		return this.store.expire()
 	}
 }
