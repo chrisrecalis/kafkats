@@ -5,6 +5,7 @@ import {
 	createTopics,
 	injectCommitFailures,
 	newClient,
+	readAllCommitted,
 	readCommittedTable,
 	sleep,
 	uniqueTopicName,
@@ -182,4 +183,53 @@ describe('KTable.groupBy aggregates across several consumers', () => {
 			await Promise.all(apps.map(app => app.close().catch(() => {})))
 		}
 	}, 85_000)
+
+	// Kafka Streams semantics (6.15): a group whose last row left keeps its aggregate, so the count ends at 0 instead
+	// of a tombstone (BC11), and a row updated within its group is one change of that group, not a subtraction and an
+	// addition (KIP-904).
+	it('exactly_once: an emptied group stays at 0 and an update within a group is one change', async () => {
+		const input = uniqueTopicName('r2-tg0-in')
+		const output = uniqueTopicName('r2-tg0-out')
+		const applicationId = uniqueTopicName('r2-tg0-app')
+		await createTopics(admin, [{ name: input }, { name: output }])
+		const app = flow({
+			applicationId,
+			client: newClient('r2-tg0-app'),
+			processingGuarantee: 'exactly_once',
+			commitIntervalMs: 100,
+			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 50 },
+			producer: { lingerMs: 0 },
+		})
+		// A row's value is `<group>:<version>`.
+		app.table(input, { key: stringCodec, value: stringCodec })
+			.groupBy((_user, value) => [value.split(':')[0]!, value] as const, { key: stringCodec, value: stringCodec })
+			.count({ storeName: 'group-counts', key: stringCodec, value: numberCodec })
+			.toStream()
+			.to(output, { key: stringCodec, value: numberCodec })
+		const rows: Array<[string, string | null]> = [
+			['u1', 'gA:1'],
+			['u2', 'gA:1'],
+			['u1', 'gA:2'], // within gA: one change, gA stays 2
+			['u1', 'gB:1'],
+			['u2', 'gB:1'], // gA empties
+			['u1', null], // a deleted row leaves gB
+		]
+		try {
+			await app.start()
+			for (const [key, value] of rows) {
+				await producer.send(input, { key, value: value === null ? null : Buffer.from(value) })
+			}
+			const want = ['gA=1', 'gA=2', 'gA=2', 'gA=1', 'gB=1', 'gA=0', 'gB=2', 'gB=1']
+			let got: string[] = []
+			for (const deadline = Date.now() + 20_000; got.length < want.length && Date.now() < deadline;) {
+				await sleep(300)
+				got = (await readAllCommitted(admin, output, 800)).map(
+					m => `${m.key!.toString()}=${m.value === null ? 'null' : numberCodec.decode(m.value)}`
+				)
+			}
+			expect(got).toEqual(want)
+		} finally {
+			await app.close().catch(() => {})
+		}
+	}, 60_000)
 })

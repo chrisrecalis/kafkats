@@ -19,6 +19,8 @@ import {
 const str = codec.string()
 const num = codec.json<number>()
 const GAP = 1_000
+// Longer than the event-time span of all records (14 steps of < 3 s from one base): no record is late.
+const GRACE = 45_000
 const KEYS = 6
 
 type Ev = { key: string; ts: number; v: number }
@@ -85,19 +87,19 @@ describe('hardening: session windows under EOS', () => {
 		})
 		const grouped = () => app.stream(input, { key: str, value: num }).groupByKey()
 		grouped()
-			.windowedBy(SessionWindows.withInactivityGap(GAP))
+			.windowedBy(SessionWindows.ofInactivityGapAndGrace(GAP, GRACE))
 			.count({ storeName: 's-count', value: num })
 			.toStream()
 			.selectKey(keyOf)
 			.to(outs.count, { key: str, value: num })
 		grouped()
-			.windowedBy(SessionWindows.withInactivityGap(GAP))
+			.windowedBy(SessionWindows.ofInactivityGapAndGrace(GAP, GRACE))
 			.reduce((a, b) => a + (b ?? 0), { storeName: 's-reduce', value: num })
 			.toStream()
 			.selectKey(keyOf)
 			.to(outs.reduce, { key: str, value: num })
 		grouped()
-			.windowedBy(SessionWindows.withInactivityGap(GAP))
+			.windowedBy(SessionWindows.ofInactivityGapAndGrace(GAP, GRACE))
 			.aggregate(
 				() => 0,
 				(_k, v, a) => a + (v ?? 0),
@@ -140,7 +142,7 @@ describe('hardening: session windows under EOS', () => {
 			for (let k = 0; k < KEYS; k++) {
 				let t = 0
 				for (let i = 0; i < 14; i++) {
-					// keep total event-time span < retention (24 x gap) so nothing is legitimately dropped as late
+					// keep the total event-time span below GRACE so nothing is legitimately dropped as late
 					t += rnd() < 0.3 ? 1_500 + Math.floor(rnd() * 1_500) : Math.floor(rnd() * 900)
 					events.push({ key: `k${k}`, ts: base + t, v: 1 + Math.floor(rnd() * 5) })
 				}

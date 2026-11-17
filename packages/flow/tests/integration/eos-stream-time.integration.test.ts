@@ -26,10 +26,10 @@ describe('stream time across aborted transactions', () => {
 		await admin.disconnect()
 	})
 
-	// BUG (F1): StreamTimeTracker lives on the processor graph and is advanced by records of a
-	// transaction that is later aborted. After the worker restarts and re-reads the same records,
-	// the old record is judged "late" (its window is older than streamTime - 24 windows) and dropped,
-	// so the committed output differs from a failure-free run.
+	// BUG (F1): the late-record clock lived on the processor graph and was advanced by records of a transaction that was
+	// later aborted, so the records re-read after the abort were judged against a clock ahead of the committed one. The
+	// clock is now committed with the offsets and seeded from them (D5). The late record (99.7 s behind stream time, its
+	// window closed 76 s ago) is dropped by the failure-free run and by the run whose first commit fails.
 	const scenario = async (inject: boolean) => {
 		const input = uniqueTopicName('r2-st-in')
 		const output = uniqueTopicName('r2-st-out')
@@ -39,6 +39,7 @@ describe('stream time across aborted transactions', () => {
 		await producer.send(input, [
 			{ key: 'a', value: numberCodec.encode(1), timestamp: new Date(base) },
 			{ key: 'a', value: numberCodec.encode(1), timestamp: new Date(base + 100_000) },
+			{ key: 'a', value: numberCodec.encode(1), timestamp: new Date(base + 300) },
 		])
 
 		const client = newClient('r2-st-app')
@@ -54,7 +55,7 @@ describe('stream time across aborted transactions', () => {
 		})
 		app.stream(input, { key: stringCodec, value: numberCodec })
 			.groupByKey()
-			.windowedBy(TimeWindows.of(1_000))
+			.windowedBy(TimeWindows.ofSizeAndGrace('1s', '23s'))
 			.count({ storeName: 'w', value: numberCodec })
 			.toStream()
 			.selectKey(k => `${k!.key}@${k!.window.start}`)
@@ -66,6 +67,7 @@ describe('stream time across aborted transactions', () => {
 				m => `${m.key!.toString()}=${numberCodec.decode(m.value!)}`
 			)
 			if (inject) expect(failures).toBeGreaterThanOrEqual(2) // failed once, then succeeded
+			// Both on-time records counted once; the late one dropped (no `a@${base}=2`).
 			expect(out.sort()).toEqual([`a@${base}=1`, `a@${base + 100_000}=1`].sort())
 		} finally {
 			await app.close()

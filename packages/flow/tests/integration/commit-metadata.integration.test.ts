@@ -70,10 +70,10 @@ describe('commit metadata', () => {
 					consumer: { maxWaitMs: 100 },
 					producer: { lingerMs: 0 },
 				})
-				// Windows expire 24 windows behind the processor clock (the windowed count's store retention).
+				// A window accepts records until 23 s after its end (its grace period).
 				app.stream(input, { key: str, value: str })
 					.groupByKey()
-					.windowedBy(TimeWindows.of(1000))
+					.windowedBy(TimeWindows.ofSizeAndGrace('1s', '23s'))
 					.count({ storeName: 'w', value: num })
 					.toStream()
 					.selectKey(key => `${key!.key}@${key!.window.start - BASE}`)
@@ -99,11 +99,17 @@ describe('commit metadata', () => {
 				const decoded = decodeCommitMetadata(metadata)
 				expect(decoded.invalid).toBeUndefined()
 				expect(decoded.partitionTime).toBe(BASE + 100_000)
-				// The window aggregation's clock, keyed by its store: the start of the newest window it saw.
-				expect([...decoded.metadata]).toEqual([['w', BASE + 100_000]])
+				// The window aggregation's clock, keyed by its store: the newest record time it saw; and the store's
+				// clock: the end of the newest window written to it (6.2).
+				expect(new Map(decoded.metadata)).toEqual(
+					new Map([
+						['w', BASE + 100_000],
+						['w.observed', BASE + 101_000],
+					])
+				)
 
-				// The window [0, 1000) expired 76 windows ago: the restarted run drops a record of it, as the
-				// failure-free one would. A clock started from scratch would count it.
+				// The window [0, 1000) closed 76 s ago: the restarted run drops a record of it, as the failure-free
+				// one would. A clock started from scratch would count it.
 				app = build()
 				await app.start()
 				await send([300, 100_500])

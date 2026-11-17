@@ -3,6 +3,7 @@ import type { KafkaClient, Producer } from '@kafkats/client'
 import {
 	ChangelogPartitionMismatchError,
 	type ChangelogCheckpointStore,
+	JoinWindows,
 	SourceTopicNotFoundError,
 	TimeWindows,
 	buildChangelogTopicName,
@@ -20,6 +21,7 @@ import {
 	requireKafkaBrokers,
 	sleep,
 	uniqueTopicName,
+	waitUntil,
 	withTimeout,
 } from './test-helpers.js'
 
@@ -661,13 +663,16 @@ describe('stream-table joins', () => {
 		).rejects.toThrow('Timed out')
 	})
 
-	it('null keys are skipped by join processors', async () => {
-		await producer.send(eventsTopic, { key: null, value: eventCodec.encode({ action: 'click' }) })
-		await expect(output.waitFor(outLeft, m => m.key === null, 400)).rejects.toThrow('Timed out')
+	it('null-key records are dropped by the inner join and joined with null by the left join (KIP-962)', async () => {
+		await producer.send(eventsTopic, { key: null, value: eventCodec.encode({ action: 'keyless' }) })
+		const left = await output.waitFor<string | null, Enriched>(outLeft, m => m.key === null)
+		expect(left.value).toEqual({ action: 'keyless', user: null })
+		await expect(output.waitFor(outInner, m => m.key === null, 400)).rejects.toThrow('Timed out')
 	})
 })
 
-describe('stream-stream joins', () => {
+// The deprecated `Joined.within` (JoinWindows.of): unmatched left and outer results are emitted at once.
+describe('stream-stream joins (deprecated Joined.within: eager left and outer results)', () => {
 	const leftTopic = uniqueTopicName('flow-it-ss-left')
 	const rightTopic = uniqueTopicName('flow-it-ss-right')
 	const outInner = uniqueTopicName('flow-it-ss-out-inner')
@@ -766,9 +771,146 @@ describe('stream-stream joins', () => {
 		await output.waitFor(outOuter, m => m.key === 'k7' && m.value === 8)
 	})
 
-	it('null keys are skipped by stream-stream joins', async () => {
+	it('null-key records are dropped by the inner join and joined with null by left and outer joins (KIP-962)', async () => {
 		await producer.send(leftTopic, { key: null, value: numberCodec.encode(1), timestamp: new Date(90_000) })
-		await expect(output.waitFor(outLeft, m => m.key === null, 400)).rejects.toThrow('Timed out')
+		await output.waitFor(outLeft, m => m.key === null && m.value === 1)
+		await output.waitFor(outOuter, m => m.key === null && m.value === 1)
+		await expect(output.waitFor(outInner, m => m.key === null, 400)).rejects.toThrow('Timed out')
+	})
+})
+
+// JoinWindows.ofTimeDifferenceAndGrace(1 s, 500 ms): a left record at t matches right records in [t - 1 s, t + 1 s];
+// an unmatched record of an outer side waits until stream time passed t + 1.5 s and is joined with null only then, and
+// never once a match arrived in its window (Kafka Streams' spurious result fix). Stream time belongs to the task (one
+// partition per topic here) and moves only with records, so the tests drive it with a later record; the tests share
+// the task, so each one starts after the stream time the previous one left.
+describe('stream-stream joins (JoinWindows: left and outer results when the window closes)', () => {
+	const leftTopic = uniqueTopicName('flow-it-ssw-left')
+	const rightTopic = uniqueTopicName('flow-it-ssw-right')
+	const outInner = uniqueTopicName('flow-it-ssw-out-inner')
+	const outLeft = uniqueTopicName('flow-it-ssw-out-left')
+	const outOuter = uniqueTopicName('flow-it-ssw-out-outer')
+	const TICK = '__tick__'
+
+	const appId = `flow-it-join-ssw-${Date.now()}`
+	let app: ReturnType<typeof flow>
+	let output: MultiTopicCollector
+	let tick = 0
+
+	beforeAll(async () => {
+		app = flow({
+			applicationId: appId,
+			client,
+			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 100 },
+		})
+
+		const left = app.stream(leftTopic, { key: stringCodec, value: numberCodec })
+		const right = app.stream(rightTopic, { key: stringCodec, value: numberCodec })
+		const windows = JoinWindows.ofTimeDifferenceAndGrace('1s', 500)
+
+		left.join(right, (l, r) => l + r, windows).to(outInner, { value: numberCodec })
+		left.leftJoin(right, (l, r) => (r === null ? l : l + r), windows).to(outLeft, { value: numberCodec })
+		left.outerJoin(right, (l, r) => (l ?? 0) + (r ?? 0), windows).to(outOuter, { value: numberCodec })
+
+		output = new MultiTopicCollector({
+			client,
+			groupId: `${appId}-collector`,
+			topics: [
+				{ topic: outInner, keyCodec: stringCodec, valueCodec: numberCodec },
+				{ topic: outLeft, keyCodec: stringCodec, valueCodec: numberCodec },
+				{ topic: outOuter, keyCodec: stringCodec, valueCodec: numberCodec },
+			],
+		})
+
+		await createTopics(client, [
+			{ name: leftTopic },
+			{ name: rightTopic },
+			{ name: outInner },
+			{ name: outLeft },
+			{ name: outOuter },
+		])
+
+		await output.start()
+		await app.start()
+
+		await producer.send(leftTopic, { key: '__warmup__', value: numberCodec.encode(1), timestamp: new Date(1_000) })
+		await producer.send(rightTopic, { key: '__warmup__', value: numberCodec.encode(1), timestamp: new Date(1_000) })
+		await output.waitFor(outInner, m => m.key === '__warmup__', 15_000)
+	})
+
+	afterAll(async () => {
+		await app.close()
+		await output.stop()
+	})
+
+	/**
+	 * Sends left records later than `after` until `done` holds: each one moves stream time, and the closed windows are
+	 * scanned at most once a second (wall clock), so one record may come too early.
+	 */
+	async function advancePast(after: number, done: () => boolean): Promise<void> {
+		for (let attempt = 0; attempt < 8 && !done(); attempt++) {
+			tick = Math.max(tick, after) + 1
+			await producer.send(leftTopic, { key: TICK, value: numberCodec.encode(0), timestamp: new Date(tick) })
+			await waitUntil('a closed window was scanned', done, 1_200).catch(() => {})
+		}
+		expect(done()).toBe(true)
+	}
+
+	/** Whether the left and the outer join both joined `key`'s record of `value` with null. */
+	const joinedWithNull = (key: string, value: number) => () =>
+		[outLeft, outOuter].every(topic =>
+			output.getTopicMessages<string, number>(topic).some(m => m.key === key && m.value === value)
+		)
+	const results = (topic: string, key: string) =>
+		output
+			.getTopicMessages<string, number>(topic)
+			.filter(m => m.key === key)
+			.map(m => m.value)
+
+	it('matches records within the window in either order, without a null result after the window closed', async () => {
+		await producer.send(leftTopic, { key: 'k1', value: numberCodec.encode(1), timestamp: new Date(10_000) })
+		await producer.send(rightTopic, { key: 'k1', value: numberCodec.encode(2), timestamp: new Date(10_500) })
+		await producer.send(rightTopic, { key: 'k2', value: numberCodec.encode(2), timestamp: new Date(10_500) })
+		await producer.send(leftTopic, { key: 'k2', value: numberCodec.encode(1), timestamp: new Date(11_200) })
+		// An unmatched left record as late as the others: once it is joined with null, their windows closed too.
+		await producer.send(leftTopic, { key: 'w1', value: numberCodec.encode(5), timestamp: new Date(11_200) })
+		for (const topic of [outInner, outLeft, outOuter]) {
+			await output.waitFor(topic, m => m.key === 'k1' && m.value === 3)
+			await output.waitFor(topic, m => m.key === 'k2' && m.value === 3)
+		}
+		await advancePast(11_200 + 1_500, joinedWithNull('w1', 5))
+		for (const topic of [outLeft, outOuter]) {
+			expect(results(topic, 'k1')).toEqual([3])
+			expect(results(topic, 'k2')).toEqual([3])
+		}
+	})
+
+	it('left and outer joins hold an unmatched left record until its window and grace closed', async () => {
+		await producer.send(leftTopic, { key: 'k3', value: numberCodec.encode(9), timestamp: new Date(20_000) })
+		// Stream time reaches the end of the grace period: still open.
+		tick = 21_500
+		await producer.send(leftTopic, { key: TICK, value: numberCodec.encode(0), timestamp: new Date(tick) })
+		await sleep(1_500)
+		expect(results(outLeft, 'k3')).toEqual([])
+		expect(results(outOuter, 'k3')).toEqual([])
+		await advancePast(21_500, joinedWithNull('k3', 9))
+	})
+
+	it('the outer join holds an unmatched right record until its window and grace closed; the left join drops it', async () => {
+		await producer.send(rightTopic, { key: 'k4', value: numberCodec.encode(8), timestamp: new Date(30_000) })
+		await producer.send(leftTopic, { key: 'w4', value: numberCodec.encode(5), timestamp: new Date(30_000) })
+		await sleep(500)
+		expect(results(outOuter, 'k4')).toEqual([])
+		await advancePast(31_500, () => results(outOuter, 'k4').length > 0 && joinedWithNull('w4', 5)())
+		expect(results(outOuter, 'k4')).toEqual([8])
+		expect(results(outLeft, 'k4')).toEqual([])
+	})
+
+	it('null-key records are dropped by the inner join and joined with null at once by left and outer joins (KIP-962)', async () => {
+		await producer.send(leftTopic, { key: null, value: numberCodec.encode(7), timestamp: new Date(40_000) })
+		await output.waitFor(outLeft, m => m.key === null && m.value === 7)
+		await output.waitFor(outOuter, m => m.key === null && m.value === 7)
+		await expect(output.waitFor(outInner, m => m.key === null, 400)).rejects.toThrow('Timed out')
 	})
 })
 

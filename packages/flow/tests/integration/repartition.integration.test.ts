@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import type { KafkaClient, Producer } from '@kafkats/client'
-import { codec, flow, SessionWindows, TimeWindows, type FlowApp } from '../../src/index.js'
+import { murmur2, toPositive, type KafkaClient, type Producer } from '@kafkats/client'
+import { codec, flow, SessionWindows, TimeWindows, WindowedCodecs, type FlowApp } from '../../src/index.js'
 import {
 	createTopics,
 	injectCommitFailures,
@@ -233,7 +233,10 @@ describe('repartitioning keeps event time, totals and topic identity', () => {
 			.windowedBy(TimeWindows.of(size))
 			.count({ storeName: 'per-window', value: numberCodec })
 			.toStream()
-			.join(labelTable, (count, label) => `${label}=${count}`, { key: windowCodec, value: numberCodec })
+			// Windowed results stay in the partition of their base key; the labels are where the whole windowed key
+			// hashes to, so the results move there through a repartition with a plain key codec (BC10).
+			.repartition({ key: windowCodec, value: numberCodec })
+			.join(labelTable, (count, label) => `${label}=${count}`)
 			.to(output, { key: windowCodec, value: stringCodec })
 		try {
 			await app.start()
@@ -250,6 +253,71 @@ describe('repartitioning keeps event time, totals and topic identity', () => {
 				joined = (await readAllCommitted(admin, output, 800)).map(m => m.value!.toString())
 			}
 			expect(joined.sort()).toEqual(keys.map(key => `label-${key}=1`))
+		} finally {
+			await app.close().catch(() => {})
+		}
+	}, 60_000)
+
+	// BC10, KS `WindowedStreamPartitioner`: a sink writes a windowed key to the partition its base key hashes to (with the
+	// producer's default partitioner), not where the bytes of the whole windowed key hash to.
+	it('windowed results are written to the partition of their base key', async () => {
+		const input = uniqueTopicName('r2-rp-wsink-in')
+		const timeOut = uniqueTopicName('r2-rp-wsink-time')
+		const sessionOut = uniqueTopicName('r2-rp-wsink-session')
+		const OUT_PARTITIONS = 3
+		await createTopics(admin, [
+			{ name: input, partitions: 4 },
+			{ name: timeOut, partitions: OUT_PARTITIONS },
+			{ name: sessionOut, partitions: OUT_PARTITIONS },
+		])
+		const size = 10_000
+		const app = flow({
+			applicationId: uniqueTopicName('r2-rp-wsink-app'),
+			client: newClient('r2-rp-wsink-app'),
+			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 50 },
+			producer: { lingerMs: 0 },
+		})
+		const grouped = app.stream(input, { key: stringCodec, value: stringCodec }).groupByKey()
+		grouped
+			.windowedBy(TimeWindows.ofSizeWithNoGrace(size))
+			.count({ storeName: 'per-window', value: numberCodec })
+			.toStream()
+			.to(timeOut)
+		grouped
+			.windowedBy(SessionWindows.ofInactivityGapWithNoGrace(size))
+			.count({ storeName: 'per-session', value: numberCodec })
+			.toStream()
+			.to(sessionOut)
+		const keys = Array.from({ length: 12 }, (_, i) => `key-${i}`)
+		const start = Math.floor(1_650_000_000_000 / size) * size
+		try {
+			await app.start()
+			await producer.send(
+				input,
+				keys.map(key => ({ key, value: Buffer.from('x'), timestamp: new Date(start + 1) }))
+			)
+			const formats = [
+				{ topic: timeOut, key: WindowedCodecs.timeWindowed(stringCodec, size) },
+				{ topic: sessionOut, key: WindowedCodecs.sessionWindowed(stringCodec) },
+			]
+			for (const { topic, key } of formats) {
+				let rows: Awaited<ReturnType<typeof readAllCommitted>> = []
+				for (const deadline = Date.now() + 20_000; rows.length < keys.length && Date.now() < deadline;) {
+					await sleep(300)
+					rows = await readAllCommitted(admin, topic, 800)
+				}
+				const placed = rows.map(row => {
+					const windowed = key.decode(row.key!)
+					return { key: windowed.key, start: windowed.window.start, partition: row.partition }
+				})
+				const expected = keys.map(base => ({
+					key: base,
+					start: start + (topic === timeOut ? 0 : 1),
+					partition: toPositive(murmur2(Buffer.from(base))) % OUT_PARTITIONS,
+				}))
+				const byKey = (a: { key: string }, b: { key: string }) => a.key.localeCompare(b.key)
+				expect(placed.sort(byKey), topic).toEqual(expected.sort(byKey))
+			}
 		} finally {
 			await app.close().catch(() => {})
 		}

@@ -1,7 +1,7 @@
 /**
  * Round 3 / attack 2: KTable.groupBy count/reduce/aggregate against a ground truth computed from the final table
  * contents, with 4 instances (formerly 2 instances x 2 threads), random row moves / tombstones / re-adds, instance
- * churn and commit failures.
+ * churn and commit failures. Emptied groups end at 0.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { KafkaClient, Producer } from '@kafkats/client'
@@ -111,6 +111,7 @@ describe('hardening: KTable.groupBy vs ground truth', () => {
 		const apps: FlowApp[] = Array.from({ length: opts.instances }, () => mk(opts.failCommits))
 		const rnd = lcg(opts.seed)
 		const table = new Map<string, number>() // ground truth: last value per key
+		const groups = new Set<string>() // every group a row was ever in
 		try {
 			await Promise.all(apps.map(a => a.start()))
 			let extra: FlowApp | null = null
@@ -126,6 +127,7 @@ describe('hardening: KTable.groupBy vs ground truth', () => {
 						const n = 1 + Math.floor(rnd() * 40)
 						batch.push({ key: u, value: Buffer.from(JSON.stringify(n)) })
 						table.set(u, n)
+						groups.add(`g${n % GROUPS}`)
 					}
 				}
 				await producer.send(input, batch)
@@ -145,9 +147,11 @@ describe('hardening: KTable.groupBy vs ground truth', () => {
 				}
 			}
 			await extra?.close().catch(() => {})
-			const wantCount: Record<string, number> = {}
-			const wantSum: Record<string, number> = {}
-			const wantAgg: Record<string, number> = {}
+			// A group that had a member keeps its aggregate when it empties: count, sum and agg 0, not a tombstone
+			// (Kafka Streams; BC11).
+			const wantCount: Record<string, number> = Object.fromEntries([...groups].map(g => [g, 0]))
+			const wantSum: Record<string, number> = { ...wantCount }
+			const wantAgg: Record<string, number> = { ...wantCount }
 			for (const n of table.values()) {
 				const g = `g${n % GROUPS}`
 				wantCount[g] = (wantCount[g] ?? 0) + 1
