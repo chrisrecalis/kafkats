@@ -32,7 +32,7 @@ export function reduceWith<V>(reducer: (aggregate: V, value: V) => V): Aggregati
 }
 
 /** Whether a record takes part in an aggregation: null keys and values are dropped (ksdsl§1.4). */
-export function aggregatable<K, V>(
+function aggregatable<K, V>(
 	context: Pick<InternalProcessorContext, 'recordDropped'>,
 	store: string,
 	record: StreamRecord<K | null, V | null>

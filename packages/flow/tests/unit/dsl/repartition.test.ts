@@ -2,10 +2,8 @@ import { describe, expect, it } from 'vitest'
 import { TopologyError } from '@/api/errors.js'
 import type { Windowed } from '@/api/grouped.js'
 import { codec, type Codec } from '@/codec.js'
-import type { KStreamImpl } from '@/dsl/kstream.js'
 import { WindowedCodecs } from '@/operators/windowed.js'
 import type { RecordMetadata } from '@/processor/api.js'
-import type { StreamRecord } from '@/processor/record.js'
 import { TestDriver } from '@/testing/driver.js'
 
 const str = codec.string()
@@ -182,22 +180,25 @@ describe('null keys on repartition() topics (4.1.6, KS ksdsl§15.3)', () => {
 		expect(seen).toEqual(['k'])
 	})
 
-	it('records with a null key are kept when a relaxed join is downstream', async () => {
+	it('records with a null key are kept when a left join is downstream (KF12), which joins them with null (KIP-962)', async () => {
 		const driver = new TestDriver()
-		const seen: unknown[] = []
-		const read = driver.input('in', { key: str, value: str }).repartition() as KStreamImpl<string, string>
-		read.ctx.builder.addProcessor({
-			name: 'left-join',
-			parents: [read.node],
-			stores: [],
-			supplier: () => ({ process: (record: StreamRecord<unknown, unknown>) => void seen.push(record.key) }),
-			relaxedNullKeyJoin: true,
-		})
-		await driver.run(async ({ send }) => {
+		const joined: unknown[] = []
+		const labels = driver.table('labels', { key: str, value: str })
+		driver
+			.input('in', { key: str, value: str })
+			.repartition()
+			.leftJoin(labels, (v, label) => `${v}+${label}`)
+			.peek((k, v) => joined.push([k, v]))
+		await driver.run(async ({ send, output }) => {
+			await send('labels', 'L', { ...key('k'), codec: str })
 			await send('in', 'v', { key: null, codec: str })
-			await send('in', 'v', { ...key('k'), codec: str })
+			await send('in', 'w', { ...key('k'), codec: str })
+			expect(output('test-app-repartition-0-repartition', { key: str }).map(r => r.key)).toEqual([null, 'k'])
 		})
-		expect(seen).toEqual([null, 'k'])
+		expect(joined).toEqual([
+			[null, 'v+null'],
+			['k', 'w+L'],
+		])
 	})
 })
 
