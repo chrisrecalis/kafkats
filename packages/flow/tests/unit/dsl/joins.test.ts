@@ -660,7 +660,7 @@ describe('stream-stream joins', () => {
 		])
 	})
 
-	it('buffers are window stores logged to changelogs with window retention (twice the join window)', () => {
+	it('buffers are window stores logged to changelogs with their retention (twice the join window) plus a day', () => {
 		const app = flow({ applicationId: 'app', client })
 		app.stream('l', S).join(app.stream('r', S), (a, b) => a + b, { within: TimeWindows.of('10s') })
 		const [join] = internals(app).build().subtopologies
@@ -672,7 +672,7 @@ describe('stream-stream joins', () => {
 			expect(store.logging).toMatchObject({ enabled: true, topic: `app-${store.name}-changelog` })
 			const { configs } = store.logging as { configs: Record<string, string> }
 			expect(configs['cleanup.policy']).toBe('delete,compact')
-			expect(configs['retention.ms']).toBe('20000')
+			expect(configs['retention.ms']).toBe(String(20_000 + 86_400_000))
 		}
 		const noLog = flow({ applicationId: 'app', client })
 		noLog.stream('l', S).join(noLog.stream('r', S), (a, b) => a + b, JoinWindows.of(10), { changelog: false })

@@ -262,9 +262,9 @@ describe('windowed/session store changelog wiring (copied from flow.test.ts)', (
 		const changelogKey = windowedKeyCodec(store.keyCodec as Codec<string>)
 		const encoded = changelogKey.encode({ key: 'k', windowStart: 1000, windowEnd: 2000 })
 		expect(changelogKey.decode(encoded)).toEqual({ key: 'k', windowStart: 1000, windowEnd: 2000 })
-		// delete,compact with the store's retention (24 windows of 10 s), so the broker prunes expired windows.
+		// delete,compact with the store's retention (24 windows of 10 s) plus a day, so the broker prunes expired windows.
 		expect(store.logging.configs['cleanup.policy']).toBe('delete,compact')
-		expect(store.logging.configs['retention.ms']).toBe(String(10_000 * 24))
+		expect(store.logging.configs['retention.ms']).toBe(String(10_000 * 24 + 86_400_000))
 	})
 
 	it('session-windowed aggregations create a changelog-backed session store', () => {
@@ -278,10 +278,10 @@ describe('windowed/session store changelog wiring (copied from flow.test.ts)', (
 		const { store, subtopology } = storeOf(topologyOf(driver), 'session-counts')
 		expect(store.kind).toBe('session')
 		expect(subtopology.changelogTopics.get('session-counts')).toBe('test-app-session-counts-changelog')
-		// delete,compact with the store's retention (24 gaps of 30 s), like a window store.
+		// delete,compact with the store's retention (24 gaps of 30 s) plus a day, like a window store.
 		if (!store.logging.enabled) throw new Error('not logged')
 		expect(store.logging.configs['cleanup.policy']).toBe('delete,compact')
-		expect(store.logging.configs['retention.ms']).toBe(String(30_000 * 24))
+		expect(store.logging.configs['retention.ms']).toBe(String(30_000 * 24 + 86_400_000))
 	})
 
 	it('co-partitions windowedBy state with its source or repartition topic', () => {

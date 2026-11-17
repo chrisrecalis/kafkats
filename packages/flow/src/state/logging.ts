@@ -5,6 +5,11 @@ import type { KeyValueStore, SessionStore, WindowedKey, WindowStore } from '@/st
  * Logs every write of a store to its changelog. The store below is written first (local first): a crash between the
  * two leaves the local store behind the changelog, which the replay repairs, never the changelog ahead of a store that
  * disagrees with it. Changelog sends are not awaited; reads go to the store below.
+ *
+ * Expiry of window and session stores is local only, as in Kafka Streams, which drops expired segments without
+ * logging (`AbstractSegments.java:218-223`; 5.3, KF17): their changelogs are `delete,compact` with a retention a day
+ * longer than the store's, so the broker drops the records of expired windows, and a restore that brings some back
+ * is hidden by the store clock's read clipping until the next expiry (`state/time-clipping.ts`).
  */
 abstract class ChangelogBackedStore<K, V, S extends KeyValueStore<K, V>> implements KeyValueStore<K, V> {
 	constructor(
@@ -74,8 +79,6 @@ export class ChangelogBackedWindowStore<K, V>
 	}
 
 	expireOldWindows(currentTime: number): Promise<number> {
-		// No tombstones: the changelog is `delete,compact` with a retention tied to the store's, so the broker drops the
-		// records of expired windows (by write time, like Kafka Streams' windowed changelogs).
 		return this.inner.expireOldWindows(currentTime)
 	}
 }
@@ -100,12 +103,7 @@ export class ChangelogBackedSessionStore<K, V>
 		}
 	}
 
-	async expireOldSessions(currentTime: number): Promise<WindowedKey<K>[]> {
-		// Tombstones, or a restore would replay the original puts and resurrect the expired sessions.
-		const expired = await this.inner.expireOldSessions(currentTime)
-		for (const session of expired) {
-			this.writer.writeTombstone(session)
-		}
-		return expired
+	expireOldSessions(currentTime: number): Promise<WindowedKey<K>[]> {
+		return this.inner.expireOldSessions(currentTime)
 	}
 }

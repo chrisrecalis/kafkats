@@ -63,6 +63,20 @@ export type ResolvedChangelogConfig =
 			readonly skipRestoration: boolean
 	  }
 
+/**
+ * The windows of an emit-on-window-close aggregation (6.8): time or sliding windows of `sizeMs` (the time difference of
+ * sliding windows), or sessions.
+ */
+export type EmitFinalWindows =
+	| { readonly kind: 'time' | 'sliding'; readonly sizeMs: number }
+	| { readonly kind: 'session' }
+
+/** How the store clock of a window or session(-layout) store is kept (6.2, `state/time-clipping.ts`). */
+export interface StoreClockSpec {
+	/** The store of an emit-on-window-close aggregation: expiry waits for the task's emit progress (`<store>.emit`). */
+	readonly emitFinal?: EmitFinalWindows
+}
+
 export interface StoreBuilder<S extends StateStore = StateStore> {
 	readonly name: string
 	readonly kind: 'key-value' | 'window' | 'session'
@@ -74,13 +88,10 @@ export interface StoreBuilder<S extends StateStore = StateStore> {
 	/** Window stores. */
 	readonly windowSizeMs?: number
 	/**
-	 * Clock and clipping layer; undefined for key-value stores. A builder is shared by every task, so it
-	 * carries no per-task callback: `emitFinal` makes reads unclipped and bounds expiry by the task's emit
-	 * progress, read from the task's metadata key `<store>.emit`.
+	 * A store clock and the clipping layer on top of the task's stack: window and session stores of time-based
+	 * processors only. A builder is shared by every task, so it carries no per-task callback.
 	 */
-	readonly clock?: {
-		readonly emitFinal?: { readonly kind: 'time' | 'session' | 'sliding'; readonly sizeMs?: number }
-	}
+	readonly clock?: StoreClockSpec
 	/** The provider store (bottom of the stack). */
 	create(provider: StateStoreProvider, providerName: string): S
 	/** As seen by processors. */
