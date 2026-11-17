@@ -150,7 +150,7 @@ describe('windowed/session reduce + session aggregate retention', () => {
 		expect(await store.approximateNumEntries()).toBe(2)
 	})
 
-	it('ChangelogBackedSessionStore.expireOldSessions emits a tombstone for each expired key', async () => {
+	it('ChangelogBackedSessionStore.expireOldSessions expires locally, without tombstones (KF17)', async () => {
 		const inner = new InMemorySessionStore<string, number>('s', {
 			keyCodec: stringCodec,
 			valueCodec: numberCodec,
@@ -168,7 +168,8 @@ describe('windowed/session reduce + session aggregate retention', () => {
 		const expired = await wrapped.expireOldSessions(100_000)
 
 		expect(expired.length).toBe(1)
+		expect(await inner.approximateNumEntries()).toBe(1)
 		expect(writer.write).not.toHaveBeenCalled()
-		expect(writer.writeTombstone.mock.calls).toEqual([[{ key: 'a', windowStart: 0, windowEnd: 1_000 }]])
+		expect(writer.writeTombstone).not.toHaveBeenCalled()
 	})
 })

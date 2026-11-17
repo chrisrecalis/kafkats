@@ -58,6 +58,13 @@ export const DEFAULT_CHANGELOG_CONFIGS: Record<string, string> = {
 }
 
 /**
+ * How much longer a window or session changelog keeps records than its store keeps windows: a day, the default of Kafka
+ * Streams' `windowstore.changelog.additional.retention.ms`. The broker deletes by its own clock, so the margin keeps
+ * windows the store still holds when stream time lags behind it.
+ */
+export const WINDOWED_CHANGELOG_ADDITIONAL_RETENTION_MS = 86_400_000
+
+/**
  * Repartition topics (Kafka Streams' RepartitionTopicConfig): never compacted, not expired by time; the records below
  * the committed offset are purged instead.
  */
@@ -96,7 +103,8 @@ export interface ChangelogDefaults {
 /**
  * The changelog of a store: its topic and the configs it is created with (the defaults, then the application's, then
  * the store's own). Window and session stores (those with a `retentionMs`) default to `delete,compact` with the store's
- * retention, so the broker drops the records of expired windows instead of keeping every window forever.
+ * retention plus a day (5.4), so the broker drops the records of expired windows instead of keeping every window
+ * forever; their expiry writes no tombstones (`state/logging.ts`).
  */
 export function resolveStoreChangelog(
 	defaults: ChangelogDefaults,
@@ -110,7 +118,10 @@ export function resolveStoreChangelog(
 	const windowed: Record<string, string> =
 		store.retentionMs === undefined
 			? {}
-			: { 'cleanup.policy': 'delete,compact', 'retention.ms': String(store.retentionMs) }
+			: {
+					'cleanup.policy': 'delete,compact',
+					'retention.ms': String(store.retentionMs + WINDOWED_CHANGELOG_ADDITIONAL_RETENTION_MS),
+				}
 	return {
 		enabled: true,
 		topic: config.topicName ?? buildChangelogTopicName(defaults.applicationId, store.name),

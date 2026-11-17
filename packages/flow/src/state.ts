@@ -134,7 +134,7 @@ export interface WindowStore<K, V> extends KeyValueStore<WindowedKey<K>, V> {
 	fetchRange(keyFrom: K, keyTo: K, timeFrom: number, timeTo: number): AsyncIterable<[WindowedKey<K>, V]>
 
 	/**
-	 * Remove expired windows based on retention period.
+	 * Remove the windows that end before `currentTime - retentionMs` (the store's retention).
 	 * @param currentTime Current timestamp in milliseconds
 	 * @returns Number of expired entries removed
 	 */
@@ -161,11 +161,9 @@ export interface SessionStore<K, V> extends KeyValueStore<WindowedKey<K>, V> {
 	remove(key: K): Promise<void>
 
 	/**
-	 * Remove sessions whose end time is older than the cutoff (i.e. inactive
-	 * for at least the configured retention). Returns the list of removed
-	 * session keys so callers (e.g. ChangelogBackedSessionStore) can emit
-	 * tombstones to keep the durable log in sync. Without expiry, closed
-	 * sessions persist forever and the store grows unboundedly.
+	 * Remove the sessions that end before `currentTime - retentionMs` (inactive
+	 * for at least the configured retention); returns their keys. Without
+	 * expiry, closed sessions persist forever and the store grows unboundedly.
 	 */
 	expireOldSessions(currentTime: number): Promise<WindowedKey<K>[]>
 }

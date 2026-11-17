@@ -6,6 +6,7 @@ import {
 	getDefaultTopicConfigs,
 	resolveChangelogConfig,
 	resolveStoreChangelog,
+	WINDOWED_CHANGELOG_ADDITIONAL_RETENTION_MS,
 } from '@/changelog/config.js'
 import { ChangelogPartitionMismatchError, SourceTopicNotFoundError } from '@/changelog/errors.js'
 import { ChangelogWriter, windowedKeyCodec } from '@/changelog/writer.js'
@@ -96,11 +97,12 @@ describe('changelog', () => {
 			})
 		})
 
-		it('window and session changelogs are delete,compact with the store retention', () => {
+		it('window and session changelogs are delete,compact with the store retention plus a day (Kafka Streams)', () => {
+			expect(WINDOWED_CHANGELOG_ADDITIONAL_RETENTION_MS).toBe(86_400_000)
 			const resolved = resolveStoreChangelog(defaults, { name: 'windows', retentionMs: 240_000 }, true)
 			expect(resolved.enabled && resolved.configs).toEqual({
 				'cleanup.policy': 'delete,compact',
-				'retention.ms': '240000',
+				'retention.ms': String(240_000 + 86_400_000),
 				'segment.bytes': '52428800',
 			})
 		})
@@ -270,7 +272,7 @@ describe('changelog', () => {
 			expect(await collect(store.fetch('k', 0, 0))).toEqual([[w('k', 0, 1000), '1']])
 		})
 
-		it('window expiry writes no tombstones (the changelog retention drops expired windows)', async () => {
+		it('KF17: window expiry writes no tombstones (the changelog retention drops expired windows)', async () => {
 			const inner = new InMemoryWindowStore<string, string>('w', {
 				keyCodec: str,
 				valueCodec: str,
@@ -324,12 +326,13 @@ describe('changelog', () => {
 			expect(await inner.approximateNumEntries()).toBe(1)
 		})
 
-		it('expiry writes a tombstone for every expired session', async () => {
-			const { inner, store, tombstones } = sessionStore()
+		it('KF17: expiry is local only, it writes no tombstones (the changelog retention drops expired sessions)', async () => {
+			const { inner, output, store } = sessionStore()
 			await inner.put(w('k', 0, 10), 'old')
 			await inner.put(w('k', 9_500, 9_600), 'live')
 			expect(await store.expireOldSessions(10_000)).toEqual([w('k', 0, 10)])
-			expect(tombstones()).toEqual([w('k', 0, 10)])
+			expect(await inner.approximateNumEntries()).toBe(1)
+			expect(output.sent).toEqual([])
 		})
 	})
 

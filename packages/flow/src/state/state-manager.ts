@@ -12,7 +12,7 @@ import {
 	ChangelogBackedWindowStore,
 } from '@/state/logging.js'
 import type { StateDirectory } from '@/state/state-directory.js'
-import type { StoreClock } from '@/state/time-clipping.js'
+import { ClockedSessionStore, ClockedWindowStore, TaskStoreClock, type StoreClock } from '@/state/time-clipping.js'
 import {
 	TransactionalKeyValueStore,
 	TransactionalSessionStore,
@@ -30,7 +30,7 @@ export interface RegisteredStore {
 	readonly top: StateStore
 	/** The exactly-once write buffer. */
 	readonly buffer?: TransactionalLayer
-	/** Window and session(-layout) stores with a clipping layer. */
+	/** Window and session(-layout) stores with a clock, kept by the clipping layer on top of the stack (6.2). */
 	readonly clock?: StoreClock
 	readonly changelog?: { readonly topic: string; readonly partition: number; readonly skipRestoration: boolean }
 }
@@ -56,6 +56,8 @@ interface Layers {
 	logged(inner: StateStore, writer: Writer): StateStore
 	/** The key codec of changelog records. */
 	changelogKey(builder: StoreBuilder): Codec<unknown>
+	/** The clipping layer of a store with a clock; key-value stores have none. */
+	clocked?(inner: StateStore, clock: StoreClock, retentionMs: number): StateStore
 }
 
 const LAYERS: Record<StoreBuilder['kind'], Layers> = {
@@ -70,12 +72,14 @@ const LAYERS: Record<StoreBuilder['kind'], Layers> = {
 			new TransactionalWindowStore(raw as Window, builder.keyCodec, builder.valueCodec, retention(builder)),
 		logged: (inner, writer) => new ChangelogBackedWindowStore(inner as Window, writer as WindowedWriter),
 		changelogKey: builder => windowedKeyCodec(builder.keyCodec) as Codec<unknown>,
+		clocked: (inner, clock, retentionMs) => new ClockedWindowStore(inner as Window, clock, retentionMs),
 	},
 	session: {
 		transactional: (raw, builder) =>
 			new TransactionalSessionStore(raw as Session, builder.keyCodec, builder.valueCodec, retention(builder)),
 		logged: (inner, writer) => new ChangelogBackedSessionStore(inner as Session, writer as WindowedWriter),
 		changelogKey: builder => windowedKeyCodec(builder.keyCodec) as Codec<unknown>,
+		clocked: (inner, clock, retentionMs) => new ClockedSessionStore(inner as Session, clock, retentionMs),
 	},
 }
 
@@ -89,7 +93,8 @@ function retention(builder: StoreBuilder): number {
 /**
  * The stores of one task (Kafka Streams' ProcessorStateManager). For every store of its subtopology it leases the
  * provider store of the task's partition and stacks on it: under exactly-once a write buffer, then changelog logging
- * to the changelog partition of the task's partition, then a handle that rejects writes once the stack is closed.
+ * to the changelog partition of the task's partition, then a handle that rejects writes once the stack is closed, and
+ * for a store with a clock the clipping layer, which sees every processor write and clips every processor read (6.2).
  */
 export class TaskStateManager {
 	private registered: RegisteredStore[] = []
@@ -208,7 +213,12 @@ export class TaskStateManager {
 			)
 			changelog = { topic, partition: this.partition, skipRestoration }
 		}
-		const top = storeHandle(layer, builder.kind, () => this.closed, `task ${this.task.key}`)
-		return { builder, raw, top, buffer, changelog }
+		const handle = storeHandle(layer, builder.kind, () => this.closed, `task ${this.task.key}`)
+		if (builder.clock === undefined || layers.clocked === undefined) {
+			return { builder, raw, top: handle, buffer, changelog }
+		}
+		const retentionMs = retention(builder)
+		const clock = new TaskStoreClock(this.deps.metadata, builder.name, retentionMs, builder.clock.emitFinal)
+		return { builder, raw, top: layers.clocked(handle, clock, retentionMs), buffer, clock, changelog }
 	}
 }

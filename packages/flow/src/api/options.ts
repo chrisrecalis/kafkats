@@ -48,7 +48,10 @@ export interface Materialized<K, V> {
 	value?: Codec<V>
 	/** Changelog backing for fault-tolerant state. Default: true (enabled). */
 	changelog?: boolean | ChangelogConfig
-	/** Window and session stores: how long windows are kept (minimum and default: window size + grace). */
+	/**
+	 * Windowed aggregations: how long the store keeps windows. Default and minimum: size + grace for time windows,
+	 * gap + grace for sessions, twice the time difference + grace for sliding windows.
+	 */
 	retention?: WindowDuration
 }
 
