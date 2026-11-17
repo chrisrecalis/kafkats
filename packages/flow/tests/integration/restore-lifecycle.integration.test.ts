@@ -3,9 +3,10 @@
  * (start/close/restart) against a real broker.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import type { KafkaClient, Producer } from '@kafkats/client'
+import type { Consumer, KafkaClient, Producer } from '@kafkats/client'
 import {
 	ChangelogRestorer,
+	FailedProcessingError,
 	InMemoryKeyValueStore,
 	InMemoryStateStoreProvider,
 	buildChangelogTopicName,
@@ -414,7 +415,9 @@ describe('processing failures', () => {
 			for (const v of [1, 2, 3]) await producer.send(input, { key: 'a', value: numberCodec.encode(v) })
 			await collector.waitFor<string, number>(out, m => m.value === 1, 10_000)
 			await waitUntil('app1 ERROR', () => app1.state() === 'ERROR', 10_000)
-			expect(app1.getError()?.message).toContain('boom')
+			// The processing exception handler's 'fail' (the default) wraps the error (4.6.4).
+			expect(app1.getError()).toBeInstanceOf(FailedProcessingError)
+			expect(app1.getError()?.cause).toEqual(new Error('boom'))
 			await app1.close()
 			const app2 = build(null)
 			await app2.start()
@@ -713,15 +716,24 @@ describe('app lifecycle', () => {
 			topics: [{ topic: out, keyCodec: stringCodec, valueCodec: numberCodec }],
 		})
 		await collector.start()
-		const app = flow({ applicationId: appId, client, consumer: { maxWaitMs: 100 } })
+		// The app's group consumer, from a client whose consumer() keeps what it created.
+		const appClient = newClient('restore-transient-app')
+		const groupConsumers: Consumer[] = []
+		const createConsumer = appClient.consumer.bind(appClient)
+		appClient.consumer = config => {
+			const consumer = createConsumer(config)
+			if (config.groupId === appId) groupConsumers.push(consumer)
+			return consumer
+		}
+		const app = flow({ applicationId: appId, client: appClient, consumer: { maxWaitMs: 100 } })
 		app.stream(input, { key: stringCodec, value: numberCodec })
 			.mapValues(v => v)
 			.to(out, { key: stringCodec, value: numberCodec })
 		try {
 			await app.start()
 			// The client emits 'error' for non-fatal conditions too (e.g. auto-commit failures).
-			// eslint-disable-next-line @typescript-eslint/no-explicit-any
-			;(app as any).workers.active[0].context.consumer.emit('error', new Error('transient commit failure'))
+			expect(groupConsumers).toHaveLength(1)
+			groupConsumers[0]!.emit('error', new Error('transient commit failure'))
 			await producer.send(input, { key: 'a', value: numberCodec.encode(7) })
 			await collector.waitFor<string, number>(out, m => m.value === 7, 10_000) // still processing
 			await sleep(300)
@@ -729,10 +741,11 @@ describe('app lifecycle', () => {
 		} finally {
 			await app.close().catch(() => {})
 			await collector.stop()
+			await appClient.disconnect()
 		}
 	}, 30_000)
 
-	it('start() failing while workers are starting (consumer cannot join) cleans up its sockets', async () => {
+	it('start() failing while joining the group (consumer cannot join) cleans up its sockets', async () => {
 		const input = uniqueTopicName('restore-joinfail-in')
 		await createTopics(client, [{ name: input }])
 		const app = flow({

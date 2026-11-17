@@ -14,7 +14,7 @@ import {
 const stringCodec = codec.string()
 const numberCodec = codec.json<number>()
 
-describe('global tables and worker lifecycle', () => {
+describe('global tables and app lifecycle', () => {
 	let admin: KafkaClient
 	let producer: Producer
 	beforeAll(async () => {
@@ -172,15 +172,30 @@ describe('global tables and worker lifecycle', () => {
 		}
 	}, 40_000)
 
-	it('a fatal error while preparing newly assigned partitions puts the app in ERROR instead of restarting forever', async () => {
+	it('a fatal error while restoring a task assigned anew puts the app in ERROR instead of restarting forever', async () => {
 		const input = uniqueTopicName('r2-fatal-restore-in')
 		const output = uniqueTopicName('r2-fatal-restore-out')
 		const applicationId = uniqueTopicName('r2-fatal-restore-app')
 		await createTopics(admin, [{ name: input, partitions: 2 }, { name: output }])
-		const build = (): FlowApp => {
+		// Once armed, every restore consumer of the first instance (groupId `<appId>-restore-<taskId>-<n>`, DL14)
+		// fails with an error that no restart can fix.
+		const denied = new KafkaError('not authorized to read the changelog', ErrorCode.TopicAuthorizationFailed)
+		let armed = false
+		let restores = 0
+		const firstClient = newClient('r2-fatal-restore-app')
+		const createConsumer = firstClient.consumer.bind(firstClient)
+		firstClient.consumer = config => {
+			const consumer = createConsumer(config)
+			if (armed && config.groupId.startsWith(`${applicationId}-restore-`)) {
+				restores += 1
+				consumer.runBatch = () => Promise.reject(denied)
+			}
+			return consumer
+		}
+		const build = (client: KafkaClient): FlowApp => {
 			const app = flow({
 				applicationId,
-				client: newClient('r2-fatal-restore-app'),
+				client,
 				consumer: { autoOffsetReset: 'earliest', maxWaitMs: 50, sessionTimeoutMs: 6_000 },
 				producer: { lingerMs: 0 },
 			})
@@ -191,29 +206,39 @@ describe('global tables and worker lifecycle', () => {
 				.to(output, { key: stringCodec, value: numberCodec })
 			return app
 		}
-		const first = build()
-		const second = build()
+		const first = build(firstClient)
+		const second = build(newClient('r2-fatal-restore-app'))
 		try {
 			await first.start()
-			// From now on restoring state fails with an error that no restart can fix.
-			const denied = new KafkaError('not authorized to read the changelog', ErrorCode.TopicAuthorizationFailed)
-			// eslint-disable-next-line @typescript-eslint/no-explicit-any
-			;(first as any).restoration.enqueue = () => Promise.reject(denied)
-
-			// A second instance joins: the first one is assigned its remaining partition anew.
+			// The second instance joins and takes one of the two tasks; both count a record per partition, so the
+			// changelog of the second instance's task moves past what the first one has of it.
 			await second.start()
+			await producer.send(input, [
+				{ key: 'a', value: Buffer.from('x'), partition: 0 },
+				{ key: 'b', value: Buffer.from('x'), partition: 1 },
+			])
+			for (const deadline = Date.now() + 20_000; Date.now() < deadline;) {
+				if ((await readAllCommitted(admin, output, 500)).length >= 2) break
+			}
+			expect(await readAllCommitted(admin, output, 500)).toHaveLength(2)
+
+			// The second instance leaves: the first one gets its task anew and must restore it.
+			armed = true
+			await second.close()
 			for (const deadline = Date.now() + 20_000; first.state() !== 'ERROR' && Date.now() < deadline;) {
 				await sleep(100)
 			}
+			expect(restores).toBe(1)
 			expect(first.state()).toBe('ERROR')
 			expect(first.getError()).toBe(denied)
 		} finally {
 			await first.close().catch(() => {})
 			await second.close().catch(() => {})
+			await firstClient.disconnect().catch(() => {})
 		}
 	}, 60_000)
 
-	it('close() while a worker is in restart backoff returns promptly and leaves no extra handles', async () => {
+	it('close() during the recovery backoff returns promptly and leaves no extra handles', async () => {
 		const input = uniqueTopicName('r2-lc-in')
 		const output = uniqueTopicName('r2-lc-out')
 		await createTopics(admin, [{ name: input }, { name: output }])
@@ -236,7 +261,7 @@ describe('global tables and worker lifecycle', () => {
 				.toStream()
 				.to(output, { key: stringCodec, value: numberCodec })
 			await app.start()
-			await sleep(2_500) // several failed commits -> worker is in backoff
+			await sleep(2_500) // several failed commits -> the app is in its recovery backoff
 			const t0 = Date.now()
 			await app.close()
 			expect(Date.now() - t0).toBeLessThan(5_000)
@@ -347,7 +372,7 @@ describe('start() retry', () => {
 		expect(new Set([...first, ...second]).size).toBe(N)
 	})
 
-	it('at-least-once: partitions processed concurrently count every record', async () => {
+	it('at-least-once: the tasks of one instance process concurrently and count every record', async () => {
 		const P = 4
 		const input = uniqueTopicName('r2-conc-in')
 		const output = uniqueTopicName('r2-conc-out')
@@ -391,7 +416,7 @@ describe('start() retry', () => {
 		}
 	})
 
-	it('at-least-once: topics that share state are not processed concurrently for the same partition', async () => {
+	it('at-least-once: the records of one task (two topics, one store) are processed one at a time', async () => {
 		const left = uniqueTopicName('r2-conc-merge-a')
 		const right = uniqueTopicName('r2-conc-merge-b')
 		const output = uniqueTopicName('r2-conc-merge-out')

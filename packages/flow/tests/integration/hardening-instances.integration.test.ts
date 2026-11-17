@@ -1,11 +1,12 @@
 /**
- * Round 3 / attack 6: numStreamThreads 2 and 3 on 4-partition topics with injected commit failures: count,
+ * Round 3 / attack 6, on instances (D1: one runtime per app instance, scaled by running more of them): 2 and 3
+ * instances of one app in one process on 4-partition topics with injected commit failures: count,
  * groupBy(newKey).count, stream-stream join, stream-table join must all be exact (no loss, no duplicates), and the
- * co-partitioned join inputs must end up on the same worker (join results complete).
+ * co-partitioned join inputs must end up on the same instance (join results complete).
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { KafkaClient, Producer } from '@kafkats/client'
-import { TimeWindows, codec, flow } from '../../src/index.js'
+import { TimeWindows, codec, flow, type FlowApp } from '../../src/index.js'
 import {
 	createTopics,
 	injectCommitFailures,
@@ -20,7 +21,7 @@ const num = codec.json<number>()
 const KEYS = 10
 const N = 30
 
-describe('hardening: multi-thread EOS topologies with commit failures', () => {
+describe('hardening: EOS topologies on several instances with commit failures', () => {
 	let admin: KafkaClient
 	let producer: Producer
 	beforeAll(async () => {
@@ -33,9 +34,9 @@ describe('hardening: multi-thread EOS topologies with commit failures', () => {
 		await admin.disconnect()
 	})
 
-	for (const threads of [2, 3]) {
-		it(`exactly_once numStreamThreads=${threads}: count, groupBy, stream-stream join, stream-table join are exact`, async () => {
-			const t = (n: string) => uniqueTopicName(`r3-th${threads}-${n}`)
+	for (const instances of [2, 3]) {
+		it(`exactly_once, ${instances} instances: count, groupBy, stream-stream join, stream-table join are exact`, async () => {
+			const t = (n: string) => uniqueTopicName(`r3-in${instances}-${n}`)
 			const T = {
 				a: t('a'),
 				b: t('b'),
@@ -46,7 +47,7 @@ describe('hardening: multi-thread EOS topologies with commit failures', () => {
 				oJoin: t('ojoin'),
 				oTj: t('otj'),
 			}
-			const applicationId = uniqueTopicName('r3-th-app')
+			const applicationId = uniqueTopicName('r3-in-app')
 			await createTopics(admin, [
 				{ name: T.a, partitions: 4 },
 				{ name: T.b, partitions: 4 },
@@ -57,41 +58,49 @@ describe('hardening: multi-thread EOS topologies with commit failures', () => {
 				{ name: T.oJoin },
 				{ name: T.oTj },
 			])
-			const client = newClient('r3-th-app')
 			let commits = 0
-			injectCommitFailures(client, () => {
-				commits += 1
-				return commits % 9 === 0 && commits <= 90
-			})
-			const app = flow({
-				applicationId,
-				client,
-				processingGuarantee: 'exactly_once',
-				commitIntervalMs: 100,
-				consumer: { autoOffsetReset: 'earliest', maxWaitMs: 50 },
-				producer: { lingerMs: 0 },
-				changelog: { restoration: { idleTimeoutMs: 1_000, initialIdleTimeoutMs: 5_000, checkIntervalMs: 50 } },
-			})
-			const a = app.stream(T.a, { key: str, value: str })
-			a.groupByKey()
-				.count({ storeName: 'cnt', key: str, value: num })
-				.toStream()
-				.to(T.oCount, { key: str, value: num })
-			a.groupBy((k, _v) => `grp${Number(k!.slice(1)) % 3}`, { key: str, value: str })
-				.count({ storeName: 'gcnt', key: str, value: num })
-				.toStream()
-				.to(T.oGroup, { key: str, value: num })
-			a.join(app.stream(T.b, { key: str, value: str }), (l, r) => `${l}|${r}`, {
-				within: TimeWindows.of(60_000),
-				key: str,
-				value: str,
-				otherValue: str,
-			}).to(T.oJoin, { key: str, value: str })
-			app.stream(T.s, { key: str, value: str })
-				.join(app.table(T.tbl, { key: str, value: str }), (sv, tv) => `${sv}|${tv}`)
-				.to(T.oTj, { key: str, value: str })
+			const clients: KafkaClient[] = []
+			const build = (): FlowApp => {
+				const client = newClient('r3-in-app')
+				clients.push(client)
+				injectCommitFailures(client, () => {
+					commits += 1
+					return commits % 9 === 0 && commits <= 90
+				})
+				const app = flow({
+					applicationId,
+					client,
+					processingGuarantee: 'exactly_once',
+					commitIntervalMs: 100,
+					consumer: { autoOffsetReset: 'earliest', maxWaitMs: 50 },
+					producer: { lingerMs: 0 },
+					changelog: {
+						restoration: { idleTimeoutMs: 1_000, initialIdleTimeoutMs: 5_000, checkIntervalMs: 50 },
+					},
+				})
+				const a = app.stream(T.a, { key: str, value: str })
+				a.groupByKey()
+					.count({ storeName: 'cnt', key: str, value: num })
+					.toStream()
+					.to(T.oCount, { key: str, value: num })
+				a.groupBy((k, _v) => `grp${Number(k!.slice(1)) % 3}`, { key: str, value: str })
+					.count({ storeName: 'gcnt', key: str, value: num })
+					.toStream()
+					.to(T.oGroup, { key: str, value: num })
+				a.join(app.stream(T.b, { key: str, value: str }), (l, r) => `${l}|${r}`, {
+					within: TimeWindows.of(60_000),
+					key: str,
+					value: str,
+					otherValue: str,
+				}).to(T.oJoin, { key: str, value: str })
+				app.stream(T.s, { key: str, value: str })
+					.join(app.table(T.tbl, { key: str, value: str }), (sv, tv) => `${sv}|${tv}`)
+					.to(T.oTj, { key: str, value: str })
+				return app
+			}
+			const apps = Array.from({ length: instances }, build)
 			try {
-				await app.start()
+				await Promise.all(apps.map(app => app.start()))
 				await sleep(1_500)
 				// table rows first, let them settle
 				await producer.send(
@@ -187,7 +196,8 @@ describe('hardening: multi-thread EOS topologies with commit failures', () => {
 				expect(tjs.length, 'table-join duplicates/missing').toBe(wantTj.size)
 				expect(new Set(tjs)).toEqual(wantTj)
 			} finally {
-				await app.close().catch(() => {})
+				await Promise.all(apps.map(app => app.close().catch(() => {})))
+				await Promise.all(clients.map(client => client.disconnect()))
 			}
 		}, 88_000)
 	}
