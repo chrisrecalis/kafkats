@@ -1,6 +1,6 @@
 /**
  * The task runtime against a real broker (WP2.3, the 2A walking skeleton): a stateless and a counting topology under
- * both guarantees, start and close. Topics are fresh, so changelogs start empty (this build restores nothing).
+ * both guarantees, start and close. Topics are fresh, so changelogs start empty.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { string, type Consumer, type KafkaClient, type Producer } from '@kafkats/client'

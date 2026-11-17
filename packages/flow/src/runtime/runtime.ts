@@ -16,6 +16,7 @@ import { GlobalStateManager } from '@/runtime/global-tables.js'
 import type { RuntimeIO } from '@/runtime/io.js'
 import { Run } from '@/runtime/run.js'
 import { cap, raceSignal } from '@/runtime/signals.js'
+import { StartPositions } from '@/runtime/start-positions.js'
 import type { Checkpoints } from '@/state/checkpoints.js'
 import type { StateDirectory } from '@/state/state-directory.js'
 import type { BuiltTopology } from '@/topology/built-topology.js'
@@ -55,6 +56,8 @@ export class FlowRuntime {
 	 */
 	readonly shutdown = new AbortController()
 	private readonly globals: GlobalStateManager | undefined
+	/** 'latest' pins of this start: every run of it settles start positions with them (4.7.4). */
+	private readonly startPositions: StartPositions
 	private run: Run | undefined
 	/** Stream processing waits for a global table loaded again (4.12 step 3). */
 	private paused = false
@@ -67,6 +70,10 @@ export class FlowRuntime {
 
 	constructor(private readonly deps: FlowRuntimeDeps) {
 		const { topology, io, config, stateDirectory, logger } = deps
+		this.startPositions = new StartPositions({
+			policy: topic => topology.resetPolicy(topic, config.defaultResetPolicy),
+			logger,
+		})
 		if (topology.globalStores.length > 0) {
 			this.globals = new GlobalStateManager({
 				io,
@@ -107,6 +114,7 @@ export class FlowRuntime {
 			const run: Run = new Run({
 				...this.deps,
 				counts,
+				startPositions: this.startPositions,
 				globalStore: name => this.globals!.store(name),
 				paused: () => this.paused,
 				onFailure: (error, site) => this.fail(error, site, run),

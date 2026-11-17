@@ -3,8 +3,6 @@
  * CommitCoordinator, the TaskManager and the Scheduler, wired to each other and to the consumer's rebalance hooks
  * (4.3). Created by FlowRuntime.start (and, from the recovery of a later build, by every recovery); never revived: a
  * Run ends once, gracefully (close) or abandoned (failure).
- *
- * This build settles start positions without pins.
  */
 import type { Logger } from '@kafkats/client'
 import { NoOffsetResetError, StreamsError } from '@/api/errors.js'
@@ -14,11 +12,12 @@ import type { ResolvedFlowConfig } from '@/runtime/config.js'
 import { errorMessage, type FailureSite } from '@/runtime/errors.js'
 import type { GroupConsumerHooks, GroupConsumerPort, ProducerPort, RuntimeIO } from '@/runtime/io.js'
 import { SinkPartitionCounts } from '@/runtime/partition-count-cache.js'
+import { RepartitionPurger } from '@/runtime/purge.js'
 import { RecordCollector } from '@/runtime/record-collector.js'
-import type { StartPositionSettler } from '@/runtime/restore-pipelines.js'
 import { RestorationPool } from '@/runtime/restoration.js'
 import { Scheduler } from '@/runtime/scheduler.js'
 import { cap, raceSignal } from '@/runtime/signals.js'
+import type { StartPositions } from '@/runtime/start-positions.js'
 import { TaskIdRegistry } from '@/runtime/task-id.js'
 import { TaskManager } from '@/runtime/task-manager.js'
 import type { StateStore } from '@/state.js'
@@ -45,6 +44,8 @@ export interface RunDeps {
 	readonly io: RuntimeIO
 	readonly stateDirectory: StateDirectory
 	readonly checkpoints: Checkpoints
+	/** The start's 'latest' pins (4.7.4): they outlive the run. */
+	readonly startPositions: StartPositions
 	/** The app state follows rebalances and restores (4.3.5). */
 	readonly lifecycle: Pick<AppLifecycle, 'setRunning' | 'setRebalancing'>
 	/** The read-only view of a global store (GlobalStateManager.store). */
@@ -93,7 +94,14 @@ export class Run {
 			assignmentMetadata: () => this.tasks.assignmentMetadata,
 			eos: config.eos,
 			checkpoints: deps.checkpoints,
-			onCommitted: { noteCommitted: () => {} },
+			onCommitted: new RepartitionPurger({
+				admin: io.admin,
+				topics: new Set(deps.topology.subtopologies.flatMap(s => [...s.repartitionSourceTopics])),
+				intervalMs: config.repartitionPurgeIntervalMs,
+				clock: io.clock,
+				signal: this.hardStop.signal,
+				logger,
+			}),
 			failed: () => this.isFailed,
 			hardStop: this.hardStop.signal,
 			config,
@@ -121,7 +129,7 @@ export class Run {
 				commitIntervalMs: config.commitIntervalMs,
 				logger,
 			}),
-			startPositions: withoutPins,
+			startPositions: deps.startPositions.settler(this.consumer),
 			exclusive: fn => this.scheduler.exclusive(fn),
 			commit: (reason, signal) => this.commits.commit(reason, signal),
 			resetOutput: () => this.resetOutput(),
@@ -375,17 +383,6 @@ export class Run {
 			logger,
 		})
 	}
-}
-
-/** Start positions of this build: where the client put each partition without a committed offset (no pins). */
-const withoutPins: StartPositionSettler = {
-	settle: task => {
-		const positions = new Map<string, bigint>()
-		for (const [key, start] of task.starts) {
-			if (start.committed === null) positions.set(key, start.resolved)
-		}
-		return Promise.resolve(positions)
-	},
 }
 
 function once<T>(fn: () => Promise<T>): () => Promise<T> {
