@@ -1,7 +1,7 @@
 export const flowVersion = '0.1.0'
 
 // Core flow API
-export { flow, topic, TimeWindows, SessionWindows, SlidingWindows } from '@/flow.js'
+export { flow, topic, TimeWindows, SessionWindows, SlidingWindows } from '@/legacy/flow.js'
 
 // Types
 export type {
@@ -22,7 +22,7 @@ export type {
 	Grouped,
 	Materialized,
 	Joined,
-} from '@/flow.js'
+} from '@/legacy/flow.js'
 
 // Codecs
 export { codec, string, json, buffer } from '@/codec.js'
@@ -40,7 +40,7 @@ export {
 	ChangelogBackedKeyValueStore,
 	ChangelogBackedWindowStore,
 	ChangelogBackedSessionStore,
-} from '@/state/changelog.js'
+} from '@/legacy/state/changelog.js'
 export type {
 	StateStoreProvider,
 	ChangelogCheckpointStore,

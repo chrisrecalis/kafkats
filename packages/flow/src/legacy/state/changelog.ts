@@ -1,0 +1,121 @@
+import type { KeyValueStore, WindowStore, SessionStore, WindowedKey } from '@/state.js'
+import type { ChangelogWriter } from '@/legacy/changelog.js'
+
+/**
+ * Store wrapper that logs every mutation to a changelog topic. Reads delegate to the inner store.
+ */
+abstract class ChangelogBackedStore<K, V, S extends KeyValueStore<K, V>> implements KeyValueStore<K, V> {
+	constructor(
+		protected readonly inner: S,
+		protected readonly writer: ChangelogWriter<K, V>
+	) {}
+
+	/** The wrapped store. */
+	get innerStore(): S {
+		return this.inner
+	}
+
+	get name(): string {
+		return this.inner.name
+	}
+
+	get(key: K): Promise<V | undefined> {
+		return this.inner.get(key)
+	}
+
+	async put(key: K, value: V): Promise<void> {
+		// Local-first: a crash between the two must leave local stale (replayed on restart),
+		// not the changelog ahead (downstream forwards aggregates that disagree with the durable log).
+		await this.inner.put(key, value)
+		await this.writer.write(key, value)
+	}
+
+	async delete(key: K): Promise<void> {
+		await this.inner.delete(key)
+		await this.writer.writeTombstone(key)
+	}
+
+	all(): AsyncIterable<[K, V]> {
+		return this.inner.all()
+	}
+
+	range(from: K, to: K): AsyncIterable<[K, V]> {
+		return this.inner.range(from, to)
+	}
+
+	approximateNumEntries(): Promise<number> {
+		return this.inner.approximateNumEntries()
+	}
+
+	init(): Promise<void> {
+		return this.inner.init()
+	}
+
+	flush(): Promise<void> {
+		return this.inner.flush()
+	}
+
+	close(): Promise<void> {
+		return this.inner.close()
+	}
+}
+
+export class ChangelogBackedKeyValueStore<K, V> extends ChangelogBackedStore<K, V, KeyValueStore<K, V>> {}
+
+export class ChangelogBackedWindowStore<K, V>
+	extends ChangelogBackedStore<WindowedKey<K>, V, WindowStore<K, V>>
+	implements WindowStore<K, V>
+{
+	fetch(key: K, timeFrom: number, timeTo: number): AsyncIterable<[WindowedKey<K>, V]> {
+		return this.inner.fetch(key, timeFrom, timeTo)
+	}
+
+	fetchAll(timeFrom: number, timeTo: number): AsyncIterable<[WindowedKey<K>, V]> {
+		return this.inner.fetchAll(timeFrom, timeTo)
+	}
+
+	fetchRange(keyFrom: K, keyTo: K, timeFrom: number, timeTo: number): AsyncIterable<[WindowedKey<K>, V]> {
+		return this.inner.fetchRange(keyFrom, keyTo, timeFrom, timeTo)
+	}
+
+	async expireOldWindows(currentTime: number): Promise<number> {
+		// No per-window tombstones: the window changelog topic is configured with delete+compact and
+		// a finite retention.ms tied to the store's retention (see StoreRegistry.setupChangelog), so the
+		// broker prunes records for expired windows — the same approximate, time-based cleanup Kafka
+		// Streams uses for windowed changelogs. It is broker wall-clock based, not stream-time exact,
+		// so restore can briefly replay a window the local store had already expired; such a window is
+		// re-expired once stream time advances far enough after restore.
+		return this.inner.expireOldWindows(currentTime)
+	}
+}
+
+export class ChangelogBackedSessionStore<K, V>
+	extends ChangelogBackedStore<WindowedKey<K>, V, SessionStore<K, V>>
+	implements SessionStore<K, V>
+{
+	findSessions(key: K, earliestStart: number, latestEnd: number): AsyncIterable<[WindowedKey<K>, V]> {
+		return this.inner.findSessions(key, earliestStart, latestEnd)
+	}
+
+	async remove(key: K): Promise<void> {
+		const toDelete: WindowedKey<K>[] = []
+		for await (const [windowedKey] of this.inner.findSessions(key, 0, Number.MAX_SAFE_INTEGER)) {
+			toDelete.push(windowedKey)
+		}
+		await this.inner.remove(key)
+		for (const windowedKey of toDelete) {
+			await this.writer.writeTombstone(windowedKey)
+		}
+	}
+
+	async expireOldSessions(currentTime: number): Promise<WindowedKey<K>[]> {
+		// Without per-key tombstones, restoration would replay the original puts and resurrect
+		// expired sessions (changelog's last value per key wins). Mirror remove(): inner deletes
+		// first (local-first), then emit a tombstone for each so the durable log stays consistent.
+		const expired = await this.inner.expireOldSessions(currentTime)
+		for (const key of expired) {
+			await this.writer.writeTombstone(key)
+		}
+		return expired
+	}
+}

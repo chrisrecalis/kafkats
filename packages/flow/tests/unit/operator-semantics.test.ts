@@ -2,11 +2,11 @@ import { describe, it, expect } from 'vitest'
 
 import { TestDriver } from '../../src/testing.js'
 import { codec } from '../../src/index.js'
-import { TimeWindows, SessionWindows } from '../../src/windows.js'
+import { TimeWindows, SessionWindows } from '../../src/legacy/windows.js'
 import { InMemoryWindowStore, InMemorySessionStore } from '../../src/state/memory.js'
-import { StreamStreamJoinNode } from '../../src/processors/joins/stream-stream.js'
-import { SessionReduceNode, SessionAggregateNode } from '../../src/processors/aggregation.js'
-import { Processor, type StreamRecord } from '../../src/processors/base.js'
+import { StreamStreamJoinNode } from '../../src/legacy/processors/joins/stream-stream.js'
+import { SessionReduceNode, SessionAggregateNode } from '../../src/legacy/processors/aggregation.js'
+import { Processor, type StreamRecord } from '../../src/legacy/processors/base.js'
 
 const str = codec.string()
 const num = {

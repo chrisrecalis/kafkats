@@ -29,15 +29,37 @@ export interface SessionStoreOptions<K, V> extends KeyValueStoreOptions<K, V> {
 }
 
 /**
- * A key-value state store for maintaining local state in stream processing.
+ * Base of every state store. Stores are used by stateful operations like aggregations, joins and
+ * deduplication; each store has a unique name within the application.
  *
- * State stores are used by stateful operations like aggregations, joins, and
- * deduplication. Each store has a unique name within the application.
+ * Iteration order: `range()` iterates in ascending serialized-key order; `fetch()` and `findSessions()`
+ * iterate in `(start, end)` order for one key; the order of `all()`, `fetchAll()` and `fetchRange()` is
+ * unspecified.
  */
-export interface KeyValueStore<K, V> {
+export interface StateStore {
 	/** Unique name of this store */
 	readonly name: string
 
+	/**
+	 * Initialize the store. Called before first use.
+	 */
+	init(): Promise<void>
+
+	/**
+	 * Flush any pending writes to durable storage.
+	 */
+	flush(): Promise<void>
+
+	/**
+	 * Close the store and release resources.
+	 */
+	close(): Promise<void>
+}
+
+/**
+ * A key-value state store for maintaining local state in stream processing.
+ */
+export interface KeyValueStore<K, V> extends StateStore {
 	/**
 	 * Get the value for a key.
 	 * @returns The value, or undefined if not found
@@ -66,24 +88,9 @@ export interface KeyValueStore<K, V> {
 	range(from: K, to: K): AsyncIterable<[K, V]>
 
 	/**
-	 * Get approximate number of entries in the store.
+	 * Get approximate number of entries in the store (0 iff the store is empty).
 	 */
 	approximateNumEntries(): Promise<number>
-
-	/**
-	 * Initialize the store. Called before first use.
-	 */
-	init(): Promise<void>
-
-	/**
-	 * Flush any pending writes to durable storage.
-	 */
-	flush(): Promise<void>
-
-	/**
-	 * Close the store and release resources.
-	 */
-	close(): Promise<void>
 }
 
 /**
@@ -163,6 +170,24 @@ export interface SessionStore<K, V> extends KeyValueStore<WindowedKey<K>, V> {
 	expireOldSessions(currentTime: number): Promise<WindowedKey<K>[]>
 }
 
+/** A value with the timestamp of the record that last updated it. */
+export interface ValueAndTimestamp<V> {
+	readonly value: V
+	readonly timestamp: number
+}
+
+/** Key-value store whose values carry a timestamp (DSL tables and aggregations). */
+export interface TimestampedKeyValueStore<K, V> extends KeyValueStore<K, ValueAndTimestamp<V>> {}
+
+/** Window store whose values carry a timestamp (time-window aggregations). */
+export interface TimestampedWindowStore<K, V> extends WindowStore<K, ValueAndTimestamp<V>> {}
+
+/** What processors may do with a global table's store: read it. */
+export type ReadOnlyTimestampedKeyValueStore<K, V> = Pick<
+	TimestampedKeyValueStore<K, V>,
+	'name' | 'get' | 'range' | 'all' | 'approximateNumEntries'
+>
+
 /**
  * Durable store for tracking changelog restore/write progress.
  *
@@ -179,7 +204,9 @@ export interface ChangelogCheckpointStore {
 	/**
 	 * Set the next offset to restore from for a changelog topic-partition.
 	 *
-	 * The offset should be the "next" offset (i.e. last-applied offset + 1).
+	 * The offset should be the "next" offset (i.e. last-applied offset + 1). It may be `-1n`, the sentinel
+	 * that invalidates a checkpoint (always below the earliest offset, so never trusted); implementations
+	 * store it like any other value.
 	 */
 	set(topic: string, partition: number, offset: bigint): Promise<void>
 

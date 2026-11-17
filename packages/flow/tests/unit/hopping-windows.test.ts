@@ -1,140 +1,108 @@
-import { describe, it, expect, vi } from 'vitest'
+import { describe, expect, it } from 'vitest'
+import { TopologyError } from '@/api/errors.js'
+import type { Windowed } from '@/api/grouped.js'
+import type { KTable } from '@/api/ktable.js'
+import { codec } from '@/codec.js'
+import { TimeWindows } from '@/dsl/windows.js'
+import { TestDriver } from '@/testing/driver.js'
 
-import { WindowedAggregateNode, WindowedReduceNode } from '@/processors/aggregation.js'
-import type { WindowStore, WindowedKey } from '@/state.js'
+const str = codec.string()
+const num = codec.json<number>()
 
-function makeStubStore<K, A>() {
-	const data = new Map<string, A>()
-	const store: WindowStore<K, A> = {
-		name: 's',
-		get: vi.fn(async (key: WindowedKey<K>) => data.get(JSON.stringify(key)) ?? undefined),
-		put: vi.fn(async (key: WindowedKey<K>, value: A) => {
-			data.set(JSON.stringify(key), value)
-		}),
-		delete: vi.fn(async () => {}),
-		all: vi.fn(() => (async function* () {})()),
-		range: vi.fn(),
-		fetch: vi.fn(),
-		fetchAll: vi.fn(),
-		fetchRange: vi.fn(),
-		expireOldWindows: vi.fn().mockResolvedValue(0),
-		approximateNumEntries: vi.fn().mockResolvedValue(0),
-		init: vi.fn(),
-		flush: vi.fn(),
-		close: vi.fn(),
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	} as any
-	return store
+const grouped = (driver: TestDriver) => driver.input('in', { key: str, value: num }).groupByKey()
+
+/** The updates of `build`'s table for records of key 'a' with the given values and timestamps. */
+async function updates(
+	build: (driver: TestDriver) => KTable<Windowed<string>, number>,
+	records: readonly (readonly [value: number, timestamp: number])[]
+): Promise<{ start: number; end: number; value: number | null }[]> {
+	const driver = new TestDriver()
+	const out: { start: number; end: number; value: number | null }[] = []
+	build(driver)
+		.toStream()
+		.peek((k, value) => out.push({ start: k!.window.start, end: k!.window.end, value }))
+	await driver.run(async ({ send }) => {
+		for (const [value, timestamp] of records) {
+			await send('in', value, { key: Buffer.from('a'), codec: num, timestamp })
+		}
+	})
+	return out
 }
 
 describe('hopping windows', () => {
-	it('WindowedAggregateNode aggregates a record into every overlapping window', async () => {
-		// size=1000, advance=500 → 2 overlapping windows per record.
-		// Record at t=750 belongs to:
-		//  - window [0, 1000)   (started at 0, covers 0..999)
-		//  - window [500, 1500) (started at 500, covers 500..1499)
-		const store = makeStubStore<string, number>()
-		const ref = { store }
-		const node = new WindowedAggregateNode<string, number, number>(
-			's',
-			ref,
-			() => 0,
-			(_k, v, agg) => agg + v,
-			1000,
-			500
+	it('aggregate() aggregates a record into every overlapping window', async () => {
+		// size=1000, advance=500: a record at 750 belongs to [0, 1000) and [500, 1500).
+		const out = await updates(
+			driver =>
+				grouped(driver)
+					.windowedBy(TimeWindows.of(1000).advanceBy(500))
+					.aggregate(
+						() => 0,
+						(_k, v, agg) => agg + v,
+						{ value: num }
+					),
+			[[5, 750]]
 		)
-		const forwards: Array<{ start: number; end: number; value: number }> = []
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		;(node as any).forward = async (record: any) => {
-			forwards.push({ start: record.key.window.start, end: record.key.window.end, value: record.value })
-		}
-
-		await node.process({
-			key: 'a',
-			value: 5,
-			timestamp: 750n,
-			topic: 't',
-			partition: 0,
-			offset: 0n,
-			headers: {},
-		})
-
-		// Expect TWO forwards, one per overlapping window.
-		expect(forwards).toHaveLength(2)
-		const sorted = [...forwards].sort((a, b) => a.start - b.start)
-		expect(sorted[0]).toEqual({ start: 0, end: 1000, value: 5 })
-		expect(sorted[1]).toEqual({ start: 500, end: 1500, value: 5 })
+		expect(out).toEqual([
+			{ start: 0, end: 1000, value: 5 },
+			{ start: 500, end: 1500, value: 5 },
+		])
 	})
 
-	it('WindowedReduceNode reduces a record into every overlapping window', async () => {
-		const store = makeStubStore<string, number>()
-		const ref = { store }
-		const node = new WindowedReduceNode<string, number>('s', ref, (a, b) => a + b, 1000, 500)
-		const forwards: Array<{ start: number; end: number; value: number }> = []
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		;(node as any).forward = async (record: any) => {
-			forwards.push({ start: record.key.window.start, end: record.key.window.end, value: record.value })
-		}
-
-		await node.process({
-			key: 'a',
-			value: 7,
-			timestamp: 750n,
-			topic: 't',
-			partition: 0,
-			offset: 0n,
-			headers: {},
-		})
-
-		expect(forwards).toHaveLength(2)
+	it('reduce() reduces a record into every overlapping window', async () => {
+		const out = await updates(
+			driver =>
+				grouped(driver)
+					.windowedBy(TimeWindows.of(1000).advanceBy(500))
+					.reduce((a, b) => a + b),
+			[
+				[7, 750],
+				[1, 900],
+			]
+		)
+		expect(out).toEqual([
+			{ start: 0, end: 1000, value: 7 },
+			{ start: 500, end: 1500, value: 7 },
+			{ start: 0, end: 1000, value: 8 },
+			{ start: 500, end: 1500, value: 8 },
+		])
 	})
 
-	it('throws when advanceBy is greater than window size (would silently drop records otherwise)', () => {
-		const store = makeStubStore<string, number>()
-		expect(
-			() =>
-				new WindowedAggregateNode<string, number, number>(
-					's',
-					{ store },
-					() => 0,
-					(_k, v, agg) => agg + v,
-					1000,
-					2000 // advanceMs > windowSizeMs — illegal
-				)
-		).toThrow(/advanceBy must be <= window size/)
-
-		expect(() => new WindowedReduceNode<string, number>('s', { store }, (a, b) => a + b, 1000, 2000)).toThrow(
-			/advanceBy must be <= window size/
+	it('no window starts before 0: a record near the epoch is only in its windows from 0 on (Kafka Streams)', async () => {
+		// size=10, advance=3: a record at 4 would also be in [-3, 7).
+		const out = await updates(
+			driver => grouped(driver).windowedBy(TimeWindows.of(10).advanceBy(3)).count(),
+			[[1, 4]]
 		)
+		expect(out).toEqual([
+			{ start: 0, end: 10, value: 1 },
+			{ start: 3, end: 13, value: 1 },
+		])
 	})
 
-	it('tumbling windows (advance == size) still produce exactly one update per record', async () => {
-		const store = makeStubStore<string, number>()
-		const ref = { store }
-		const node = new WindowedAggregateNode<string, number, number>(
-			's',
-			ref,
-			() => 0,
-			(_k, v, agg) => agg + v,
-			1000
-			// advance defaults to size
+	it('throws a TopologyError at the aggregation when advanceBy is greater than the window size', () => {
+		// Larger advances would silently drop the records that fall between windows.
+		const driver = new TestDriver()
+		const windowed = grouped(driver).windowedBy(TimeWindows.of(1000).advanceBy(2000))
+		expect(() => windowed.count()).toThrow(TopologyError)
+		expect(() => windowed.reduce((a, b) => a + b)).toThrow(/advanceBy must be <= window size/)
+	})
+
+	it('throws a TopologyError at the aggregation for windows of size 0 (no record would ever fall into one)', () => {
+		const driver = new TestDriver()
+		expect(() => grouped(driver).windowedBy(TimeWindows.of(0)).count()).toThrow(TopologyError)
+	})
+
+	it('advanceBy(0) gives tumbling windows, as today', async () => {
+		const out = await updates(
+			driver => grouped(driver).windowedBy(TimeWindows.of(1000).advanceBy(0)).count(),
+			[[1, 750]]
 		)
-		const forwards: Array<{ start: number; end: number }> = []
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		;(node as any).forward = async (record: any) => {
-			forwards.push({ start: record.key.window.start, end: record.key.window.end })
-		}
+		expect(out).toEqual([{ start: 0, end: 1000, value: 1 }])
+	})
 
-		await node.process({
-			key: 'a',
-			value: 1,
-			timestamp: 750n,
-			topic: 't',
-			partition: 0,
-			offset: 0n,
-			headers: {},
-		})
-
-		expect(forwards).toEqual([{ start: 0, end: 1000 }])
+	it('tumbling windows (advance == size) produce exactly one update per record', async () => {
+		const out = await updates(driver => grouped(driver).windowedBy(TimeWindows.of(1000)).count(), [[1, 750]])
+		expect(out).toEqual([{ start: 0, end: 1000, value: 1 }])
 	})
 })

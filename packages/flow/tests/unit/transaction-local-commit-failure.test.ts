@@ -1,70 +1,57 @@
 import { describe, expect, it } from 'vitest'
-import type { ConsumeContext, Message, Producer } from '@kafkats/client'
-import { codec } from '../../src/index.js'
-import type { WorkerContext } from '../../src/processors/base.js'
-import { PendingCheckpoints, type Checkpoints } from '../../src/runtime/checkpoints.js'
-import { recordContextStorage } from '../../src/runtime/context.js'
-import { PendingSends } from '../../src/runtime/pending-sends.js'
-import { WorkerTransactions } from '../../src/runtime/transactions.js'
-import { BufferedKeyValueStore } from '../../src/state/buffered.js'
-import { InMemoryKeyValueStore } from '../../src/state/memory.js'
-
-const str = codec.string()
-
-/** A worker whose producer commits every transaction successfully. */
-function workerWithTransactions() {
-	const producer = {
-		transaction: async (run: (tx: object) => Promise<void>) => run({ sendOffsets: async () => {} }),
-	} as unknown as Producer
-	const worker = {
-		id: 0,
-		producer,
-		activeTransaction: null,
-		pendingCheckpoints: new PendingCheckpoints(),
-		sends: new PendingSends(),
-		streamClocks: new Map(),
-		dirtyStores: new Set(),
-		failure: null,
-		processedSinceRestart: false,
-	} as unknown as WorkerContext
-	const failures: unknown[] = []
-	const transactions = new WorkerTransactions(
-		worker,
-		60_000,
-		{ flush: async () => {} } as unknown as Checkpoints,
-		error => failures.push(error)
-	)
-	const process = (work: () => Promise<void>) =>
-		transactions.process({ topic: 't', partition: 0, offset: 0n } as Message<Buffer>, {} as ConsumeContext, () =>
-			recordContextStorage.run({ worker, topic: 't', partition: 0 }, work)
-		)
-	const read = <T>(work: () => Promise<T>) => recordContextStorage.run({ worker, topic: 't', partition: 0 }, work)
-	return { worker, transactions, failures, process, read }
-}
+import { classify } from '@/runtime/errors.js'
+import type { KeyValueStore } from '@/state.js'
+import { kvStore, pipe, TaskHarness } from './support/task-harness.js'
+import type { ProcessorContext } from '@/processor/api.js'
 
 describe('exactly-once: applying buffered state after the Kafka commit fails', () => {
-	it('drops the buffers of every store of the transaction, not only of the one that failed', async () => {
-		const { transactions, failures, process, read } = workerWithTransactions()
-		const failingInner = new InMemoryKeyValueStore<string, string>('a', { keyCodec: str, valueCodec: str })
-		failingInner.put = async () => {
-			throw new Error('disk full')
-		}
-		const inner = new InMemoryKeyValueStore<string, string>('b', { keyCodec: str, valueCodec: str })
-		const failing = new BufferedKeyValueStore<string, string>(failingInner, str, str)
-		const store = new BufferedKeyValueStore<string, string>(inner, str, str)
-
-		await process(async () => {
-			await failing.put('k', 'buffered')
-			await store.put('k', 'buffered')
+	it('drops the buffers of every task of the transaction, not only of the one that failed, and migrates', async () => {
+		const h = new TaskHarness({
+			eos: true,
+			partitions: 3,
+			build: b =>
+				pipe(b, {
+					stores: [kvStore('s')],
+					processor: () => {
+						let context: ProcessorContext<string, string>
+						let store: KeyValueStore<string, string>
+						return {
+							init: ctx => {
+								context = ctx
+								store = ctx.getStateStore('s')
+							},
+							process: async record => {
+								await store.put(record.key, record.value)
+								return context.forward(record)
+							},
+						}
+					},
+				}),
 		})
-		await expect(transactions.commit()).rejects.toThrow('disk full')
-		expect(failures).toHaveLength(1)
+		const tasks = [h.task(0, 0), h.task(0, 1), h.task(0, 2)]
+		for (const task of tasks) {
+			await h.start(task)
+			h.enqueue(task, 'input', [{ key: 'k', value: 'buffered', timestamp: 1 }])
+			await h.process(task)
+		}
+		const raw = (task: (typeof tasks)[number]) => task.stores[0]!.raw as KeyValueStore<string, string>
+		raw(tasks[1]!).put = () => Promise.reject(new Error('disk full'))
 
-		// The worker restarts: its transaction is torn down and the stores are restored from the
-		// changelog, which holds a newer value by now.
-		await transactions.abort(new Error('worker stopped'))
-		await inner.put('k', 'restored')
+		const failure = await h.commit().catch((error: unknown) => error)
 
-		expect(await read(() => store.get('k'))).toBe('restored')
+		// Kafka committed: the stores are now behind their changelogs and only a restore repairs them.
+		expect((failure as Error).message).toBe('disk full')
+		expect(classify(failure, 'commit')).toBe('migrate')
+		expect(h.producer.transactions[0]!.state).toBe('committed')
+		expect(tasks.map(task => h.state(task).bufferDiscards)).toEqual([1, 1, 1])
+		expect(tasks.map(task => h.state(task).checkpoints)).toEqual([[], [], []])
+		expect(h.events).not.toContain('noteCommitted')
+
+		// The task restarts from a restore, which brings a newer value: no buffer of the transaction may hide it.
+		for (const task of tasks) {
+			delete (raw(task) as Partial<KeyValueStore<string, string>>).put
+			await raw(task).put('k', 'restored')
+			expect(await (task.store('s') as KeyValueStore<string, string>).get('k')).toBe('restored')
+		}
 	})
 })

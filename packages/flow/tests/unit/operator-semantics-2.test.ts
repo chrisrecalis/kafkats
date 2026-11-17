@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest'
 
 import { TestDriver } from '../../src/testing.js'
 import { codec } from '../../src/index.js'
-import { TimeWindows, SessionWindows } from '../../src/windows.js'
+import { TimeWindows, SessionWindows } from '../../src/legacy/windows.js'
 import { InMemoryKeyValueStore, InMemoryWindowStore } from '../../src/state/memory.js'
 
 const str = codec.string()

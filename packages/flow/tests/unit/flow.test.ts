@@ -10,7 +10,7 @@ import {
 	type ProducerConfig,
 } from '@kafkats/client'
 import { codec, flow, TimeWindows, SessionWindows } from '../../src/index.js'
-import { PartitionedWindowStore, PartitionedSessionStore } from '../../src/state/partitioned.js'
+import { PartitionedWindowStore, PartitionedSessionStore } from '../../src/legacy/state/partitioned.js'
 
 type TestMessage = Omit<Message<Buffer>, 'value'> & { value: Buffer | null }
 type TestContext = BatchContext

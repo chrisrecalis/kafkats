@@ -1,0 +1,76 @@
+import { describe, expectTypeOf, it } from 'vitest'
+import type { FlowApp } from '@/api/app.js'
+import type { KGroupedStream, SessionWindowedKStream, TimeWindowedKStream, Windowed } from '@/api/grouped.js'
+import type { KStream } from '@/api/kstream.js'
+import type { GlobalKTable, KTable } from '@/api/ktable.js'
+import type { JoinWindows, SessionWindows, TimeWindows } from '@/dsl/windows.js'
+
+/** Compile-time checks of the public overloads; never called. */
+function overloads(
+	app: FlowApp,
+	stream: KStream<string, number>,
+	other: KStream<string, boolean>,
+	table: KTable<string, Date>,
+	global: GlobalKTable<number, Date>,
+	windows: { join: JoinWindows; time: TimeWindows; session: SessionWindows }
+) {
+	expectTypeOf(stream.mapValues(value => String(value))).toEqualTypeOf<KStream<string, string>>()
+	expectTypeOf(stream.mapValues((key: string | null, value: number | null) => [key, value])).toEqualTypeOf<
+		KStream<string, (string | number | null)[]>
+	>()
+	expectTypeOf(stream.selectKey((key, value) => `${key}:${value}`)).toEqualTypeOf<KStream<string, number>>()
+
+	expectTypeOf(stream.join(other, (value, otherValue) => [value, otherValue] as const, windows.join)).toEqualTypeOf<
+		KStream<string, readonly [number, boolean]>
+	>()
+	expectTypeOf(stream.leftJoin(other, (_value, otherValue) => otherValue, windows.join)).toEqualTypeOf<
+		KStream<string, boolean | null>
+	>()
+	expectTypeOf(
+		stream.join(other, (value, otherValue) => value + Number(otherValue), { within: windows.time })
+	).toEqualTypeOf<KStream<string, number>>()
+	expectTypeOf(stream.join(table, (value, tableValue) => tableValue.getTime() + value)).toEqualTypeOf<
+		KStream<string, number>
+	>()
+	expectTypeOf(stream.leftJoin(table, (_value, tableValue) => tableValue)).toEqualTypeOf<
+		KStream<string, Date | null>
+	>()
+	expectTypeOf(
+		stream.join(
+			global,
+			(_key, value) => value,
+			(value, globalValue) => globalValue.getTime() + value
+		)
+	).toEqualTypeOf<KStream<string, number>>()
+	expectTypeOf(
+		stream.outerJoin(other, (value, otherValue) => [value, otherValue] as const, windows.join)
+	).toEqualTypeOf<KStream<string, readonly [number | null, boolean | null]>>()
+
+	const grouped = stream.groupByKey()
+	expectTypeOf(grouped).toEqualTypeOf<KGroupedStream<string, number>>()
+	expectTypeOf(grouped.windowedBy(windows.time)).toEqualTypeOf<TimeWindowedKStream<string, number>>()
+	expectTypeOf(grouped.windowedBy(windows.session)).toEqualTypeOf<SessionWindowedKStream<string, number>>()
+	expectTypeOf(
+		grouped.windowedBy(windows.session).aggregate(
+			() => 0,
+			(_key, value, aggregate) => aggregate + value,
+			(_key, a, b) => a + b
+		)
+	).toEqualTypeOf<KTable<Windowed<string>, number>>()
+
+	expectTypeOf(table.toStream()).toEqualTypeOf<KStream<string, Date>>()
+	expectTypeOf(table.toStream((key, value) => `${key}${value?.getTime()}`)).toEqualTypeOf<KStream<string, Date>>()
+	expectTypeOf(table.groupBy((key, value) => [value.getTime(), key] as const)).toMatchTypeOf<unknown>()
+
+	expectTypeOf(app.globalTable<number, Date>('dates')).toEqualTypeOf<GlobalKTable<number, Date>>()
+	// @ts-expect-error a global table cannot be streamed
+	app.globalTable('dates').toStream()
+	// @ts-expect-error a key-value lambda needs explicit parameter types to pick the keyed overload
+	stream.mapValues((key, value) => [key, value])
+}
+
+describe('public API types', () => {
+	it('type-checks the overloads', () => {
+		expectTypeOf(overloads).toBeFunction()
+	})
+})

@@ -1,81 +1,77 @@
-import { describe, it, expect, vi } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+import { codec } from '@/codec.js'
+import {
+	DELTA_OP_HEADER,
+	groupedRowCodec,
+	repartitionMapProcessor,
+	type GroupedRow,
+} from '@/operators/ktable-repartition-map.js'
+import type { RecordHeaders, StreamRecord } from '@/processor/record.js'
+import { InMemoryKeyValueStore } from '@/state/memory.js'
+import { processorDef, ProcessorHarness, sourceDef } from './support/processor-harness.js'
 
-import { TableGroupByNode } from '@/processors/table.js'
+const str = codec.string()
 
-const DELTA_OP_HEADER = '__kafkats_delta_op'
-const DELTA_SUB_VALUE = 'sub'
-const DELTA_ADD_VALUE = 'add'
-import type { KeyValueStore } from '@/state.js'
-
-interface MappingEntry<K, V> {
-	groupedKey: K
-	value: V
+/** KTable.groupBy's repartition map over the changes of the source 'table', regrouped by `selector`. */
+async function repartitionMap(selector: (key: string, value: number) => readonly [string, number]) {
+	const order: string[] = []
+	const forwarded: StreamRecord<string, number>[] = []
+	const mapping = new InMemoryKeyValueStore<string, GroupedRow<string, number>>('mapping', {
+		keyCodec: str,
+		valueCodec: groupedRowCodec(str, codec.json<number>()),
+	})
+	const put = mapping.put.bind(mapping)
+	vi.spyOn(mapping, 'put').mockImplementation((key, row) => {
+		order.push(`put(${key}, group=${row.groupedKey}, value=${row.value})`)
+		return put(key, row)
+	})
+	const deleted = vi.spyOn(mapping, 'delete')
+	const record = (r: StreamRecord<string, number>) => {
+		forwarded.push(r)
+		order.push(`forward(${r.headers[DELTA_OP_HEADER]?.toString()}: key=${r.key}, value=${r.value})`)
+	}
+	const harness = await ProcessorHarness.start(
+		[
+			sourceDef('source', ['table']),
+			processorDef('select', ['source'], repartitionMapProcessor(selector, 'mapping'), ['mapping']),
+			processorDef('sink', ['select'], () => ({ process: record })),
+		],
+		{ stores: [mapping] }
+	)
+	const update = (key: string, newValue: number | null, headers: RecordHeaders = {}) =>
+		harness.process('table', { key, value: { newValue, oldValue: null }, timestamp: 3, headers })
+	return { order, forwarded, mapping, deleted, update }
 }
 
-describe('TableGroupByNode mapping ordering', () => {
-	it('forwards SUB/ADD deltas BEFORE persisting the new mapping (replay re-emits them instead of losing them)', async () => {
-		const order: string[] = []
+describe('KTable.groupBy repartition map (mapping store)', () => {
+	it('forwards the retraction and the addition BEFORE persisting the new mapping (a replay re-emits them)', async () => {
+		const { order, mapping, update } = await repartitionMap((_k, v) => ['new-group', v])
+		await mapping.put('source-key', { groupedKey: 'old-group', value: 10 })
+		order.length = 0
 
-		const data = new Map<string, MappingEntry<string, number>>()
-		data.set('source-key', { groupedKey: 'old-group', value: 10 })
+		await update('source-key', 20)
 
-		const store: KeyValueStore<string, MappingEntry<string, number>> = {
-			name: 'mapping',
-			get: vi.fn(async (key: string) => data.get(key)),
-			put: vi.fn(async (key: string, value: MappingEntry<string, number>) => {
-				order.push(`put(${key},group=${value.groupedKey},value=${value.value})`)
-				data.set(key, value)
-			}),
-			delete: vi.fn(async (key: string) => {
-				data.delete(key)
-			}),
-			all: vi.fn(),
-			range: vi.fn(),
-			approximateNumEntries: vi.fn().mockResolvedValue(0),
-			init: vi.fn(),
-			flush: vi.fn(),
-			close: vi.fn(),
-			// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		} as any
+		expect(order).toEqual([
+			'forward(sub: key=old-group, value=10)',
+			'forward(add: key=new-group, value=20)',
+			'put(source-key, group=new-group, value=20)',
+		])
+	})
 
-		const storeRef = { store }
+	it('a deleted row only retracts its contribution and drops its mapping; user headers are kept', async () => {
+		const { forwarded, mapping, deleted, update } = await repartitionMap((k, v) => [`${k}-group`, v * 2])
+		const trace = { trace: Buffer.from('t') }
 
-		const node = new TableGroupByNode<string, number, string>(
-			(_k, v) => ['new-group', v],
-			storeRef as unknown as { store: KeyValueStore<string, MappingEntry<string, number>> | null }
-		)
-		const forwards: Array<{ key: string | null; value: number | null; headers: Record<string, Buffer> }> = []
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		;(node as any).forward = async (record: any) => {
-			const opBuf = record.headers[DELTA_OP_HEADER]
-			const op = Buffer.isBuffer(opBuf) ? opBuf.toString() : String(opBuf)
-			order.push(`forward(${op}: key=${record.key}, value=${record.value})`)
-			forwards.push(record)
-		}
+		await update('row', 1, trace)
+		await update('row', null, trace)
+		await update('row', null, trace)
 
-		await node.process({
-			key: 'source-key',
-			value: 20,
-			timestamp: 0n,
-			topic: 't',
-			partition: 0,
-			offset: 0n,
-			headers: {},
-		})
-
-		const subIdx = order.findIndex(s => s.startsWith(`forward(${DELTA_SUB_VALUE}`))
-		const putIdx = order.findIndex(s => s.startsWith('put('))
-		const addIdx = order.findIndex(s => s.startsWith(`forward(${DELTA_ADD_VALUE}`))
-
-		expect(subIdx).toBeGreaterThanOrEqual(0)
-		expect(addIdx).toBeGreaterThan(subIdx)
-		expect(putIdx).toBeGreaterThan(addIdx)
-
-		const subForward = forwards.find(f => {
-			const op = f.headers[DELTA_OP_HEADER]
-			return Buffer.isBuffer(op) ? op.toString() === DELTA_SUB_VALUE : false
-		})
-		expect(subForward?.key).toBe('old-group')
-		expect(subForward?.value).toBe(10)
+		expect(forwarded.map(r => [r.headers[DELTA_OP_HEADER]?.toString(), r.key, r.value, r.timestamp])).toEqual([
+			['add', 'row-group', 2, 3],
+			['sub', 'row-group', 2, 3],
+		])
+		expect(forwarded.map(r => r.headers.trace?.toString())).toEqual(['t', 't'])
+		expect(deleted).toHaveBeenCalledTimes(1)
+		expect(await mapping.get('row')).toBeUndefined()
 	})
 })
