@@ -7,7 +7,7 @@ import { applyHandler, errorHandlerContext, type HandlerScope, ProcessorNode } f
 import type { CollectedRecord, SendKind, TaskOutput } from '@/processor/output.js'
 import type { StreamRecord } from '@/processor/record.js'
 import type { ProcessingErrorRoute } from '@/runtime/config.js'
-import type { SinkDef } from '@/topology/nodes.js'
+import type { SinkDef, TopicNameExtractorContext } from '@/topology/nodes.js'
 
 /** A record whose key or value could not be encoded: returns to drop it ('continue'), throws to fail. */
 export type SerializationErrorRoute = (error: unknown, record: CollectedRecord, ctx: RecordContext | null) => void
@@ -47,7 +47,7 @@ class SinkProcessor<K, V> implements Processor<K, V> {
 			return
 		}
 		const topic =
-			typeof def.topic === 'string' ? def.topic : def.topic(record.key, record.value, context.recordMetadata())
+			typeof def.topic === 'string' ? def.topic : def.topic(record.key, record.value, this.routed(record))
 		let key: Buffer | null = null
 		let value: Buffer | null = null
 		try {
@@ -70,6 +70,18 @@ class SinkProcessor<K, V> implements Processor<K, V> {
 			return
 		}
 		return output.loadPartitionCount(topic).then(loaded => this.sendTo(output, encoded, record, loaded))
+	}
+
+	/** What a TopicNameExtractor gets (KS `SinkNode`): the input record's origin, the record's timestamp and headers. */
+	private routed(record: StreamRecord<K, V>): TopicNameExtractorContext {
+		const input = this.context.recordMetadata()
+		return {
+			topic: input?.topic ?? null,
+			partition: input?.partition ?? -1,
+			offset: input?.offset ?? -1n,
+			timestamp: record.timestamp,
+			headers: record.headers,
+		}
 	}
 
 	/** The partitioner's answer must be undefined (producer default on the encoded key) or in `[0, count)`. */

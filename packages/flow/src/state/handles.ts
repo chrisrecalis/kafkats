@@ -1,11 +1,18 @@
 import { IllegalStateError } from '@/api/errors.js'
 import type { KeyValueStore, SessionStore, StateStore, WindowedKey, WindowStore } from '@/state.js'
+import {
+	ClockedSessionStore,
+	ClockedWindowStore,
+	type SessionStoreReads,
+	type WindowStoreReads,
+} from '@/state/time-clipping.js'
 import type { StoreBuilder } from '@/topology/nodes.js'
 
 /**
  * A view of a task's store whose writes reject with IllegalStateError once `closed()` holds, so that nothing of a
  * closed task incarnation changes a store another incarnation may own by then. Reads pass through. The store's
  * lifecycle belongs to flow (the StateDirectory initializes it, the provider closes it): `init()` and `close()` reject.
+ * The handle of a store with a clock (6.2) keeps the clipping layer's `expire()`, a write, and its unclipped reads.
  */
 export function storeHandle(
 	store: StateStore,
@@ -13,6 +20,12 @@ export function storeHandle(
 	closed: () => boolean,
 	owner: string
 ): StateStore {
+	if (store instanceof ClockedWindowStore) {
+		return new ClockedWindowHandle(store, closed, owner)
+	}
+	if (store instanceof ClockedSessionStore) {
+		return new ClockedSessionHandle(store, closed, owner)
+	}
 	switch (kind) {
 		case 'key-value':
 			return new KeyValueHandle(store as KeyValueStore<unknown, unknown>, closed, owner)
@@ -81,7 +94,10 @@ class KeyValueHandle<K, V, S extends KeyValueStore<K, V>> implements KeyValueSto
 	}
 }
 
-class WindowHandle<K, V> extends KeyValueHandle<WindowedKey<K>, V, WindowStore<K, V>> implements WindowStore<K, V> {
+class WindowHandle<K, V, S extends WindowStore<K, V> = WindowStore<K, V>>
+	extends KeyValueHandle<WindowedKey<K>, V, S>
+	implements WindowStore<K, V>
+{
 	fetch(key: K, timeFrom: number, timeTo: number): AsyncIterable<[WindowedKey<K>, V]> {
 		return this.inner.fetch(key, timeFrom, timeTo)
 	}
@@ -99,7 +115,20 @@ class WindowHandle<K, V> extends KeyValueHandle<WindowedKey<K>, V, WindowStore<K
 	}
 }
 
-class SessionHandle<K, V> extends KeyValueHandle<WindowedKey<K>, V, SessionStore<K, V>> implements SessionStore<K, V> {
+class ClockedWindowHandle<K, V> extends WindowHandle<K, V, ClockedWindowStore<K, V>> {
+	get unclipped(): WindowStoreReads<K, V> {
+		return this.inner.unclipped
+	}
+
+	expire(): Promise<void> {
+		return this.closed() ? this.rejectClosed() : this.inner.expire()
+	}
+}
+
+class SessionHandle<K, V, S extends SessionStore<K, V> = SessionStore<K, V>>
+	extends KeyValueHandle<WindowedKey<K>, V, S>
+	implements SessionStore<K, V>
+{
 	findSessions(key: K, earliestStart: number, latestEnd: number): AsyncIterable<[WindowedKey<K>, V]> {
 		return this.inner.findSessions(key, earliestStart, latestEnd)
 	}
@@ -110,5 +139,15 @@ class SessionHandle<K, V> extends KeyValueHandle<WindowedKey<K>, V, SessionStore
 
 	expireOldSessions(currentTime: number): Promise<WindowedKey<K>[]> {
 		return this.closed() ? this.rejectClosed() : this.inner.expireOldSessions(currentTime)
+	}
+}
+
+class ClockedSessionHandle<K, V> extends SessionHandle<K, V, ClockedSessionStore<K, V>> {
+	get unclipped(): SessionStoreReads<K, V> {
+		return this.inner.unclipped
+	}
+
+	expire(): Promise<void> {
+		return this.closed() ? this.rejectClosed() : this.inner.expire()
 	}
 }

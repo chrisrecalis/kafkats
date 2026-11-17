@@ -9,6 +9,12 @@
  */
 import type { ProcessorMetadata } from '@/processor/api.js'
 
+/** The metadata key of a store's clock (6.2). */
+export const observedKey = (store: string): string => `${store}.observed`
+
+/** The metadata key of a store's emit-on-window-close progress: the close time of its last scan (6.8). */
+export const emitKey = (store: string): string => `${store}.emit`
+
 const MAGIC_PARTITION_TIME = 1
 const MAGIC_WITH_METADATA = 2
 const INT32 = 4
@@ -26,15 +32,23 @@ export interface CommitMetadata {
 
 /**
  * The processor metadata of one task: one object per task, shared by its processor contexts, processor clocks and
- * store clocks, and replaced in place when the task is seeded from its commits.
+ * store clocks, and replaced in place when the task is seeded from its commits. It also keeps the values of the last
+ * commit, which a task restarted from that commit starts with.
  */
 export class ProcessorMetadataImpl implements ProcessorMetadata {
 	private readonly values = new Map<string, number>()
+	/** Equal to `values` while nothing changed since the last commit or seed. */
+	private committedValues: ReadonlyMap<string, number> = new Map()
 	private changed = false
 	private serialized: Buffer | undefined = EMPTY
 
 	get(key: string): number | undefined {
 		return this.values.get(key)
+	}
+
+	/** The value as of the last commit, or as seeded before the first. */
+	committed(key: string): number | undefined {
+		return this.committedValues.get(key)
 	}
 
 	/** Sets the value; the task then needs a commit of all its input partitions. */
@@ -52,9 +66,12 @@ export class ProcessorMetadataImpl implements ProcessorMetadata {
 		return this.changed
 	}
 
-	/** After a successful commit. */
-	clearNeedsCommit(): void {
-		this.changed = false
+	/** After a successful commit: the values are the committed ones, and no change is pending. */
+	markCommitted(): void {
+		if (this.changed) {
+			this.committedValues = new Map(this.values)
+			this.changed = false
+		}
 	}
 
 	/**
@@ -71,6 +88,7 @@ export class ProcessorMetadataImpl implements ProcessorMetadata {
 				}
 			}
 		}
+		this.committedValues = new Map(this.values)
 		this.changed = false
 		this.serialized = undefined
 	}

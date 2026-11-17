@@ -98,7 +98,7 @@ describe('DSL shells delegate every method to its operator builder', () => {
 
 	it('KStream joins dispatch on the other side: stream, table or global table', () => {
 		const other = new KStreamImpl<string, number>(ctx, 'other', {}, false)
-		const global = new GlobalKTableImpl<string, number>(ctx, 'global-store', {})
+		const global = new GlobalKTableImpl<string, number>(ctx, 'global-store')
 		const windows = instance(JoinWindows)
 		const inner = (value: number, otherValue: number) => value + otherValue
 		const left = (value: number, otherValue: number | null) => value + (otherValue ?? 0)
@@ -192,7 +192,8 @@ describe('DSL shells delegate every method to its operator builder', () => {
 	})
 
 	it('grouped tables aggregate', () => {
-		const grouped = new KGroupedTableImpl<string, number>(ctx, 'map', {}, undefined)
+		const codecs = {} as KGroupedTableImpl<string, number>['codecs']
+		const grouped = new KGroupedTableImpl<string, number>(ctx, 'map', codecs, undefined)
 		grouped.count(options)
 		expect(tableGroupBy.count).toHaveBeenCalledWith(grouped, options)
 		grouped.reduce(fn, fn, options)
@@ -202,7 +203,7 @@ describe('DSL shells delegate every method to its operator builder', () => {
 	})
 
 	it('the split builder adds branches in order and returns itself', () => {
-		const branched = new BranchedKStreamImpl(stream, options)
+		const branched = new BranchedKStreamImpl(stream, 'splitter', [])
 		expect(branched.branch(fn, { name: 'a' }).branch(fn)).toBe(branched)
 		expect(stateless.addBranch).toHaveBeenNthCalledWith(1, branched, fn, { name: 'a' })
 		expect(stateless.addBranch).toHaveBeenNthCalledWith(2, branched, fn, undefined)

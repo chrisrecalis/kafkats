@@ -41,17 +41,28 @@ export class StreamRecord<K, V> {
 	}
 }
 
-/** A record whose key cannot be changed (`processValues`). Same validation as StreamRecord. */
+/**
+ * A record whose key cannot be changed (`processValues`). Same validation as StreamRecord. Users never construct one:
+ * a FixedKeyProcessor derives the records it forwards from those it receives (`withValue()`, `withTimestamp()`,
+ * `withHeaders()`), so the key stays the input's (Kafka Streams' package-private constructor).
+ */
 export class FixedKeyRecord<K, V> {
+	/** Makes the type nominal: an object of the same shape is not a FixedKeyRecord. */
+	declare private readonly derived: true
 	readonly timestamp: number
 
-	constructor(
+	private constructor(
 		readonly key: K,
 		readonly value: V,
 		timestamp: number,
-		readonly headers: RecordHeaders = {}
+		readonly headers: RecordHeaders
 	) {
 		this.timestamp = checkTimestamp(timestamp)
+	}
+
+	/** Internal (processValues): the only way to create one (KS `InternalFixedKeyRecordFactory`). */
+	static from<K, V>(record: StreamRecord<K, V>): FixedKeyRecord<K, V> {
+		return new FixedKeyRecord(record.key, record.value, record.timestamp, record.headers)
 	}
 
 	withValue<V2>(value: V2): FixedKeyRecord<K, V2> {

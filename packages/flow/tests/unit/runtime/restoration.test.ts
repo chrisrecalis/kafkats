@@ -247,7 +247,7 @@ describe('RestorationPool (4.7.1)', () => {
 		expect(classify(error, 'restore')).toBe('corrupted')
 	})
 
-	it('resolves the max key time applied to each window and session store, by store name', async () => {
+	it('resolves the max key time applied to each window and session store, by store name: window ends (6.2)', async () => {
 		const h = new PoolHarness()
 		const windowed = windowedKeyCodec(str)
 		const key = (k: string, start: number, end: number) =>
@@ -277,7 +277,7 @@ describe('RestorationPool (4.7.1)', () => {
 
 		expect(storeTimes).toEqual(
 			new Map([
-				['w', 120],
+				['w', 130],
 				['ses', 70],
 			])
 		)

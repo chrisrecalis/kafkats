@@ -3,6 +3,7 @@
  * the per-subtopology checks of 4.1.1 (sources of one topic, commit metadata keys).
  */
 import { TopologyError } from '@/api/errors.js'
+import { emitKey, observedKey } from '@/processor/metadata.js'
 import type { Subtopology } from '@/topology/built-topology.js'
 import type { GlobalStoreDef, NodeDef, NodeName, SourceDef, StoreBuilder } from '@/topology/nodes.js'
 
@@ -132,8 +133,8 @@ function metadataKeys(id: number, stores: readonly StoreBuilder[]): Set<string> 
 	const owners = new Map<string, string>()
 	for (const store of stores) {
 		const keys = [store.name]
-		if (store.clock) keys.push(`${store.name}.observed`)
-		if (store.clock?.emitFinal) keys.push(`${store.name}.emit`)
+		if (store.clock) keys.push(observedKey(store.name))
+		if (store.clock?.emitFinal) keys.push(emitKey(store.name))
 		for (const key of keys) {
 			const owner = owners.get(key)
 			if (owner !== undefined) {

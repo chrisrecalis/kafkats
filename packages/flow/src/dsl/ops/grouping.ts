@@ -41,18 +41,24 @@ export function groupByKey<K, V>(stream: KStreamImpl<K, V>, options?: Grouped<K,
  * The records an aggregation of `grouped` reads (KS GroupedStreamAggregateBuilder): the grouped records, or, when
  * their keys changed upstream, what is read back from a repartition topic, written with the Grouped codecs (the
  * aggregation's key codec when Grouped has none). A named grouping repartitions once, for every aggregation built from
- * it (KF6); an unnamed one once per aggregation, as in Kafka Streams.
+ * it (KF6); an unnamed one once per aggregation, as in Kafka Streams, through a topic named after the aggregation's
+ * `storeName` if it has one (as KGroupedTable aggregations, 6.15).
  */
-export function aggregationInput<K, V>(grouped: KGroupedStreamImpl<K, V>, keyCodec: Codec<K>): KStreamImpl<K, V> {
+export function aggregationInput<K, V>(
+	grouped: KGroupedStreamImpl<K, V>,
+	keyCodec: Codec<K>,
+	storeName: string | undefined
+): KStreamImpl<K, V> {
+	if (grouped.repartitioned !== undefined) {
+		return grouped.repartitioned
+	}
 	const { stream, name } = grouped
-	const input =
-		grouped.repartitioned ??
-		repartitionIfRequired(stream, {
-			name,
-			owner: grouped,
-			codecs: { key: (stream.format.keyCodec as Codec<K> | undefined) ?? keyCodec },
-			operator: 'groupBy()/groupByKey()',
-		})
+	const input = repartitionIfRequired(stream, {
+		name: name ?? storeName,
+		owner: name === undefined ? {} : grouped,
+		codecs: { key: (stream.format.keyCodec as Codec<K> | undefined) ?? keyCodec },
+		operator: 'groupBy()/groupByKey()',
+	})
 	if (name !== undefined) {
 		grouped.repartitioned = input
 	}

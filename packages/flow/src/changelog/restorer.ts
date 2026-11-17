@@ -162,7 +162,7 @@ async function isTrusted(
 /**
  * The target of one changelog partition and its store. A batch is applied as the latest change of each key
  * (runtime§6.37), decoded with the changelog's codecs, written together (state/bulk.ts); `keyTime` gives the key time
- * of a written key (window start, session end) for the store's clock.
+ * of a written key (the window end, `state/time-clipping.ts`) for the store's clock.
  */
 export function restoreTarget<K, V>(
 	changelog: { readonly topic: string; readonly partition: number },

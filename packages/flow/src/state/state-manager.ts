@@ -1,18 +1,25 @@
 import { IllegalStateError } from '@/api/errors.js'
 import { ChangelogWriter, windowedKeyCodec } from '@/changelog/writer.js'
 import type { Codec } from '@/codec.js'
-import type { ProcessorMetadata, TaskId } from '@/processor/api.js'
+import type { TaskId } from '@/processor/api.js'
 import type { TaskOutput } from '@/processor/output.js'
 import type { KeyValueStore, SessionStore, StateStore, WindowedKey, WindowStore } from '@/state.js'
 import type { Checkpoints } from '@/state/checkpoints.js'
 import { storeHandle } from '@/state/handles.js'
+import { HeldDeletesKeyValueStore } from '@/state/held-deletes.js'
 import {
 	ChangelogBackedKeyValueStore,
 	ChangelogBackedSessionStore,
 	ChangelogBackedWindowStore,
 } from '@/state/logging.js'
 import type { StateDirectory } from '@/state/state-directory.js'
-import type { StoreClock } from '@/state/time-clipping.js'
+import {
+	ClockedSessionStore,
+	ClockedWindowStore,
+	TaskStoreClock,
+	type ClockMetadata,
+	type StoreClock,
+} from '@/state/time-clipping.js'
 import {
 	TransactionalKeyValueStore,
 	TransactionalSessionStore,
@@ -30,8 +37,10 @@ export interface RegisteredStore {
 	readonly top: StateStore
 	/** The exactly-once write buffer. */
 	readonly buffer?: TransactionalLayer
-	/** Window and session(-layout) stores with a clipping layer. */
+	/** Window and session(-layout) stores with a clock, kept by the clipping layer on top of the stack (6.2). */
 	readonly clock?: StoreClock
+	/** At-least-once, the deletes of a store that holds them until the task committed. */
+	readonly held?: HeldDeletesKeyValueStore<unknown, unknown>
 	readonly changelog?: { readonly topic: string; readonly partition: number; readonly skipRestoration: boolean }
 }
 
@@ -41,7 +50,7 @@ export interface TaskStateManagerDeps {
 	readonly eos: boolean
 	readonly checkpoints: Checkpoints
 	/** The task's processor metadata (one object per task, updated in place): store clocks persist into it. */
-	readonly metadata: ProcessorMetadata
+	readonly metadata: ClockMetadata
 }
 
 type KeyValue = KeyValueStore<unknown, unknown>
@@ -56,6 +65,8 @@ interface Layers {
 	logged(inner: StateStore, writer: Writer): StateStore
 	/** The key codec of changelog records. */
 	changelogKey(builder: StoreBuilder): Codec<unknown>
+	/** The clipping layer of a store with a clock; key-value stores have none. */
+	clocked?(inner: StateStore, clock: StoreClock, retentionMs: number): StateStore
 }
 
 const LAYERS: Record<StoreBuilder['kind'], Layers> = {
@@ -70,12 +81,14 @@ const LAYERS: Record<StoreBuilder['kind'], Layers> = {
 			new TransactionalWindowStore(raw as Window, builder.keyCodec, builder.valueCodec, retention(builder)),
 		logged: (inner, writer) => new ChangelogBackedWindowStore(inner as Window, writer as WindowedWriter),
 		changelogKey: builder => windowedKeyCodec(builder.keyCodec) as Codec<unknown>,
+		clocked: (inner, clock, retentionMs) => new ClockedWindowStore(inner as Window, clock, retentionMs),
 	},
 	session: {
 		transactional: (raw, builder) =>
 			new TransactionalSessionStore(raw as Session, builder.keyCodec, builder.valueCodec, retention(builder)),
 		logged: (inner, writer) => new ChangelogBackedSessionStore(inner as Session, writer as WindowedWriter),
 		changelogKey: builder => windowedKeyCodec(builder.keyCodec) as Codec<unknown>,
+		clocked: (inner, clock, retentionMs) => new ClockedSessionStore(inner as Session, clock, retentionMs),
 	},
 }
 
@@ -89,7 +102,9 @@ function retention(builder: StoreBuilder): number {
 /**
  * The stores of one task (Kafka Streams' ProcessorStateManager). For every store of its subtopology it leases the
  * provider store of the task's partition and stacks on it: under exactly-once a write buffer, then changelog logging
- * to the changelog partition of the task's partition.
+ * to the changelog partition of the task's partition, under at-least-once a layer that holds the deletes of a store
+ * that needs them held until the task committed, and for a store with a clock the clipping layer, which sees every
+ * processor write and clips every processor read (6.2).
  */
 export class TaskStateManager {
 	private registered: RegisteredStore[] = []
@@ -161,6 +176,13 @@ export class TaskStateManager {
 		}
 	}
 
+	/** At-least-once, after a commit of the task: the deletes held for it take effect. */
+	async applyHeldDeletes(): Promise<void> {
+		for (const { held } of this.registered) {
+			await held?.applyHeld()
+		}
+	}
+
 	/**
 	 * Checkpoints the changelog partitions written since the last commit. `positions`: the offset of the last
 	 * acknowledged write per changelog partition (`<topic>:<partition>`). Under at-least-once the checkpoint is the
@@ -220,6 +242,16 @@ export class TaskStateManager {
 			)
 			changelog = { topic, partition: this.partition, skipRestoration }
 		}
-		return { builder, raw, top: layer, buffer, changelog }
+		const held =
+			builder.holdDeletes && !this.deps.eos
+				? new HeldDeletesKeyValueStore(layer as KeyValue, builder.keyCodec)
+				: undefined
+		const top = held ?? layer
+		if (builder.clock === undefined || layers.clocked === undefined) {
+			return { builder, raw, top, buffer, held, changelog }
+		}
+		const retentionMs = retention(builder)
+		const clock = new TaskStoreClock(this.deps.metadata, builder.name, retentionMs, builder.clock.emitFinal)
+		return { builder, raw, top: layers.clocked(top, clock, retentionMs), buffer, clock, changelog }
 	}
 }

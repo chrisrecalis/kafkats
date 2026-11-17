@@ -1,33 +1,17 @@
 import { describe, expect, it, vi } from 'vitest'
 import { FailedProcessingError } from '@/api/errors.js'
-import type { KStream } from '@/api/kstream.js'
 import { codec } from '@/codec.js'
-import { KStreamImpl } from '@/dsl/kstream.js'
-import type { InternalProcessorContext, ProcessorContext, ProcessorSupplier } from '@/processor/api.js'
+import type { InternalProcessorContext, ProcessorContext } from '@/processor/api.js'
 import { TimestampExtractors } from '@/processor/timestamps.js'
 import type { KeyValueStore, ValueAndTimestamp } from '@/state.js'
-import { keyValueStoreBuilder } from '@/state/store-builders.js'
+import { Stores } from '@/state/store-builders.js'
 import { TestDriver, type TestDriverConfig } from '@/testing/driver.js'
 
 const str = codec.string()
 const START = 1_000_000
 
-/** A processor under `stream` (the Processor API of the DSL comes later), connected to `stores`. */
-function processWith<K, V, KR, VR>(
-	stream: KStream<K, V>,
-	supplier: ProcessorSupplier<K, V, KR, VR>,
-	stores: readonly string[] = []
-): KStream<KR, VR> {
-	const parent = stream as KStreamImpl<K, V>
-	const node = parent.ctx.processor('TEST-PROCESSOR', undefined, [parent.node], supplier, stores)
-	return new KStreamImpl<KR, VR>(parent.ctx, node, {}, true)
-}
-
-/** Registers a string key-value store named `name`. */
-function addStore(stream: KStream<unknown, unknown>, name: string): void {
-	const { ctx } = stream as KStreamImpl<unknown, unknown>
-	ctx.builder.addStateStore(keyValueStoreBuilder(ctx.changelog, { name, keyCodec: str, valueCodec: str }))
-}
+/** A string key-value store named `name`. */
+const stringStore = (name: string) => Stores.keyValueStore({ name, key: str, value: str })
 
 /** in -> mapValues(upper) -> out, with string codecs. */
 function upperCase(config: TestDriverConfig = {}): TestDriver {
@@ -120,8 +104,8 @@ describe('TestDriver', () => {
 		const driver = new TestDriver()
 		const seen: number[] = []
 		// One input record leads to a record of x (ts 20), then one of y (ts 10).
-		const fanOut = processWith<Buffer, Buffer, Buffer, Buffer>(driver.input('in'), () => {
-			let context: ProcessorContext<Buffer, Buffer>
+		const fanOut = driver.input('in').process<Buffer | null, Buffer | null>(() => {
+			let context: ProcessorContext<Buffer | null, Buffer | null>
 			return {
 				init: ctx => {
 					context = ctx
@@ -136,7 +120,7 @@ describe('TestDriver', () => {
 		fanOut.to('y', { name: 'y-sink' })
 		const x = driver.flow.stream('x')
 		const y = driver.flow.stream('y')
-		processWith(x.merge(y), () => ({ process: record => void seen.push(record.timestamp) }))
+		x.merge(y).process(() => ({ process: record => void seen.push(record.timestamp) }))
 		await driver.run(async ({ send }) => {
 			await send('in', Buffer.from('v'), { timestamp: 30n })
 		})
@@ -150,7 +134,7 @@ describe('TestDriver', () => {
 			.input('in', { key: str, value: str })
 			.selectKey((_k, v) => (v === 'none' ? null : v))
 			.through('mid', { key: str, value: str })
-		processWith(mid, () => {
+		mid.process(() => {
 			let context: ProcessorContext<never, never>
 			return {
 				init: ctx => {
@@ -206,17 +190,19 @@ describe('TestDriver', () => {
 
 	it('creates the tasks of partition 0 at start, the others for the first record of their partition', async () => {
 		const driver = new TestDriver()
-		const stream = driver.input('in', { key: str, value: str })
-		addStore(stream as KStream<unknown, unknown>, 'last')
-		processWith(stream, () => {
-			let store: KeyValueStore<string, string>
-			return {
-				init: ctx => {
-					store = ctx.getStateStore('last')
-				},
-				process: record => store.put(record.key!, record.value!),
-			}
-		}, ['last'])
+		const last = stringStore('last')
+		driver.input('in', { key: str, value: str }).process(
+			() => {
+				let store: KeyValueStore<string, string>
+				return {
+					init: ctx => {
+						store = ctx.getStateStore(last)
+					},
+					process: record => store.put(record.key!, record.value!),
+				}
+			},
+			{ stores: [last] }
+		)
 		await driver.run(async ({ send, getStateStore }) => {
 			expect(await getStateStore<KeyValueStore<string, string>>('last').approximateNumEntries()).toBe(0)
 			expect(() => getStateStore('last', 1)).toThrow("No task of partition 1 has a state store named 'last'")
@@ -255,35 +241,11 @@ describe('TestDriver', () => {
 		expect(counts).toEqual([4, 1])
 	})
 
-	it('runs wall-clock punctuations when the mock wall clock advances, with the current wall clock', async () => {
-		const driver = new TestDriver({ initialWallClockTimeMs: START })
-		const fired: number[] = []
-		processWith(driver.input('in'), () => ({
-			init: ctx => void ctx.schedule(100, 'wall-clock', now => void fired.push(now)),
-			process: () => {},
-		}))
-		await driver.run(async ({ advanceWallClockTime }) => {
-			await advanceWallClockTime(99)
-			expect(fired).toEqual([])
-			await advanceWallClockTime(151)
-			expect(fired).toEqual([START + 250])
+	// Punctuators and commit requests through the driver: 'punctuation and commits' in tests/unit/dsl/process.test.ts.
+	it('advanceWallClockTime() rejects a negative step', async () => {
+		await upperCase().run(async ({ advanceWallClockTime }) => {
 			await expect(advanceWallClockTime(-1)).rejects.toThrow(RangeError)
 		})
-	})
-
-	it('runs stream-time punctuations as records advance the stream time', async () => {
-		const driver = new TestDriver()
-		const fired: number[] = []
-		processWith(driver.input('in'), () => ({
-			init: ctx => void ctx.schedule(10, 'stream-time', time => void fired.push(time)),
-			process: () => {},
-		}))
-		await driver.run(async ({ send }) => {
-			await send('in', Buffer.from('a'), { timestamp: 5 })
-			await send('in', Buffer.from('b'), { timestamp: 8 })
-			await send('in', Buffer.from('c'), { timestamp: 25 })
-		})
-		expect(fired).toEqual([5, 25])
 	})
 
 	it('commits only when it stops with commitEvery: stop', async () => {
@@ -304,27 +266,6 @@ describe('TestDriver', () => {
 			expect(consumer.committed.size).toBe(0)
 			await advanceWallClockTime(1)
 			expect(consumer.committed.get('in:0')?.offset).toBe(1n)
-		})
-	})
-
-	it('commits at the next step when a processor requests it', async () => {
-		const driver = new TestDriver({ commitEvery: 'stop' })
-		processWith<Buffer, Buffer, never, never>(driver.input('in'), () => {
-			let context: ProcessorContext
-			return {
-				init: ctx => {
-					context = ctx
-				},
-				process: record => {
-					if (record.value.toString() === 'commit') context.commit()
-				},
-			}
-		})
-		await driver.run(async ({ send, consumer }) => {
-			await send('in', Buffer.from('a'))
-			expect(consumer.committed.size).toBe(0)
-			await send('in', Buffer.from('commit'))
-			expect(consumer.committed.get('in:0')?.offset).toBe(2n)
 		})
 	})
 
@@ -376,7 +317,7 @@ describe('TestDriver', () => {
 		const intervals: number[] = []
 		for (const config of [{}, { emitIntervalMs: 250 }]) {
 			const driver = new TestDriver(config)
-			processWith(driver.input('in'), () => ({
+			driver.input('in').process(() => ({
 				init: ctx => void intervals.push((ctx as InternalProcessorContext<never, never>).config.emitIntervalMs),
 				process: () => {},
 			}))
@@ -466,17 +407,20 @@ describe('TestDriver', () => {
 
 	it('grows topics without a configured count together, so co-partitioned topics stay assignable', async () => {
 		const driver = new TestDriver()
+		const seen = stringStore('seen')
 		const merged = driver.input('a', { key: str, value: str }).merge(driver.input('b', { key: str, value: str }))
-		addStore(merged as KStream<unknown, unknown>, 'seen')
-		processWith(merged, () => {
-			let store: KeyValueStore<string, string>
-			return {
-				init: ctx => {
-					store = ctx.getStateStore('seen')
-				},
-				process: record => store.put(record.key!, record.value!),
-			}
-		}, ['seen'])
+		merged.process(
+			() => {
+				let store: KeyValueStore<string, string>
+				return {
+					init: ctx => {
+						store = ctx.getStateStore(seen)
+					},
+					process: record => store.put(record.key!, record.value!),
+				}
+			},
+			{ stores: [seen] }
+		)
 		await driver.run(async ({ send, getStateStore }) => {
 			await send('b', Buffer.from('v'), { ...key('k'), partition: 2 })
 			await send('a', Buffer.from('w'), { ...key('j'), partition: 2 })
@@ -487,13 +431,13 @@ describe('TestDriver', () => {
 
 	it('fails start() when a processor fails to initialize, and stops cleanly', async () => {
 		const driver = new TestDriver()
-		processWith(driver.input('in'), () => ({
+		driver.input('in').process(() => ({
 			init: () => {
 				throw new Error('no init')
 			},
 			process: () => {},
 		}))
-		await expect(driver.start()).rejects.toThrow("failed to initialize processor 'TEST-PROCESSOR")
+		await expect(driver.start()).rejects.toThrow("failed to initialize processor 'KSTREAM-PROCESSOR")
 		await driver.stop()
 		await expect(new TestDriver().stop()).resolves.toBeUndefined()
 	})

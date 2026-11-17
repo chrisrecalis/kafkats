@@ -92,7 +92,7 @@ describe('hardening: session windows under EOS', () => {
 			.to(outs.count, { key: str, value: num })
 		grouped()
 			.windowedBy(SessionWindows.withInactivityGap(GAP))
-			.reduce((a, b) => a + b, { storeName: 's-reduce', value: num })
+			.reduce((a, b) => a + (b ?? 0), { storeName: 's-reduce', value: num })
 			.toStream()
 			.selectKey(keyOf)
 			.to(outs.reduce, { key: str, value: num })
@@ -100,7 +100,7 @@ describe('hardening: session windows under EOS', () => {
 			.windowedBy(SessionWindows.withInactivityGap(GAP))
 			.aggregate(
 				() => 0,
-				(_k, v, a) => a + v,
+				(_k, v, a) => a + (v ?? 0),
 				{ storeName: 's-agg', value: num, merger: (a: number, b: number) => a + b } as never
 			)
 			.toStream()

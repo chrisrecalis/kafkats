@@ -1,7 +1,8 @@
 /**
  * InternalTopologyBuilder: what the DSL registers (nodes, stores, global stores, internal topics), frozen by build()
- * into a BuiltTopology (3.3, 4.1.1; KS InternalTopologyBuilder). Structural mistakes throw TopologyError at the call,
- * so the DSL method that made them throws; rules spanning several registrations are checked by build().
+ * into a BuiltTopology (3.3, 4.1.1; KS InternalTopologyBuilder). Structural mistakes (illegal or duplicate names
+ * included) throw TopologyError at the call, so the DSL method that made them throws; rules spanning several
+ * registrations are checked by build().
  */
 import { TopologyError } from '@/api/errors.js'
 import { createBuiltTopology, type BuiltTopology } from '@/topology/built-topology.js'
@@ -14,6 +15,7 @@ import type {
 	SourceDef,
 	StoreBuilder,
 } from '@/topology/nodes.js'
+import { checkName } from '@/topology/names.js'
 import { markNullKeys } from '@/topology/null-keys.js'
 import { groupSubtopologies } from '@/topology/subtopologies.js'
 
@@ -86,6 +88,7 @@ export class InternalTopologyBuilder {
 	 */
 	addStateStore(builder: StoreBuilder, connectTo: readonly NodeName[] = [], options?: { shared?: boolean }): void {
 		this.checkOpen()
+		checkStoreNames(builder)
 		const shared = options?.shared === true
 		const existing = this.stores.get(builder.name)
 		if (existing !== undefined && !(existing.shared && shared && existing.builder === builder)) {
@@ -110,6 +113,7 @@ export class InternalTopologyBuilder {
 		if (def.sourceName === def.processorName) {
 			throw new TopologyError(`Global store '${def.store.name}' needs distinct source and processor names`)
 		}
+		checkStoreNames(def.store)
 		const existing = this.stores.get(def.store.name)
 		if (existing !== undefined) throw duplicateStore(existing.builder, def.store)
 		if (def.store.logging.enabled) {
@@ -129,12 +133,15 @@ export class InternalTopologyBuilder {
 	 */
 	addRepartitionTopic(name: string, owner: object, partitions?: number): string {
 		this.checkOpen()
+		checkName('Repartition topic', name)
 		if (partitions !== undefined && !(Number.isInteger(partitions) && partitions > 0)) {
 			throw new TopologyError(
 				`Repartition topic '${name}' needs a positive integer partition count, got ${partitions}`
 			)
 		}
 		const topic = `${this.applicationId}-${name}-repartition`
+		// The application id and the suffix count too.
+		checkName('Repartition topic', topic)
 		const existing = this.repartitionTopics.get(topic)
 		if (existing === undefined) {
 			this.repartitionTopics.set(topic, { owner, partitions })
@@ -150,6 +157,11 @@ export class InternalTopologyBuilder {
 	markThroughTopic(topic: string): void {
 		this.checkOpen()
 		this.throughTopics.add(topic)
+	}
+
+	/** The nodes registered so far, by name: the DSL walks its graph upstream through them (suppress's grace search). */
+	registeredNodes(): ReadonlyMap<NodeName, NodeDef> {
+		return this.nodes
 	}
 
 	/** `named`, or `<prefix>-<10-digit counter>` (KS `KSTREAM-FILTER-0000000003`). */
@@ -197,6 +209,7 @@ export class InternalTopologyBuilder {
 	}
 
 	private checkNewNode(name: NodeName): void {
+		checkName('Node', name)
 		if (this.nodes.has(name) || this.globalNodes.has(name)) {
 			throw new TopologyError(`A node named '${name}' already exists; node names must be unique`)
 		}
@@ -239,11 +252,20 @@ export class InternalTopologyBuilder {
 	}
 }
 
-function checkSupplier(name: NodeName, supplier: () => unknown): void {
+/** KS `ApiUtils.checkSupplier`: a supplier must create a new instance per call (the node's per-task instances). */
+export function checkSupplier(name: NodeName, supplier: () => unknown): void {
 	if (supplier() === supplier()) {
 		throw new TopologyError(
 			`The supplier of '${name}' returned the same processor twice; it must create a new one per call`
 		)
+	}
+}
+
+/** The store's name and, if it has one, its changelog topic's (a custom `ChangelogConfig.topicName`, say). */
+function checkStoreNames(store: StoreBuilder): void {
+	checkName('State store', store.name)
+	if (store.logging.enabled) {
+		checkName('Changelog topic', store.logging.topic)
 	}
 }
 

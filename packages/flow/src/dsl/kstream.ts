@@ -134,11 +134,17 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 		return streamStreamJoin(this, 'outer', other, ...args)
 	}
 
-	process<KR, VR>(supplier: ProcessorSupplier<K, V, KR, VR>, options?: ProcessOptions): KStream<KR, VR> {
+	process<KR, VR>(
+		supplier: ProcessorSupplier<K | null, V | null, KR, VR>,
+		options?: ProcessOptions
+	): KStream<KR, VR> {
 		return process(this, supplier, options)
 	}
 
-	processValues<VR>(supplier: FixedKeyProcessorSupplier<K, V, VR>, options?: ProcessOptions): KStream<K, VR> {
+	processValues<VR>(
+		supplier: FixedKeyProcessorSupplier<K | null, V | null, VR>,
+		options?: ProcessOptions
+	): KStream<K, VR> {
 		return processValues(this, supplier, options)
 	}
 

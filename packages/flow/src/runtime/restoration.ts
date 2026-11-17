@@ -16,6 +16,7 @@ import type { StreamTask } from '@/runtime/task.js'
 import type { KeyValueStore, WindowedKey } from '@/state.js'
 import type { Checkpoints } from '@/state/checkpoints.js'
 import type { RegisteredStore } from '@/state/state-manager.js'
+import { keyTime } from '@/state/time-clipping.js'
 
 export interface RestorationPoolDeps {
 	readonly io: Pick<RuntimeIO, 'restoreConsumers' | 'admin'>
@@ -119,7 +120,8 @@ export class RestorationPool implements TaskRestorer {
 
 /**
  * The restore target of a logged store: its raw store, written with the codecs of its changelog writer (window and
- * session stores: windowed keys); window stores report window starts, session stores session ends (6.2).
+ * session stores: windowed keys), which reports the max key time it applied: window ends for every kind of window
+ * (the store clock's key time, 6.2).
  */
 function target(
 	{ builder, raw }: RegisteredStore,
@@ -130,9 +132,5 @@ function target(
 		return restoreTarget(changelog, raw as KeyValueStore<unknown, unknown>, codecs)
 	}
 	const store = raw as KeyValueStore<WindowedKey<unknown>, unknown>
-	const keyTime = builder.kind === 'window' ? windowStart : windowEnd
 	return restoreTarget(changelog, store, { ...codecs, key: windowedKeyCodec(builder.keyCodec) }, keyTime)
 }
-
-const windowStart = (key: WindowedKey<unknown>): number => key.windowStart
-const windowEnd = (key: WindowedKey<unknown>): number => key.windowEnd

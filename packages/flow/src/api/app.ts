@@ -84,32 +84,49 @@ export interface CloseOptions {
 	timeoutMs?: number
 }
 
-/** A node of a described topology. */
+/**
+ * A node of a described topology (Kafka Streams' `TopologyDescription.Node`). Neighbours are listed by name in Kafka
+ * Streams' order: nodes with more descendants first, then by name.
+ */
 export interface TopologyNodeDescription {
 	readonly name: string
 	readonly kind: 'source' | 'processor' | 'sink'
-	/** Sources: the topics read; sinks: the topic written (empty for a TopicNameExtractor). */
+	/**
+	 * Sources: the topics read; sinks: the topic written, none when a TopicNameExtractor picks it per record. Internal
+	 * topics carry their full names (`<applicationId>-<name>-repartition`).
+	 */
 	readonly topics: readonly string[]
-	/** Processors: the stores connected to them. */
+	/** Processors: the state stores connected to them (global stores are readable without being connected). */
 	readonly stores: readonly string[]
+	/** The parent nodes; none for sources. */
 	readonly predecessors: readonly string[]
+	/** The child nodes; none for sinks. */
 	readonly successors: readonly string[]
 }
 
+/** A connected part of the topology; it runs as one task per input partition, with the task ids `<id>_<partition>`. */
 export interface SubtopologyDescription {
 	readonly id: number
+	/** Kafka Streams' order: nodes with more descendants first (so a node precedes its children), then by name. */
 	readonly nodes: readonly TopologyNodeDescription[]
 }
 
+/** A global store: the source of its topic and the processor that writes the store. It generates no tasks. */
 export interface GlobalStoreDescription {
+	/** Numbered after the subtopologies, so that the ids of subtopologies are those of their tasks. */
 	readonly id: number
 	readonly source: TopologyNodeDescription
 	readonly processor: TopologyNodeDescription
 }
 
-/** The built topology; `toString()` prints it in Kafka Streams' format. */
+/**
+ * The topology an app runs (Kafka Streams' `TopologyDescription`), in plain data: `JSON.stringify` keeps all of it.
+ * `toString()` prints it in Kafka Streams' format.
+ */
 export interface TopologyDescription {
+	/** By id. */
 	readonly subtopologies: readonly SubtopologyDescription[]
+	/** By id. */
 	readonly globalStores: readonly GlobalStoreDescription[]
 	toString(): string
 }
@@ -120,12 +137,24 @@ export interface FlowApp {
 		source: string | Topic<K, V>,
 		options?: Consumed<K, V> & { materialized?: Materialized<K, V> }
 	): KTable<K, V>
+	/**
+	 * A table every instance reads in full: loaded before processing starts, then followed, in a store without a
+	 * changelog (the topic is one). Only usable as the lookup side of `KStream.join/leftJoin`.
+	 */
 	globalTable<K = Buffer, V = Buffer>(
 		source: string | Topic<K, V>,
 		options?: Consumed<K, V> & { materialized?: Materialized<K, V> }
 	): GlobalKTable<K, V>
-	/** Registers a Processor API store; processors connect to it through `process(..., { stores })`. */
+	/**
+	 * Registers a store made by `Stores` (Kafka Streams' `addStateStore()`), so that processors connect to it by name in
+	 * `process(supplier, { stores: [name] })`. Naming the definition itself in `stores` registers it too; registering
+	 * it again has no effect. Another store of the same name is a TopologyError.
+	 */
 	addStateStore(definition: StoreDefinition<StateStore>): this
+	/**
+	 * Builds the topology and describes it. Building freezes it, as start() does: later DSL calls throw TopologyError,
+	 * and an invalid topology throws its TopologyError here.
+	 */
 	describe(): TopologyDescription
 	start(): Promise<void>
 	close(options?: CloseOptions): Promise<void>

@@ -1,8 +1,11 @@
 /**
  * Windowed stream-stream joins: inner, left and outer (6.10). Each side is repartitioned if its keys changed upstream
- * and buffered in its own window store; a join processor per side probes the other side's buffer and a pass-through
- * node merges their results. Both processors are connected to both buffers, so the sides end in one subtopology and
- * their topics must be co-partitioned (4.1.3). Everything is validated before anything is registered (B22).
+ * and buffered in its own join buffer, kept `before + after + grace`; a join processor per side probes the other side's
+ * buffer and a pass-through node merges their results. Left and outer joins keep their unmatched records in a shared
+ * outer-join store until their window closed, except with the deprecated JoinWindows.of (and `Joined.within`), which
+ * joins them with null at once (KS `enableSpuriousResultFix`). Both processors are connected to both buffers, so the
+ * sides end in one subtopology and their topics must be co-partitioned (4.1.3). Everything is validated before anything
+ * is registered (B22).
  */
 import { TopologyError } from '@/api/errors.js'
 import type { KStream } from '@/api/kstream.js'
@@ -11,13 +14,15 @@ import type { Codec } from '@/codec.js'
 import type { DslContext } from '@/dsl/context.js'
 import { requireCodec } from '@/dsl/format.js'
 import { KStreamImpl } from '@/dsl/kstream.js'
-import { NodePrefix, storeName, StorePrefix } from '@/dsl/naming.js'
+import { NodePrefix, storeName, StorePrefix, suffixed } from '@/dsl/naming.js'
 import { repartitionIfRequired } from '@/dsl/ops/repartition.js'
-import { JoinWindows, SessionWindows, TimeWindows } from '@/dsl/windows.js'
-import { joinBufferWindow } from '@/operators/join-buffer.js'
+import { joinRetentionMs } from '@/dsl/retention.js'
+import { JoinWindows, joinWindowsWithin } from '@/dsl/windows.js'
+import { joinBufferBuilder } from '@/operators/join-buffer.js'
+import { outerJoinStoreBuilder } from '@/operators/outer-join-store.js'
 import { passThroughProcessor } from '@/operators/stateless.js'
 import { streamStreamJoinProcessor } from '@/operators/stream-stream-join.js'
-import { windowStoreBuilder, type WindowStoreBuilderOptions } from '@/state/store-builders.js'
+import type { StoreBuilder } from '@/topology/nodes.js'
 
 /**
  * `(joiner, windows, options?)`, or the deprecated `(joiner, joined)` whose `within` gives the window. The
@@ -58,8 +63,7 @@ export function streamStreamJoin<K, V, VO, VR>(
 		`${operator} of the other stream`
 	)
 
-	const { name } = options
-	const named = (suffix: string) => (name === undefined ? undefined : `${name}-${suffix}`)
+	const named = (suffix: string) => suffixed(options.name, suffix)
 	const thisSide = repartitionIfRequired(stream, { name: named('left'), owner: {}, codecs: { key, value }, operator })
 	const otherSide = repartitionIfRequired(right, {
 		name: named('right'),
@@ -69,21 +73,12 @@ export function streamStreamJoin<K, V, VO, VR>(
 	})
 
 	const { ctx } = stream
-	const windowMs = Math.max(windows.beforeMs, windows.afterMs)
-	const base = (options as StreamJoined<K, V, VO>).storeName ?? name
-	const buffer = (side: 'left' | 'right', suffix: string, valueCodec: Codec<unknown>) =>
-		addBuffer(ctx, {
-			name: base === undefined ? storeName(ctx.builder, `${STORE_PREFIX[kind]}-${side}`) : `${base}-${suffix}`,
-			keyCodec: key,
-			valueCodec,
-			logging: options.changelog,
-			...joinBufferWindow(windowMs),
-		})
-	const thisStore = buffer('left', 'this-join-store', value)
-	const otherStore = buffer('right', 'other-join-store', otherValue)
-
-	// One clock for both sides, under the left buffer's name (4.8.5).
-	const shared = { clock: thisStore, windowMs }
+	const { thisStore, otherStore, outerStore } = addStores(ctx, kind, windows, options, { key, value, otherValue })
+	const outer = outerStore === undefined ? [] : [outerStore]
+	// One processor clock for both sides, under the left buffer's name (4.8.5).
+	const shared = { clock: thisStore, graceMs: windows.graceMs }
+	// Left and outer joins pass null keys, so repartition topics before either side keep them (4.1.6, KF12).
+	const marks = kind === 'inner' ? {} : { relaxedNullKeyJoin: true as const }
 	// Kafka Streams' node names (KStreamImplJoin): "outer" marks this side's node in an outer join and the other
 	// side's node in left and outer joins.
 	const thisJoin = ctx.processor(
@@ -92,14 +87,18 @@ export function streamStreamJoin<K, V, VO, VR>(
 		[thisSide.node],
 		streamStreamJoinProcessor<K, V, VO, VR>({
 			...shared,
+			side: 'left',
 			thisStore,
 			otherStore,
 			beforeMs: windows.beforeMs,
 			afterMs: windows.afterMs,
 			joiner,
 			outer: kind !== 'inner',
+			otherOuter: kind === 'outer',
+			outerStore: outerStore === undefined ? undefined : { name: outerStore, key, value, otherValue },
 		}),
-		[thisStore, otherStore]
+		[thisStore, otherStore, ...outer],
+		marks
 	)
 	const otherJoin = ctx.processor(
 		kind === 'inner' ? NodePrefix.JOIN_OTHER : NodePrefix.OUTER_OTHER,
@@ -107,24 +106,64 @@ export function streamStreamJoin<K, V, VO, VR>(
 		[otherSide.node],
 		streamStreamJoinProcessor<K, VO, V, VR>({
 			...shared,
+			side: 'right',
 			thisStore: otherStore,
 			otherStore: thisStore,
 			beforeMs: windows.afterMs,
 			afterMs: windows.beforeMs,
 			joiner: (otherValue, thisValue) => joiner(thisValue, otherValue),
 			outer: kind === 'outer',
+			otherOuter: kind !== 'inner',
+			outerStore:
+				outerStore === undefined ? undefined : { name: outerStore, key, value: otherValue, otherValue: value },
 		}),
-		[otherStore, thisStore]
+		[otherStore, thisStore, ...outer],
+		marks
 	)
 	const merge = ctx.processor(NodePrefix.MERGE, named('merge'), [thisJoin, otherJoin], passThroughProcessor())
 	const windowed = options.key === undefined ? thisSide.format.windowed : undefined
 	return new KStreamImpl<K, VR>(ctx, merge, { keyCodec: key, windowed }, false)
 }
 
-/** Registers the window store of one side's buffer; returns its name. */
-function addBuffer(ctx: DslContext, options: WindowStoreBuilderOptions<unknown, unknown>): string {
-	ctx.builder.addStateStore(windowStoreBuilder(ctx.changelog, options))
-	return options.name
+/**
+ * Registers the buffers of both sides and, for left and outer joins that defer their unmatched records (all but the
+ * deprecated JoinWindows.of: KS `enableSpuriousResultFix`), the outer-join store; returns their names.
+ */
+function addStores<K, V, VO>(
+	ctx: DslContext,
+	kind: JoinKind,
+	windows: JoinWindows,
+	options: StreamJoined<K, V, VO> | Joined<K, V, VO>,
+	codecs: { readonly key: Codec<K>; readonly value: Codec<V>; readonly otherValue: Codec<VO> }
+): { thisStore: string; otherStore: string; outerStore?: string } {
+	const base = (options as StreamJoined<K, V, VO>).storeName ?? options.name
+	/** `<base>-<suffix>`, or a generated `<prefix>-<generated>-<n>`. */
+	const name = (suffix: string, generated: string) =>
+		suffixed(base, suffix) ?? storeName(ctx.builder, `${STORE_PREFIX[kind]}-${generated}`)
+	const logging = options.changelog
+	const add = (builder: StoreBuilder): string => {
+		ctx.builder.addStateStore(builder)
+		return builder.name
+	}
+	const buffer = <T>(suffix: string, generated: string, valueCodec: Codec<T>) =>
+		add(
+			joinBufferBuilder(ctx.changelog, {
+				name: name(suffix, generated),
+				keyCodec: codecs.key,
+				valueCodec,
+				retentionMs: joinRetentionMs(windows),
+				logging,
+			})
+		)
+	const thisStore = buffer('this-join-store', 'left', codecs.value)
+	const otherStore = buffer('other-join-store', 'right', codecs.otherValue)
+	if (kind === 'inner' || !windows.spuriousResultFix) {
+		return { thisStore, otherStore }
+	}
+	const outerStore = add(
+		outerJoinStoreBuilder(ctx.changelog, { name: name(`${kind}-shared-join-store`, 'shared'), logging })
+	)
+	return { thisStore, otherStore, outerStore }
 }
 
 interface JoinArguments<K, V, VO, VR> {
@@ -142,22 +181,5 @@ function joinArguments<K, V, VO, VR>(
 	if (windows instanceof JoinWindows) {
 		return { joiner: join, windows, options: options ?? {} }
 	}
-	return { joiner: join, windows: legacyJoinWindows(operator, windows?.within), options: windows ?? {} }
-}
-
-/** The JoinWindows of the deprecated `Joined.within` (6.1): the size or gap of other windows, symmetric. */
-function legacyJoinWindows(operator: string, within: Joined<unknown, unknown, unknown>['within']): JoinWindows {
-	if (within instanceof JoinWindows) {
-		return within
-	}
-	if (within instanceof TimeWindows) {
-		return JoinWindows.of(within.sizeMs)
-	}
-	if (within instanceof SessionWindows) {
-		return JoinWindows.of(within.gapMs)
-	}
-	if (within === undefined) {
-		throw new TopologyError(`${operator} with a stream needs JoinWindows as its third argument`)
-	}
-	throw new TopologyError(`${operator} with a stream cannot use SlidingWindows; pass JoinWindows`)
+	return { joiner: join, windows: joinWindowsWithin(windows?.within, operator), options: windows ?? {} }
 }

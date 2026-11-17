@@ -5,8 +5,15 @@
  */
 import type { StateStore } from '@/state.js'
 
-/** The methods of the store kinds that write (and may log to the changelog). */
-const WRITES: ReadonlySet<PropertyKey> = new Set(['put', 'delete', 'remove', 'expireOldWindows', 'expireOldSessions'])
+/** The methods of the store kinds that write (and may log to the changelog); `expire()`: stores with a clock (6.2). */
+const WRITES: ReadonlySet<PropertyKey> = new Set([
+	'put',
+	'delete',
+	'remove',
+	'expire',
+	'expireOldWindows',
+	'expireOldSessions',
+])
 
 /** `store` whose writes await `open()` first; reads pass through. */
 export function writesInTransaction<S extends StateStore>(store: S, open: () => Promise<void>): S {

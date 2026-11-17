@@ -76,6 +76,37 @@ describe('TaskStateManager - store stacks', () => {
 		])
 	})
 
+	it('at-least-once, a store holding its deletes: they reach the changelog and the provider store after a commit', async () => {
+		const { state, output } = manager([{ ...counts, holdDeletes: true }])
+		await state.register()
+		const store = kv(state, 'counts')
+		await store.put('a', '1')
+		await store.put('b', '2')
+		await store.put('c', '3')
+		await store.delete('a')
+		await store.delete('b')
+		await store.put('b', '4') // cancels the held delete of b
+		expect(await store.get('a')).toBeUndefined()
+		expect(await collect(store.all())).toEqual([
+			['b', '4'],
+			['c', '3'],
+		])
+		expect(await rawKv(state).get('a')).toBe('1')
+		expect(output.changelog().filter(({ value }) => value === null)).toEqual([])
+
+		await state.applyHeldDeletes()
+		expect(await rawKv(state).get('a')).toBeUndefined()
+		expect(output.changelog().filter(({ value }) => value === null)).toEqual([
+			{ topic: 'app-counts-changelog', partition: 2, key: 'a', value: null },
+		])
+	})
+
+	it('a store holding its deletes holds none under exactly-once: its transaction holds every write', async () => {
+		const { state } = manager([{ ...counts, holdDeletes: true }], { eos: true })
+		await state.register()
+		expect(state.stores[0]!.held).toBeUndefined()
+	})
+
 	it('exactly-once: writes are buffered and logged, and reach the provider store when the buffers are applied', async () => {
 		const { state, output } = manager([counts], { eos: true })
 		await state.register()

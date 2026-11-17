@@ -40,6 +40,7 @@ export type {
 	TableOptions,
 	TransformValuesOptions,
 	ProcessOptions,
+	ConnectedStores,
 	StreamJoined,
 	Joined,
 	Repartitioned,
@@ -47,7 +48,6 @@ export type {
 	SplitOptions,
 	BranchOptions,
 } from '@/api/options.js'
-export type { StoreDefinition, StoreOptions, StoresFactory } from '@/api/stores.js'
 export type { Topic } from '@/topic.js'
 export type { ResetPolicy, TopicNameExtractor } from '@/topology/nodes.js'
 
@@ -76,8 +76,16 @@ export type {
 export type { CollectedRecord } from '@/processor/output.js'
 
 // Processor API
-export { StreamRecord, FixedKeyRecord } from '@/processor/record.js'
-export type { RecordHeaders } from '@/processor/record.js'
+export { Stores } from '@/state/store-builders.js'
+export type {
+	StoreDefinition,
+	StoreOptions,
+	WindowStoreDefinitionOptions,
+	SessionStoreDefinitionOptions,
+	StoresFactory,
+} from '@/api/stores.js'
+export { StreamRecord } from '@/processor/record.js'
+export type { FixedKeyRecord, RecordHeaders } from '@/processor/record.js'
 export type {
 	Processor,
 	ProcessorSupplier,
@@ -100,6 +108,8 @@ export type { TimestampExtractor, ConsumedRecord } from '@/processor/timestamps.
 // Codecs
 export { codec, string, json, buffer } from '@/codec.js'
 export type { Codec } from '@/codec.js'
+export { WindowedCodecs } from '@/operators/windowed.js'
+export type { WindowedCodec } from '@/operators/windowed.js'
 
 // State stores
 export {

@@ -1,17 +1,32 @@
 /**
  * What every DSL object of one app shares (KS InternalStreamsBuilder): the topology builder, the changelog defaults
- * that store builders resolve against, and the registrations every operator family makes (sources, processors).
+ * that store builders resolve against, the registrations every operator family makes (sources, processors), the
+ * grace periods of the windowed aggregations and the builders of the Processor API stores.
  */
 import type { Consumed } from '@/api/options.js'
+import type { StoreDefinition } from '@/api/stores.js'
 import type { ChangelogDefaults } from '@/changelog/config.js'
 import { sourceFormat } from '@/dsl/format.js'
 import { KStreamImpl } from '@/dsl/kstream.js'
 import { NodePrefix } from '@/dsl/naming.js'
 import type { ProcessorSupplier } from '@/processor/api.js'
+import type { StateStore } from '@/state.js'
 import type { InternalTopologyBuilder } from '@/topology/builder.js'
-import type { NodeName, SourceDef } from '@/topology/nodes.js'
+import type { NodeName, ProcessorDef, SourceDef, StoreBuilder } from '@/topology/nodes.js'
 
 export class DslContext {
+	/**
+	 * The grace period of each windowed aggregation, by processor (KS GracePeriodGraphNode): how long after its end a
+	 * window may still change, for a session including its gap. `suppress()` finds when windows close through it.
+	 */
+	readonly windowGraces = new Map<NodeName, number>()
+
+	/**
+	 * The builder of each Processor API store definition, made once per app: every processor connected to the store
+	 * registers the same builder (`dsl/ops/process.ts`).
+	 */
+	readonly definedStores = new Map<StoreDefinition<StateStore>, StoreBuilder>()
+
 	constructor(
 		readonly builder: InternalTopologyBuilder,
 		/** Store builders resolve their changelogs against these. */
@@ -50,13 +65,17 @@ export class DslContext {
 		return name
 	}
 
-	/** Registers the processor `name ?? <prefix>-<n>` under `parents`, connected to `stores`; returns its name. */
+	/**
+	 * Registers the processor `name ?? <prefix>-<n>` under `parents`, connected to `stores`; returns its name. `marks`:
+	 * whether it is a join that passes null keys (4.1.6).
+	 */
 	processor<KIn, VIn, KOut, VOut>(
 		prefix: string,
 		name: string | undefined,
 		parents: readonly NodeName[],
 		supplier: ProcessorSupplier<KIn, VIn, KOut, VOut>,
-		stores: readonly string[] = []
+		stores: readonly string[] = [],
+		marks: Pick<ProcessorDef, 'relaxedNullKeyJoin'> = {}
 	): NodeName {
 		const node = this.builder.nodeName(prefix, name)
 		this.builder.addProcessor({
@@ -64,6 +83,7 @@ export class DslContext {
 			parents,
 			stores,
 			supplier: supplier as ProcessorSupplier<unknown, unknown, unknown, unknown>,
+			...marks,
 		})
 		return node
 	}

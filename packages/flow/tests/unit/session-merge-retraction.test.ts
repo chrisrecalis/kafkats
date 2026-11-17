@@ -1,82 +1,90 @@
 import { describe, expect, it } from 'vitest'
 import { codec } from '@/codec.js'
 import { SessionWindows } from '@/dsl/windows.js'
+import { WindowedCodecs } from '@/operators/windowed.js'
 import { TestDriver, type TestContextApi } from '@/testing/driver.js'
+import { GUARANTEES } from './support/guarantees.js'
 
 const str = codec.string()
 const num = codec.json<number>()
-const GAP_MS = 10
+const keys = WindowedCodecs.sessionWindowed(str)
 
-type Update = { start: number; end: number; value: number | null }
+type Update = { start: number; end: number; value: number | null; timestamp: number }
 
-/** A session sum (reduce or aggregate) of topic 'in' with a gap of 10 ms; returns its updates. */
-function sessionSums(driver: TestDriver, kind: 'reduce' | 'aggregate'): Update[] {
-	const updates: Update[] = []
+/** A session sum (reduce or aggregate) of topic 'in' with a gap of 10 ms, written to 'out'. */
+function sessionSums(driver: TestDriver, kind: 'reduce' | 'aggregate'): void {
 	const windowed = driver
 		.input('in', { key: str, value: num })
 		.groupByKey()
-		.windowedBy(SessionWindows.withInactivityGap(GAP_MS))
+		.windowedBy(SessionWindows.ofInactivityGapAndGrace(10, 100))
 	const table =
 		kind === 'reduce'
-			? windowed.reduce((a, b) => a + b)
+			? windowed.reduce((a, b) => a + (b ?? 0))
 			: windowed.aggregate(
 					() => 0,
-					(_k, v, agg) => agg + v,
+					(_k, v, agg) => agg + (v ?? 0),
 					(_k, a, b) => a + b,
 					{ value: num }
 				)
-	table.toStream().peek((k, value) => updates.push({ start: k!.window.start, end: k!.window.end, value }))
-	return updates
+	table.toStream().to('out', { key: keys, value: num })
+}
+
+/** The updates written to 'out', with their timestamps. */
+function updates(ctx: TestContextApi): Update[] {
+	return ctx.producer.messagesFor('out').map(({ key, value, timestamp }) => {
+		const { window } = keys.decode(key!)
+		return { ...window, value: value === null ? null : num.decode(value), timestamp: Number(timestamp) }
+	})
 }
 
 const send = (ctx: TestContextApi, timestamp: number) =>
 	ctx.send('in', 1, { key: Buffer.from('a'), codec: num, timestamp })
 
 describe.each(['reduce', 'aggregate'] as const)('session merge retraction (%s)', kind => {
-	it('retracts the merged-away session before emitting the merged result', async () => {
-		const driver = new TestDriver()
-		const updates = sessionSums(driver, kind)
-		await driver.run(async ctx => {
-			await send(ctx, 0) // session [0,0] = 1
-			await send(ctx, 5) // merges [0,0] into [0,5] = 2
-		})
-		// The old [0,0] window must be retracted (tombstone) before the merged [0,5] result, so a downstream
-		// table or consumer keyed on the windowed key does not keep a stale [0,0] entry.
-		expect(updates).toEqual([
-			{ start: 0, end: 0, value: 1 },
-			{ start: 0, end: 0, value: null },
-			{ start: 0, end: 5, value: 2 },
-		])
-	})
+	describe.each(GUARANTEES)('%s', (_, config) => {
+		/** Sends records at `timestamps` to a session sum; returns the updates of the last `last` records. */
+		async function run(timestamps: readonly number[], last = timestamps.length): Promise<Update[]> {
+			const driver = new TestDriver(config)
+			sessionSums(driver, kind)
+			let result: Update[] = []
+			await driver.run(async ctx => {
+				for (const [i, timestamp] of timestamps.entries()) {
+					if (i === timestamps.length - last) ctx.clear()
+					await send(ctx, timestamp)
+				}
+				result = updates(ctx)
+			})
+			return result
+		}
 
-	it('does not retract when the merged window equals the existing session (in-place update)', async () => {
-		const driver = new TestDriver()
-		const updates = sessionSums(driver, kind)
-		await driver.run(async ctx => {
-			await send(ctx, 0)
-			await send(ctx, 5) // [0,5] = 2
-			updates.length = 0
-			// A record inside [0,5] keeps the window's bounds: no tombstone, just an updated value.
-			await send(ctx, 3)
+		it('retracts the merged-away session before emitting the merged result, each at its session end', async () => {
+			// [0,0] = 1, then 5 merges it into [0,5] = 2: a table keyed by the window must not keep [0,0].
+			expect(await run([0, 5])).toEqual([
+				{ start: 0, end: 0, value: 1, timestamp: 0 },
+				{ start: 0, end: 0, value: null, timestamp: 0 },
+				{ start: 0, end: 5, value: 2, timestamp: 5 },
+			])
 		})
-		expect(updates).toEqual([{ start: 0, end: 5, value: 3 }])
-	})
 
-	it('retracts both sessions a middle record bridges', async () => {
-		const driver = new TestDriver()
-		const updates = sessionSums(driver, kind)
-		await driver.run(async ctx => {
-			await send(ctx, 0) // session [0,0]
-			await send(ctx, 20) // separate session [20,20] (gap 10)
-			updates.length = 0
-			// A record at 10 is within the gap of both sessions and bridges them into [0,20] = 3. Both absorbed
-			// windows differ from the merged window, so both are retracted, in start order.
-			await send(ctx, 10)
+		it('BC23: retracts a merged session even when the merged session has its bounds (Kafka Streams)', async () => {
+			// 3 falls into [0,5]: the session is retracted, then sent again with the new aggregate.
+			expect(await run([0, 5, 3], 1)).toEqual([
+				{ start: 0, end: 5, value: null, timestamp: 5 },
+				{ start: 0, end: 5, value: 3, timestamp: 5 },
+			])
 		})
-		expect(updates).toEqual([
-			{ start: 0, end: 0, value: null },
-			{ start: 20, end: 20, value: null },
-			{ start: 0, end: 20, value: 3 },
-		])
+
+		it('updates a one-point session in place: a record at its timestamp merges nothing else', async () => {
+			expect(await run([7, 7], 1)).toEqual([{ start: 7, end: 7, value: 2, timestamp: 7 }])
+		})
+
+		it('retracts both sessions a middle record bridges, in start order', async () => {
+			// 10 is within the gap of [0,0] and [20,20] and bridges them into [0,20] = 3.
+			expect(await run([0, 20, 10], 1)).toEqual([
+				{ start: 0, end: 0, value: null, timestamp: 0 },
+				{ start: 20, end: 20, value: null, timestamp: 20 },
+				{ start: 0, end: 20, value: 3, timestamp: 20 },
+			])
+		})
 	})
 })

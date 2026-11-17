@@ -86,14 +86,27 @@ describe('decodeCommitMetadata', () => {
 })
 
 describe('ProcessorMetadataImpl', () => {
-	it('needs a commit after a put, until cleared', () => {
+	it('needs a commit after a put, until committed', () => {
 		const meta = new ProcessorMetadataImpl()
 		expect(meta.needsCommit).toBe(false)
 		meta.put('a', 1)
 		expect(meta.needsCommit).toBe(true)
-		meta.clearNeedsCommit()
+		meta.markCommitted()
 		expect(meta.needsCommit).toBe(false)
 		expect(meta.get('a')).toBe(1)
+	})
+
+	it('keeps the values of the last commit, or of the seed before the first', () => {
+		const meta = new ProcessorMetadataImpl()
+		meta.replaceAll([new Map([['a', 1]])], new Set(['a', 'b']))
+		meta.put('a', 2)
+		meta.put('b', 5)
+		expect([meta.committed('a'), meta.committed('b')]).toEqual([1, undefined])
+		meta.markCommitted()
+		meta.put('a', 3)
+		expect([meta.committed('a'), meta.committed('b')]).toEqual([2, 5])
+		meta.replaceAll([new Map([['a', 1]])], new Set(['a', 'b']))
+		expect([meta.committed('a'), meta.committed('b')]).toEqual([1, undefined])
 	})
 
 	it.each([1.5, Number.NaN, 2 ** 53])('rejects the value %s', value => {

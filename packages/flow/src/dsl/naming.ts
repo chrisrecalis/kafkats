@@ -1,6 +1,9 @@
 /**
- * Generated names (4.1.1, 6.22). A `{ name }` option wins; otherwise names come from the builder's counters, so they
- * depend on the order of DSL calls, as in Kafka Streams. Persisted state is keyed by store names, never by node names.
+ * Names of nodes, stores and internal topics (4.1.1, 6.22). A `{ name }` option wins; otherwise names come from the
+ * builder's counters, so they depend on the order of DSL calls, as in Kafka Streams. An operator registering several
+ * nodes or topics derives their names from its `{ name }` with Kafka Streams' suffixes (`suffixed()`), so explicit
+ * names (`{ name }`, `Grouped.name`, store names) fix every name a program registers. Persisted state is keyed by store
+ * names, never by node names. The builder rejects illegal and duplicate names (`topology/names.ts`, B4, B5).
  */
 import type { InternalTopologyBuilder } from '@/topology/builder.js'
 
@@ -57,10 +60,10 @@ export const StorePrefix = {
 	TABLE_REDUCE: 'table-reduce-store',
 	TABLE_AGGREGATE: 'table-aggregate-store',
 	TO_TABLE: 'toTable-store',
-	GROUP_BY_MAPPING: 'groupby-mapping',
 	STREAM_JOIN: 'stream-join',
 	STREAM_LEFT_JOIN: 'stream-left-join',
 	STREAM_OUTER_JOIN: 'stream-outer-join',
+	SUPPRESS: 'KTABLE-SUPPRESS-STATE-STORE',
 	table: (topic: string) => `table-${topic}`,
 	globalTable: (topic: string) => `global-table-${topic}`,
 } as const
@@ -76,4 +79,12 @@ export function storeName(builder: InternalTopologyBuilder, prefix: string, name
  */
 export function repartitionName(builder: InternalTopologyBuilder, name?: string): string {
 	return name ?? `repartition-${builder.repartitionId()}`
+}
+
+/**
+ * The name `<name>-<suffix>` of one of the nodes, stores or topics an operator named `name` registers (KS
+ * `NamedInternal.suffixWithOrElseGet`); undefined (generated) when the operator is unnamed.
+ */
+export function suffixed(name: string | undefined, suffix: string): string | undefined {
+	return name === undefined ? undefined : `${name}-${suffix}`
 }

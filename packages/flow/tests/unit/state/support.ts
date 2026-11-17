@@ -2,7 +2,8 @@
 import { noopLogger } from '@kafkats/client'
 import type { ChangelogDefaults } from '@/changelog/config.js'
 import { codec } from '@/codec.js'
-import type { ProcessorMetadata, TaskId } from '@/processor/api.js'
+import type { TaskId } from '@/processor/api.js'
+import { ProcessorMetadataImpl } from '@/processor/metadata.js'
 import type { CollectedRecord, SendKind, TaskOutput } from '@/processor/output.js'
 import type { ChangelogCheckpointStore, StateStoreProvider } from '@/state.js'
 import { Checkpoints } from '@/state/checkpoints.js'
@@ -46,9 +47,8 @@ export class RecordingOutput implements TaskOutput {
 	}
 }
 
-export function metadata(): ProcessorMetadata {
-	const values = new Map<string, number>()
-	return { get: key => values.get(key), put: (key, value) => void values.set(key, value) }
+export function metadata(): ProcessorMetadataImpl {
+	return new ProcessorMetadataImpl()
 }
 
 /** A durable checkpoint store over a Map, with the flushes it saw. */

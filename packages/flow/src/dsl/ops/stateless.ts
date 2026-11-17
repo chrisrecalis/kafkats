@@ -1,19 +1,19 @@
 /**
- * Stateless operators: filter, map, flatMap, peek, foreach, selectKey, merge, branch and KTable.toStream (6.0, 6.20).
- * Key-changing operators flag the stream for repartitioning and forget the key codec; value-changing ones forget the
- * value codec.
+ * Stateless operators: filter, map, flatMap, peek, foreach, selectKey, merge, split, branch and KTable.toStream (6.0,
+ * 6.20). Key-changing operators flag the stream for repartitioning and forget the key codec; value-changing ones forget
+ * the value codec.
  */
 import { TopologyError } from '@/api/errors.js'
 import type { BranchedKStream, KStream, KeyValue, ValueMapper } from '@/api/kstream.js'
 import type { BranchOptions, NamedOptions, SplitOptions } from '@/api/options.js'
-import type { BranchedKStreamImpl } from '@/dsl/branched.js'
+import { BranchedKStreamImpl } from '@/dsl/branched.js'
 import { mergedFormat, withNewKeys, withNewValues } from '@/dsl/format.js'
 import { KStreamImpl } from '@/dsl/kstream.js'
 import type { KTableImpl } from '@/dsl/ktable.js'
 import { NodePrefix } from '@/dsl/naming.js'
-import { notImplemented } from '@/dsl/not-implemented.js'
 import {
 	branchProcessor,
+	type BranchRoute,
 	filterProcessor,
 	flatMapProcessor,
 	flatMapValuesProcessor,
@@ -125,45 +125,85 @@ export function merge<K, V>(stream: KStreamImpl<K, V>, other: KStream<K, V>, opt
 	return new KStreamImpl<K, V>(ctx, node, format, stream.repartitionRequired || right.repartitionRequired)
 }
 
-export function split<K, V>(_stream: KStreamImpl<K, V>, _options?: SplitOptions): BranchedKStream<K, V> {
-	return notImplemented('KStream.split')
+/** KStream.split (KS BranchedKStreamImpl): registers the splitter `options.name ?? KSTREAM-BRANCH-<n>`. */
+export function split<K, V>(stream: KStreamImpl<K, V>, options?: SplitOptions): BranchedKStream<K, V> {
+	const routes: BranchRoute<K | null, V | null>[] = []
+	const node = add(stream, NodePrefix.BRANCH, options, branchProcessor(routes))
+	return new BranchedKStreamImpl(stream, node, routes)
+}
+
+/** A branch of the split, named by its 1-based position unless `options.name` names it (KS). */
+export function addBranch<K, V>(
+	branched: BranchedKStreamImpl<K, V>,
+	predicate: Predicate<K, V>,
+	options?: BranchOptions<K, V>
+): void {
+	addRoute(branched, predicate, branched.routes.length + 1, options)
+}
+
+/** Ends the split with a branch for the records no branch matched, named `0` unless `options.name` names it (KS). */
+export function defaultBranch<K, V>(
+	branched: BranchedKStreamImpl<K, V>,
+	options?: BranchOptions<K, V>
+): Record<string, KStream<K, V>> {
+	addRoute(branched, undefined, 0, options)
+	return noDefaultBranch(branched)
+}
+
+/** Ends the split; records no branch matched are dropped. */
+export function noDefaultBranch<K, V>(branched: BranchedKStreamImpl<K, V>): Record<string, KStream<K, V>> {
+	checkOpen(branched)
+	branched.ended = true
+	return branched.branches
 }
 
 /** The deprecated KStream.branch(...predicates): records go to the first matching predicate's stream only. */
 export function branch<K, V>(stream: KStreamImpl<K, V>, predicates: readonly Predicate<K, V>[]): KStream<K, V>[] {
-	const { ctx } = stream
-	const branchNode = ctx.builder.nodeName(NodePrefix.BRANCH)
-	const children = predicates.map(() => ctx.builder.nodeName(NodePrefix.BRANCH_CHILD))
-	ctx.processor(NodePrefix.BRANCH, branchNode, [stream.node], branchProcessor(predicates, children))
-	return children.map(child => {
-		ctx.processor(NodePrefix.BRANCH_CHILD, child, [branchNode], passThroughProcessor<K | null, V | null>())
-		return new KStreamImpl<K, V>(ctx, child, stream.format, stream.repartitionRequired)
-	})
-}
-
-export function addBranch<K, V>(
-	_branched: BranchedKStreamImpl<K, V>,
-	_predicate: Predicate<K, V>,
-	_options?: BranchOptions<K, V>
-): void {
-	notImplemented('BranchedKStream.branch')
-}
-
-export function defaultBranch<K, V>(
-	_branched: BranchedKStreamImpl<K, V>,
-	_options?: BranchOptions<K, V>
-): Record<string, KStream<K, V>> {
-	return notImplemented('BranchedKStream.defaultBranch')
-}
-
-export function noDefaultBranch<K, V>(_branched: BranchedKStreamImpl<K, V>): Record<string, KStream<K, V>> {
-	return notImplemented('BranchedKStream.noDefaultBranch')
+	const { builder } = stream.ctx
+	const splitter = builder.nodeName(NodePrefix.BRANCH)
+	const routes = predicates.map(predicate => ({ child: builder.nodeName(NodePrefix.BRANCH_CHILD), predicate }))
+	add(stream, NodePrefix.BRANCH, { name: splitter }, branchProcessor(routes))
+	return routes.map(({ child }) => branchStream(stream, splitter, child))
 }
 
 /**
- * KTable.toStream: `change.newValue` of every update. Without a mapper the records stay in the partition of their key;
- * a mapper re-keys them, so a key-based operation downstream repartitions first. So does one on windowed results: in
- * this build they stay in the partition of their base key, not where their windowed key hashes to (BC10 drops this).
+ * Registers the branch `<splitter><options.name ?? position>` after the branches added so far; the branch, or what its
+ * chain returns, joins the result under that name (nothing, if the chain returns nothing).
+ */
+function addRoute<K, V>(
+	branched: BranchedKStreamImpl<K, V>,
+	predicate: Predicate<K, V> | undefined,
+	position: number,
+	options: BranchOptions<K, V> | undefined
+): void {
+	checkOpen(branched)
+	const branch = branchStream(branched.stream, branched.node, `${branched.node}${options?.name ?? position}`)
+	branched.routes.push({ child: branch.node, predicate })
+	const result = options?.chain ? options.chain(branch) : branch
+	if (result) {
+		branched.branches[branch.node] = result
+	}
+}
+
+function checkOpen<K, V>(branched: BranchedKStreamImpl<K, V>): void {
+	if (branched.ended) {
+		throw new TopologyError(
+			`split() '${branched.node}' already returned its branches: add every branch before defaultBranch() or noDefaultBranch()`
+		)
+	}
+}
+
+/** A branch of a splitter: a pass-through node keeping the stream's format and repartition flag (KS). */
+function branchStream<K, V>(stream: KStreamImpl<K, V>, splitter: NodeName, name: NodeName): KStreamImpl<K, V> {
+	const { ctx } = stream
+	const node = ctx.processor(NodePrefix.BRANCH_CHILD, name, [splitter], passThroughProcessor<K | null, V | null>())
+	return new KStreamImpl<K, V>(ctx, node, stream.format, stream.repartitionRequired)
+}
+
+/**
+ * KTable.toStream: `change.newValue` of every update. Without a mapper the records stay in the partition of their key
+ * (windowed results in the partition of their base key, where key-based operations on them find them, BC10); a mapper
+ * re-keys them, so a key-based operation downstream repartitions first.
  */
 export function toStream<K, V, KR>(
 	table: KTableImpl<K, V>,
@@ -176,5 +216,5 @@ export function toStream<K, V, KR>(
 	const { ctx } = table
 	const node = ctx.processor(NodePrefix.TABLE_TO_STREAM, named?.name, [table.node], toStreamProcessor(mapper))
 	const format = mapper === undefined ? table.format : withNewKeys(table.format)
-	return new KStreamImpl<K | KR, V>(ctx, node, format, mapper !== undefined || table.format.windowed !== undefined)
+	return new KStreamImpl<K | KR, V>(ctx, node, format, mapper !== undefined)
 }

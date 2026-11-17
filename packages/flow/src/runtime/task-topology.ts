@@ -45,6 +45,8 @@ export interface TaskTopologyDeps {
 
 export class TaskTopology {
 	private closed = false
+	/** How many nodes completed init(), in order: only those are closed (KS: a `ProcessorNode` starts closed). */
+	private initialized = 0
 	private readonly handles = new Map<string, StateStore>()
 
 	private constructor(
@@ -108,10 +110,11 @@ export class TaskTopology {
 		return topology
 	}
 
-	/** init() of every node in topological order, without a record context. */
+	/** init() of every node in topological order, without a record context; stops at the first that throws. */
 	async init(): Promise<void> {
 		for (const node of this.nodes) {
 			await node.init()
+			this.initialized++
 		}
 	}
 
@@ -178,13 +181,14 @@ export class TaskTopology {
 
 	/**
 	 * Closes every context and store handle first, so a late forward or write of this incarnation throws
-	 * IllegalStateError; then every node. The first error is rethrown after all closed.
+	 * IllegalStateError; then every node whose init() completed (after a failed init(), the nodes before the one that
+	 * threw). The first error is rethrown after all closed.
 	 */
 	async close(): Promise<void> {
 		this.closed = true
 		this.context.close()
 		const errors: unknown[] = []
-		for (const node of this.nodes) {
+		for (const node of this.nodes.slice(0, this.initialized)) {
 			await node.close().catch((error: unknown) => errors.push(error))
 		}
 		if (errors.length > 0) {

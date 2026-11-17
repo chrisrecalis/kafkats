@@ -1,10 +1,10 @@
 /**
  * KStream-KTable and KStream-GlobalKTable joins (KS KStreamKTableJoinProcessor): a stream record looks up the table
  * value of the key it maps to (its own key for a KTable, the selector's key for a GlobalKTable) through the table's
- * value getter and is joined with it. A left join joins records without a table value with null; an inner join drops
- * them. Records with a null value or a null lookup key are dropped (as in the legacy runtime; KIP-962's left join of
- * null keys is Stage 3, 6.14). Only stream records produce results, with their key, timestamp and headers; the table
- * is read as it is when the record is processed.
+ * value getter and is joined with it (6.14, ksdsl§8). A left join joins records without a table value with null; an
+ * inner join drops them. Records with a null value are dropped; so are records without a lookup key in an inner join,
+ * while a left join joins them with null without a lookup (KIP-962). Only stream records produce results, with their
+ * key, timestamp and headers; the table is read as it is when the record is processed.
  */
 import type { ValueJoiner } from '@/api/kstream.js'
 import type { KTableValueGetter, KTableValueGetterSupplier } from '@/operators/ktable-node.js'
@@ -19,7 +19,7 @@ import type { StreamRecord } from '@/processor/record.js'
 
 export interface StreamTableJoin<K, V, KT, VT, VR> {
 	readonly valueGetter: KTableValueGetterSupplier<KT, VT>
-	/** The table key a record looks up. */
+	/** The table key a record looks up; null, or undefined (a selector reading a missing field), when it has none. */
 	readonly lookupKey: (key: K | null, value: V) => KT | null
 	readonly joiner: (key: K | null, value: V, tableValue: VT | null) => VR
 	readonly left: boolean
@@ -60,11 +60,12 @@ class StreamTableJoinProcessor<K, V, KT, VT, VR> implements Processor<K | null, 
 			return
 		}
 		const lookupKey = this.join.lookupKey(key, value)
-		if (lookupKey === null || lookupKey === undefined) {
+		const keyless = lookupKey === null || lookupKey === undefined
+		if (keyless && !this.join.left) {
 			this.context.recordDropped('null-key')
 			return
 		}
-		const tableValue = await this.getter.get(lookupKey)
+		const tableValue = keyless ? null : await this.getter.get(lookupKey)
 		if (tableValue === null && !this.join.left) {
 			return
 		}

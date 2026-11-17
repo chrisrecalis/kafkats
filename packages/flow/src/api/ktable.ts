@@ -11,16 +11,29 @@ import type {
 import type { ValueTransformerWithKeySupplier } from '@/processor/api.js'
 
 /**
- * A changelog stream read as a table: the latest value per key; a null value deletes the key. Callbacks
- * never see null values (tombstones are propagated without calling them).
+ * A changelog stream read as a table: the latest value per key; a null value deletes the key. Deletes are propagated
+ * without calling the callbacks of `filter()`, `filterNot()`, `mapValues()`, `groupBy()` and the joins (a joiner gets
+ * null only for a side that has no value, as its type says). `transformValues()` and `toStream(mapper)` get them, as a
+ * null value (Kafka Streams).
  */
 export interface KTable<K, V> {
+	/** The entries the predicate accepts: an update it rejects deletes the key. */
 	filter(predicate: (key: K, value: V) => boolean, options?: TableOptions<K, V>): KTable<K, V>
+	/** The entries the predicate rejects: an update it accepts deletes the key. */
 	filterNot(predicate: (key: K, value: V) => boolean, options?: TableOptions<K, V>): KTable<K, V>
-	/** A null result deletes the key. */
+	/**
+	 * A null result deletes the key. A mapper declaring two parameters gets the key too (give a two-parameter lambda
+	 * explicit parameter types).
+	 */
 	mapValues<VR>(mapper: (value: V) => VR | null, options?: TableOptions<K, VR>): KTable<K, VR>
 	mapValues<VR>(mapper: (key: K, value: V) => VR | null, options?: TableOptions<K, VR>): KTable<K, VR>
-	/** One transformer result per update; tombstones reach the transformer. */
+	/**
+	 * Kafka Streams' `transformValues()`: every task creates a transformer with `supplier()` (which must return a new
+	 * one per call) and calls `transform(key, value)` once per update, tombstones included (`value` null); the result
+	 * is the key's new value, null deleting it. The transformer's context reads the stores of `options.stores` and
+	 * schedules punctuators, but cannot forward. Without a materialized store, a lookup of the result table (a join)
+	 * transforms the parent's current value with a transformer instance of its own.
+	 */
 	transformValues<VR>(
 		supplier: ValueTransformerWithKeySupplier<K, V, VR>,
 		options?: TransformValuesOptions<K, VR>
@@ -52,11 +65,13 @@ export interface KTable<K, V> {
 }
 
 /**
- * A table every instance reads in full, outside the consumer group. Only usable as the lookup side of a
- * stream join; it cannot be streamed.
+ * A table every instance reads in full, outside the consumer group, and keeps up to date while it runs: the
+ * latest value per key of its topic (a null value deletes the key, a record without a key is skipped). Only
+ * usable as the lookup side of a stream join (`KStream.join/leftJoin(globalTable, keySelector, joiner)`); it
+ * cannot be streamed.
  */
 export interface GlobalKTable<K, V> {
-	/** Name of the table's store. */
+	/** Name of the table's store: `materialized.storeName`, else `global-table-<topic>-<n>`. */
 	readonly storeName: string
 	/** Phantom: carries the key and value types. */
 	readonly __global?: { readonly key: K; readonly value: V }

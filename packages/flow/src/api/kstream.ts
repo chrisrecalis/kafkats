@@ -26,39 +26,66 @@ export type KeyValue<K, V> = readonly [K, V]
 export type ValueMapper<K, V, VR> = ((value: V) => VR) | ((key: K, value: V) => VR)
 /** A value joiner with or without the key (same arity rule as ValueMapper). */
 export type ValueJoiner<K, V, VO, VR> = ((value: V, otherValue: VO) => VR) | ((key: K, value: V, otherValue: VO) => VR)
+/** Computes something, such as the key a stream-global table join looks up, from a record's key and value. */
+export type KeyValueMapper<K, V, R> = (key: K, value: V) => R
 
 /**
  * An unbounded stream of key-value records. Keys and values may be null (a null value is a tombstone in a
  * topic read as a table). Every callback takes `(key, value)`.
  */
 export interface KStream<K, V> {
+	/** The records the predicate accepts. */
 	filter(predicate: (key: K | null, value: V | null) => boolean, options?: NamedOptions): KStream<K, V>
+	/** The records the predicate rejects. */
 	filterNot(predicate: (key: K | null, value: V | null) => boolean, options?: NamedOptions): KStream<K, V>
 	/** Changes keys: a key-based operation downstream repartitions first. */
 	map<KR, VR>(mapper: (key: K | null, value: V | null) => KeyValue<KR, VR>, options?: NamedOptions): KStream<KR, VR>
+	/**
+	 * One new value per record; the key is kept. A mapper declaring two parameters gets the key too (ValueMapper:
+	 * give a two-parameter lambda explicit parameter types).
+	 */
 	mapValues<VR>(mapper: (value: V | null) => VR, options?: NamedOptions): KStream<K, VR>
 	mapValues<VR>(mapper: (key: K | null, value: V | null) => VR, options?: NamedOptions): KStream<K, VR>
-	/** Changes keys: a key-based operation downstream repartitions first. */
+	/** Zero or more records per record. Changes keys: a key-based operation downstream repartitions first. */
 	flatMap<KR, VR>(
 		mapper: (key: K | null, value: V | null) => Iterable<KeyValue<KR, VR>>,
 		options?: NamedOptions
 	): KStream<KR, VR>
+	/** Zero or more values per record, each with the record's key; the mapper's arity as for mapValues(). */
 	flatMapValues<VR>(mapper: (value: V | null) => Iterable<VR>, options?: NamedOptions): KStream<K, VR>
 	flatMapValues<VR>(mapper: (key: K | null, value: V | null) => Iterable<VR>, options?: NamedOptions): KStream<K, VR>
+	/** Calls the action for every record, then passes the record on. */
 	peek(action: (key: K | null, value: V | null) => void, options?: NamedOptions): KStream<K, V>
-	/** Terminal. */
+	/** Calls the action for every record. Terminal. */
 	foreach(action: (key: K | null, value: V | null) => void, options?: NamedOptions): void
 	/** Changes keys: a key-based operation downstream repartitions first. */
 	selectKey<KR>(mapper: (key: K | null, value: V | null) => KR, options?: NamedOptions): KStream<KR, V>
 	merge(other: KStream<K, V>, options?: NamedOptions): KStream<K, V>
-	/** Routes each record to the first branch whose predicate matches. */
+	/**
+	 * Splits the stream: each record goes to the first branch whose predicate matches, else to the default branch, if
+	 * any. Add branches with `branch()`, then end with `defaultBranch()` or `noDefaultBranch()`:
+	 * ```ts
+	 * const { 'kind-a': a, 'kind-other': other } = stream
+	 * 	.split({ name: 'kind-' })
+	 * 	.branch((key, value) => value?.type === 'a', { name: 'a' })
+	 * 	.defaultBranch({ name: 'other' })
+	 * ```
+	 */
 	split(options?: SplitOptions): BranchedKStream<K, V>
 	/** @deprecated Use split(): records go to the first matching predicate; unmatched records are dropped. */
 	branch(...predicates: ((key: K | null, value: V | null) => boolean)[]): KStream<K, V>[]
+	/**
+	 * Writes every record to `topic`, or to the topic the extractor names for the record. Codecs: `options` first,
+	 * then the stream's; without either, only Buffers can be written.
+	 */
 	to(topic: string | TopicNameExtractor<K | null, V | null>, options?: Produced<K, V>): void
 	/** @deprecated Use repartition(), or to() and stream(). Writes to a user topic and reads it back. */
 	through(topic: string, options?: Produced<K, V>): KStream<K, V>
-	/** Writes to and reads back the internal topic `<applicationId>-<name | repartition-N>-repartition`. */
+	/**
+	 * Writes to and reads back the internal topic `<applicationId>-<name | repartition-N>-repartition`, even if the keys
+	 * did not change; key-based operations downstream do not repartition again. Records with a null key are dropped
+	 * unless a left or outer join is downstream.
+	 */
 	repartition(options?: Repartitioned<K, V>): KStream<K, V>
 	toTable(options?: Materialized<K, V> & NamedOptions): KTable<K, V>
 	/** Always repartitions. */
@@ -90,20 +117,28 @@ export interface KStream<K, V> {
 		joiner: (key: K, value: V, tableValue: VT) => VR,
 		options?: Joined<K, V, VT>
 	): KStream<K, VR>
-	/** Stream-global table inner join on the key `keySelector` picks; no repartitioning. */
+	/**
+	 * Stream-global table inner join: each record looks up the global table's current value for the key
+	 * `keySelector` picks and is joined with it. No repartitioning: every instance holds the whole table, so the
+	 * topics need not be co-partitioned, and a key change upstream is still pending downstream. Records with a null
+	 * value, records whose selector returns null and records the table has no value for are dropped. Only stream
+	 * records produce results, with their key, timestamp and headers; the table is read as it is when the record is
+	 * processed (it is not synchronized with the stream's time).
+	 */
 	join<GK, GV, VR>(
 		globalTable: GlobalKTable<GK, GV>,
-		keySelector: (key: K | null, value: V) => GK | null,
+		keySelector: KeyValueMapper<K | null, V, GK | null>,
 		joiner: (value: V, globalValue: GV) => VR,
 		options?: NamedOptions
 	): KStream<K, VR>
+	/** Stream-global table inner join whose joiner also receives the record's key (not the selected one). */
 	join<GK, GV, VR>(
 		globalTable: GlobalKTable<GK, GV>,
-		keySelector: (key: K | null, value: V) => GK | null,
+		keySelector: KeyValueMapper<K | null, V, GK | null>,
 		joiner: (key: K | null, value: V, globalValue: GV) => VR,
 		options?: NamedOptions
 	): KStream<K, VR>
-	/** @deprecated Pass a key selector: `join(globalTable, (key) => key, joiner)`. */
+	/** @deprecated Pass a key selector: `join(globalTable, (key) => key, joiner)` (the record key is looked up). */
 	join<GV, VR>(globalTable: GlobalKTable<K, GV>, joiner: (value: V, globalValue: GV) => VR): KStream<K, VR>
 
 	/** Windowed stream-stream left join. */
@@ -129,19 +164,24 @@ export interface KStream<K, V> {
 		joiner: (key: K | null, value: V, tableValue: VT | null) => VR,
 		options?: Joined<K, V, VT>
 	): KStream<K, VR>
+	/**
+	 * Stream-global table left join: like the inner join, but records the table has no value for, and records whose
+	 * selector returns null (KIP-962), are joined with null. Records with a null value are dropped.
+	 */
 	leftJoin<GK, GV, VR>(
 		globalTable: GlobalKTable<GK, GV>,
-		keySelector: (key: K | null, value: V) => GK | null,
+		keySelector: KeyValueMapper<K | null, V, GK | null>,
 		joiner: (value: V, globalValue: GV | null) => VR,
 		options?: NamedOptions
 	): KStream<K, VR>
+	/** Stream-global table left join whose joiner also receives the record's key (not the selected one). */
 	leftJoin<GK, GV, VR>(
 		globalTable: GlobalKTable<GK, GV>,
-		keySelector: (key: K | null, value: V) => GK | null,
+		keySelector: KeyValueMapper<K | null, V, GK | null>,
 		joiner: (key: K | null, value: V, globalValue: GV | null) => VR,
 		options?: NamedOptions
 	): KStream<K, VR>
-	/** @deprecated Pass a key selector: `leftJoin(globalTable, (key) => key, joiner)`. */
+	/** @deprecated Pass a key selector: `leftJoin(globalTable, (key) => key, joiner)` (the record key is looked up). */
 	leftJoin<GV, VR>(globalTable: GlobalKTable<K, GV>, joiner: (value: V, globalValue: GV | null) => VR): KStream<K, VR>
 
 	/** Windowed stream-stream outer join. */
@@ -158,17 +198,36 @@ export interface KStream<K, V> {
 		options: Joined<K, V, VO>
 	): KStream<K, VR>
 
-	/** Processor API. The processor may change keys: a key-based operation downstream repartitions first. */
-	process<KR, VR>(supplier: ProcessorSupplier<K, V, KR, VR>, options?: ProcessOptions): KStream<KR, VR>
-	/** Processor API with the key kept. */
-	processValues<VR>(supplier: FixedKeyProcessorSupplier<K, V, VR>, options?: ProcessOptions): KStream<K, VR>
+	/**
+	 * Runs a processor of the Processor API (Kafka Streams' `process()`): every task creates its own instance with
+	 * `supplier()` (which must return a new processor per call), calls `init(context)`, then `process(record)` for each
+	 * record, and `close()` when the task closes. Through its context the processor forwards any number of records, reads
+	 * and writes the stores of `options.stores`, schedules stream-time and wall-clock punctuators, and requests commits.
+	 * The processor may change keys, so a key-based operation downstream repartitions first, and neither codec is known
+	 * downstream.
+	 */
+	process<KR, VR>(supplier: ProcessorSupplier<K | null, V | null, KR, VR>, options?: ProcessOptions): KStream<KR, VR>
+	/**
+	 * Like `process()`, with a processor that cannot change keys: it forwards FixedKeyRecords derived from its input
+	 * (`withValue()`, `withTimestamp()`, `withHeaders()`), so the key codec and the repartition flag are kept.
+	 */
+	processValues<VR>(
+		supplier: FixedKeyProcessorSupplier<K | null, V | null, VR>,
+		options?: ProcessOptions
+	): KStream<K, VR>
 }
 
-/** Built by `split()`: add branches, then end with defaultBranch() or noDefaultBranch(). */
+/**
+ * Built by `split()` (Kafka Streams' BranchedKStream): add branches, then end with `defaultBranch()` or
+ * `noDefaultBranch()`, which return the branches keyed `<split name><branch name>`. Without a split name, the prefix is
+ * the generated name of the split node (`KSTREAM-BRANCH-<n>`), as in Kafka Streams: name the split to destructure the
+ * result.
+ */
 export interface BranchedKStream<K, V> {
+	/** Adds a branch for the records the predicate matches that no earlier branch took. */
 	branch(predicate: (key: K | null, value: V | null) => boolean, options?: BranchOptions<K, V>): this
-	/** Records no predicate matched go to this branch. The result is keyed `<splitName><branchName>`. */
+	/** Ends the split with a branch for the records no predicate matched; returns the branches. */
 	defaultBranch(options?: BranchOptions<K, V>): Record<string, KStream<K, V>>
-	/** Records no predicate matched are dropped. The result is keyed `<splitName><branchName>`. */
+	/** Ends the split; records no predicate matched are dropped. Returns the branches. */
 	noDefaultBranch(): Record<string, KStream<K, V>>
 }
