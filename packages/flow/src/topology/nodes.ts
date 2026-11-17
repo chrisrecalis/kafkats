@@ -32,7 +32,10 @@ export interface ProcessorDef {
 
 /** Picks the partition of a record; undefined: the producer's default partitioning of the encoded key. */
 export type StreamPartitioner<K, V> = (topic: string, key: K, value: V, partitionCount: number) => number | undefined
-/** Picks the topic of a record (Kafka Streams' TopicNameExtractor). */
+/**
+ * Picks the topic of a record (Kafka Streams' TopicNameExtractor). `context`: the metadata of the input record being
+ * processed, null in punctuators.
+ */
 export type TopicNameExtractor<K, V> = (key: K, value: V, context: RecordMetadata | null) => string
 
 export interface SinkDef {

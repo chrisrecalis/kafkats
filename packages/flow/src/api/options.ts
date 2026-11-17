@@ -144,15 +144,22 @@ export type SuppressOptions =
 			whenFull?: 'emit-early' | 'shutdown'
 	  }
 
-/** Options of `split()`: the name prefixes every branch name in the result. */
+/** Options of `split()`. */
 export interface SplitOptions {
+	/** Names the split node and prefixes every branch name. Default: `KSTREAM-BRANCH-<n>`. */
 	name?: string
 }
 
 /** Options of one branch of `split()`. */
 export interface BranchOptions<K, V> {
-	/** Default: the 1-based position of the branch. */
+	/**
+	 * Appended to the split name, it names the branch node and its key in the result. Default: the 1-based position of
+	 * the branch, `0` for the default branch.
+	 */
 	name?: string
-	/** Applied to the branch; a chain that returns nothing omits the branch from the result. */
+	/**
+	 * Builds on the branch; what it returns replaces the branch in the result, and a chain that returns nothing (for
+	 * example one ending in `to()`) leaves the branch out of the result.
+	 */
 	chain?: (stream: KStream<K, V>) => KStream<K, V> | void
 }

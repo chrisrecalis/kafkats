@@ -203,7 +203,7 @@ describe('DSL shells delegate every method to its operator builder', () => {
 	})
 
 	it('the split builder adds branches in order and returns itself', () => {
-		const branched = new BranchedKStreamImpl(stream, options)
+		const branched = new BranchedKStreamImpl(stream, 'splitter', [])
 		expect(branched.branch(fn, { name: 'a' }).branch(fn)).toBe(branched)
 		expect(stateless.addBranch).toHaveBeenNthCalledWith(1, branched, fn, { name: 'a' })
 		expect(stateless.addBranch).toHaveBeenNthCalledWith(2, branched, fn, undefined)

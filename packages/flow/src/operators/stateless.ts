@@ -124,14 +124,23 @@ export function passThroughProcessor<K, V>(): ProcessorSupplier<K, V, K, V> {
 	return stateless((context, record) => context.forward(record))
 }
 
-/** Each record goes to the child of the first matching predicate only; records no predicate matches are dropped. */
-export function branchProcessor<K, V>(
-	predicates: readonly ((key: K, value: V) => boolean)[],
-	children: readonly string[]
-): ProcessorSupplier<K, V, K, V> {
+/** A branch of a splitter: its records go to `child`. A branch without a predicate (a default branch) takes any record. */
+export interface BranchRoute<K, V> {
+	readonly child: string
+	readonly predicate?: (key: K, value: V) => boolean
+}
+
+/**
+ * The splitter of `split()` and `branch()` (KS KStreamBranch): each record goes to the child of the first matching
+ * branch only; records no branch matches are dropped. `branches` may grow until the topology is built.
+ */
+export function branchProcessor<K, V>(branches: readonly BranchRoute<K, V>[]): ProcessorSupplier<K, V, K, V> {
 	return stateless((context, record) => {
-		const index = predicates.findIndex(predicate => predicate(record.key, record.value))
-		return index < 0 ? undefined : context.forward(record, children[index])
+		for (const { child, predicate } of branches) {
+			if (predicate === undefined || predicate(record.key, record.value)) {
+				return context.forward(record, child)
+			}
+		}
 	})
 }
 
