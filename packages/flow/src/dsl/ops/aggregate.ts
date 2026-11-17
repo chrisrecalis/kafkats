@@ -101,7 +101,7 @@ function materialize<K, V, A>(
 ): KTable<K, A> {
 	const operator = `${kind}()`
 	const keyCodec = requireCodec(options.key, grouped.stream.format.keyCodec, 'key', operator)
-	const input = aggregationInput(grouped, keyCodec)
+	const input = aggregationInput(grouped, keyCodec, options.storeName)
 	const { ctx } = input
 	const [storePrefix, nodePrefix] = PREFIXES[kind]
 	const store = storeName(ctx.builder, storePrefix, options.storeName)

@@ -464,7 +464,9 @@ describe('stream-stream joins', () => {
 		])
 		const join = topology.subtopologyOf('app-pairs-left-repartition')!
 		expect(join).toBe(topology.subtopologyOf('r'))
+		expect(topology.subtopologyOf('l')!.nodes.map(n => n.name)).toContain('pairs-left-repartition-sink')
 		expect(join.nodes.map(n => n.name).filter(n => n.startsWith('pairs'))).toEqual([
+			'pairs-left-repartition-source',
 			'pairs-this-join',
 			'pairs-other-join',
 			'pairs-merge',

@@ -14,7 +14,7 @@ import type { Codec } from '@/codec.js'
 import type { DslContext } from '@/dsl/context.js'
 import { requireCodec } from '@/dsl/format.js'
 import { KStreamImpl } from '@/dsl/kstream.js'
-import { NodePrefix, storeName, StorePrefix } from '@/dsl/naming.js'
+import { NodePrefix, storeName, StorePrefix, suffixed } from '@/dsl/naming.js'
 import { repartitionIfRequired } from '@/dsl/ops/repartition.js'
 import { joinRetentionMs } from '@/dsl/retention.js'
 import { JoinWindows, joinWindowsWithin } from '@/dsl/windows.js'
@@ -63,8 +63,7 @@ export function streamStreamJoin<K, V, VO, VR>(
 		`${operator} of the other stream`
 	)
 
-	const { name } = options
-	const named = (suffix: string) => (name === undefined ? undefined : `${name}-${suffix}`)
+	const named = (suffix: string) => suffixed(options.name, suffix)
 	const thisSide = repartitionIfRequired(stream, { name: named('left'), owner: {}, codecs: { key, value }, operator })
 	const otherSide = repartitionIfRequired(right, {
 		name: named('right'),
@@ -140,7 +139,7 @@ function addStores<K, V, VO>(
 	const base = (options as StreamJoined<K, V, VO>).storeName ?? options.name
 	/** `<base>-<suffix>`, or a generated `<prefix>-<generated>-<n>`. */
 	const name = (suffix: string, generated: string) =>
-		base === undefined ? storeName(ctx.builder, `${STORE_PREFIX[kind]}-${generated}`) : `${base}-${suffix}`
+		suffixed(base, suffix) ?? storeName(ctx.builder, `${STORE_PREFIX[kind]}-${generated}`)
 	const logging = options.changelog
 	const add = (builder: StoreBuilder): string => {
 		ctx.builder.addStateStore(builder)

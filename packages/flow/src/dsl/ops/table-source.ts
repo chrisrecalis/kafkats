@@ -10,7 +10,7 @@ import { requireCodec, sourceFormat, type StreamFormat } from '@/dsl/format.js'
 import { GlobalKTableImpl } from '@/dsl/global-ktable.js'
 import type { KStreamImpl } from '@/dsl/kstream.js'
 import { KTableImpl } from '@/dsl/ktable.js'
-import { NodePrefix, storeName, StorePrefix } from '@/dsl/naming.js'
+import { NodePrefix, storeName, StorePrefix, suffixed } from '@/dsl/naming.js'
 import { repartitionIfRequired } from '@/dsl/ops/repartition.js'
 import { KTableSource } from '@/operators/ktable-source.js'
 import type { ProcessorSupplier } from '@/processor/api.js'
@@ -21,7 +21,7 @@ export type TableConsumed<K, V> = Consumed<K, V> & { materialized?: Materialized
 /** `app.table()`: the source node, then the table's KTableSource (`<name>-table-source` when the source is named). */
 export function table<K, V>(ctx: DslContext, topic: string, options: TableConsumed<K, V> = {}): KTable<K, V> {
 	const source = ctx.source(topic, options)
-	const name = options.name === undefined ? undefined : `${options.name}-table-source`
+	const name = suffixed(options.name, 'table-source')
 	const store = storeName(ctx.builder, StorePrefix.table(topic), options.materialized?.storeName)
 	return materialize(ctx, source, store, name, NodePrefix.TABLE_SOURCE, sourceFormat(options), options.materialized)
 }
@@ -51,10 +51,7 @@ export function globalTable<K, V>(ctx: DslContext, topic: string, options: Table
 	const store = storeName(builder, StorePrefix.globalTable(topic), options.materialized?.storeName)
 	const codecs = storeCodecs(format, options.materialized)
 	const sourceName = builder.nodeName(NodePrefix.SOURCE, options.name)
-	const processorName = builder.nodeName(
-		NodePrefix.TABLE_SOURCE,
-		options.name === undefined ? undefined : `${options.name}-table-source`
-	)
+	const processorName = builder.nodeName(NodePrefix.TABLE_SOURCE, suffixed(options.name, 'table-source'))
 	builder.addGlobalStore({
 		topic,
 		sourceName,

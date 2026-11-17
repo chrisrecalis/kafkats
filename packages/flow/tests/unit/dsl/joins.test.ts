@@ -367,7 +367,7 @@ describe('join wiring (copied from flow.test.ts)', () => {
 
 		const topology = internals(app).build()
 		const perRegion = topology.subtopologies.find(s => s.stores.some(store => store.name === 'per-region'))
-		expect([...perRegion!.sourceTopics]).toEqual(['app-repartition-0-repartition'])
+		expect([...perRegion!.sourceTopics]).toEqual(['app-per-region-repartition'])
 	})
 
 	it('BC10: joins the results of a windowed aggregation with a table without repartitioning them', () => {

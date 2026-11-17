@@ -11,7 +11,7 @@ import type { Codec } from '@/codec.js'
 import type { DslContext } from '@/dsl/context.js'
 import type { StreamFormat } from '@/dsl/format.js'
 import { KTableImpl } from '@/dsl/ktable.js'
-import { NodePrefix, storeName, StorePrefix } from '@/dsl/naming.js'
+import { NodePrefix, storeName, StorePrefix, suffixed } from '@/dsl/naming.js'
 import { durationMs } from '@/dsl/windows.js'
 import { suppressBufferStoreBuilder } from '@/operators/suppress-buffer.js'
 import { KTableSuppress, type Suppression } from '@/operators/suppress.js'
@@ -21,7 +21,7 @@ export function suppress<K, V>(table: KTableImpl<K, V>, options: SuppressOptions
 	const { ctx } = table
 	const suppression = resolve(table, options)
 	const codecs = { key: bufferCodec<K>(table.format, 'key'), value: bufferCodec<V>(table.format, 'value') }
-	const store = options.name === undefined ? storeName(ctx.builder, StorePrefix.SUPPRESS) : `${options.name}-store`
+	const store = suffixed(options.name, 'store') ?? storeName(ctx.builder, StorePrefix.SUPPRESS)
 	ctx.builder.addStateStore(suppressBufferStoreBuilder(ctx.changelog, store))
 	const node = new KTableSuppress(table.table, store, suppression, codecs)
 	const processor = ctx.processor(NodePrefix.TABLE_SUPPRESS, options.name, [table.node], node.supplier, [store])

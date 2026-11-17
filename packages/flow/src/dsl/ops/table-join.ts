@@ -11,7 +11,7 @@ import type { KTable } from '@/api/ktable.js'
 import type { Joined, TableOptions } from '@/api/options.js'
 import { warnDeprecated } from '@/dsl/deprecation.js'
 import { KTableImpl } from '@/dsl/ktable.js'
-import { NodePrefix } from '@/dsl/naming.js'
+import { NodePrefix, suffixed } from '@/dsl/naming.js'
 import { derivedFormat, materializedStore } from '@/dsl/ops/table-ops.js'
 import { KTableJoin, type TableJoiner, type TableJoinKind } from '@/operators/ktable-join.js'
 
@@ -48,17 +48,16 @@ export function tableJoin<K, V, VO, VR>(
 
 	// Kafka Streams' naming order: the merger, then this side, then the other side.
 	const merger = ctx.builder.nodeName(NodePrefix.TABLE_MERGE, name)
-	const named = (suffix: string) => (name === undefined ? undefined : `${name}-${suffix}`)
 	const thisSide = ctx.processor(
 		NodePrefix.TABLE_JOIN_THIS,
-		named('join-this'),
+		suffixed(name, 'join-this'),
 		[table.node],
 		join.thisSide,
 		right.table.valueGetter.storeNames
 	)
 	const otherSide = ctx.processor(
 		NodePrefix.TABLE_JOIN_OTHER,
-		named('join-other'),
+		suffixed(name, 'join-other'),
 		[right.node],
 		join.otherSide,
 		table.table.valueGetter.storeNames

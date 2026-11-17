@@ -10,11 +10,11 @@ import type { Produced, Repartitioned } from '@/api/options.js'
 import type { Codec } from '@/codec.js'
 import { requireCodec } from '@/dsl/format.js'
 import type { KStreamImpl } from '@/dsl/kstream.js'
-import { repartitionName } from '@/dsl/naming.js'
+import { repartitionName, suffixed } from '@/dsl/naming.js'
 import { addSink } from '@/dsl/ops/to.js'
 
 export interface RepartitionOptions<K, V> {
-	/** Names the topic `<applicationId>-<name>-repartition`; generated (`repartition-<n>`) otherwise. */
+	/** Names the topic `<applicationId>-<name>-repartition` and its nodes; generated (`repartition-<n>`) otherwise. */
 	readonly name?: string
 	/** Who claims the name: the same owner (a named grouping) gets the same topic, another one a TopologyError. */
 	readonly owner: object
@@ -36,9 +36,7 @@ export function repartitionIfRequired<K, V>(
 		return stream
 	}
 	const codecs = requiredCodecs(stream, options.codecs, options.operator)
-	const { builder } = stream.ctx
-	const topic = builder.addRepartitionTopic(repartitionName(builder, options.name), options.owner)
-	return writeAndReadBack(stream, topic, codecs, 'repartition')
+	return viaRepartitionTopic(stream, options.name, { owner: options.owner }, codecs)
 }
 
 /**
@@ -50,9 +48,8 @@ export function repartitionIfRequired<K, V>(
  */
 export function repartition<K, V>(stream: KStreamImpl<K, V>, options: Repartitioned<K, V> = {}): KStream<K, V> {
 	const codecs = requiredCodecs(stream, options, 'repartition()')
-	const { builder } = stream.ctx
-	const topic = builder.addRepartitionTopic(repartitionName(builder, options.name), {}, options.numberOfPartitions)
-	return writeAndReadBack(stream, topic, { ...codecs, partitioner: options.partitioner }, 'repartition')
+	const claim = { owner: {}, partitions: options.numberOfPartitions }
+	return viaRepartitionTopic(stream, options.name, claim, { ...codecs, partitioner: options.partitioner })
 }
 
 /**
@@ -77,18 +74,37 @@ function requiredCodecs<K, V>(
 }
 
 /**
- * Writes `stream` to `topic` and returns what is read back from it, decoded with the codecs it was written with (raw
- * Buffers where neither the options nor the format have one): a new stream that needs no repartitioning.
+ * Writes `stream` to the repartition topic `<applicationId>-<name | repartition-<n>>-repartition`, claimed for `owner`,
+ * and reads it back. A named repartition names its nodes after the topic, `<name>-repartition-sink` and
+ * `<name>-repartition-source` (KS `KStreamImpl.createRepartitionedSource`); an unnamed one generates them.
+ */
+function viaRepartitionTopic<K, V>(
+	stream: KStreamImpl<K, V>,
+	name: string | undefined,
+	claim: { readonly owner: object; readonly partitions?: number },
+	produced: Produced<K, V>
+): KStreamImpl<K, V> {
+	const { builder } = stream.ctx
+	const topic = builder.addRepartitionTopic(repartitionName(builder, name), claim.owner, claim.partitions)
+	const sink = { ...produced, name: suffixed(name, 'repartition-sink') }
+	return writeAndReadBack(stream, topic, sink, 'repartition', suffixed(name, 'repartition-source'))
+}
+
+/**
+ * Writes `stream` to `topic` with the sink `produced.name` and returns what is read back from it by the source
+ * `sourceName` (both generated without a name), decoded with the codecs it was written with (raw Buffers where neither
+ * the options nor the format have one): a new stream that needs no repartitioning.
  */
 function writeAndReadBack<K, V>(
 	stream: KStreamImpl<K, V>,
 	topic: string,
 	produced: Produced<K, V>,
-	internal: 'repartition' | 'through'
+	internal: 'repartition' | 'through',
+	sourceName?: string
 ): KStreamImpl<K, V> {
 	const { ctx, format } = stream
 	addSink(stream, topic, produced, internal === 'repartition' ? 'repartition' : false)
 	const key = produced.key ?? (format.keyCodec as Codec<K> | undefined)
 	const value = produced.value ?? (format.valueCodec as Codec<V> | undefined)
-	return ctx.stream(topic, { key, value }, internal)
+	return ctx.stream(topic, { key, value, name: sourceName }, internal)
 }
