@@ -30,3 +30,14 @@ export function clockedSessionStore(name: string, retentionMs: number) {
 	const clock = new TaskStoreClock(new ProcessorMetadataImpl(), name, retentionMs)
 	return { inner, store: new ClockedSessionStore(inner, clock, retentionMs) }
 }
+
+/** A session-layout store of timestamped numbers (sliding-window aggregations) and the provider store under it. */
+export function clockedSlidingStore(name: string, retentionMs: number) {
+	const inner = new InMemorySessionStore<string, ValueAndTimestamp<number>>(name, {
+		keyCodec,
+		valueCodec: valueAndTimestampCodec(valueCodec),
+		retentionMs,
+	})
+	const clock = new TaskStoreClock(new ProcessorMetadataImpl(), name, retentionMs)
+	return { inner, store: new ClockedSessionStore(inner, clock, retentionMs) }
+}

@@ -38,7 +38,7 @@ export type SessionMergerArg<K, A> =
 	| ((key: K, aggregate1: A, aggregate2: A) => A)
 	| (WindowedAggregateOptions<K, A> & { merger: (aggregate1: A, aggregate2: A) => A })
 
-/** Store-name and node-name prefixes of each kind (time and session windows share the store prefixes, as today). */
+/** Store-name and node-name prefixes of each kind, shared by time windows, sessions (as today) and sliding windows. */
 const PREFIXES: Readonly<Record<AggregationKind, readonly [store: string, node: string]>> = {
 	count: [StorePrefix.WINDOW_COUNT, NodePrefix.AGGREGATE],
 	reduce: [StorePrefix.WINDOW_REDUCE, NodePrefix.REDUCE],
@@ -193,7 +193,7 @@ function sessionWindowed<K, V, A>(
  * Registers the aggregation's store and processor (after the repartitioning its input needs); returns its table,
  * keyed by `Windowed<K>`. Its options are validated before anything is registered.
  */
-function materialize<K, V, A>(
+export function materialize<K, V, A>(
 	grouped: KGroupedStreamImpl<K, V>,
 	kind: AggregationKind,
 	options: WindowedAggregateOptions<K, A>,
