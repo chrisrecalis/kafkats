@@ -1,29 +1,100 @@
-/** Non-windowed KGroupedStream aggregations: count, reduce, aggregate (6.3). */
+/**
+ * Non-windowed KGroupedStream aggregations (6.3): count, reduce and aggregate, each materialized in its own timestamped
+ * key-value store; the result table's format is the store's codecs.
+ */
+import { TopologyError } from '@/api/errors.js'
 import type { KTable } from '@/api/ktable.js'
 import type { AggregateOptions } from '@/api/options.js'
+import type { Codec } from '@/codec.js'
+import { requireCodec } from '@/dsl/format.js'
 import type { KGroupedStreamImpl } from '@/dsl/kgrouped-stream.js'
-import { notImplemented } from '@/dsl/not-implemented.js'
+import { KTableImpl } from '@/dsl/ktable.js'
+import { NodePrefix, storeName, StorePrefix } from '@/dsl/naming.js'
+import { aggregationInput } from '@/dsl/ops/grouping.js'
+import { aggregateWith, KStreamAggregate, reduceWith, type Aggregation } from '@/operators/kstream-aggregate.js'
+import { timestampedKeyValueStoreBuilder } from '@/state/store-builders.js'
+
+/** Default codec of counts: an 8-byte little-endian double (today's format; WP3.10 switches to KS's int64). */
+export const COUNT_CODEC: Codec<number> = {
+	encode: count => {
+		const encoded = Buffer.alloc(8)
+		encoded.writeDoubleLE(count, 0)
+		return encoded
+	},
+	decode: encoded => encoded.readDoubleLE(0),
+}
+
+/** count(): +1 per record; merging two counts adds them. */
+export const counting = {
+	initializer: (): number => 0,
+	aggregator: (_key: unknown, _value: unknown, count: number): number => count + 1,
+	merger: (_key: unknown, count1: number, count2: number): number => count1 + count2,
+}
+
+/** The codec of aggregates of another type than the values: only Materialized.value can give it. */
+export function requireAggregateCodec<A>(codec: Codec<A> | undefined, operator: string): Codec<A> {
+	if (codec === undefined) {
+		throw new TopologyError(`${operator} needs a codec for its aggregates: pass one as the value option`)
+	}
+	return codec
+}
+
+/** count(), reduce() or aggregate(). */
+export type AggregationKind = 'count' | 'reduce' | 'aggregate'
+
+/** Store-name and node-name prefixes of each kind. */
+const PREFIXES: Readonly<Record<AggregationKind, readonly [store: string, node: string]>> = {
+	count: [StorePrefix.COUNT, NodePrefix.AGGREGATE],
+	reduce: [StorePrefix.REDUCE, NodePrefix.REDUCE],
+	aggregate: [StorePrefix.AGGREGATE, NodePrefix.AGGREGATE],
+}
 
 export function count<K, V>(
-	_grouped: KGroupedStreamImpl<K, V>,
-	_options?: AggregateOptions<K, number>
+	grouped: KGroupedStreamImpl<K, V>,
+	options: AggregateOptions<K, number> = {}
 ): KTable<K, number> {
-	return notImplemented('KGroupedStream.count')
+	const aggregation = aggregateWith<K, V, number>(counting.initializer, counting.aggregator)
+	return materialize(grouped, 'count', options, options.value ?? COUNT_CODEC, aggregation)
 }
 
 export function reduce<K, V>(
-	_grouped: KGroupedStreamImpl<K, V>,
-	_reducer: (aggregate: V, value: V) => V,
-	_options?: AggregateOptions<K, V>
+	grouped: KGroupedStreamImpl<K, V>,
+	reducer: (aggregate: V, value: V) => V,
+	options: AggregateOptions<K, V> = {}
 ): KTable<K, V> {
-	return notImplemented('KGroupedStream.reduce')
+	const valueCodec = requireCodec(options.value, grouped.stream.format.valueCodec, 'value', 'reduce()')
+	return materialize(grouped, 'reduce', options, valueCodec, reduceWith(reducer))
 }
 
 export function aggregate<K, V, A>(
-	_grouped: KGroupedStreamImpl<K, V>,
-	_initializer: () => A,
-	_aggregator: (key: K, value: V, aggregate: A) => A,
-	_options?: AggregateOptions<K, A>
+	grouped: KGroupedStreamImpl<K, V>,
+	initializer: () => A,
+	aggregator: (key: K, value: V, aggregate: A) => A,
+	options: AggregateOptions<K, A> = {}
 ): KTable<K, A> {
-	return notImplemented('KGroupedStream.aggregate')
+	const valueCodec = requireAggregateCodec(options.value, 'aggregate()')
+	return materialize(grouped, 'aggregate', options, valueCodec, aggregateWith(initializer, aggregator))
+}
+
+/** Registers the aggregation's store and processor (after the repartitioning its input needs); returns its table. */
+function materialize<K, V, A>(
+	grouped: KGroupedStreamImpl<K, V>,
+	kind: AggregationKind,
+	options: AggregateOptions<K, A>,
+	valueCodec: Codec<A>,
+	aggregation: Aggregation<K, V, A>
+): KTable<K, A> {
+	const operator = `${kind}()`
+	const keyCodec = requireCodec(options.key, grouped.stream.format.keyCodec, 'key', operator)
+	const input = aggregationInput(grouped, keyCodec)
+	const { ctx } = input
+	const [storePrefix, nodePrefix] = PREFIXES[kind]
+	const store = storeName(ctx.builder, storePrefix, options.storeName)
+	const logging = options.changelog
+	ctx.builder.addStateStore(
+		timestampedKeyValueStoreBuilder(ctx.changelog, { name: store, keyCodec, valueCodec, logging })
+	)
+	const node = new KStreamAggregate<K, V, A>(store, aggregation)
+	const processor = ctx.processor(nodePrefix, options.name, [input.node], node.supplier, [store])
+	return new KTableImpl<K, A>(ctx, processor, { keyCodec, valueCodec }, node)
 }
