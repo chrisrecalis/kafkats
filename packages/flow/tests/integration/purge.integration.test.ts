@@ -1,7 +1,8 @@
 /**
- * Internal topics against the broker (4.1.5, 4.8.6, BC20): records of a repartition topic below the app's committed
- * offset are deleted after commits (DeleteRecords), never one that is not processed yet; `repartitionPurgeIntervalMs:
- * 0` keeps them; a missing changelog with `changelog.autoCreate: false` fails the start (W17).
+ * Internal topics against the broker (4.1.5, 4.8.6, 5.4, BC20): records of a repartition topic below the app's
+ * committed offset are deleted after commits (DeleteRecords), never one that is not processed yet;
+ * `repartitionPurgeIntervalMs: 0` keeps them; the global `changelog.topicConfigs` reach the created changelog and
+ * repartition topics (B3); a missing changelog with `changelog.autoCreate: false` fails the start (W17).
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { string, type KafkaClient, type Producer } from '@kafkats/client'
@@ -134,6 +135,42 @@ describe('internal topics', () => {
 			await app.close()
 		}
 	}, 60_000)
+
+	// B3: the global topic configs reach the topics flow creates. The broker shows it: with `max.message.bytes` 4096,
+	// a record above it is rejected, which fails the app (production handler 'fail'), naming the topic.
+	describe.each(['changelog', 'repartition'] as const)('changelog.topicConfigs on a %s topic', kind => {
+		it('is applied when flow creates it', async () => {
+			const input = uniqueTopicName(`configs-${kind}-in`)
+			const out = uniqueTopicName(`configs-${kind}-out`)
+			await createTopics(client, [{ name: input }, { name: out }])
+			const app = flow({
+				applicationId: uniqueTopicName(`configs-${kind}`),
+				client,
+				commitIntervalMs: 200,
+				consumer: { maxWaitMs: 100 },
+				changelog: { topicConfigs: { 'max.message.bytes': '4096' } },
+			})
+			app.stream(input, strings)
+				.groupBy(() => 'all', strings)
+				.reduce((aggregate, value) => aggregate + value, strings)
+				.toStream()
+				.to(out, strings)
+			const topic = [...internals(app).build().internalTopics.values()].find(spec => spec.kind === kind)!.name
+			try {
+				await app.start()
+				// Changelog: the aggregate outgrows the limit at the third value. Repartition: one value is above it.
+				const values = kind === 'changelog' ? ['a', 'b', 'c'].map(c => c.repeat(1500)) : ['d'.repeat(5000)]
+				for (const value of values) {
+					await producer.send(input, { key: Buffer.from('k'), value: Buffer.from(value) })
+					await sleep(500)
+				}
+				await until('ERROR', async () => app.state() === 'ERROR', 15_000)
+				expect(app.getError()?.message).toContain(`'${topic}'`)
+			} finally {
+				await app.close()
+			}
+		}, 60_000)
+	})
 
 	it('a missing changelog with changelog.autoCreate false fails the start with SourceTopicNotFoundError', async () => {
 		const input = uniqueTopicName('autocreate-in')

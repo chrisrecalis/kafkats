@@ -1,6 +1,7 @@
 /**
  * Round 3 / attack 2: KTable.groupBy count/reduce/aggregate against a ground truth computed from the final table
- * contents, with 2 instances x 2 threads, random row moves / tombstones / re-adds, instance churn and commit failures.
+ * contents, with 4 instances (formerly 2 instances x 2 threads), random row moves / tombstones / re-adds, instance
+ * churn and commit failures.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { KafkaClient, Producer } from '@kafkats/client'
@@ -38,7 +39,6 @@ describe('hardening: KTable.groupBy vs ground truth', () => {
 		input: string,
 		outs: { count: string; sum: string; agg: string },
 		guarantee: 'at_least_once' | 'exactly_once',
-		threads: number,
 		client: KafkaClient
 	): FlowApp => {
 		const app = flow({
@@ -82,7 +82,7 @@ describe('hardening: KTable.groupBy vs ground truth', () => {
 		guarantee: 'at_least_once' | 'exactly_once'
 		failCommits: boolean
 		churn: boolean
-		threads: number
+		instances: number
 		seed: number
 	}) {
 		const input = uniqueTopicName('r3-tg-in')
@@ -106,9 +106,9 @@ describe('hardening: KTable.groupBy vs ground truth', () => {
 					commits += 1
 					return commits % 7 === 0 && commits <= 70
 				})
-			return build(applicationId, input, outs, opts.guarantee, opts.threads, c)
+			return build(applicationId, input, outs, opts.guarantee, c)
 		}
-		const apps: FlowApp[] = [mk(opts.failCommits), mk(opts.failCommits)]
+		const apps: FlowApp[] = Array.from({ length: opts.instances }, () => mk(opts.failCommits))
 		const rnd = lcg(opts.seed)
 		const table = new Map<string, number>() // ground truth: last value per key
 		try {
@@ -183,14 +183,14 @@ describe('hardening: KTable.groupBy vs ground truth', () => {
 	}
 
 	for (const guarantee of ['exactly_once', 'at_least_once'] as const) {
-		it(`${guarantee}: 2 instances x 2 threads, moves/tombstones/re-adds + churn => final per group equals truth`, async () => {
-			const r = await scenario({ guarantee, failCommits: false, churn: true, threads: 2, seed: 7 })
+		it(`${guarantee}: 4 instances, moves/tombstones/re-adds + churn => final per group equals truth`, async () => {
+			const r = await scenario({ guarantee, failCommits: false, churn: true, instances: 4, seed: 7 })
 			expect(r.got).toEqual(r.want)
 		}, 85_000)
 	}
 
-	it('exactly_once: injected commit failures + 2 instances x 2 threads => final per group equals truth', async () => {
-		const r = await scenario({ guarantee: 'exactly_once', failCommits: true, churn: false, threads: 2, seed: 11 })
+	it('exactly_once: injected commit failures + 4 instances => final per group equals truth', async () => {
+		const r = await scenario({ guarantee: 'exactly_once', failCommits: true, churn: false, instances: 4, seed: 11 })
 		expect(r.commits).toBeGreaterThan(7)
 		expect(r.got).toEqual(r.want)
 	}, 85_000)
