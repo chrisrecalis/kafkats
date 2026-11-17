@@ -20,7 +20,7 @@ export { codec, string, json, buffer } from '@/codec.js'
 export type { Codec } from '@/codec.js'
 
 // Producer
-export { Producer } from '@/producer/index.js'
+export { Producer, murmur2, toPositive } from '@/producer/index.js'
 export type {
 	ProducerConfig,
 	ProducerMessage,

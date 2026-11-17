@@ -27,6 +27,8 @@ export type {
 // Codecs
 export { codec, string, json, buffer } from '@/codec.js'
 export type { Codec } from '@/codec.js'
+export { WindowedCodecs } from '@/operators/windowed.js'
+export type { WindowedCodec } from '@/operators/windowed.js'
 
 // State stores
 export {
