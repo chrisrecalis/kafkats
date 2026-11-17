@@ -1,7 +1,7 @@
 import { IllegalStateError } from '@/api/errors.js'
 import { ChangelogWriter, windowedKeyCodec } from '@/changelog/writer.js'
 import type { Codec } from '@/codec.js'
-import type { ProcessorMetadata, TaskId } from '@/processor/api.js'
+import type { TaskId } from '@/processor/api.js'
 import type { TaskOutput } from '@/processor/output.js'
 import type { KeyValueStore, SessionStore, StateStore, WindowedKey, WindowStore } from '@/state.js'
 import type { Checkpoints } from '@/state/checkpoints.js'
@@ -12,7 +12,13 @@ import {
 	ChangelogBackedWindowStore,
 } from '@/state/logging.js'
 import type { StateDirectory } from '@/state/state-directory.js'
-import { ClockedSessionStore, ClockedWindowStore, TaskStoreClock, type StoreClock } from '@/state/time-clipping.js'
+import {
+	ClockedSessionStore,
+	ClockedWindowStore,
+	TaskStoreClock,
+	type ClockMetadata,
+	type StoreClock,
+} from '@/state/time-clipping.js'
 import {
 	TransactionalKeyValueStore,
 	TransactionalSessionStore,
@@ -41,7 +47,7 @@ export interface TaskStateManagerDeps {
 	readonly eos: boolean
 	readonly checkpoints: Checkpoints
 	/** The task's processor metadata (one object per task, updated in place): store clocks persist into it. */
-	readonly metadata: ProcessorMetadata
+	readonly metadata: ClockMetadata
 }
 
 type KeyValue = KeyValueStore<unknown, unknown>

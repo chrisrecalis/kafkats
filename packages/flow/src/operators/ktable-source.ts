@@ -3,26 +3,20 @@
  * dropped; a null value deletes the key. Every update is written to the table's timestamped store and forwarded as
  * a Change, with the old value once downstream asked for old values.
  */
-import { storeValueGetter, type KTableNode, type KTableValueGetterSupplier } from '@/operators/ktable-node.js'
+import { MaterializedTableNode, storeValueGetter, type KTableValueGetterSupplier } from '@/operators/ktable-node.js'
 import type { Change } from '@/operators/change.js'
 import type { InternalProcessorContext, Processor, ProcessorContext, ProcessorSupplier } from '@/processor/api.js'
 import type { StreamRecord } from '@/processor/record.js'
 import type { TimestampedKeyValueStore } from '@/state.js'
 
-export class KTableSource<K, V> implements KTableNode<K, V> {
+export class KTableSource<K, V> extends MaterializedTableNode<K, V> {
 	readonly supplier: ProcessorSupplier<K, V | null, K, Change<V>>
 	readonly valueGetter: KTableValueGetterSupplier<K, V>
-	private sendOldValues = false
 
 	constructor(readonly storeName: string) {
-		this.supplier = () => new KTableSourceProcessor<K, V>(storeName, () => this.sendOldValues)
+		super()
+		this.supplier = () => new KTableSourceProcessor<K, V>(storeName, this.sendOldValues)
 		this.valueGetter = storeValueGetter(storeName)
-	}
-
-	/** A source table is always materialized: its store has the old values. */
-	enableSendingOldValues(): boolean {
-		this.sendOldValues = true
-		return true
 	}
 }
 

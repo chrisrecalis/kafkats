@@ -7,6 +7,7 @@ import { codec } from '@/codec.js'
 import { DslContext } from '@/dsl/context.js'
 import { JoinWindows, SessionWindows, SlidingWindows, TimeWindows } from '@/dsl/windows.js'
 import { decodeCommitMetadata } from '@/processor/metadata.js'
+import type { StreamTask } from '@/runtime/task.js'
 import type { SessionStore } from '@/state.js'
 import type { TaskStateManager } from '@/state/state-manager.js'
 import { TestDriver, type TestContextApi, type TestDriverConfig } from '@/testing/driver.js'
@@ -518,10 +519,14 @@ describe('stream-stream joins', () => {
 				ctx.getStateStore<SessionStore<string, string[]>>(store).approximateNumEntries()
 			// R's expiry ran by the shared clock's cadence, but L is the newest record of its buffer: it stays.
 			expect(await entries('stream-join-left-0')).toBe(1)
-			// A minute of stream time later, each buffer drops what is past its retention by its own clock.
+			// A minute of stream time later, each buffer drops what is past its retention by its own clock as of the last
+			// commit: R2's expiry drops L, not R, which is the newest record of the committed right buffer.
 			await send(ctx, 'l', 'k', 'L2', 100_000)
 			await send(ctx, 'r', 'k', 'R2', 1_100_000)
 			expect(await entries('stream-join-left-0')).toBe(1)
+			expect(await entries('stream-join-right-1')).toBe(2)
+			await send(ctx, 'l', 'k', 'L3', 1_200_000)
+			expect(await entries('stream-join-left-0')).toBe(2)
 			expect(await entries('stream-join-right-1')).toBe(1)
 		})
 	})
@@ -589,4 +594,30 @@ describe('stream-stream joins', () => {
 			expect(h.output('out').map(o => [o.value, o.timestamp])).toEqual([['A+null', 100]])
 		})
 	}
+
+	it('at-least-once: a match forwarded after the last commit is forwarded again by the revived task', async () => {
+		const h = new TaskHarness({
+			build: builder => {
+				const ctx = new DslContext(builder, { applicationId: APP })
+				const left: KStream<string, string> = ctx.stream('l', S)
+				const right: KStream<string, string> = ctx.stream('r', S)
+				left.join(right, joiner, JoinWindows.ofTimeDifferenceWithNoGrace(10)).to('out', S)
+			},
+		})
+		const first = await h.start(h.task())
+		h.enqueue(first, 'l', [{ key: 'a', value: 'A', timestamp: 100 }])
+		await h.process(first)
+		expect(await h.commit()).toBe('committed')
+		const uncommitted = async (task: StreamTask) => {
+			h.enqueue(task, 'r', [{ key: 'a', value: 'R', timestamp: 105 }])
+			await h.process(task)
+			// Its expiry pass runs with the left buffer's clock past the retention of A.
+			h.enqueue(task, 'l', [{ key: 'b', value: 'B', timestamp: 70_000 }])
+			await h.process(task)
+		}
+		await uncommitted(first)
+		// Revived as after a failed send: the replay finds A again.
+		await uncommitted(await h.revive(first))
+		expect(h.output('out').map(o => o.value)).toEqual(['A+R', 'A+R'])
+	})
 })

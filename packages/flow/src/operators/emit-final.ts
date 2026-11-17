@@ -12,10 +12,12 @@
 import type { Windowed } from '@/api/grouped.js'
 import type { Change } from '@/operators/change.js'
 import type { InternalProcessorContext } from '@/processor/api.js'
+import { emitKey } from '@/processor/metadata.js'
 import { StreamRecord, type RecordHeaders } from '@/processor/record.js'
 import { yieldIfDue } from '@/runtime/signals.js'
-import type { SessionStoreReads } from '@/state/time-clipping.js'
+import { firstUnemittedKeyTime, type SessionStoreReads } from '@/state/time-clipping.js'
 import type { ValueAndTimestamp } from '@/state.js'
+import type { EmitFinalWindows } from '@/topology/nodes.js'
 
 /** The final result of one window. */
 export interface FinalResult<K, A> {
@@ -25,10 +27,11 @@ export interface FinalResult<K, A> {
 }
 
 /**
- * The windows that closed after the close time of the last emission (`last`, -1 before the first) and by `closeTime`,
- * in emit order; undefined when no window can have closed in between (no read, and the progress stays).
+ * The windows that closed by `closeTime` and end at `lowerEnd` or later: from the first window end the last emission
+ * did not cover (`firstUnemittedKeyTime`, the bound the store's expiry keeps too, KF1). In emit order; undefined when
+ * no window can have closed in between (no read, and the progress stays).
  */
-export type ClosedWindows<K, A> = (last: number, closeTime: number) => Promise<FinalResult<K, A>[]> | undefined
+export type ClosedWindows<K, A> = (lowerEnd: number, closeTime: number) => Promise<FinalResult<K, A>[]> | undefined
 
 export class EmitFinal<K, A> {
 	/** Wall clock time from which the next emission may run (KS `TimeTracker.nextTimeToEmit`). */
@@ -38,9 +41,10 @@ export class EmitFinal<K, A> {
 	constructor(
 		private readonly context: InternalProcessorContext<Windowed<K>, Change<A>>,
 		store: string,
+		private readonly windows: EmitFinalWindows,
 		private readonly closedWindows: ClosedWindows<K, A>
 	) {
-		this.progressKey = `${store}.emit`
+		this.progressKey = emitKey(store)
 	}
 
 	/** After each record: forwards the windows closed by `closeTime`, with the headers of the record. */
@@ -55,7 +59,7 @@ export class EmitFinal<K, A> {
 		if (last !== -1 && last >= closeTime) {
 			return
 		}
-		const closed = this.closedWindows(last, closeTime)
+		const closed = this.closedWindows(firstUnemittedKeyTime(this.windows, last), closeTime)
 		if (closed === undefined) {
 			return
 		}

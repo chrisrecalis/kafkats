@@ -80,6 +80,32 @@ async function run<V>(
 const windowContents = (config: TestDriverConfig, windows: SlidingWindows, records: readonly Input[]) =>
 	run(config, windows.timeDifferenceMs, driver => contents(driver, windows), records, list)
 
+/**
+ * The counts of the windows of each key, regrouped by key and summed (a KGroupedTable reduce, which subtracts each
+ * window's old count), written to 'totals': the last one is the sum of the latest count of every window.
+ */
+async function regroupedTotals(config: TestDriverConfig, windows: SlidingWindows, records: readonly Input[]) {
+	const driver = new TestDriver(config)
+	driver
+		.input('in', S)
+		.groupByKey()
+		.windowedBy(windows)
+		.count()
+		.groupBy((windowed, count) => [windowed.key, count], { key: str, value: COUNT_CODEC })
+		.reduce(
+			(total, count) => total + count,
+			(total, count) => total - count
+		)
+		.toStream()
+		.to('totals', { value: COUNT_CODEC })
+	let totals: number[] = []
+	await driver.run(async ctx => {
+		for (const record of records) await send(ctx, record)
+		totals = ctx.producer.messagesFor('totals').map(({ value }) => COUNT_CODEC.decode(value!))
+	})
+	return totals
+}
+
 /** The last result of each window, by start. */
 function latest<V>(results: readonly Result<V>[]): Result<V>[] {
 	const byWindow = new Map(results.map(result => [`${result[0]}/${result[1]}`, result]))
@@ -275,6 +301,58 @@ describe.each(GUARANTEES)('sliding-window aggregation (%s)', (_, config) => {
 		])
 	})
 
+	it("a record d + 1 after the previous one creates the previous record's right window, its left window, once", async () => {
+		expect(
+			await windowContents(config, SlidingWindows.ofTimeDifferenceWithNoGrace(5), [
+				['a', 30],
+				['b', 35],
+				['c', 41],
+			])
+		).toEqual([
+			['k', 25, 30, ['a'], 30],
+			['k', 31, 36, ['b'], 35], // a's right window
+			['k', 30, 35, ['a', 'b'], 35],
+			['k', 36, 41, ['c'], 41], // b's right window and c's left window: one update (KS: two, merged by its cache)
+		])
+	})
+
+	it('counts regrouped by key sum the latest count of every window, each window counted once', async () => {
+		// Windows [25, 30], [31, 36], [30, 35] (2), [36, 41]: c is d + 1 after b.
+		const noGrace = SlidingWindows.ofTimeDifferenceWithNoGrace(5)
+		expect(
+			await regroupedTotals(config, noGrace, [
+				['a', 30],
+				['b', 35],
+				['c', 41],
+			])
+		).toEqual([1, 2, 4, 5])
+		// Windows [90, 100], [101, 111], [92, 102] (2), [103, 113]: c is d + 1 after b.
+		const grace = SlidingWindows.ofTimeDifferenceAndGrace(10, 100)
+		expect(
+			await regroupedTotals(config, grace, [
+				['a', 100],
+				['b', 102],
+				['c', 113],
+			])
+		).toEqual([1, 2, 4, 5])
+	})
+
+	it('a record at a timestamp seen before finds its right window and leaves it alone', async () => {
+		expect(
+			await windowContents(config, SlidingWindows.ofTimeDifferenceAndGrace(10, 100), [
+				['a', 100],
+				['c', 105],
+				['b', 100], // [101, 111], a's right window, holds c only
+			])
+		).toEqual([
+			['k', 90, 100, ['a'], 100],
+			['k', 101, 111, ['c'], 105],
+			['k', 95, 105, ['a', 'c'], 105],
+			['k', 90, 100, ['a', 'b'], 100],
+			['k', 95, 105, ['a', 'b', 'c'], 105],
+		])
+	})
+
 	it('records of one timestamp share their windows', async () => {
 		expect(
 			await windowContents(config, SlidingWindows.ofTimeDifferenceWithNoGrace(10), [
@@ -402,25 +480,31 @@ describe.each(GUARANTEES)('sliding windows emitted on window close (%s)', (_, co
 describe('sliding windows emitted on window close across a restart', () => {
 	const keys = WindowedCodecs.timeWindowed(str, 10)
 
+	/** A task of final sliding-window counts with time difference 10, and the start and count of what it emitted. */
+	function finalCounts(eos: boolean) {
+		const h = new TaskHarness({
+			eos,
+			build: builder => {
+				const ctx = new DslContext(builder, { applicationId: APP })
+				ctx.stream('in', S)
+					.groupByKey()
+					.windowedBy(SlidingWindows.ofTimeDifferenceWithNoGrace(10))
+					.count({ emit: 'on-window-close' })
+					.toStream()
+					.to('out', { key: keys, value: COUNT_CODEC })
+			},
+		})
+		const emitted = () =>
+			h.producer.committedRecords('out').map(({ message }) => {
+				const { window }: Windowed<string> = keys.decode(message.key!)
+				return [window.start, COUNT_CODEC.decode(message.value!)]
+			})
+		return { h, emitted }
+	}
+
 	for (const eos of [false, true]) {
 		it(`${eos ? 'exactly-once' : 'at-least-once'}: a window emitted before the commit is not emitted again`, async () => {
-			const h = new TaskHarness({
-				eos,
-				build: builder => {
-					const ctx = new DslContext(builder, { applicationId: APP })
-					ctx.stream('in', S)
-						.groupByKey()
-						.windowedBy(SlidingWindows.ofTimeDifferenceWithNoGrace(10))
-						.count({ emit: 'on-window-close' })
-						.toStream()
-						.to('out', { key: keys, value: COUNT_CODEC })
-				},
-			})
-			const emitted = () =>
-				h.producer.committedRecords('out').map(({ message }) => {
-					const { window }: Windowed<string> = keys.decode(message.key!)
-					return [window.start, COUNT_CODEC.decode(message.value!)]
-				})
+			const { h, emitted } = finalCounts(eos)
 			const first = await h.start(h.task())
 			h.enqueue(first, 'in', [
 				{ key: 'k', value: 'v', timestamp: 100 },
@@ -442,6 +526,26 @@ describe('sliding windows emitted on window close across a restart', () => {
 			])
 		})
 	}
+
+	it('KF1, at-least-once: a window emitted after the last commit is emitted again by the revived task', async () => {
+		const { h, emitted } = finalCounts(false)
+		const first = await h.start(h.task())
+		h.enqueue(first, 'in', [{ key: 'k', value: 'v', timestamp: 100 }])
+		await h.process(first)
+		expect(await h.commit()).toBe('committed')
+		// Closes [90, 100], and its expiry pass runs with the store clock past the retention of [90, 100].
+		const closing = { key: 'k', value: 'v', timestamp: 70_100 }
+		h.enqueue(first, 'in', [closing])
+		await h.process(first)
+		// Revived as after a failed send: the replay emits [90, 100] again.
+		const revived = await h.revive(first)
+		h.enqueue(revived, 'in', [closing])
+		await h.process(revived)
+		expect(emitted()).toEqual([
+			[90, 1],
+			[90, 1],
+		])
+	})
 })
 
 describe('sliding-window aggregation store and results', () => {

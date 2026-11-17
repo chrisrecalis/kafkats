@@ -1,13 +1,13 @@
 import { describe, expect, it, vi } from 'vitest'
 import { IllegalStateError } from '@/api/errors.js'
 import { windowedKeyCodec } from '@/changelog/writer.js'
-import type { ProcessorContext, ProcessorMetadata, ProcessorSupplier } from '@/processor/api.js'
+import type { ProcessorContext, ProcessorSupplier } from '@/processor/api.js'
 import { decodeCommitMetadata } from '@/processor/metadata.js'
 import type { SessionStore, WindowedKey, WindowStore } from '@/state.js'
 import { storeHandle } from '@/state/handles.js'
 import { TaskStateManager } from '@/state/state-manager.js'
 import { sessionStoreBuilder, windowStoreBuilder } from '@/state/store-builders.js'
-import { ClockedSessionStore, ClockedWindowStore, TaskStoreClock } from '@/state/time-clipping.js'
+import { ClockedSessionStore, ClockedWindowStore, TaskStoreClock, type ClockMetadata } from '@/state/time-clipping.js'
 import type { EmitFinalWindows, StoreBuilder, StoreClockSpec } from '@/topology/nodes.js'
 import { pipe, TaskHarness } from '../support/task-harness.js'
 import { DEFAULTS, RecordingOutput, collect, directory, metadata, str, taskId } from './support.js'
@@ -19,8 +19,8 @@ const w = (key: string, windowStart: number, windowEnd: number): WindowedKey<str
 })
 const ends = (entries: [WindowedKey<string>, string][]) => entries.map(([key]) => key.windowEnd)
 
-/** Metadata that records its puts. */
-function recordingMetadata(): ProcessorMetadata & { readonly puts: [string, number][] } {
+/** Metadata that records its puts; `markCommitted()` stands for a commit of the task. */
+function recordingMetadata(): ClockMetadata & { readonly puts: [string, number][]; markCommitted(): void } {
 	const inner = metadata()
 	const puts: [string, number][] = []
 	return {
@@ -30,6 +30,8 @@ function recordingMetadata(): ProcessorMetadata & { readonly puts: [string, numb
 			puts.push([key, value])
 			inner.put(key, value)
 		},
+		committed: key => inner.committed(key),
+		markCommitted: () => inner.markCommitted(),
 	}
 }
 
@@ -84,10 +86,16 @@ describe('TaskStoreClock (6.2)', () => {
 		expect(meta.puts).toEqual([])
 	})
 
-	it('reads and expiry stop at time - retention + 1', () => {
-		const clock = new TaskStoreClock(metadata(), 'w', 10)
+	it('reads stop at time - retention + 1; expiry at the time of the last commit - retention + 1', () => {
+		const meta = metadata()
+		const clock = new TaskStoreClock(meta, 'w', 10)
 		clock.advance(100)
 		expect(clock.readFloor).toBe(91)
+		expect(clock.expiryCutoff).toBe(-10)
+		meta.markCommitted()
+		clock.advance(200)
+		expect(clock.readFloor).toBe(191)
+		// A task revived from this commit replays the records since, which read from 91 on.
 		expect(clock.expiryCutoff).toBe(91)
 	})
 
@@ -108,22 +116,25 @@ describe('TaskStoreClock (6.2)', () => {
 		['sessions, nothing emitted yet', { kind: 'session' }, -1, 0],
 		['sessions', { kind: 'session' }, 500, 500],
 	])(
-		'KF1: emit on window close, %s: expiry waits for the next scan read from <store>.emit',
+		'KF1: emit on window close, %s: expiry waits for the next scan from the committed <store>.emit',
 		(_, emitFinal, last, bound) => {
 			const meta = metadata()
 			if (last !== -1) meta.put('w.emit', last)
 			const clock = new TaskStoreClock(meta, 'w', 10, emitFinal)
 			clock.advance(10_000)
+			meta.markCommitted()
 			expect(clock.readFloor).toBe(9_991)
 			expect(clock.expiryCutoff).toBe(bound)
 			meta.put('w.emit', 20_000)
+			expect(clock.expiryCutoff).toBe(bound)
+			meta.markCommitted()
 			expect(clock.expiryCutoff).toBe(9_991)
 		}
 	)
 })
 
 describe('clocked window store (6.2)', () => {
-	it('is the top of the stack of a store with a clock; the clock advances on put only, by window end', async () => {
+	it('is the top of the stack of a store with a clock; the clock advances on put and delete, by window end', async () => {
 		const { state, registered, clock, metadata: meta } = await stack(windows())
 		const store = state.store('w') as ClockedWindowStore<string, string>
 		expect(store).toBeInstanceOf(ClockedWindowStore)
@@ -133,11 +144,26 @@ describe('clocked window store (6.2)', () => {
 		expect(clock()).toBe(110)
 		await store.get(w('k', 200, 210))
 		await collect(store.fetch('k', 0, 1_000))
-		await store.delete(w('k', 300, 310))
 		await store.put(w('k', 50, 60), 'older')
 		await store.expire()
 		expect(clock()).toBe(110)
-		expect(meta.puts).toEqual([['w.observed', 110]])
+		// Kafka Streams' segmented stores advance their clock on remove and on putting null too.
+		await store.delete(w('k', 300, 310))
+		expect(clock()).toBe(310)
+		expect(meta.puts).toEqual([
+			['w.observed', 110],
+			['w.observed', 310],
+		])
+	})
+
+	it('a delete above the clock clips the reads of what it left below the new floor', async () => {
+		const { state } = await stack(windows())
+		const store = state.store('w') as ClockedWindowStore<string, string>
+		await store.put(w('k', 50, 60), 'a')
+		await store.delete(w('j', 200, 210))
+		// clock 210, retention 100: the floor is 111
+		expect(await store.get(w('k', 50, 60))).toBeUndefined()
+		expect(await collect(store.fetch('k', 0, 1_000))).toEqual([])
 	})
 
 	it('reads return nothing below time - retention + 1, whichever read it is', async () => {
@@ -172,11 +198,12 @@ describe('clocked window store (6.2)', () => {
 	})
 
 	it('expire() deletes what lies below the cutoff, locally only (KF17)', async () => {
-		const { state, registered, output } = await stack(windows())
+		const { state, registered, output, metadata: meta } = await stack(windows())
 		const store = state.store('w') as ClockedWindowStore<string, string>
 		await store.put(w('k', 90, 100), 'below')
 		await store.put(w('k', 91, 101), 'at the floor')
 		await store.put(w('k', 190, 200), 'newest')
+		meta.markCommitted()
 		await store.expire()
 
 		const raw = registered.raw as WindowStore<string, string>
@@ -195,24 +222,29 @@ describe('clocked window store (6.2)', () => {
 		await store.put(w('k', 0, 10), 'a')
 		await store.put(w('k', 100, 110), 'b')
 		await store.put(w('k', 500, 510), 'c')
+		meta.markCommitted()
 		// clock 510, retention 20: reads stop at 491, but nothing was emitted yet
 		expect(await store.get(w('k', 100, 110))).toBeUndefined()
 		await store.expire()
 		expect(ends(await collect(raw.all())).sort()).toEqual([10, 110, 510])
 
-		// A scan closed everything up to 120: the next one starts at window start 111 (end 121).
+		// A scan closed everything up to 120: once committed, the next one starts at window start 111 (end 121).
 		meta.put('w.emit', 120)
+		await store.expire()
+		expect(ends(await collect(raw.all())).sort()).toEqual([10, 110, 510])
+		meta.markCommitted()
 		await store.expire()
 		expect(ends(await collect(raw.all()))).toEqual([510])
 	})
 
 	it('exactly-once: expiry deletes through the write buffer, applied with the transaction', async () => {
-		const { state, registered, output } = await stack(windows(), true)
+		const { state, registered, output, metadata: meta } = await stack(windows(), true)
 		const store = state.store('w') as ClockedWindowStore<string, string>
 		const raw = registered.raw as WindowStore<string, string>
 		await store.put(w('k', 0, 10), 'old')
 		await state.commitBuffers()
 		await store.put(w('k', 500, 510), 'new')
+		meta.markCommitted()
 		await store.expire()
 		expect(ends(await collect(raw.all()))).toEqual([10])
 		expect(ends(await collect(store.unclipped.all())).sort()).toEqual([510])
@@ -262,7 +294,7 @@ describe('clocked session store (6.2)', () => {
 	})
 
 	it('remove() logs a tombstone for every session of the key, clipped ones included; expire() logs none', async () => {
-		const { state, registered, output } = await stack(sessions(10))
+		const { state, registered, output, metadata: meta } = await stack(sessions(10))
 		const store = state.store('s') as ClockedSessionStore<string, string>
 		const raw = registered.raw as SessionStore<string, string>
 		const tombstones = () =>
@@ -275,6 +307,7 @@ describe('clocked session store (6.2)', () => {
 
 		await store.remove('j')
 		expect(tombstones()).toEqual([w('j', 85, 90), w('j', 100, 100)])
+		meta.markCommitted()
 		await store.expire()
 		expect(await collect(raw.all())).toEqual([])
 		expect(tombstones()).toHaveLength(2)

@@ -7,19 +7,19 @@
  * timestamp, persisted under the store's name and advanced before the late check: the record is dropped when the
  * merged session ends before `streamTime - grace - gap`, so a late record falling into a session still open is merged.
  * Unless the merged session is the record's own `[ts, ts]`, every session found is removed and retracted, also one with
- * the merged bounds (BC23); then the merged session is stored and forwarded, without an old value. A session's results
- * carry its end as their timestamp (KS). Null keys are dropped; null values reach the aggregator. Results carry the
+ * the merged bounds (BC23); then the merged session is stored and forwarded, without an old value. A `[ts, ts]` session
+ * found is updated in place instead, its aggregate the old value (what Kafka Streams' record cache sends,
+ * `CachingSessionStore.putAndMaybeForward`). A session's results carry its end as their timestamp (KS). Null keys are dropped; null values reach the aggregator. Results carry the
  * headers of the record (KS forwards session updates without headers). With emit on window close, only the final
  * result of each session is forwarded (`operators/emit-final.ts`).
  */
 import type { Windowed } from '@/api/grouped.js'
 import type { Change } from '@/operators/change.js'
-import { EmitFinal, scanClosedWindows, type FinalResult } from '@/operators/emit-final.js'
-import type { KTableNode, KTableValueGetterSupplier } from '@/operators/ktable-node.js'
-import { windowedValueGetter, type Window } from '@/operators/window-aggregate.js'
-import type { InternalProcessorContext, Processor, ProcessorContext, ProcessorSupplier } from '@/processor/api.js'
-import { StreamRecord, type RecordHeaders } from '@/processor/record.js'
-import { ObservedStreamTime } from '@/processor/time-tracker.js'
+import { scanClosedWindows, type FinalResult } from '@/operators/emit-final.js'
+import { MaterializedTableNode, type KTableValueGetterSupplier } from '@/operators/ktable-node.js'
+import { windowedValueGetter, WindowedAggregateProcessor, type Window } from '@/operators/windowed-processor.js'
+import type { ProcessorSupplier } from '@/processor/api.js'
+import type { RecordHeaders, StreamRecord } from '@/processor/record.js'
 import type { ValueAndTimestamp, WindowedKey } from '@/state.js'
 import type { ClockedSessionStore } from '@/state/time-clipping.js'
 
@@ -57,55 +57,30 @@ export interface SessionWindowSpec {
 /** A session's aggregate as a result: at the session's end (KS). */
 const atEnd = <A>(value: A, window: Window): ValueAndTimestamp<A> => ({ value, timestamp: window.end })
 
-export class SessionWindowAggregate<K, V, A> implements KTableNode<Windowed<K>, A> {
+export class SessionWindowAggregate<K, V, A> extends MaterializedTableNode<Windowed<K>, A> {
 	readonly supplier: ProcessorSupplier<K | null, V | null, Windowed<K>, Change<A>>
 	readonly valueGetter: KTableValueGetterSupplier<Windowed<K>, A>
-	private sendOldValues = false
 
 	constructor(storeName: string, windows: SessionWindowSpec, merge: SessionMerge<K, V, A>, emitFinal: boolean) {
+		super()
 		this.supplier = () =>
-			new SessionWindowAggregateProcessor(storeName, windows, merge, emitFinal, () => this.sendOldValues)
+			new SessionWindowAggregateProcessor(storeName, windows, merge, emitFinal, this.sendOldValues)
 		this.valueGetter = windowedValueGetter<K, A, A>(storeName, atEnd)
-	}
-
-	/** Always materialized: the store has the old values. */
-	enableSendingOldValues(): boolean {
-		this.sendOldValues = true
-		return true
 	}
 }
 
-class SessionWindowAggregateProcessor<K, V, A> implements Processor<K | null, V | null, Windowed<K>, Change<A>> {
-	private context!: InternalProcessorContext<Windowed<K>, Change<A>>
-	private store!: ClockedSessionStore<K, A>
-	private clock!: ObservedStreamTime
-	private final: EmitFinal<K, A> | undefined
-
+class SessionWindowAggregateProcessor<K, V, A> extends WindowedAggregateProcessor<K, V, A, ClockedSessionStore<K, A>> {
 	constructor(
-		private readonly storeName: string,
+		storeName: string,
 		private readonly windows: SessionWindowSpec,
 		private readonly merge: SessionMerge<K, V, A>,
-		private readonly emitFinal: boolean,
-		private readonly sendOldValues: () => boolean
-	) {}
-
-	init(context: ProcessorContext<Windowed<K>, Change<A>>): void {
-		this.context = context as InternalProcessorContext<Windowed<K>, Change<A>>
-		this.store = context.getStateStore(this.storeName)
-		this.clock = new ObservedStreamTime(this.context, this.storeName)
-		if (this.emitFinal) {
-			this.final = new EmitFinal(this.context, this.storeName, (last, closeTime) =>
-				this.closedSessions(last, closeTime)
-			)
-		}
+		emitFinal: boolean,
+		sendOldValues: () => boolean
+	) {
+		super(storeName, emitFinal ? { kind: 'session' } : undefined, sendOldValues)
 	}
 
-	async process(record: StreamRecord<K | null, V | null>): Promise<void> {
-		const { key, value, timestamp, headers } = record
-		if (key === null || key === undefined) {
-			this.context.recordDropped('null-key', { store: this.storeName })
-			return
-		}
+	protected async aggregate({ key, value, timestamp, headers }: StreamRecord<K, V | null>): Promise<number> {
 		const { gapMs, graceMs } = this.windows
 		// Advanced before the late check (6.0): the record is judged by a clock that includes it.
 		const closeTime = this.clock.advance(timestamp) - graceMs - gapMs
@@ -126,10 +101,7 @@ class SessionWindowAggregateProcessor<K, V, A> implements Processor<K | null, V 
 		} else {
 			await this.update(key, value as V, sessions, merged, headers)
 		}
-		await this.final?.maybeEmit(closeTime, headers)
-		if (this.clock.expiryDue()) {
-			await this.store.expire()
-		}
+		return closeTime
 	}
 
 	private async update(
@@ -139,13 +111,15 @@ class SessionWindowAggregateProcessor<K, V, A> implements Processor<K | null, V 
 		merged: Window,
 		headers: RecordHeaders
 	): Promise<void> {
-		// A merged session of one point is the record's own [ts, ts]: a session found has its bounds and is overwritten.
-		if (merged.start !== merged.end) {
-			const sendOldValues = this.sendOldValues()
+		const sendOldValues = this.sendOldValues()
+		// A merged session of one point is the record's own [ts, ts]: a session found has its bounds and is updated.
+		const inPlace = merged.start === merged.end
+		if (!inPlace) {
 			for (const [session, aggregate] of sessions) {
 				await this.store.delete(session)
 				const window = { start: session.windowStart, end: session.windowEnd }
-				await this.forward(key, window, { newValue: null, oldValue: sendOldValues ? aggregate : null }, headers)
+				const retraction = { newValue: null, oldValue: sendOldValues ? aggregate : null }
+				await this.forward(key, window, retraction, window.end, headers)
 			}
 		}
 		const aggregate = this.merge(
@@ -159,23 +133,16 @@ class SessionWindowAggregateProcessor<K, V, A> implements Processor<K | null, V 
 		} else {
 			await this.store.put(mergedKey, aggregate)
 		}
-		await this.forward(key, merged, { newValue: aggregate ?? null, oldValue: null }, headers)
-	}
-
-	/** An update at the session's end, unless only final results are emitted. */
-	private async forward(key: K, window: Window, change: Change<A>, headers: RecordHeaders): Promise<void> {
-		if (this.final === undefined) {
-			await this.context.forward(new StreamRecord({ key, window }, change, window.end, headers))
-		}
+		const oldValue = inPlace && sendOldValues ? (sessions[0]?.[1] ?? null) : null
+		await this.forward(key, merged, { newValue: aggregate ?? null, oldValue }, merged.end, headers)
 	}
 
 	/**
-	 * The sessions of every key that ended since the last emission: ends in `[last, closeTime - 1]` (from 0 before the
-	 * first; KS `emitRangeLowerBound`, `emitRangeUpperBound`, `shouldRangeFetch`).
+	 * The sessions of every key that ended since the last emission: ends in `[lowerEnd, closeTime - 1]` (KS
+	 * `emitRangeLowerBound`, `emitRangeUpperBound`, `shouldRangeFetch`).
 	 */
-	private closedSessions(last: number, closeTime: number): Promise<FinalResult<K, A>[]> | undefined {
-		const lower = Math.max(0, last)
+	protected closedWindows(lowerEnd: number, closeTime: number): Promise<FinalResult<K, A>[]> | undefined {
 		const upper = closeTime - 1
-		return upper < 0 || upper < lower ? undefined : scanClosedWindows(this.store.unclipped, lower, upper, atEnd)
+		return upper < lowerEnd ? undefined : scanClosedWindows(this.store.unclipped, lowerEnd, upper, atEnd)
 	}
 }

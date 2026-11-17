@@ -453,6 +453,19 @@ export class TaskHarness {
 		return this.start(task, starts)
 	}
 
+	/**
+	 * At-least-once revive in place (4.7.5), as after a failed send: `task` closed dirty, keeping its stores, and a new
+	 * task started from its last commits, the consumer moved back to them.
+	 */
+	async revive(task: StreamTask): Promise<StreamTask> {
+		const starts = task.restartStarts()
+		await task.close('dirty')
+		for (const [key, start] of starts) {
+			this.consumer.positions.set(key, start.resolved)
+		}
+		return this.start(this.task(task.id.subtopology, task.partition), starts)
+	}
+
 	/** The last committed offset per tp, in commit order: consumer commits, or offsets of committed transactions. */
 	committedOffsets(): OffsetAndMetadata[] {
 		const batches = this.eos

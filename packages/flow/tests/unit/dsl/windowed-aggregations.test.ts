@@ -9,7 +9,7 @@ import type { RecordHeaders } from '@/processor/record.js'
 import type { WindowStore } from '@/state.js'
 import { TestDriver, type TestContextApi, type TestDriverConfig } from '@/testing/driver.js'
 import { GUARANTEES } from '../support/guarantees.js'
-import { APP, TaskHarness } from '../support/task-harness.js'
+import { APP, TaskHarness, type TestRecord } from '../support/task-harness.js'
 
 const str = codec.string()
 const num = codec.json<number>()
@@ -94,6 +94,37 @@ describe.each(GUARANTEES)('windowed aggregation results (%s)', (_, config) => {
 	})
 })
 
+describe.each(GUARANTEES)('windowed counts regrouped by key (%s)', (_, config) => {
+	it('summed session counts end at the sum of the sessions when records share a timestamp', async () => {
+		const driver = new TestDriver(config)
+		driver
+			.input('in', S)
+			.groupByKey()
+			.windowedBy(SessionWindows.ofInactivityGapWithNoGrace(10))
+			.count({ value: num })
+			.groupBy((windowed, count) => [windowed.key, count], { key: str, value: num })
+			.reduce(
+				(total, count) => total + count,
+				(total, count) => total - count
+			)
+			.toStream()
+			.to('totals', { value: num })
+		await driver.run(async ctx => {
+			for (const timestamp of [100, 100, 105, 100, 130, 130]) await send(ctx, 'a', timestamp)
+			expect(ctx.producer.messagesFor('totals').map(({ value }) => num.decode(value!))).toEqual([
+				1, // [100,100] = 1
+				2, // [100,100] = 2, updated in place
+				0, // [100,100] retracted
+				3, // [100,105] = 3
+				0, // [100,105] retracted
+				4, // [100,105] = 4
+				5, // [130,130] = 1
+				6, // [130,130] = 2, updated in place
+			])
+		})
+	})
+})
+
 describe.each(GUARANTEES)('emit on window close (%s)', (_, config) => {
 	it('KF1: time windows are emitted once each, once closed, with their max timestamp; updates are not', async () => {
 		const driver = new TestDriver(config)
@@ -132,6 +163,61 @@ describe.each(GUARANTEES)('emit on window close (%s)', (_, config) => {
 				FINAL
 			)
 		).toEqual([['k', 0, 10, 2, 8]])
+	})
+
+	it('a time window ending exactly where the last emission stopped is not emitted again', async () => {
+		expect(
+			await run(
+				config,
+				TimeWindows.ofSizeWithNoGrace(10),
+				[
+					['k', 5],
+					['k', 15], // closes [0,10)
+					['k', 20], // closes [10,20): the next scan starts after it
+					['k', 35], // closes [20,30)
+				],
+				FINAL
+			)
+		).toEqual([
+			['k', 0, 10, 1, 5],
+			['k', 10, 20, 1, 15],
+			['k', 20, 30, 1, 20],
+		])
+	})
+
+	it('a session ending at the close time is still open, and emitted once it closed', async () => {
+		const written = await run(
+			config,
+			SessionWindows.ofInactivityGapWithNoGrace(10),
+			[
+				['k', 0],
+				['j', 10], // close time 0: [k,0,0] may still take a record at 10
+				['k', 10], // a new session: [k,0,0] lies below the store's read floor (1)
+				['j', 40], // close time 30
+			],
+			FINAL
+		)
+		// Sessions ending at the same time come out in store order, which differs between the stores.
+		expect(written.sort((a, b) => a[2] - b[2] || a[0].localeCompare(b[0]))).toEqual([
+			['k', 0, 0, 1, 0],
+			['j', 10, 10, 1, 10],
+			['k', 10, 10, 1, 10],
+		])
+	})
+
+	it('a session ending at the close time of the last emission is emitted by the next one', async () => {
+		expect(
+			await run(
+				config,
+				SessionWindows.ofInactivityGapWithNoGrace(10),
+				[
+					['a', 20],
+					['b', 30], // close time 20: [a,20,20] is still open
+					['b', 31], // close time 21
+				],
+				FINAL
+			)
+		).toEqual([['a', 20, 20, 1, 20]])
 	})
 
 	it('sessions are emitted once closed, at their end; merged-away sessions never are', async () => {
@@ -236,4 +322,91 @@ describe('emit on window close across a restart', () => {
 			])
 		})
 	}
+})
+
+describe('at-least-once revive after an expiry pass (4.7.5)', () => {
+	/** A task counting the records of 'in' per key in `windows` into 'out', and what it sent there from `from` on. */
+	function counting(windows: TimeWindows | SessionWindows, options: WindowedAggregateOptions<string, number>) {
+		const keys: WindowedCodec<string> =
+			windows instanceof SessionWindows
+				? WindowedCodecs.sessionWindowed(str)
+				: WindowedCodecs.timeWindowed(str, windows.sizeMs)
+		const h = new TaskHarness({
+			build: builder => {
+				const grouped = new DslContext(builder, { applicationId: APP }).stream('in', S).groupByKey()
+				const table =
+					windows instanceof SessionWindows
+						? grouped.windowedBy(windows).count(options)
+						: grouped.windowedBy(windows).count(options)
+				table.toStream().to('out', { key: keys, value: num })
+			},
+		})
+		const sent = (from: number) =>
+			h.producer.sent
+				.slice(from)
+				.filter(({ topic }) => topic === 'out')
+				.map(({ message }) => {
+					const { key, window }: Windowed<string> = keys.decode(message.key!)
+					return [key, window.start, window.end, message.value === null ? null : num.decode(message.value)]
+				})
+		return { h, sent }
+	}
+
+	/**
+	 * Processes `committed` and commits, then `uncommitted`, whose expiry pass runs past the retention of the records
+	 * before; revives the task as a failed send would and processes `uncommitted` again. Returns what each run of
+	 * `uncommitted` sent.
+	 */
+	async function replay(
+		{ h, sent }: ReturnType<typeof counting>,
+		committed: readonly TestRecord[],
+		uncommitted: readonly TestRecord[]
+	) {
+		const first = await h.start(h.task())
+		h.enqueue(first, 'in', committed)
+		await h.process(first)
+		expect(await h.commit()).toBe('committed')
+		const before = h.producer.sent.length
+		h.enqueue(first, 'in', uncommitted)
+		await h.process(first)
+		const firstRun = sent(before)
+		const revived = await h.revive(first)
+		const replayed = h.producer.sent.length
+		h.enqueue(revived, 'in', uncommitted)
+		await h.process(revived)
+		return [firstRun, sent(replayed)]
+	}
+
+	const at = (key: string, timestamp: number): TestRecord => ({ key, value: 'v', timestamp })
+
+	it('KF1: a final time window forwarded after the last commit is forwarded again', async () => {
+		const task = counting(TimeWindows.ofSizeWithNoGrace(10), FINAL)
+		// k@70005 closes [10,20) and moves the store clock past its retention.
+		const [first, again] = await replay(task, [at('k', 5), at('k', 15)], [at('k', 70_005)])
+		expect(first).toEqual([['k', 10, 20, 1]])
+		expect(again).toEqual(first)
+	})
+
+	it('KF1: a final session forwarded after the last commit is forwarded again', async () => {
+		const task = counting(SessionWindows.ofInactivityGapWithNoGrace(10), FINAL)
+		const [first, again] = await replay(task, [at('k', 5)], [at('j', 70_000)])
+		expect(first).toEqual([['k', 5, 5, 1]])
+		expect(again).toEqual(first)
+	})
+
+	it('a session merged after the last commit is merged again', async () => {
+		const task = counting(SessionWindows.ofInactivityGapWithNoGrace(10), { value: num })
+		const [first, again] = await replay(task, [at('k', 100)], [at('k', 105), at('j', 70_000)])
+		expect(first).toEqual([
+			['k', 100, 100, null],
+			['k', 100, 105, 2],
+			['j', 70_000, 70_000, 1],
+		])
+		// The local store keeps the merged session: at-least-once counts the replayed records twice (Kafka Streams too).
+		expect(again).toEqual([
+			['k', 100, 105, null],
+			['k', 100, 105, 3],
+			['j', 70_000, 70_000, 2],
+		])
+	})
 })

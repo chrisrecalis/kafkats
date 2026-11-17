@@ -7,7 +7,7 @@
  * exactly-once commits the store writes with the offsets.
  */
 import type { Change } from '@/operators/change.js'
-import { storeValueGetter, type KTableNode, type KTableValueGetterSupplier } from '@/operators/ktable-node.js'
+import { MaterializedTableNode, storeValueGetter, type KTableValueGetterSupplier } from '@/operators/ktable-node.js'
 import type { InternalProcessorContext, Processor, ProcessorContext, ProcessorSupplier } from '@/processor/api.js'
 import type { StreamRecord } from '@/processor/record.js'
 import type { TimestampedKeyValueStore } from '@/state.js'
@@ -48,20 +48,14 @@ function aggregatable<K, V>(
 	return true
 }
 
-export class KStreamAggregate<K, V, A> implements KTableNode<K, A> {
+export class KStreamAggregate<K, V, A> extends MaterializedTableNode<K, A> {
 	readonly supplier: ProcessorSupplier<K | null, V | null, K, Change<A>>
 	readonly valueGetter: KTableValueGetterSupplier<K, A>
-	private sendOldValues = false
 
 	constructor(storeName: string, aggregation: Aggregation<K, V, A>) {
-		this.supplier = () => new KStreamAggregateProcessor(storeName, aggregation, () => this.sendOldValues)
+		super()
+		this.supplier = () => new KStreamAggregateProcessor(storeName, aggregation, this.sendOldValues)
 		this.valueGetter = storeValueGetter(storeName)
-	}
-
-	/** Always materialized: the store has the old values. */
-	enableSendingOldValues(): boolean {
-		this.sendOldValues = true
-		return true
 	}
 }
 

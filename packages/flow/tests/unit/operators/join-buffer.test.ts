@@ -45,8 +45,9 @@ function joinBuffer(retentionMs = 100) {
 		valueCodec: listCodec(str),
 		retentionMs,
 	})
-	const clock = new TaskStoreClock(new ProcessorMetadataImpl(), 'buffer', retentionMs)
-	return { bytes, raw, buffer: new JoinBuffer(new ClockedSessionStore(raw, clock, retentionMs)) }
+	const metadata = new ProcessorMetadataImpl()
+	const clock = new TaskStoreClock(metadata, 'buffer', retentionMs)
+	return { bytes, raw, metadata, buffer: new JoinBuffer(new ClockedSessionStore(raw, clock, retentionMs)) }
 }
 
 const fetched = async (entries: AsyncIterable<[number, string[]]>) => {
@@ -92,10 +93,11 @@ describe('JoinBuffer', () => {
 		expect(bytes.visited).toBe(50)
 	})
 
-	it('expire() deletes the entries past the retention by its own clock', async () => {
-		const { raw, buffer } = joinBuffer()
+	it('expire() deletes the entries past the retention by its own clock, as committed', async () => {
+		const { raw, metadata, buffer } = joinBuffer()
 		await buffer.put('a', 100, 'old')
 		await buffer.put('a', 300, 'new')
+		metadata.markCommitted()
 		await buffer.expire()
 		expect(await raw.approximateNumEntries()).toBe(1)
 		expect(await raw.get({ key: 'a', windowStart: 300, windowEnd: 300 })).toEqual(['new'])

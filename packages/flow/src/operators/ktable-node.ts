@@ -34,6 +34,24 @@ export interface KTableNode<K, V> {
 	readonly valueGetter: KTableValueGetterSupplier<K, V>
 }
 
+/**
+ * A table node whose processor keeps the table in a store of its own: source tables and aggregations (KS: always
+ * materialized). It sends old values from that store once asked, never needing its parent's.
+ */
+export abstract class MaterializedTableNode<K, V> implements KTableNode<K, V> {
+	abstract readonly supplier: KTableNode<K, V>['supplier']
+	abstract readonly valueGetter: KTableValueGetterSupplier<K, V>
+	private oldValues = false
+
+	enableSendingOldValues(): boolean {
+		this.oldValues = true
+		return true
+	}
+
+	/** For the node's processors, which read it at each record: a request made after they were created applies. */
+	protected readonly sendOldValues = (): boolean => this.oldValues
+}
+
 /** The getter of a materialized table: a point read of its timestamped store. */
 export function storeValueGetter<K, V>(storeName: string): KTableValueGetterSupplier<K, V> {
 	return {

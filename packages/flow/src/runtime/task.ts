@@ -6,7 +6,7 @@
 import type { Logger, Message, TopicPartition } from '@kafkats/client'
 import { IllegalStateError } from '@/api/errors.js'
 import type { DroppedReason, MaybePromise, TaskId } from '@/processor/api.js'
-import { decodeCommitMetadata, encodeCommitMetadata, ProcessorMetadataImpl } from '@/processor/metadata.js'
+import { decodeCommitMetadata, encodeCommitMetadata, observedKey, ProcessorMetadataImpl } from '@/processor/metadata.js'
 import type { TaskOutput } from '@/processor/output.js'
 import type { TimestampExtractor } from '@/processor/timestamps.js'
 import type { ResolvedHandlers } from '@/runtime/config.js'
@@ -497,7 +497,7 @@ export class StreamTask {
 		this.commitNeeded = false
 		this.userCommitRequested = false
 		this.consumedOffsets.clear()
-		this.metadata.clearNeedsCommit()
+		this.metadata.markCommitted()
 		for (const offset of committed) {
 			const key = tpKey(offset)
 			if (this.inputKeys.has(key)) {
@@ -553,7 +553,7 @@ export class StreamTask {
 		this.metadata.replaceAll(committed, this.subtopology.metadataKeys)
 		for (const { builder, clock } of this.stateManager.stores) {
 			if (clock) {
-				const observed = this.metadata.get(`${builder.name}.observed`) ?? -1
+				const observed = this.metadata.get(observedKey(builder.name)) ?? -1
 				clock.seed(Math.max(observed, restoredStoreTimes.get(builder.name) ?? -1))
 			}
 		}

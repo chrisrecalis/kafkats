@@ -26,13 +26,12 @@
  */
 import type { Windowed } from '@/api/grouped.js'
 import type { Change } from '@/operators/change.js'
-import { EmitFinal, scanClosedWindows, type FinalResult } from '@/operators/emit-final.js'
+import { scanClosedWindows, type FinalResult } from '@/operators/emit-final.js'
 import type { Aggregation } from '@/operators/kstream-aggregate.js'
-import type { KTableNode, KTableValueGetterSupplier } from '@/operators/ktable-node.js'
-import { windowedValueGetter } from '@/operators/window-aggregate.js'
-import type { InternalProcessorContext, Processor, ProcessorContext, ProcessorSupplier } from '@/processor/api.js'
-import { StreamRecord, type RecordHeaders } from '@/processor/record.js'
-import { ObservedStreamTime } from '@/processor/time-tracker.js'
+import { MaterializedTableNode, type KTableValueGetterSupplier } from '@/operators/ktable-node.js'
+import { windowedValueGetter, WindowedAggregateProcessor } from '@/operators/windowed-processor.js'
+import type { ProcessorSupplier } from '@/processor/api.js'
+import type { RecordHeaders, StreamRecord } from '@/processor/record.js'
 import type { ValueAndTimestamp } from '@/state.js'
 import type { ClockedSessionStore } from '@/state/time-clipping.js'
 
@@ -66,61 +65,46 @@ interface Found<A> {
 	readonly rightExists: boolean
 }
 
-export class SlidingWindowAggregate<K, V, A> implements KTableNode<Windowed<K>, A> {
+export class SlidingWindowAggregate<K, V, A> extends MaterializedTableNode<Windowed<K>, A> {
 	readonly supplier: ProcessorSupplier<K | null, V | null, Windowed<K>, Change<A>>
 	readonly valueGetter: KTableValueGetterSupplier<Windowed<K>, A>
-	private sendOldValues = false
 
 	constructor(storeName: string, windows: SlidingWindowSpec, aggregation: Aggregation<K, V, A>, emitFinal: boolean) {
+		super()
 		this.supplier = () =>
-			new SlidingWindowAggregateProcessor(storeName, windows, aggregation, emitFinal, () => this.sendOldValues)
+			new SlidingWindowAggregateProcessor(storeName, windows, aggregation, emitFinal, this.sendOldValues)
 		this.valueGetter = windowedValueGetter<K, ValueAndTimestamp<A>, A>(storeName, stored => stored)
-	}
-
-	/** Always materialized: the store has the old values. */
-	enableSendingOldValues(): boolean {
-		this.sendOldValues = true
-		return true
 	}
 }
 
-class SlidingWindowAggregateProcessor<K, V, A> implements Processor<K | null, V | null, Windowed<K>, Change<A>> {
-	private context!: InternalProcessorContext<Windowed<K>, Change<A>>
-	private store!: ClockedSessionStore<K, ValueAndTimestamp<A>>
-	private clock!: ObservedStreamTime
-	private final: EmitFinal<K, A> | undefined
+class SlidingWindowAggregateProcessor<K, V, A> extends WindowedAggregateProcessor<
+	K,
+	V,
+	A,
+	ClockedSessionStore<K, ValueAndTimestamp<A>>
+> {
 	private readonly d: number
 
 	constructor(
-		private readonly storeName: string,
+		storeName: string,
 		private readonly windows: SlidingWindowSpec,
 		private readonly aggregation: Aggregation<K, V, A>,
-		private readonly emitFinal: boolean,
-		private readonly sendOldValues: () => boolean
+		emitFinal: boolean,
+		sendOldValues: () => boolean
 	) {
+		super(storeName, emitFinal ? { kind: 'sliding', sizeMs: windows.timeDifferenceMs } : undefined, sendOldValues)
 		this.d = windows.timeDifferenceMs
 	}
 
-	init(context: ProcessorContext<Windowed<K>, Change<A>>): void {
-		this.context = context as InternalProcessorContext<Windowed<K>, Change<A>>
-		this.store = context.getStateStore(this.storeName)
-		this.clock = new ObservedStreamTime(this.context, this.storeName)
-		if (this.emitFinal) {
-			this.final = new EmitFinal(this.context, this.storeName, (last, closeTime) =>
-				this.closedWindows(last, closeTime)
-			)
-		}
-	}
-
-	async process(record: StreamRecord<K | null, V | null>): Promise<void> {
-		const { key, value, timestamp, headers } = record
-		if (key === null || key === undefined) {
-			this.context.recordDropped('null-key', { store: this.storeName })
-			return
-		}
+	protected async aggregate({
+		key,
+		value,
+		timestamp,
+		headers,
+	}: StreamRecord<K, V | null>): Promise<number | undefined> {
 		if (value === null || value === undefined) {
 			this.context.recordDropped('null-value', { store: this.storeName })
-			return
+			return undefined
 		}
 		// Advanced before the late check (6.0): the record is judged by a clock that includes it.
 		const closeTime = this.clock.advance(timestamp) - this.windows.graceMs
@@ -133,10 +117,7 @@ class SlidingWindowAggregateProcessor<K, V, A> implements Processor<K | null, V 
 		} else {
 			await this.processInOrder(current)
 		}
-		await this.final?.maybeEmit(closeTime, headers)
-		if (this.clock.expiryDue()) {
-			await this.store.expire()
-		}
+		return closeTime
 	}
 
 	/**
@@ -217,13 +198,17 @@ class SlidingWindowAggregateProcessor<K, V, A> implements Processor<K | null, V 
 		await this.createRightWindow(r, found.after, found.rightExists)
 	}
 
-	/** The previous record's right window, if it does not exist and the record falls into it: the record alone. */
+	/**
+	 * The previous record's right window, if it does not exist and the record falls into it: the record alone. One
+	 * ending at the record is the record's left window, which `createWindows` creates next: Kafka Streams writes that
+	 * window twice (`>=`), which its record cache merges into one update, where flow would forward both.
+	 */
 	private async createPreviousRightWindow(
 		r: Current<K, V>,
 		previous: number | undefined,
 		starts: ReadonlySet<number>
 	): Promise<void> {
-		if (previous !== undefined && !starts.has(previous + 1) && previous + 1 + this.d >= r.timestamp) {
+		if (previous !== undefined && !starts.has(previous + 1) && previous + 1 + this.d > r.timestamp) {
 			await this.fold(r, previous + 1, undefined)
 		}
 	}
@@ -279,11 +264,8 @@ class SlidingWindowAggregateProcessor<K, V, A> implements Processor<K | null, V 
 		} else {
 			await this.store.put(windowKey, { value: aggregate, timestamp })
 		}
-		if (this.final === undefined) {
-			const change = { newValue: aggregate ?? null, oldValue: this.sendOldValues() ? (old ?? null) : null }
-			const result = new StreamRecord({ key: r.key, window: { start, end } }, change, timestamp, r.headers)
-			await this.context.forward(result)
-		}
+		const change = { newValue: aggregate ?? null, oldValue: this.sendOldValues() ? (old ?? null) : null }
+		await this.forward(r.key, { start, end }, change, timestamp, r.headers)
 	}
 
 	/** The starts and aggregates of the windows of the record's key starting in `[t - 2d, t + 1]`, by start. */
@@ -295,16 +277,11 @@ class SlidingWindowAggregateProcessor<K, V, A> implements Processor<K | null, V 
 	}
 
 	/**
-	 * The windows of every key that closed since the last emission: those starting in `[lower, upper]`, where `upper` is
-	 * the start of the newest window ended before `closeTime` (both ends are inclusive) and `lower` the first start the
-	 * last emission did not cover (KS `emitRangeLowerBound`, `emitRangeUpperBound`, `shouldRangeFetch`).
+	 * The windows of every key that closed since the last emission: those ending in `[lowerEnd, closeTime - 1]` (both
+	 * ends of a window are inclusive; KS `emitRangeLowerBound`, `emitRangeUpperBound`, `shouldRangeFetch`).
 	 */
-	private closedWindows(last: number, closeTime: number): Promise<FinalResult<K, A>[]> | undefined {
-		const upper = closeTime - this.d - 1
-		if (upper < 0) {
-			return undefined
-		}
-		const lower = last === -1 ? 0 : Math.max(0, last - this.d)
-		return scanClosedWindows(this.store.unclipped, lower + this.d, upper + this.d, stored => stored)
+	protected closedWindows(lowerEnd: number, closeTime: number): Promise<FinalResult<K, A>[]> | undefined {
+		const upper = closeTime - 1
+		return upper < lowerEnd ? undefined : scanClosedWindows(this.store.unclipped, lowerEnd, upper, stored => stored)
 	}
 }

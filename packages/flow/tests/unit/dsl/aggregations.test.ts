@@ -1216,5 +1216,25 @@ describe('aggregations', () => {
 			// A session's timestamp is its end (KS).
 			expect(looked).toEqual([{ value: 3, timestamp: 5 }])
 		})
+
+		it("a record at a one-point session's timestamp updates it in place, its previous value the old value", async () => {
+			const driver = new TestDriver()
+			const table = driver
+				.input('in', { key: str, value: str })
+				.groupByKey()
+				.windowedBy(SessionWindows.ofInactivityGapWithNoGrace(10))
+				.count() as KTableImpl<Windowed<string>, number>
+			table.table.enableSendingOldValues(true)
+			const changes = changesOf(table)
+			await driver.run(async ({ send }) => {
+				await send('in', 'x', at('k', 100))
+				// Not retracted: KS's record cache sends the stored aggregate as the old value of this update.
+				await send('in', 'x', at('k', 100))
+			})
+			expect(changes).toEqual([
+				{ newValue: 1, oldValue: null },
+				{ newValue: 2, oldValue: 1 },
+			])
+		})
 	})
 })

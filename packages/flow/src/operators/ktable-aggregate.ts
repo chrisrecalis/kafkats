@@ -8,7 +8,7 @@
  * Streams' default record cache does.
  */
 import type { Change } from '@/operators/change.js'
-import { storeValueGetter, type KTableNode, type KTableValueGetterSupplier } from '@/operators/ktable-node.js'
+import { MaterializedTableNode, storeValueGetter, type KTableValueGetterSupplier } from '@/operators/ktable-node.js'
 import type { InternalProcessorContext, Processor, ProcessorContext, ProcessorSupplier } from '@/processor/api.js'
 import type { StreamRecord } from '@/processor/record.js'
 import type { TimestampedKeyValueStore } from '@/state.js'
@@ -46,20 +46,14 @@ export const tableCount: TableAggregator<unknown, unknown, number> = tableAggreg
 	(_key, _value, count) => count - 1
 )
 
-export class KTableAggregate<K, V, A> implements KTableNode<K, A> {
+export class KTableAggregate<K, V, A> extends MaterializedTableNode<K, A> {
 	readonly supplier: ProcessorSupplier<K, Change<V> | null, K, Change<A>>
 	readonly valueGetter: KTableValueGetterSupplier<K, A>
-	private sendOldValues = false
 
 	constructor(storeName: string, aggregator: TableAggregator<K, V, A>) {
-		this.supplier = () => new KTableAggregateProcessor(storeName, aggregator, () => this.sendOldValues)
+		super()
+		this.supplier = () => new KTableAggregateProcessor(storeName, aggregator, this.sendOldValues)
 		this.valueGetter = storeValueGetter(storeName)
-	}
-
-	/** Always materialized: the store has the old values. */
-	enableSendingOldValues(): boolean {
-		this.sendOldValues = true
-		return true
 	}
 }
 
