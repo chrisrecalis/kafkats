@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { ErrorCode, KafkaError, type KafkaClient, type Producer } from '@kafkats/client'
-import { codec, flow, type FlowApp } from '../../src/index.js'
+import { codec, FailedProcessingError, flow, type FlowApp } from '../../src/index.js'
 import {
 	createTopics,
 	injectCommitFailures,
@@ -130,7 +130,9 @@ describe('global tables and worker lifecycle', () => {
 				await sleep(100)
 			}
 			expect(app.state()).toBe('ERROR')
-			expect(app.getError()).toBeInstanceOf(SyntaxError)
+			// The deserialization handler's 'fail' (the default) wraps the codec's error (4.6.3).
+			expect(app.getError()).toBeInstanceOf(FailedProcessingError)
+			expect(app.getError()?.cause).toBeInstanceOf(SyntaxError)
 
 			// The table no longer advances, so nothing more may be joined against it.
 			await producer.send(events, { key: 'k', value: Buffer.from('after') })
@@ -162,7 +164,8 @@ describe('global tables and worker lifecycle', () => {
 			.join(rows, (event, row) => `${event}+${row}`)
 			.to(output, { key: stringCodec, value: stringCodec })
 		try {
-			await expect(app.start()).rejects.toBeInstanceOf(SyntaxError)
+			await expect(app.start()).rejects.toBeInstanceOf(FailedProcessingError)
+			expect(app.getError()?.cause).toBeInstanceOf(SyntaxError)
 			expect(app.state()).toBe('ERROR')
 		} finally {
 			await app.close().catch(() => {})

@@ -7,7 +7,7 @@ import { TimeoutError, type Logger } from '@kafkats/client'
 import { DEFAULT_REPARTITION_CONFIGS } from '@/changelog/config.js'
 import { ChangelogPartitionMismatchError, SourceTopicNotFoundError } from '@/changelog/errors.js'
 import type { AdminPort, Clock } from '@/runtime/io.js'
-import { raceSignal } from '@/runtime/signals.js'
+import { delay } from '@/runtime/signals.js'
 import type { BuiltTopology } from '@/topology/built-topology.js'
 import type { InternalTopicSpec, PartitionCounts } from '@/topology/nodes.js'
 import { resolvePartitionCounts } from '@/topology/partition-counts.js'
@@ -140,13 +140,4 @@ function withDefaults(spec: InternalTopicSpec, options: InternalTopicOptions): I
 				? { ...DEFAULT_REPARTITION_CONFIGS, ...options.topicConfigs, ...spec.configs }
 				: spec.configs,
 	}
-}
-
-/** Resolves after `ms` of `clock`; rejects with an AbortError once `signal` aborts. */
-function delay(clock: Clock, ms: number, signal: AbortSignal): Promise<void> {
-	let cancel = (): void => {}
-	const elapsed = new Promise<void>(resolve => {
-		cancel = clock.setTimer(clock.now() + ms, resolve)
-	})
-	return raceSignal(elapsed, signal).finally(cancel)
 }
