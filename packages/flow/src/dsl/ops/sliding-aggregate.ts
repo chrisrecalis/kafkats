@@ -73,5 +73,6 @@ function slidingWindowed<K, V, A>(
 		}),
 		node: new SlidingWindowAggregate(name, windows, aggregation, emitFinal),
 		resultKeyCodec: WindowedCodecs.timeWindowed(keyCodec, windows.timeDifferenceMs),
+		graceMs: windows.graceMs,
 	}))
 }

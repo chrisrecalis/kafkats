@@ -7,7 +7,7 @@ import { codec } from '@/codec.js'
 import { DslContext } from '@/dsl/context.js'
 import type { KTableImpl } from '@/dsl/ktable.js'
 import { windowCloseGraceMs } from '@/dsl/ops/suppress.js'
-import { SessionWindows, TimeWindows } from '@/dsl/windows.js'
+import { SessionWindows, SlidingWindows, TimeWindows } from '@/dsl/windows.js'
 import { bufferedChangeCodec } from '@/operators/suppress-entry.js'
 import { WindowedCodecs, type WindowedCodec } from '@/operators/windowed.js'
 import type { RecordHeaders } from '@/processor/record.js'
@@ -99,6 +99,35 @@ describe.each(GUARANTEES)('suppress until windows close (6.16; %s)', (_, config)
 			expect(finals(ctx, keys)).toEqual([])
 			await send(ctx, 'in', 'j', 'v', 14)
 			expect(finals(ctx, keys)).toEqual([['k', 0, 7, 3, 7]])
+		})
+	})
+
+	it('waits the grace alone after the end of a sliding window', async () => {
+		const driver = new TestDriver(config)
+		const keys = WindowedCodecs.timeWindowed(str, 10)
+		driver
+			.input('in', S)
+			.groupByKey()
+			.windowedBy(SlidingWindows.ofTimeDifferenceAndGrace(10, 5))
+			.count()
+			.suppress(FINAL)
+			.toStream()
+			.to('out', { value: num })
+		await driver.run(async ctx => {
+			await send(ctx, 'in', 'k', 'v', 5) // [0,10]
+			await send(ctx, 'in', 'k', 'v', 12) // [2,12], and [6,16]: the right window of 5
+			await send(ctx, 'in', 'j', 'v', 14)
+			expect(finals(ctx, keys)).toEqual([])
+			await send(ctx, 'in', 'j', 'v', 15)
+			expect(finals(ctx, keys)).toEqual([['k', 0, 10, 1, 5]])
+			await send(ctx, 'in', 'j', 'v', 21)
+			expect(finals(ctx, keys)).toEqual([
+				['k', 0, 10, 1, 5],
+				['k', 2, 12, 2, 12],
+				['j', 4, 14, 1, 14],
+				['j', 5, 15, 2, 15],
+				['k', 6, 16, 1, 12],
+			])
 		})
 	})
 
@@ -199,6 +228,25 @@ describe.each(GUARANTEES)('suppress until a time limit (6.16; %s)', (_, config) 
 			['k', 'c', null, 9],
 			['x', 'x', null, 10],
 			['k', 'd', 'c', 11],
+		])
+	})
+
+	it('holds back the counts of a table aggregation, an emptied group included (BC11)', async () => {
+		const driver = new TestDriver(config)
+		const counts = driver
+			.table('t', S)
+			.groupBy((_key, value) => [value, value], { key: str, value: str })
+			.count()
+			.suppress(limit(5))
+		const updates = updatesOf(counts)
+		await driver.run(async ctx => {
+			await send(ctx, 't', 'k', 'A', 0)
+			await send(ctx, 't', 'k', 'B', 1) // A goes back to 0
+			await send(ctx, 't', 'x', 'X', 10)
+		})
+		expect(updates).toEqual([
+			['A', 0, null, 1],
+			['B', 1, null, 1],
 		])
 	})
 
@@ -482,6 +530,12 @@ describe('suppress topology', () => {
 			.windowedBy(SessionWindows.ofInactivityGapAndGrace(5, 3))
 			.count() as KTableImpl<Windowed<string>, number>
 		expect(windowCloseGraceMs(sessions.ctx, sessions.node)).toBe(8)
+		const sliding = driver
+			.input('w', S)
+			.groupByKey()
+			.windowedBy(SlidingWindows.ofTimeDifferenceAndGrace(10, 4))
+			.count() as KTableImpl<Windowed<string>, number>
+		expect(windowCloseGraceMs(sliding.ctx, sliding.node)).toBe(4)
 	})
 
 	it('needs a windowed aggregation upstream of every parent until windows close', () => {
