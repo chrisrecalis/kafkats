@@ -61,6 +61,7 @@ export const StorePrefix = {
 	STREAM_JOIN: 'stream-join',
 	STREAM_LEFT_JOIN: 'stream-left-join',
 	STREAM_OUTER_JOIN: 'stream-outer-join',
+	SUPPRESS: 'KTABLE-SUPPRESS-STATE-STORE',
 	table: (topic: string) => `table-${topic}`,
 	globalTable: (topic: string) => `global-table-${topic}`,
 } as const

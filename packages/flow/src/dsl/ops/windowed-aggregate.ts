@@ -45,7 +45,10 @@ const PREFIXES: Readonly<Record<AggregationKind, readonly [store: string, node: 
 	aggregate: [StorePrefix.WINDOW_AGGREGATE, NodePrefix.AGGREGATE],
 }
 
-/** The store, the processor and the result key codec of one windowed aggregation, given its store name and key codec. */
+/**
+ * The store, the processor and the result key codec of one windowed aggregation, given its store name and key codec,
+ * and how long after their end its windows may still change (`suppress()` waits that long for a window to close).
+ */
 type Create<K, A> = (
 	ctx: DslContext,
 	store: string,
@@ -54,6 +57,7 @@ type Create<K, A> = (
 	readonly builder: StoreBuilder
 	readonly node: KTableNode<Windowed<K>, A>
 	readonly resultKeyCodec: WindowedCodec<K>
+	readonly graceMs: number
 }
 
 export function timeWindowedCount<K, V>(
@@ -161,6 +165,7 @@ function timeWindowed<K, V, A>(
 		}),
 		node: new TimeWindowAggregate(name, windows, aggregation, emitFinal),
 		resultKeyCodec: WindowedCodecs.timeWindowed(keyCodec, windows.sizeMs),
+		graceMs: windows.graceMs,
 	}))
 }
 
@@ -186,6 +191,8 @@ function sessionWindowed<K, V, A>(
 		}),
 		node: new SessionWindowAggregate(name, windows, merge, emitFinal),
 		resultKeyCodec: WindowedCodecs.sessionWindowed(keyCodec),
+		// A record within the gap of a session's end still merges into it (KS SessionWindowedKStreamImpl).
+		graceMs: windows.graceMs + windows.gapMs,
 	}))
 }
 
@@ -206,10 +213,11 @@ function materialize<K, V, A>(
 	const { ctx } = grouped.stream
 	const [storePrefix, nodePrefix] = PREFIXES[kind]
 	const store = storeName(ctx.builder, storePrefix, options.storeName)
-	const { builder, node, resultKeyCodec } = create(ctx, store, keyCodec)
+	const { builder, node, resultKeyCodec, graceMs } = create(ctx, store, keyCodec)
 	const input = aggregationInput(grouped, keyCodec)
 	ctx.builder.addStateStore(builder)
 	const processor = ctx.processor(nodePrefix, options.name, [input.node], node.supplier, [store])
+	ctx.windowGraces.set(processor, graceMs)
 	const format = { keyCodec: resultKeyCodec, valueCodec, windowed }
 	return new KTableImpl(ctx, processor, format, node)
 }

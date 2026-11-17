@@ -1,6 +1,7 @@
 /**
  * What every DSL object of one app shares (KS InternalStreamsBuilder): the topology builder, the changelog defaults
- * that store builders resolve against, and the registrations every operator family makes (sources, processors).
+ * that store builders resolve against, the registrations every operator family makes (sources, processors), and the
+ * grace periods of the windowed aggregations.
  */
 import type { Consumed } from '@/api/options.js'
 import type { ChangelogDefaults } from '@/changelog/config.js'
@@ -12,6 +13,12 @@ import type { InternalTopologyBuilder } from '@/topology/builder.js'
 import type { NodeName, ProcessorDef, SourceDef } from '@/topology/nodes.js'
 
 export class DslContext {
+	/**
+	 * The grace period of each windowed aggregation, by processor (KS GracePeriodGraphNode): how long after its end a
+	 * window may still change, for a session including its gap. `suppress()` finds when windows close through it.
+	 */
+	readonly windowGraces = new Map<NodeName, number>()
+
 	constructor(
 		readonly builder: InternalTopologyBuilder,
 		/** Store builders resolve their changelogs against these. */
