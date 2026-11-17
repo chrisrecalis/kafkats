@@ -1,23 +1,23 @@
 /**
- * Time-window and session-window aggregations (6.4, 6.5), as today: stores keep 24 window sizes / session gaps, and
- * result keys are `Windowed<K>` in today's format, `[key][start int64BE][end int64BE]`. Results stay in the partition
- * of their base key, so a key-based operation on them repartitions first. Retention options, emit on window close and
- * Kafka Streams' windowed formats come in Stage 3 (WP3.3, WP3.4).
+ * Time-window and session-window aggregations (6.4, 6.5, 6.8): each keeps its windows in a clocked store whose
+ * retention follows the retention model (`dsl/retention.ts`), emits each update or, with `emit: 'on-window-close'`,
+ * each final result, and keys its result table by `Windowed<K>` in Kafka Streams' formats (`WindowedCodecs`, 6.9).
+ * The results stay in the partition of their base key, where key-based operations on them find them: they need no
+ * repartitioning (BC10).
  */
 import { TopologyError } from '@/api/errors.js'
 import type { Windowed } from '@/api/grouped.js'
 import type { KTable } from '@/api/ktable.js'
 import type { WindowedAggregateOptions } from '@/api/options.js'
-import { windowedKeyCodec } from '@/changelog/writer.js'
 import type { Codec } from '@/codec.js'
 import type { DslContext } from '@/dsl/context.js'
 import { requireCodec, type WindowedFormat } from '@/dsl/format.js'
 import type { KGroupedStreamImpl } from '@/dsl/kgrouped-stream.js'
 import { KTableImpl } from '@/dsl/ktable.js'
 import { NodePrefix, storeName, StorePrefix } from '@/dsl/naming.js'
-import { notImplemented } from '@/dsl/not-implemented.js'
 import { COUNT_CODEC, counting, requireAggregateCodec, type AggregationKind } from '@/dsl/ops/aggregate.js'
 import { aggregationInput } from '@/dsl/ops/grouping.js'
+import { aggregationRetentionMs } from '@/dsl/retention.js'
 import type { SessionWindowedKStreamImpl } from '@/dsl/session-windowed-kstream.js'
 import type { TimeWindowedKStreamImpl } from '@/dsl/time-windowed-kstream.js'
 import { aggregateWith, reduceWith, type Aggregation } from '@/operators/kstream-aggregate.js'
@@ -28,8 +28,9 @@ import {
 	SessionWindowAggregate,
 	type SessionMerge,
 } from '@/operators/session-aggregate.js'
-import { TimeWindowAggregate, WINDOW_STORE_RETENTION_MULTIPLIER } from '@/operators/window-aggregate.js'
-import { sessionStoreBuilder, windowStoreBuilder } from '@/state/store-builders.js'
+import { TimeWindowAggregate } from '@/operators/window-aggregate.js'
+import { WindowedCodecs, type WindowedCodec } from '@/operators/windowed.js'
+import { sessionStoreBuilder, timestampedWindowStoreBuilder } from '@/state/store-builders.js'
 import type { StoreBuilder } from '@/topology/nodes.js'
 
 /** The session merger, or the deprecated options form carrying a two-argument merger. */
@@ -44,12 +45,16 @@ const PREFIXES: Readonly<Record<AggregationKind, readonly [store: string, node: 
 	aggregate: [StorePrefix.WINDOW_AGGREGATE, NodePrefix.AGGREGATE],
 }
 
-/** The store and processor of one windowed aggregation, given its store name and key codec. */
+/** The store, the processor and the result key codec of one windowed aggregation, given its store name and key codec. */
 type Create<K, A> = (
 	ctx: DslContext,
 	store: string,
 	keyCodec: Codec<K>
-) => { readonly builder: StoreBuilder; readonly node: KTableNode<Windowed<K>, A> }
+) => {
+	readonly builder: StoreBuilder
+	readonly node: KTableNode<Windowed<K>, A>
+	readonly resultKeyCodec: WindowedCodec<K>
+}
 
 export function timeWindowedCount<K, V>(
 	windowed: TimeWindowedKStreamImpl<K, V>,
@@ -118,18 +123,6 @@ export function sessionWindowedAggregate<K, V, A>(
 	return sessionWindowed(windowed, 'aggregate', resolved, valueCodec, merge)
 }
 
-/** Today's windowed key format: the key, then window start and end as int64 big-endian (as in changelogs). */
-function windowedCodec<K>(inner: Codec<K>): Codec<Windowed<K>> {
-	const codec = windowedKeyCodec(inner)
-	return {
-		encode: ({ key, window }) => codec.encode({ key, windowStart: window.start, windowEnd: window.end }),
-		decode: bytes => {
-			const { key, windowStart, windowEnd } = codec.decode(bytes)
-			return { key, window: { start: windowStart, end: windowEnd } }
-		},
-	}
-}
-
 /** The merger of `aggregate()` on session windows; the deprecated two-argument form is wrapped. */
 function sessionMerger<K, A>(merger: SessionMergerArg<K, A> | undefined): (key: K, a1: A, a2: A) => A {
 	if (typeof merger === 'function') {
@@ -145,6 +138,7 @@ function sessionMerger<K, A>(merger: SessionMergerArg<K, A> | undefined): (key: 
 	return (_key, aggregate1, aggregate2) => deprecated(aggregate1, aggregate2)
 }
 
+/** Windows `[start, start + size)` whose values carry the max timestamp of their records, keyed `[key][start]`. */
 function timeWindowed<K, V, A>(
 	windowed: TimeWindowedKStreamImpl<K, V>,
 	kind: AggregationKind,
@@ -154,19 +148,23 @@ function timeWindowed<K, V, A>(
 ): KTable<Windowed<K>, A> {
 	const { windows } = windowed
 	const format: WindowedFormat = { kind: 'time', sizeMs: windows.sizeMs }
+	const emitFinal = options.emit === 'on-window-close'
 	return materialize(windowed.grouped, kind, options, valueCodec, format, (ctx, name, keyCodec) => ({
-		builder: windowStoreBuilder(ctx.changelog, {
+		builder: timestampedWindowStoreBuilder(ctx.changelog, {
 			name,
 			keyCodec,
 			valueCodec,
 			logging: options.changelog,
-			retentionMs: windows.sizeMs * WINDOW_STORE_RETENTION_MULTIPLIER,
+			retentionMs: aggregationRetentionMs(name, windows, options.retention),
 			windowSizeMs: windows.sizeMs,
+			clock: { emitFinal: emitFinal ? format : undefined },
 		}),
-		node: new TimeWindowAggregate(name, windows, aggregation),
+		node: new TimeWindowAggregate(name, windows, aggregation, emitFinal),
+		resultKeyCodec: WindowedCodecs.timeWindowed(keyCodec, windows.sizeMs),
 	}))
 }
 
+/** Sessions `[start, end]`, whose results carry their end as timestamp, keyed `[key][end][start]`. */
 function sessionWindowed<K, V, A>(
 	windowed: SessionWindowedKStreamImpl<K, V>,
 	kind: AggregationKind,
@@ -174,22 +172,26 @@ function sessionWindowed<K, V, A>(
 	valueCodec: Codec<A>,
 	merge: SessionMerge<K, V, A>
 ): KTable<Windowed<K>, A> {
-	const { gapMs } = windowed.windows
-	return materialize(windowed.grouped, kind, options, valueCodec, { kind: 'session' }, (ctx, name, keyCodec) => ({
+	const { windows } = windowed
+	const format: WindowedFormat = { kind: 'session' }
+	const emitFinal = options.emit === 'on-window-close'
+	return materialize(windowed.grouped, kind, options, valueCodec, format, (ctx, name, keyCodec) => ({
 		builder: sessionStoreBuilder(ctx.changelog, {
 			name,
 			keyCodec,
 			valueCodec,
 			logging: options.changelog,
-			retentionMs: gapMs * WINDOW_STORE_RETENTION_MULTIPLIER,
+			retentionMs: aggregationRetentionMs(name, windows, options.retention),
+			clock: { emitFinal: emitFinal ? format : undefined },
 		}),
-		node: new SessionWindowAggregate(name, gapMs, merge),
+		node: new SessionWindowAggregate(name, windows, merge, emitFinal),
+		resultKeyCodec: WindowedCodecs.sessionWindowed(keyCodec),
 	}))
 }
 
 /**
  * Registers the aggregation's store and processor (after the repartitioning its input needs); returns its table,
- * keyed by `Windowed<K>`.
+ * keyed by `Windowed<K>`. Its options are validated before anything is registered.
  */
 function materialize<K, V, A>(
 	grouped: KGroupedStreamImpl<K, V>,
@@ -200,19 +202,14 @@ function materialize<K, V, A>(
 	create: Create<K, A>
 ): KTable<Windowed<K>, A> {
 	const operator = `windowed ${kind}()`
-	if (options.retention !== undefined) {
-		notImplemented(`${operator} with a retention`)
-	}
-	if (options.emit === 'on-window-close') {
-		notImplemented(`${operator} emitting on window close`)
-	}
 	const keyCodec = requireCodec(options.key, grouped.stream.format.keyCodec, 'key', operator)
-	const input = aggregationInput(grouped, keyCodec)
-	const { ctx } = input
+	const { ctx } = grouped.stream
 	const [storePrefix, nodePrefix] = PREFIXES[kind]
 	const store = storeName(ctx.builder, storePrefix, options.storeName)
-	const { builder, node } = create(ctx, store, keyCodec)
+	const { builder, node, resultKeyCodec } = create(ctx, store, keyCodec)
+	const input = aggregationInput(grouped, keyCodec)
 	ctx.builder.addStateStore(builder)
 	const processor = ctx.processor(nodePrefix, options.name, [input.node], node.supplier, [store])
-	return new KTableImpl(ctx, processor, { keyCodec: windowedCodec(keyCodec), valueCodec, windowed }, node)
+	const format = { keyCodec: resultKeyCodec, valueCodec, windowed }
+	return new KTableImpl(ctx, processor, format, node)
 }

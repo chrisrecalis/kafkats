@@ -6,7 +6,6 @@ import { windowedKeyCodec } from '@/changelog/writer.js'
 import { codec, type Codec } from '@/codec.js'
 import type { KStreamImpl } from '@/dsl/kstream.js'
 import type { KTableImpl } from '@/dsl/ktable.js'
-import { NotImplementedError } from '@/dsl/not-implemented.js'
 import { SessionWindows, TimeWindows } from '@/dsl/windows.js'
 import type { Change } from '@/operators/change.js'
 import type { InternalProcessorContext, ProcessorContext } from '@/processor/api.js'
@@ -27,6 +26,12 @@ const num: Codec<number> = {
 		return b
 	},
 	decode: b => b.readDoubleLE(0),
+}
+
+function int64(value: number): Buffer {
+	const bytes = Buffer.alloc(8)
+	bytes.writeBigInt64BE(BigInt(value))
+	return bytes
 }
 
 function topologyOf(driver: TestDriver): BuiltTopology {
@@ -251,7 +256,7 @@ describe('windowed/session store changelog wiring (copied from flow.test.ts)', (
 		driver
 			.input('events', { key: codec.string(), value: codec.json<{ type: string }>() })
 			.groupByKey()
-			.windowedBy(TimeWindows.of('10s'))
+			.windowedBy(TimeWindows.ofSizeAndGrace('10s', '5s'))
 			.count({ storeName: 'win-counts' })
 
 		const { store } = storeOf(topologyOf(driver), 'win-counts')
@@ -262,9 +267,9 @@ describe('windowed/session store changelog wiring (copied from flow.test.ts)', (
 		const changelogKey = windowedKeyCodec(store.keyCodec as Codec<string>)
 		const encoded = changelogKey.encode({ key: 'k', windowStart: 1000, windowEnd: 2000 })
 		expect(changelogKey.decode(encoded)).toEqual({ key: 'k', windowStart: 1000, windowEnd: 2000 })
-		// delete,compact with the store's retention (24 windows of 10 s) plus a day, so the broker prunes expired windows.
+		// delete,compact with the store's retention (size + grace) plus a day, so the broker prunes expired windows.
 		expect(store.logging.configs['cleanup.policy']).toBe('delete,compact')
-		expect(store.logging.configs['retention.ms']).toBe(String(10_000 * 24 + 86_400_000))
+		expect(store.logging.configs['retention.ms']).toBe(String(15_000 + 86_400_000))
 	})
 
 	it('session-windowed aggregations create a changelog-backed session store', () => {
@@ -272,16 +277,16 @@ describe('windowed/session store changelog wiring (copied from flow.test.ts)', (
 		driver
 			.input('events', { key: codec.string(), value: codec.json<{ type: string }>() })
 			.groupByKey()
-			.windowedBy(SessionWindows.withInactivityGap('30s'))
+			.windowedBy(SessionWindows.ofInactivityGapAndGrace('30s', '10s'))
 			.count({ storeName: 'session-counts' })
 
 		const { store, subtopology } = storeOf(topologyOf(driver), 'session-counts')
 		expect(store.kind).toBe('session')
 		expect(subtopology.changelogTopics.get('session-counts')).toBe('test-app-session-counts-changelog')
-		// delete,compact with the store's retention (24 gaps of 30 s) plus a day, like a window store.
+		// delete,compact with the store's retention (gap + grace) plus a day, like a window store.
 		if (!store.logging.enabled) throw new Error('not logged')
 		expect(store.logging.configs['cleanup.policy']).toBe('delete,compact')
-		expect(store.logging.configs['retention.ms']).toBe(String(30_000 * 24 + 86_400_000))
+		expect(store.logging.configs['retention.ms']).toBe(String(40_000 + 86_400_000))
 	})
 
 	it('co-partitions windowedBy state with its source or repartition topic', () => {
@@ -308,14 +313,14 @@ describe('windowed/session store changelog wiring (copied from flow.test.ts)', (
 		])
 	})
 
-	it('repartitions the results of a windowed aggregation before a key-based operation', () => {
+	it('BC10: key-based operations on windowed results do not repartition them', () => {
 		const driver = new TestDriver()
 
-		// A windowed result sits in the partition of its key, not where the windowed key itself
-		// hashes to. Whatever is keyed by the windowed key elsewhere is in a different partition.
+		// A windowed result sits in the partition of its base key, which is where a windowed key is written to and
+		// read from (WindowedCodecs and the windowed partitioner).
 		for (const [topic, windows] of [
-			['events', TimeWindows.of('10s')],
-			['visits', SessionWindows.withInactivityGap('10s')],
+			['events', TimeWindows.ofSizeWithNoGrace('10s')],
+			['visits', SessionWindows.ofInactivityGapWithNoGrace('10s')],
 		] as const) {
 			const grouped = driver
 				.input(topic, { key: codec.string(), value: codec.json<{ type: string }>() })
@@ -329,12 +334,12 @@ describe('windowed/session store changelog wiring (copied from flow.test.ts)', (
 		}
 
 		const topology = topologyOf(driver)
-		expect([...storeOf(topology, 'events-updates').subtopology.sourceTopics]).toEqual([
-			'test-app-repartition-0-repartition',
-		])
-		expect([...storeOf(topology, 'visits-updates').subtopology.sourceTopics]).toEqual([
-			'test-app-repartition-1-repartition',
-		])
+		expect(repartitionTopics(topology)).toEqual([])
+		for (const topic of ['events', 'visits']) {
+			const { subtopology } = storeOf(topology, `${topic}-updates`)
+			expect([...subtopology.sourceTopics]).toEqual([topic])
+			expect(subtopology).toBe(storeOf(topology, `${topic}-windows`).subtopology)
+		}
 	})
 })
 
@@ -564,7 +569,7 @@ describe('aggregations (copied from operator-semantics*.test.ts)', () => {
 })
 
 describe('aggregations', () => {
-	it('results keep the timestamp and headers of the record that produced them', async () => {
+	it('results carry the headers of the record that produced them; a session result its end as timestamp', async () => {
 		const driver = new TestDriver()
 		const grouped = driver.input('in', { key: str, value: str }).groupByKey()
 		grouped.count().toStream().to('counts', { key: str, value: num })
@@ -584,16 +589,16 @@ describe('aggregations', () => {
 				[15n, first],
 				[18n, second],
 			])
-			// The record at 18 merges [15,15] into [15,18]: the retraction of [15,15] is its result too.
+			// The record at 18 merges [15,15] into [15,18]: the retraction of [15,15], at its end, is its result too.
 			expect(sent('sessions')).toEqual([
 				[15n, first],
-				[18n, second],
+				[15n, second],
 				[18n, second],
 			])
 		})
 	})
 
-	it('drops records with a null value', async () => {
+	it('drops records with a null value; windowed aggregations aggregate them (Kafka Streams)', async () => {
 		const driver = new TestDriver()
 		const counts: unknown[] = []
 		const grouped = driver.input('in', { key: str, value: str }).groupByKey()
@@ -614,7 +619,10 @@ describe('aggregations', () => {
 		await driver.run(async ({ send }) => {
 			await send('in', null, key('k'))
 		})
-		expect(counts).toEqual([])
+		expect(counts).toEqual([
+			['window', 1],
+			['session', 1],
+		])
 	})
 
 	it('a null aggregate deletes the key and is forwarded as a tombstone', async () => {
@@ -845,23 +853,24 @@ describe('aggregations', () => {
 			expect(() => grouped.reduce((a, b) => a + b)).toThrow('reduce() needs a value codec')
 		})
 
-		it("the table of an aggregation has the store codecs; windowed tables key by Windowed in today's format", async () => {
+		it("the table of an aggregation has the store codecs; windowed tables key by Windowed in Kafka Streams' formats", async () => {
 			const driver = new TestDriver()
 			const grouped = driver.input('in', { key: str, value: str }).groupByKey()
 			grouped.count().toStream().to('counts')
-			grouped.windowedBy(TimeWindows.of(10)).count().toStream().to('windows')
+			grouped.windowedBy(TimeWindows.ofSizeWithNoGrace(10)).count().toStream().to('windows')
+			grouped.windowedBy(SessionWindows.ofInactivityGapWithNoGrace(10)).count().toStream().to('sessions')
 			await driver.run(async ({ send, output }) => {
 				await send('in', 'x', at('k', 15))
 				expect(output('counts', { key: str, value: num })).toEqual([
 					{ topic: 'counts', key: 'k', value: 1, partition: undefined },
 				])
 				const [windowRecord] = output('windows', { value: num })
-				const windowKey = windowRecord!.key!
-				// [key][start int64BE][end int64BE]
-				expect(windowKey.subarray(0, 1).toString()).toBe('k')
-				expect(windowKey.readBigInt64BE(1)).toBe(10n)
-				expect(windowKey.readBigInt64BE(9)).toBe(20n)
+				// [key][start int64BE] (BC10)
+				expect(windowRecord!.key).toEqual(Buffer.concat([Buffer.from('k'), int64(10)]))
 				expect(windowRecord!.value).toBe(1)
+				// [key][end int64BE][start int64BE]
+				const [sessionRecord] = output('sessions', { value: num })
+				expect(sessionRecord!.key).toEqual(Buffer.concat([Buffer.from('k'), int64(15), int64(15)]))
 			})
 		})
 	})
@@ -930,18 +939,61 @@ describe('aggregations', () => {
 		})
 	})
 
-	describe('options of later builds', () => {
-		it.each([{ retention: 1000 }, { emit: 'on-window-close' as const }])(
-			'windowed aggregations reject %o',
-			options => {
-				const driver = new TestDriver()
-				const grouped = driver.input('in', { key: str, value: str }).groupByKey()
-				expect(() => grouped.windowedBy(TimeWindows.of(10)).count(options)).toThrow(NotImplementedError)
-				expect(() => grouped.windowedBy(SessionWindows.withInactivityGap(10)).count(options)).toThrow(
-					NotImplementedError
-				)
+	describe('retention and emit options', () => {
+		it('windowed stores keep size + grace or gap + grace by default; Materialized.retention keeps them longer', () => {
+			const driver = new TestDriver()
+			const grouped = driver.input('in', { key: str, value: str }).groupByKey()
+			grouped.windowedBy(TimeWindows.ofSizeAndGrace(10, 5)).count({ storeName: 'windows' })
+			grouped.windowedBy(SessionWindows.ofInactivityGapAndGrace(10, 5)).count({ storeName: 'sessions' })
+			grouped.windowedBy(TimeWindows.ofSizeAndGrace(10, 5)).count({ storeName: 'kept', retention: '1m' })
+			grouped
+				.windowedBy(SessionWindows.ofInactivityGapAndGrace(10, 5))
+				.count({ storeName: 'kept-sessions', retention: 60_000 })
+
+			const topology = topologyOf(driver)
+			const retention = (name: string) => {
+				const { store } = storeOf(topology, name)
+				return [store.retentionMs, store.logging.enabled && store.logging.configs['retention.ms']]
 			}
-		)
+			expect(retention('windows')).toEqual([15, String(15 + 86_400_000)])
+			expect(retention('sessions')).toEqual([15, String(15 + 86_400_000)])
+			expect(retention('kept')).toEqual([60_000, String(60_000 + 86_400_000)])
+			expect(retention('kept-sessions')).toEqual([60_000, String(60_000 + 86_400_000)])
+		})
+
+		it('a retention below the minimum fails the aggregation before it registers anything', () => {
+			const driver = new TestDriver()
+			const grouped = driver.input('in', { key: str, value: str }).groupBy((_k, v) => v, { key: str })
+			expect(() => grouped.windowedBy(TimeWindows.ofSizeAndGrace(10, 5)).count({ retention: 14 })).toThrow(
+				new TopologyError(
+					"The retention of state store 'window-count-store-0' must be no smaller than the window size (10 ms) " +
+						'plus the grace period (5 ms), got 14 ms'
+				)
+			)
+			expect(() =>
+				grouped.windowedBy(SessionWindows.ofInactivityGapAndGrace(10, 5)).count({ retention: '10ms' })
+			).toThrow(TopologyError)
+			const topology = topologyOf(driver)
+			expect(repartitionTopics(topology)).toEqual([])
+			expect(topology.subtopologies.flatMap(s => s.stores)).toEqual([])
+		})
+
+		it("emit: 'on-window-close' makes the expiry of the store wait for the emission (6.8)", () => {
+			const driver = new TestDriver()
+			const grouped = driver.input('in', { key: str, value: str }).groupByKey()
+			const emit = 'on-window-close'
+			grouped.windowedBy(TimeWindows.ofSizeWithNoGrace(10)).count({ storeName: 'final-windows', emit })
+			grouped
+				.windowedBy(SessionWindows.ofInactivityGapWithNoGrace(10))
+				.count({ storeName: 'final-sessions', emit })
+			grouped.windowedBy(TimeWindows.ofSizeWithNoGrace(10)).count({ storeName: 'windows', emit: 'on-update' })
+
+			const topology = topologyOf(driver)
+			const clock = (name: string) => storeOf(topology, name).store.clock
+			expect(clock('final-windows')).toEqual({ emitFinal: { kind: 'time', sizeMs: 10 } })
+			expect(clock('final-sessions')).toEqual({ emitFinal: { kind: 'session' } })
+			expect(clock('windows')).toEqual({ emitFinal: undefined })
+		})
 	})
 
 	describe('named groupings (KF6)', () => {
@@ -1018,16 +1070,16 @@ describe('aggregations', () => {
 		const b = driver.input('b', { key: str, value: str })
 		a.merge(b)
 			.groupByKey()
-			.windowedBy(TimeWindows.of(1000))
+			.windowedBy(TimeWindows.ofSizeAndGrace(1000, 23_000))
 			.count()
 			.toStream()
 			.peek((k, v) => counts.push([`${k!.key}@${k!.window.start}`, v]))
 		await driver.run(async ({ send }) => {
-			await send('b', 'x', at('k', 80_000)) // the task clock is 80 000: expiry below 56 000
-			await send('a', 'x', at('k', 100_000))
-			await send('b', 'x', at('k', 80_500)) // in retention of the task clock: updates its window
-			await send('a', 'x', at('k', 200_000)) // expiry below 176 000 removes [80 000, 81 000)
-			await send('b', 'x', at('k', 80_700)) // expired: dropped, not re-created with a count of 1
+			await send('b', 'x', at('k', 80_000))
+			await send('a', 'x', at('k', 100_000)) // the task's clock: windows ending by 77 000 are closed
+			await send('b', 'x', at('k', 80_500)) // [80 000, 81 000) is open: updated
+			await send('a', 'x', at('k', 200_000)) // windows ending by 177 000 are closed
+			await send('b', 'x', at('k', 80_700)) // closed: dropped, not re-created with a count of 1
 		})
 		expect(counts).toEqual([
 			['k@80000', 1],
@@ -1131,10 +1183,11 @@ describe('aggregations', () => {
 				{ newValue: 1, oldValue: null },
 				{ newValue: 2, oldValue: 1 },
 			])
-			expect(looked).toEqual([{ value: 2, timestamp: 10 }, null])
+			// The window's timestamp is the max timestamp of its records (KS).
+			expect(looked).toEqual([{ value: 2, timestamp: 12 }, null])
 		})
 
-		it('a session count retracts merged sessions with their values and updates a session in place with its previous value', async () => {
+		it('BC23: a session count retracts every merged session with its value, then sends the merged one without', async () => {
 			const driver = new TestDriver()
 			const table = driver
 				.input('in', { key: str, value: str })
@@ -1147,7 +1200,7 @@ describe('aggregations', () => {
 			await driver.run(async ({ send }) => {
 				await send('in', 'x', at('k', 0))
 				await send('in', 'x', at('k', 5)) // merges [0,0] into [0,5]
-				await send('in', 'x', at('k', 3)) // inside [0,5]: updated in place
+				await send('in', 'x', at('k', 3)) // inside [0,5]: merged with it, so retracted too (KS)
 				await send('lookups', Buffer.from(''), {
 					keyValue: { key: 'k', window: { start: 0, end: 5 } },
 					keyCodec: json,
@@ -1157,7 +1210,8 @@ describe('aggregations', () => {
 				{ newValue: 1, oldValue: null },
 				{ newValue: null, oldValue: 1 },
 				{ newValue: 2, oldValue: null },
-				{ newValue: 3, oldValue: 2 },
+				{ newValue: null, oldValue: 2 },
+				{ newValue: 3, oldValue: null },
 			])
 			// A session's timestamp is its end (KS).
 			expect(looked).toEqual([{ value: 3, timestamp: 5 }])
