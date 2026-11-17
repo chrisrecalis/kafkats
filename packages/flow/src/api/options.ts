@@ -10,8 +10,16 @@ import type { ResetPolicy } from '@/topology/nodes.js'
 /** Milliseconds, or a number with a unit: `'500ms'`, `'30s'`, `'5m'`, `'1h'`, `'1d'`. */
 export type WindowDuration = number | `${number}ms` | `${number}s` | `${number}m` | `${number}h` | `${number}d`
 
-/** Every operator takes a name: it fixes the node name and, where the operator has them, store and topic names. */
+/**
+ * Every operator takes a name: it fixes the node name and, where the operator has them, store and topic names (an
+ * operator registering several names them `<name>-<suffix>`, as Kafka Streams does). Without one, names are generated
+ * in the order of the DSL calls, so adding or naming an operator can change the generated names after it.
+ */
 export interface NamedOptions {
+	/**
+	 * 1 to 249 ASCII alphanumerics, '.', '_' and '-', as Kafka topic names (names end up in topic and store names), and
+	 * unique in the app: an illegal or duplicate name is a TopologyError.
+	 */
 	name?: string
 }
 
@@ -35,7 +43,11 @@ export interface Produced<K, V> extends NamedOptions {
 	partitioner?: RecordPartitioner<K, V>
 }
 
-/** How a stream is grouped: `name` names its repartition topic, shared by every aggregation of the grouping. */
+/**
+ * How a stream is grouped: `name` names its repartition topic `<applicationId>-<name>-repartition`, shared by every
+ * aggregation of the grouping, and, for groupBy(), its key-selecting node. Without a name, every aggregation that needs
+ * to repartition has its own topic, named after its `storeName` if it has one.
+ */
 export interface Grouped<K, V> extends NamedOptions {
 	key?: Codec<K>
 	value?: Codec<V>
@@ -43,6 +55,11 @@ export interface Grouped<K, V> extends NamedOptions {
 
 /** How an operator's result is stored. */
 export interface Materialized<K, V> {
+	/**
+	 * Names the store and so its changelog topic `<applicationId>-<storeName>-changelog` and its persisted state; same
+	 * rule as NamedOptions.name. Default: generated in the order of the DSL calls, so prefer a name for state that must
+	 * survive changes of the topology.
+	 */
 	storeName?: string
 	key?: Codec<K>
 	value?: Codec<V>
@@ -85,9 +102,15 @@ export interface ProcessOptions extends NamedOptions {
 	stores?: readonly StoreDefinition<StateStore>[] | readonly string[]
 }
 
-/** Codecs and stores of a stream-stream join. */
+/**
+ * Codecs and stores of a stream-stream join. `name` names its nodes after it (`<name>-this-join`, `<name>-merge`, ...)
+ * and the repartition topics of re-keyed sides, `<name>-left` and `<name>-right`.
+ */
 export interface StreamJoined<K, V, VO> extends NamedOptions {
-	/** Base name of the join stores: `<storeName>-this-join-store` / `-other-join-store`. */
+	/**
+	 * Base name of the join stores: `<storeName>-this-join-store` / `-other-join-store`. Default: `name`, else
+	 * generated.
+	 */
 	storeName?: string
 	key?: Codec<K>
 	value?: Codec<V>
@@ -96,7 +119,10 @@ export interface StreamJoined<K, V, VO> extends NamedOptions {
 	changelog?: boolean | ChangelogConfig
 }
 
-/** Codecs of a stream-table join; also the deprecated options of a stream-stream join. */
+/**
+ * Codecs of a stream-table join; also the deprecated options of a stream-stream join. `name` names the join node and
+ * the repartition topic of a re-keyed stream.
+ */
 export interface Joined<K, V, VO> extends NamedOptions {
 	key?: Codec<K>
 	value?: Codec<V>
@@ -130,7 +156,8 @@ export interface Repartitioned<K, V> extends NamedOptions {
 /**
  * When `suppress()` emits. 'window-close' emits only final results of windowed tables and never early: a full
  * buffer stops the app. 'time-limit' emits the latest value of a key once `timeLimit` passed since its first
- * buffered update; a full buffer emits early by default.
+ * buffered update; a full buffer emits early by default. `name` names the processor and its buffer store
+ * `<name>-store`.
  */
 export type SuppressOptions =
 	| { until: 'window-close'; name?: string; maxRecords?: number; maxBytes?: number }

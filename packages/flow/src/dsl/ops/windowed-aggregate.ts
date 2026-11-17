@@ -214,7 +214,7 @@ export function materialize<K, V, A>(
 	const [storePrefix, nodePrefix] = PREFIXES[kind]
 	const store = storeName(ctx.builder, storePrefix, options.storeName)
 	const { builder, node, resultKeyCodec, graceMs } = create(ctx, store, keyCodec)
-	const input = aggregationInput(grouped, keyCodec)
+	const input = aggregationInput(grouped, keyCodec, options.storeName)
 	ctx.builder.addStateStore(builder)
 	const processor = ctx.processor(nodePrefix, options.name, [input.node], node.supplier, [store])
 	ctx.windowGraces.set(processor, graceMs)

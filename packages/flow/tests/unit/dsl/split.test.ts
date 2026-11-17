@@ -143,7 +143,7 @@ describe('KStream.split (6.20, KS BranchedKStreamImpl, KStreamBranch)', () => {
 		same!.groupByKey().count({ storeName: 'by-key' })
 		await driver.run(async ({ send, producer }) => {
 			await send('in', 'v', { ...key('k'), codec: str })
-			expect(repartitionTopics(producer.messages)).toEqual(['test-app-repartition-0-repartition'])
+			expect(repartitionTopics(producer.messages)).toEqual(['test-app-by-value-repartition'])
 			expect(producer.messages.find(m => m.topic.endsWith('-repartition'))?.value?.toString()).toBe('v')
 		})
 	})

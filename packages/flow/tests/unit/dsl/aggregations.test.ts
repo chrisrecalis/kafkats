@@ -299,7 +299,8 @@ describe('windowed/session store changelog wiring (copied from flow.test.ts)', (
 			.windowedBy(TimeWindows.of('10s'))
 			.count({ storeName: 'by-key' })
 
-		// groupBy() re-keys through a repartition topic, so its state is co-partitioned with that topic.
+		// groupBy() re-keys through a repartition topic (named after the store of an unnamed grouping's aggregation), so
+		// its state is co-partitioned with that topic.
 		driver
 			.input('events2', { key: codec.string(), value: codec.json<{ region: string }>() })
 			.groupBy((_key, value) => value!.region, { key: codec.string() })
@@ -308,9 +309,7 @@ describe('windowed/session store changelog wiring (copied from flow.test.ts)', (
 
 		const topology = topologyOf(driver)
 		expect([...storeOf(topology, 'by-key').subtopology.sourceTopics]).toEqual(['events'])
-		expect([...storeOf(topology, 'by-region').subtopology.sourceTopics]).toEqual([
-			'test-app-repartition-0-repartition',
-		])
+		expect([...storeOf(topology, 'by-region').subtopology.sourceTopics]).toEqual(['test-app-by-region-repartition'])
 	})
 
 	it('BC10: key-based operations on windowed results do not repartition them', () => {
