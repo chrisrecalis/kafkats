@@ -179,8 +179,9 @@ export class TestLoop {
 	}
 
 	/**
-	 * The store `name` of the task of `partition` (top of its stack), or the global store of that name. Under
-	 * exactly-once a write opens the driver's transaction first, so it is logged and committed like a processor's.
+	 * The store `name` of the task of `partition` (a handle on the top of its stack), or the global store of that
+	 * name. Under exactly-once a write opens the driver's transaction first, so it is logged and committed like a
+	 * processor's.
 	 */
 	store<S extends StateStore>(name: string, partition = 0): S {
 		const global = this.globals?.store(name)

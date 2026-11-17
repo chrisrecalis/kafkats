@@ -170,7 +170,7 @@ export class StreamTask {
 		return this.stateManager.stores
 	}
 
-	/** Top of the store's stack. */
+	/** A handle on the top of the store's stack for references held outside the processors (TaskStateManager.store). */
 	store(name: string): StateStore {
 		return this.stateManager.store(name)
 	}
@@ -298,10 +298,9 @@ export class StreamTask {
 			this.logger.debug('dropped records delivered to a task that is not active', { state: this.taskState })
 			return 0
 		}
-		const queue = this.group.queue(tp)
-		const size = queue.addRawRecords(messages)
+		const size = this.group.addRawRecords(tp, messages)
 		if (size > this.config.bufferedRecordsPerPartition) {
-			this.pausedForSize.add(queue)
+			this.pausedForSize.add(this.group.queue(tp))
 		}
 		return size
 	}

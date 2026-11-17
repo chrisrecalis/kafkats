@@ -73,7 +73,8 @@ export class PartitionGroup {
 	/**
 	 * The head with the smallest timestamp (ties: input partition order); advances the stream time. The partition
 	 * polled had records, so it is not idling: its deadline goes, even if no readiness check saw it non-empty (records
-	 * that arrived and drained within one slice), and its next idle period starts afresh (KS checks before every record).
+	 * that arrived and drained within one slice), and its next idle period starts afresh (KS checks readiness before
+	 * every record).
 	 */
 	nextRecord(): StampedRecord | SkipMarker | null {
 		let next: RecordQueue | undefined

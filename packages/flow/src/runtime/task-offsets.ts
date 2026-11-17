@@ -109,7 +109,7 @@ export class TaskOffsets {
 		return offsets
 	}
 
-	/** After a successful commit: nothing is consumed since; the committed offsets of the task's partitions are recorded. */
+	/** After a successful commit: nothing consumed since; records the committed offsets of the task's partitions. */
 	committed(offsets: readonly OffsetAndMetadata[]): void {
 		this.consumed.clear()
 		for (const offset of offsets) {
