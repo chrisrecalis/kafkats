@@ -1,10 +1,9 @@
 /**
- * KTable.groupBy (KS KTableRepartitionMap, 6.15), ported with today's mapping-store semantics (WP3.8 replaces them
- * with Change pairs): every update of a source row retracts the row's previous contribution to its group and adds
- * the new one, as two records for the repartition topic marked by the `__kafkats_delta_op` header (`sub`, then
- * `add`; a deleted row only retracts). The previous contribution (grouped key and value) of each source key is kept
- * in a mapping store. Both deltas are forwarded before the mapping is updated: a replay after a crash in between
- * emits them again (at least once) instead of losing the change.
+ * KTable.groupBy's repartition map (KS `KTableRepartitionMap.java:130-167`, 6.15): maps both values of a row's update
+ * (groupBy forces its table to send old values) to the groups the row leaves and joins. A mapped pair counts only
+ * when its key and value are not null (B19). A row that stays in its group (the same encoded grouped key) gives the
+ * group one record `Change(new, old)` (KIP-904); otherwise the group it leaves gets `Change(null, old)` first, then
+ * the group it joins `Change(new, null)`. Records keep the update's timestamp and headers.
  */
 import type { KeyValue } from '@/api/kstream.js'
 import type { Codec } from '@/codec.js'
@@ -16,90 +15,65 @@ import type {
 	ProcessorContext,
 	ProcessorSupplier,
 } from '@/processor/api.js'
-import { StreamRecord, type RecordHeaders } from '@/processor/record.js'
-import type { KeyValueStore } from '@/state.js'
-
-/** Marks a grouped record as the addition (`add`) or the retraction (`sub`) of a row's value. */
-export const DELTA_OP_HEADER = '__kafkats_delta_op'
-const ADD = Buffer.from('add')
-const SUB = Buffer.from('sub')
-
-/** Whether a grouped record retracts a row's value from its group. */
-export function isRetraction(headers: RecordHeaders): boolean {
-	return headers[DELTA_OP_HEADER]?.equals(SUB) ?? false
-}
-
-/** A row's contribution to its group: the grouped key and the mapped value. */
-export interface GroupedRow<K, V> {
-	readonly groupedKey: K
-	readonly value: V
-}
-
-/** `[u32BE key length][grouped key][value]`. */
-export function groupedRowCodec<K, V>(keyCodec: Codec<K>, valueCodec: Codec<V>): Codec<GroupedRow<K, V>> {
-	return {
-		encode: row => {
-			const key = keyCodec.encode(row.groupedKey)
-			const length = Buffer.alloc(4)
-			length.writeUInt32BE(key.length, 0)
-			return Buffer.concat([length, key, valueCodec.encode(row.value)])
-		},
-		decode: encoded => {
-			const end = 4 + encoded.readUInt32BE(0)
-			return {
-				groupedKey: keyCodec.decode(encoded.subarray(4, end)),
-				value: valueCodec.decode(encoded.subarray(end)),
-			}
-		},
-	}
-}
+import type { StreamRecord } from '@/processor/record.js'
 
 export function repartitionMapProcessor<K, V, KR, VR>(
 	selector: (key: K, value: V) => KeyValue<KR, VR>,
-	mappingStore: string
-): ProcessorSupplier<K, Change<V>, KR, VR> {
-	return () => new KTableRepartitionMapProcessor(selector, mappingStore)
+	keyCodec: Codec<KR>
+): ProcessorSupplier<K, Change<V>, KR, Change<VR>> {
+	return () => new KTableRepartitionMapProcessor(selector, keyCodec)
 }
 
-class KTableRepartitionMapProcessor<K, V, KR, VR> implements Processor<K, Change<V>, KR, VR> {
-	private context!: InternalProcessorContext<KR, VR>
-	private mapping!: KeyValueStore<K, GroupedRow<KR, VR>>
+class KTableRepartitionMapProcessor<K, V, KR, VR> implements Processor<K, Change<V>, KR, Change<VR>> {
+	private context!: InternalProcessorContext<KR, Change<VR>>
 
 	constructor(
 		private readonly selector: (key: K, value: V) => KeyValue<KR, VR>,
-		private readonly mappingStore: string
+		private readonly keyCodec: Codec<KR>
 	) {}
 
-	init(context: ProcessorContext<KR, VR>): void {
-		this.context = context as InternalProcessorContext<KR, VR>
-		this.mapping = context.getStateStore(this.mappingStore)
+	init(context: ProcessorContext<KR, Change<VR>>): void {
+		this.context = context as InternalProcessorContext<KR, Change<VR>>
 	}
 
-	async process(record: StreamRecord<K, Change<V>>): Promise<void> {
-		const { key } = record
+	/** Synchronous when the records' subtrees are. */
+	process(record: StreamRecord<K, Change<V>>): ForwardResult {
+		const { key, value } = record
 		if (key === null || key === undefined) {
-			this.context.recordDropped('null-key', { store: this.mappingStore })
+			this.context.recordDropped('null-key')
 			return
 		}
-		const { newValue } = record.value
-		const added = newValue === null ? undefined : this.selector(key, newValue)
-		const previous = await this.mapping.get(key)
-		if (previous !== undefined) {
-			await this.forward(record, previous.groupedKey, previous.value, SUB)
+		const newPair = this.map(key, value.newValue)
+		const oldPair = this.map(key, value.oldValue)
+		if (newPair !== undefined && oldPair !== undefined && this.sameGroup(newPair[0], oldPair[0])) {
+			return this.forward(record, newPair[0], { newValue: newPair[1], oldValue: oldPair[1] })
 		}
-		if (added === undefined) {
-			if (previous !== undefined) {
-				await this.mapping.delete(key)
-			}
-			return
+		const join = () =>
+			newPair === undefined
+				? undefined
+				: this.forward(record, newPair[0], { newValue: newPair[1], oldValue: null })
+		if (oldPair === undefined) {
+			return join()
 		}
-		const [groupedKey, value] = added
-		await this.forward(record, groupedKey, value, ADD)
-		await this.mapping.put(key, { groupedKey, value })
+		const leave = this.forward(record, oldPair[0], { newValue: null, oldValue: oldPair[1] })
+		return leave === undefined ? join() : leave.then(join)
 	}
 
-	private forward(record: StreamRecord<K, unknown>, key: KR, value: VR, op: Buffer): ForwardResult {
-		const headers = { ...record.headers, [DELTA_OP_HEADER]: op }
-		return this.context.forward(new StreamRecord(key, value, record.timestamp, headers))
+	/** The group and value of a row's value; undefined without a value, or when the group or value is null. */
+	private map(key: K, value: V | null): KeyValue<KR, VR> | undefined {
+		const pair = value === null ? undefined : this.selector(key, value)
+		return isPresent(pair) && isPresent(pair[0]) && isPresent(pair[1]) ? pair : undefined
 	}
+
+	private sameGroup(a: KR, b: KR): boolean {
+		return a === b || this.keyCodec.encode(a).equals(this.keyCodec.encode(b))
+	}
+
+	private forward(record: StreamRecord<K, Change<V>>, group: KR, change: Change<VR>): ForwardResult {
+		return this.context.forward(record.withKey(group).withValue(change))
+	}
+}
+
+function isPresent<T>(value: T | null | undefined): value is T {
+	return value !== null && value !== undefined
 }

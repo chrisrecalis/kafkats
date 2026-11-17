@@ -192,7 +192,8 @@ describe('DSL shells delegate every method to its operator builder', () => {
 	})
 
 	it('grouped tables aggregate', () => {
-		const grouped = new KGroupedTableImpl<string, number>(ctx, 'map', {}, undefined)
+		const codecs = {} as KGroupedTableImpl<string, number>['codecs']
+		const grouped = new KGroupedTableImpl<string, number>(ctx, 'map', codecs, undefined)
 		grouped.count(options)
 		expect(tableGroupBy.count).toHaveBeenCalledWith(grouped, options)
 		grouped.reduce(fn, fn, options)
