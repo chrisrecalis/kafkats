@@ -8,7 +8,7 @@
  * positions without pins.
  */
 import type { Logger } from '@kafkats/client'
-import { IllegalStateError, NoOffsetResetError, StreamsError } from '@/api/errors.js'
+import { NoOffsetResetError, StreamsError } from '@/api/errors.js'
 import type { AppLifecycle } from '@/app/lifecycle.js'
 import { CommitCoordinator } from '@/runtime/commit.js'
 import type { ResolvedFlowConfig } from '@/runtime/config.js'
@@ -21,6 +21,7 @@ import { Scheduler } from '@/runtime/scheduler.js'
 import { cap, raceSignal } from '@/runtime/signals.js'
 import { TaskIdRegistry, tpKey } from '@/runtime/task-id.js'
 import { TaskManager } from '@/runtime/task-manager.js'
+import type { StateStore } from '@/state.js'
 import type { Checkpoints } from '@/state/checkpoints.js'
 import type { StateDirectory } from '@/state/state-directory.js'
 import type { BuiltTopology } from '@/topology/built-topology.js'
@@ -46,6 +47,10 @@ export interface RunDeps {
 	readonly checkpoints: Checkpoints
 	/** The app state follows rebalances and restores (4.3.5). */
 	readonly lifecycle: Pick<AppLifecycle, 'setRunning' | 'setRebalancing'>
+	/** The read-only view of a global store (GlobalStateManager.store). */
+	readonly globalStore: (name: string) => StateStore
+	/** Stream processing waits for a global table loaded again (FlowRuntime.processingPaused, 4.12). */
+	readonly paused: () => boolean
 	/** FlowRuntime.fail for this run. */
 	readonly onFailure: (error: unknown, site: FailureSite) => void
 	/** The runtime's shutdown: aborts the restore pipelines with the close. */
@@ -102,9 +107,7 @@ export class Run {
 			config,
 			stateDirectory: deps.stateDirectory,
 			checkpoints: deps.checkpoints,
-			globalStore: name => {
-				throw new IllegalStateError(`global store '${name}': global tables are not available in this build`)
-			},
+			globalStore: deps.globalStore,
 			consumer: this.consumer,
 			outputs: {
 				forTask: task => this.current.forTask(task),
@@ -132,7 +135,7 @@ export class Run {
 			consumer: this.consumer,
 			clock: io.clock,
 			config,
-			paused: () => false,
+			paused: deps.paused,
 			failed: () => this.isFailed,
 			hardStop: this.hardStop.signal,
 			onFailure: (error, site) => this.fail(error, site),
@@ -165,17 +168,31 @@ export class Run {
 		this.scheduler.wake()
 	}
 
+	/**
+	 * The gate of a global table loaded again (4.12 step 3): inside exclusive, a commit of the RUNNING tasks (skipped
+	 * while a rebalance is pending; a failure fails the run), then `pause()`, so that no slice starts in between.
+	 */
+	commitAndPause(pause: () => void): Promise<void> {
+		return this.scheduler.exclusive(async () => {
+			if (this.acknowledges) {
+				await this.commits
+					.commit('user', cap(this.hardStop.signal, CLOSE_COMMIT_TIMEOUT_MS))
+					.catch((error: unknown) => this.fail(error, 'commit'))
+			}
+			pause()
+		})
+	}
+
 	/** Joins the group: the consumer's handler enqueues, its hooks run the TaskManager inside exclusive (4.3). */
 	start(): void {
 		const { consumer, deps } = this
 		consumer.on('rebalancePending', () => deps.lifecycle.setRebalancing())
 		consumer.on('error', error => deps.logger.warn('the group consumer reported an error', errorFields(error)))
-		consumer.on('offsetReset', ({ reason, ...reset }) => {
+		consumer.on('offsetReset', ({ reason, topic, partition, from, to }) => {
+			// Offsets as strings: the client's logger writes JSON, which has no bigint.
 			deps.logger[reason === 'out-of-range' ? 'warn' : 'info'](
 				`a partition starts at its reset position (${reason})`,
-				{
-					...reset,
-				}
+				{ topic, partition, from: from?.toString() ?? null, to: to.toString() }
 			)
 		})
 		consumer.on('offsetOutOfRange', ({ topic, partition, offset }) => {

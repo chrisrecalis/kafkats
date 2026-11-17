@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { KafkaClient } from '@kafkats/client'
-import { FlowConfigError, StreamsError, TopologyError } from '@/api/errors.js'
+import { FlowConfigError, TopologyError } from '@/api/errors.js'
 import { flow } from '@/app/flow.js'
 import { internals } from '@/app/internal.js'
 import { codec } from '@/codec.js'
@@ -56,13 +56,6 @@ describe('flow()', () => {
 		expect(app.state()).toBe('STOPPED')
 		// The user's own client stays as it is.
 		expect(disconnect).not.toHaveBeenCalled()
-	})
-
-	it('start() rejects a topology with global tables in this build', async () => {
-		const app = flow({ applicationId: 'app', client })
-		app.globalTable('users', { key: codec.string(), value: codec.string() })
-		await expect(app.start()).rejects.toThrow(StreamsError)
-		await app.close()
 	})
 
 	it('start() rejects with the TopologyError of an invalid topology', async () => {

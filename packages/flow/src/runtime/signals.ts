@@ -1,5 +1,6 @@
 import { setImmediate as nextTurn, setTimeout as sleepFor } from 'node:timers/promises'
 import type { MaybePromise } from '@/processor/api.js'
+import type { Clock } from '@/runtime/io.js'
 
 /** Longest stretch of synchronous work between two yields to the event loop. */
 export const YIELD_AFTER_MS = 10
@@ -41,6 +42,15 @@ export function raceSignal<T>(promise: Promise<T>, signal: AbortSignal): Promise
 /** Resolves after `ms`; rejects with an AbortError once `signal` aborts. */
 export function sleep(ms: number, signal: AbortSignal): Promise<void> {
 	return sleepFor(ms, undefined, { signal })
+}
+
+/** Resolves after `ms` of `clock`; rejects with an AbortError once `signal` aborts. */
+export function delay(clock: Clock, ms: number, signal: AbortSignal): Promise<void> {
+	let cancel = (): void => {}
+	const elapsed = new Promise<void>(resolve => {
+		cancel = clock.setTimer(clock.now() + ms, resolve)
+	})
+	return raceSignal(elapsed, signal).finally(cancel)
 }
 
 let lastYield = performance.now()
