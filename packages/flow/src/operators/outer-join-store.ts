@@ -34,13 +34,16 @@ export interface EmitState {
 	nextEmit: number
 }
 
-/** A pending entry as one side sees it: its own records, or the other side's. */
+/**
+ * A pending entry as one side sees it: its own records, or the other side's. Its key and values are decoded when asked
+ * for, which an emission scan does only for the entries it emits.
+ */
 export type Pending<K, V, VO> = {
 	readonly timestamp: number
-	readonly key: K
 	/** The entry's key in the store, for delete(). */
 	readonly storeKey: Buffer
-} & ({ readonly own: true; readonly values: readonly V[] } | { readonly own: false; readonly values: readonly VO[] })
+	key(): K
+} & ({ readonly own: true; values(): V[] } | { readonly own: false; values(): VO[] })
 
 const TIMESTAMP_BYTES = 8
 const KEY_OFFSET = TIMESTAMP_BYTES + 1
@@ -105,12 +108,12 @@ export class OuterJoinStore<K, V, VO> {
 		for await (const [storeKey, values] of this.store.range(FIRST, LAST)) {
 			const entry = {
 				timestamp: timestampOf(storeKey),
-				key: this.codecs.key.decode(storeKey.subarray(KEY_OFFSET)),
 				storeKey,
+				key: () => this.codecs.key.decode(storeKey.subarray(KEY_OFFSET)),
 			}
 			yield storeKey[TIMESTAMP_BYTES] === this.ownSide
-				? { ...entry, own: true, values: values.map(v => this.codecs.value.decode(v)) }
-				: { ...entry, own: false, values: values.map(v => this.codecs.otherValue.decode(v)) }
+				? { ...entry, own: true, values: () => values.map(v => this.codecs.value.decode(v)) }
+				: { ...entry, own: false, values: () => values.map(v => this.codecs.otherValue.decode(v)) }
 			if (++read % YIELD_EVERY === 0) await yieldIfDue()
 		}
 	}

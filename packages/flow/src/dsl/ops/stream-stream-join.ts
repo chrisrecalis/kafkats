@@ -95,6 +95,7 @@ export function streamStreamJoin<K, V, VO, VR>(
 			afterMs: windows.afterMs,
 			joiner,
 			outer: kind !== 'inner',
+			otherOuter: kind === 'outer',
 			outerStore: outerStore === undefined ? undefined : { name: outerStore, key, value, otherValue },
 		}),
 		[thisStore, otherStore, ...outer],
@@ -113,6 +114,7 @@ export function streamStreamJoin<K, V, VO, VR>(
 			afterMs: windows.beforeMs,
 			joiner: (otherValue, thisValue) => joiner(thisValue, otherValue),
 			outer: kind === 'outer',
+			otherOuter: kind !== 'inner',
 			outerStore:
 				outerStore === undefined ? undefined : { name: outerStore, key, value: otherValue, otherValue: value },
 		}),

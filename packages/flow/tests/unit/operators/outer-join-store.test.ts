@@ -22,7 +22,7 @@ function outerStore() {
 async function entries<V, VO>(store: OuterJoinStore<string, V, VO>) {
 	const result: [number, string, boolean, readonly (V | VO)[]][] = []
 	for await (const entry of store.pending()) {
-		result.push([entry.timestamp, entry.key, entry.own, entry.values])
+		result.push([entry.timestamp, entry.key(), entry.own, entry.values()])
 	}
 	return result
 }
@@ -62,6 +62,23 @@ describe('OuterJoinStore', () => {
 			[100, 'a', false],
 			[100, 'b', false],
 		])
+	})
+
+	it('pending() decodes the key and values of an entry only when asked for them', async () => {
+		const { raw, left, right } = outerStore()
+		await left.add('a', 100, 'L')
+		await right.add('b', 100, 2)
+		const codecs = { key: codec.string(), value: codec.string(), otherValue: codec.json<number>() }
+		const decodes = Object.values(codecs).map(c => vi.spyOn(c, 'decode'))
+		const seen: [number, boolean][] = []
+		for await (const entry of new OuterJoinStore(raw, 'left', codecs).pending()) {
+			seen.push([entry.timestamp, entry.own])
+		}
+		expect(seen).toEqual([
+			[100, false],
+			[100, true],
+		])
+		for (const decode of decodes) expect(decode).not.toHaveBeenCalled()
 	})
 
 	it("removeOther() deletes the other side's entry of a key and timestamp, and writes nothing when there is none", async () => {

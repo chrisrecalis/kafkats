@@ -31,6 +31,8 @@ export interface JoinSideSpec<K, V, VO, VR> {
 	readonly joiner: (value: V | null, otherValue: VO | null) => VR
 	/** Whether unmatched records of this side are joined with null. */
 	readonly outer: boolean
+	/** Whether those of the other side are: only then may the outer-join store hold records of the other side. */
+	readonly otherOuter: boolean
 	/** The outer-join store of the join and the codecs of its entries; absent for inner and legacy joins. */
 	readonly outerStore?: {
 		readonly name: string
@@ -70,7 +72,7 @@ class StreamStreamJoinProcessor<K, V, VO, VR> implements Processor<K | null, V |
 	async process(record: StreamRecord<K | null, V | null>): Promise<void> {
 		const { key, value, timestamp } = record
 		const streamTime = this.clock.advance(timestamp)
-		const { beforeMs, afterMs, joiner, outer } = this.spec
+		const { beforeMs, afterMs, joiner, outer, otherOuter } = this.spec
 		if (key === null || value === null) {
 			// KIP-962: an outer side joins a null-key record with null at once, without storing it.
 			if (outer && value !== null) {
@@ -88,7 +90,9 @@ class StreamStreamJoinProcessor<K, V, VO, VR> implements Processor<K | null, V |
 		const window = this.other.fetch(key, Math.max(0, timestamp - beforeMs), Math.max(0, timestamp + afterMs))
 		for await (const [otherTimestamp, otherValues] of window) {
 			matched = true
-			await this.outerStore?.removeOther(key, otherTimestamp)
+			if (otherOuter) {
+				await this.outerStore?.removeOther(key, otherTimestamp)
+			}
 			const result = keyed.withTimestamp(Math.max(timestamp, otherTimestamp))
 			for (const otherValue of otherValues) {
 				await this.context.forward(result.withValue(joiner(value, otherValue)))
@@ -130,7 +134,7 @@ class StreamStreamJoinProcessor<K, V, VO, VR> implements Processor<K | null, V |
 		trigger: StreamRecord<K, V>,
 		streamTime: number
 	): Promise<void> {
-		const { beforeMs, afterMs, graceMs, joiner } = this.spec
+		const { beforeMs, afterMs, graceMs, joiner, outer, otherOuter } = this.spec
 		const state = outerStore.emitState
 		if (state.minTime + afterMs + graceMs >= streamTime) return
 		const now = this.context.currentSystemTimeMs()
@@ -138,7 +142,8 @@ class StreamStreamJoinProcessor<K, V, VO, VR> implements Processor<K | null, V |
 		state.nextEmit = now + this.context.config.emitIntervalMs
 		// The oldest entry left (Kafka Streams keeps the last one it looked at, which can delay the next scan).
 		state.minTime = Number.POSITIVE_INFINITY
-		const open = { own: false, other: false }
+		// A side without unmatched records to wait (the right side of a left join) is open from the start.
+		const open = { own: !outer, other: !otherOuter }
 		for await (const entry of outerStore.pending()) {
 			if (entry.timestamp + (entry.own ? afterMs : beforeMs) + graceMs >= streamTime) {
 				// Later entries of the same side are newer: open too.
@@ -147,8 +152,10 @@ class StreamStreamJoinProcessor<K, V, VO, VR> implements Processor<K | null, V |
 				if (open.own && open.other) break
 				continue
 			}
-			const results = entry.own ? entry.values.map(v => joiner(v, null)) : entry.values.map(v => joiner(null, v))
-			const result = trigger.withKey(entry.key).withTimestamp(entry.timestamp)
+			const results = entry.own
+				? entry.values().map(v => joiner(v, null))
+				: entry.values().map(v => joiner(null, v))
+			const result = trigger.withKey(entry.key()).withTimestamp(entry.timestamp)
 			for (const joined of results) {
 				await this.context.forward(result.withValue(joined))
 			}

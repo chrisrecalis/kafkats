@@ -53,6 +53,7 @@ async function joinHarness(outer: { left: boolean; right: boolean }, restore?: (
 					otherStore: 'right-store',
 					joiner: (l, r) => `${l}+${r}`,
 					outer: outer.left,
+					otherOuter: outer.right,
 				}),
 				['left-store', 'right-store']
 			),
@@ -66,6 +67,7 @@ async function joinHarness(outer: { left: boolean; right: boolean }, restore?: (
 					otherStore: 'left-store',
 					joiner: (r, l) => `${l}+${r}`,
 					outer: outer.right,
+					otherOuter: outer.left,
 				}),
 				['right-store', 'left-store']
 			),

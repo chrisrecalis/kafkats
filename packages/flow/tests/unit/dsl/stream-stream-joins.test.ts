@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { TopologyError } from '@/api/errors.js'
 import type { KStream } from '@/api/kstream.js'
 import { flow } from '@/app/flow.js'
@@ -6,6 +6,7 @@ import { internals } from '@/app/internal.js'
 import { codec } from '@/codec.js'
 import { DslContext } from '@/dsl/context.js'
 import { JoinWindows, SessionWindows, SlidingWindows, TimeWindows } from '@/dsl/windows.js'
+import { OuterJoinStore } from '@/operators/outer-join-store.js'
 import { decodeCommitMetadata } from '@/processor/metadata.js'
 import type { StreamTask } from '@/runtime/task.js'
 import type { SessionStore } from '@/state.js'
@@ -224,6 +225,67 @@ describe.each(GUARANTEES)('stream-stream join results (%s)', (_guarantee, config
 			await send(ctx, 'l', 'm', 'M', 1200)
 			expect(timed(ctx)).toEqual(['J+null@850', 'K+R@1050'])
 		})
+	})
+
+	it('a record whose window ends at the stream time can still be matched: it waits', async () => {
+		const driver = windowJoin('leftJoin', JoinWindows.ofTimeDifferenceWithNoGrace(100), config)
+		await driver.run(async ctx => {
+			await send(ctx, 'l', 'k', 'K', 1000)
+			await send(ctx, 'l', 'j', 'J', 900) // its window [800, 1000] ends at the stream time
+			await send(ctx, 'r', 'j', 'R', 1000)
+			expect(timed(ctx)).toEqual(['J+R@1000'])
+		})
+	})
+
+	it('a pending record whose window and grace end at the stream time is still open', async () => {
+		const driver = windowJoin('leftJoin', JoinWindows.ofTimeDifferenceWithNoGrace(100), config)
+		await driver.run(async ctx => {
+			await send(ctx, 'l', 'a', 'A', 1000)
+			await send(ctx, 'l', 'b', 'B', 1050)
+			await send(ctx, 'l', 'c', 'C', 1150) // closes A; B's window ends at 1150
+			await send(ctx, 'r', 'b', 'R', 1150)
+			expect(timed(ctx)).toEqual(['A+null@1000', 'B+R@1150'])
+		})
+	})
+
+	it('a left join scans its pending records up to the first one still open', async () => {
+		const pending = OuterJoinStore.prototype.pending
+		let read = 0
+		const scans = vi
+			.spyOn(OuterJoinStore.prototype, 'pending')
+			.mockImplementation(async function* (this: OuterJoinStore<unknown, unknown, unknown>) {
+				for await (const entry of pending.call(this)) {
+					read++
+					yield entry
+				}
+			})
+		try {
+			const driver = windowJoin('leftJoin', JoinWindows.ofTimeDifferenceWithNoGrace(10), config)
+			await driver.run(async ctx => {
+				for (let timestamp = 0; timestamp < 50; timestamp++) await send(ctx, 'l', 'k', 'L', timestamp)
+				// Each record from 11 on closes the oldest pending one: the scan reads it and the next, still open.
+				expect(timed(ctx)).toHaveLength(39)
+				expect(read).toBe(2 * 39)
+			})
+		} finally {
+			scans.mockRestore()
+		}
+	})
+
+	it('in a left join only a match of a right record removes a pending record: the left side has them all', async () => {
+		const removeOther = vi.spyOn(OuterJoinStore.prototype, 'removeOther')
+		try {
+			const driver = windowJoin('leftJoin', JoinWindows.ofTimeDifferenceWithNoGrace(100), config)
+			await driver.run(async ctx => {
+				await send(ctx, 'r', 'k', 'R', 1000)
+				await send(ctx, 'l', 'k', 'L', 1000)
+				await send(ctx, 'r', 'k', 'S', 1000)
+				expect(timed(ctx)).toEqual(['L+R@1000', 'L+S@1000'])
+			})
+			expect(removeOther).toHaveBeenCalledTimes(1)
+		} finally {
+			removeOther.mockRestore()
+		}
 	})
 
 	it('asymmetric windows: a left record waits after + grace, a right one before + grace (KS lookBack)', async () => {
