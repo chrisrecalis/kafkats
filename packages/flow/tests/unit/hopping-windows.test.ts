@@ -35,7 +35,7 @@ describe('hopping windows', () => {
 		const out = await updates(
 			driver =>
 				grouped(driver)
-					.windowedBy(TimeWindows.of(1000).advanceBy(500))
+					.windowedBy(TimeWindows.ofSizeWithNoGrace(1000).advanceBy(500))
 					.aggregate(
 						() => 0,
 						(_k, v, agg) => agg + v,
@@ -53,7 +53,7 @@ describe('hopping windows', () => {
 		const out = await updates(
 			driver =>
 				grouped(driver)
-					.windowedBy(TimeWindows.of(1000).advanceBy(500))
+					.windowedBy(TimeWindows.ofSizeWithNoGrace(1000).advanceBy(500))
 					.reduce((a, b) => a + b),
 			[
 				[7, 750],
@@ -71,7 +71,7 @@ describe('hopping windows', () => {
 	it('no window starts before 0: a record near the epoch is only in its windows from 0 on (Kafka Streams)', async () => {
 		// size=10, advance=3: a record at 4 would also be in [-3, 7).
 		const out = await updates(
-			driver => grouped(driver).windowedBy(TimeWindows.of(10).advanceBy(3)).count(),
+			driver => grouped(driver).windowedBy(TimeWindows.ofSizeWithNoGrace(10).advanceBy(3)).count(),
 			[[1, 4]]
 		)
 		expect(out).toEqual([
@@ -80,29 +80,21 @@ describe('hopping windows', () => {
 		])
 	})
 
-	it('throws a TopologyError at the aggregation when advanceBy is greater than the window size', () => {
+	it('an advance above the size, or of 0 or less, is a TopologyError at advanceBy (Kafka Streams)', () => {
 		// Larger advances would silently drop the records that fall between windows.
-		const driver = new TestDriver()
-		const windowed = grouped(driver).windowedBy(TimeWindows.of(1000).advanceBy(2000))
-		expect(() => windowed.count()).toThrow(TopologyError)
-		expect(() => windowed.reduce((a, b) => a + b)).toThrow(/advanceBy must be <= window size/)
-	})
-
-	it('throws a TopologyError at the aggregation for windows of size 0 (no record would ever fall into one)', () => {
-		const driver = new TestDriver()
-		expect(() => grouped(driver).windowedBy(TimeWindows.of(0)).count()).toThrow(TopologyError)
-	})
-
-	it('advanceBy(0) gives tumbling windows, as today', async () => {
-		const out = await updates(
-			driver => grouped(driver).windowedBy(TimeWindows.of(1000).advanceBy(0)).count(),
-			[[1, 750]]
+		for (const advance of [2000, 0, -1]) {
+			expect(() => TimeWindows.ofSizeWithNoGrace(1000).advanceBy(advance)).toThrow(TopologyError)
+		}
+		expect(() => TimeWindows.ofSizeWithNoGrace(1000).advanceBy(2000)).toThrow(
+			'TimeWindows advance must be positive and at most the window size (1000 ms), got 2000 ms'
 		)
-		expect(out).toEqual([{ start: 0, end: 1000, value: 1 }])
 	})
 
 	it('tumbling windows (advance == size) produce exactly one update per record', async () => {
-		const out = await updates(driver => grouped(driver).windowedBy(TimeWindows.of(1000)).count(), [[1, 750]])
+		const out = await updates(
+			driver => grouped(driver).windowedBy(TimeWindows.ofSizeWithNoGrace(1000)).count(),
+			[[1, 750]]
+		)
 		expect(out).toEqual([{ start: 0, end: 1000, value: 1 }])
 	})
 })

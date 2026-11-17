@@ -13,7 +13,7 @@ import { requireCodec } from '@/dsl/format.js'
 import { KStreamImpl } from '@/dsl/kstream.js'
 import { NodePrefix, storeName, StorePrefix } from '@/dsl/naming.js'
 import { repartitionIfRequired } from '@/dsl/ops/repartition.js'
-import { JoinWindows, SessionWindows, TimeWindows } from '@/dsl/windows.js'
+import { JoinWindows, joinWindowsWithin } from '@/dsl/windows.js'
 import { joinBufferWindow } from '@/operators/join-buffer.js'
 import { passThroughProcessor } from '@/operators/stateless.js'
 import { streamStreamJoinProcessor } from '@/operators/stream-stream-join.js'
@@ -142,22 +142,5 @@ function joinArguments<K, V, VO, VR>(
 	if (windows instanceof JoinWindows) {
 		return { joiner: join, windows, options: options ?? {} }
 	}
-	return { joiner: join, windows: legacyJoinWindows(operator, windows?.within), options: windows ?? {} }
-}
-
-/** The JoinWindows of the deprecated `Joined.within` (6.1): the size or gap of other windows, symmetric. */
-function legacyJoinWindows(operator: string, within: Joined<unknown, unknown, unknown>['within']): JoinWindows {
-	if (within instanceof JoinWindows) {
-		return within
-	}
-	if (within instanceof TimeWindows) {
-		return JoinWindows.of(within.sizeMs)
-	}
-	if (within instanceof SessionWindows) {
-		return JoinWindows.of(within.gapMs)
-	}
-	if (within === undefined) {
-		throw new TopologyError(`${operator} with a stream needs JoinWindows as its third argument`)
-	}
-	throw new TopologyError(`${operator} with a stream cannot use SlidingWindows; pass JoinWindows`)
+	return { joiner: join, windows: joinWindowsWithin(windows?.within, operator), options: windows ?? {} }
 }

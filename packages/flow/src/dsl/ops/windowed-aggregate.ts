@@ -20,7 +20,6 @@ import { COUNT_CODEC, counting, requireAggregateCodec, type AggregationKind } fr
 import { aggregationInput } from '@/dsl/ops/grouping.js'
 import type { SessionWindowedKStreamImpl } from '@/dsl/session-windowed-kstream.js'
 import type { TimeWindowedKStreamImpl } from '@/dsl/time-windowed-kstream.js'
-import type { TimeWindows } from '@/dsl/windows.js'
 import { aggregateWith, reduceWith, type Aggregation } from '@/operators/kstream-aggregate.js'
 import type { KTableNode } from '@/operators/ktable-node.js'
 import {
@@ -29,11 +28,7 @@ import {
 	SessionWindowAggregate,
 	type SessionMerge,
 } from '@/operators/session-aggregate.js'
-import {
-	TimeWindowAggregate,
-	WINDOW_STORE_RETENTION_MULTIPLIER,
-	type TimeWindowSizes,
-} from '@/operators/window-aggregate.js'
+import { TimeWindowAggregate, WINDOW_STORE_RETENTION_MULTIPLIER } from '@/operators/window-aggregate.js'
 import { sessionStoreBuilder, windowStoreBuilder } from '@/state/store-builders.js'
 import type { StoreBuilder } from '@/topology/nodes.js'
 
@@ -135,20 +130,6 @@ function windowedCodec<K>(inner: Codec<K>): Codec<Windowed<K>> {
 	}
 }
 
-/** Sizes of hopping or tumbling windows; an advance above the size would drop the records between windows. */
-function timeWindowSizes({ sizeMs, advanceMs }: TimeWindows): TimeWindowSizes {
-	if (sizeMs <= 0) {
-		throw new TopologyError(`A time window needs a positive size, got ${sizeMs} ms`)
-	}
-	if (advanceMs > sizeMs) {
-		throw new TopologyError(
-			`TimeWindows.advanceBy must be <= window size (got advance=${advanceMs}, size=${sizeMs}): ` +
-				'larger advances would drop the records that fall between windows'
-		)
-	}
-	return { sizeMs, advanceMs: advanceMs > 0 ? advanceMs : sizeMs }
-}
-
 /** The merger of `aggregate()` on session windows; the deprecated two-argument form is wrapped. */
 function sessionMerger<K, A>(merger: SessionMergerArg<K, A> | undefined): (key: K, a1: A, a2: A) => A {
 	if (typeof merger === 'function') {
@@ -171,18 +152,18 @@ function timeWindowed<K, V, A>(
 	valueCodec: Codec<A>,
 	aggregation: Aggregation<K, V, A>
 ): KTable<Windowed<K>, A> {
-	const sizes = timeWindowSizes(windowed.windows)
-	const format: WindowedFormat = { kind: 'time', sizeMs: sizes.sizeMs }
+	const { windows } = windowed
+	const format: WindowedFormat = { kind: 'time', sizeMs: windows.sizeMs }
 	return materialize(windowed.grouped, kind, options, valueCodec, format, (ctx, name, keyCodec) => ({
 		builder: windowStoreBuilder(ctx.changelog, {
 			name,
 			keyCodec,
 			valueCodec,
 			logging: options.changelog,
-			retentionMs: sizes.sizeMs * WINDOW_STORE_RETENTION_MULTIPLIER,
-			windowSizeMs: sizes.sizeMs,
+			retentionMs: windows.sizeMs * WINDOW_STORE_RETENTION_MULTIPLIER,
+			windowSizeMs: windows.sizeMs,
 		}),
-		node: new TimeWindowAggregate(name, sizes, aggregation),
+		node: new TimeWindowAggregate(name, windows, aggregation),
 	}))
 }
 
