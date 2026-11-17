@@ -9,7 +9,8 @@ export function cap(parent: AbortSignal, ms: number): AbortSignal {
 	return AbortSignal.any([parent, AbortSignal.timeout(ms)])
 }
 
-function abortError(signal: AbortSignal): DOMException {
+/** The AbortError an operation rejects with once `signal` aborted. */
+export function abortError(signal: AbortSignal): DOMException {
 	return new DOMException('The operation was aborted', { name: 'AbortError', cause: signal.reason })
 }
 

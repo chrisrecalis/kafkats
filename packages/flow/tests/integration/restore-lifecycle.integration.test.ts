@@ -86,6 +86,9 @@ const RESTORE_FAST = {
 	consumerMaxWaitMs: 100,
 }
 
+/** A changelog value of a count store, which is timestamped (BC14): `[int64BE timestamp][count]`. */
+const storedCount = (count: number): Buffer => Buffer.concat([Buffer.alloc(8), numberCodec.encode(count)])
+
 async function newKvStore(name: string) {
 	const store = new InMemoryKeyValueStore<string, number>(name, { keyCodec: stringCodec, valueCodec: numberCodec })
 	await store.init()
@@ -117,7 +120,7 @@ describe('changelog restorer', () => {
 		const changelog = buildChangelogTopicName(appId, 'counts')
 		await createTopics(client, [{ name: input }, { name: changelog }])
 		for (let i = 1; i <= 5; i++) {
-			await producer.send(changelog, { key: `k${i}`, value: numberCodec.encode(i) })
+			await producer.send(changelog, { key: `k${i}`, value: storedCount(i) })
 		}
 
 		const provider = new SlowProvider(new MemoryCheckpointStore())
@@ -137,7 +140,7 @@ describe('changelog restorer', () => {
 		try {
 			await withTimeout('start', app.start(), 25_000)
 			const inner = [...provider.inners].find(([name]) => name.endsWith('.counts.p0'))![1]
-			for (let i = 1; i <= 5; i++) expect(await inner.get(`k${i}`)).toBe(i)
+			for (let i = 1; i <= 5; i++) expect(await inner.get(`k${i}`)).toEqual({ value: i, timestamp: 0 })
 		} finally {
 			await app.close().catch(() => {})
 		}
@@ -177,7 +180,7 @@ describe('changelog restorer', () => {
 		try {
 			for (let s = 0; s < storeCount; s++) {
 				await tx.transaction(async t => {
-					await t.send(buildChangelogTopicName(appId, `s${s}`), { key: 'a', value: numberCodec.encode(1) })
+					await t.send(buildChangelogTopicName(appId, `s${s}`), { key: 'a', value: storedCount(1) })
 				})
 			}
 		} finally {

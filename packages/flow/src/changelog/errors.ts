@@ -53,3 +53,23 @@ export class CoPartitioningError extends Error {
 		)
 	}
 }
+
+/**
+ * Error thrown when a changelog record cannot be decoded with the store's codecs while restoring. The changelog was
+ * written with other codecs (a changed topology, or another application's topic): restarting cannot fix it.
+ */
+export class ChangelogDecodeError extends Error {
+	override readonly name = 'ChangelogDecodeError'
+
+	constructor(
+		public readonly changelogTopic: string,
+		public readonly partition: number,
+		options: { cause: unknown }
+	) {
+		super(
+			`A record of changelog topic "${changelogTopic}" partition ${partition} cannot be decoded with the codecs of ` +
+				'its store. Reset the application state if the store changed its key or value format.',
+			options
+		)
+	}
+}

@@ -1,4 +1,4 @@
-// The legacy runtime's changelog layer: its own copies of changelog/{config,writer}.ts, the shared errors and restorer.
+// The legacy runtime's changelog layer: its own copies of changelog/{config,writer,restorer}.ts and the shared errors.
 export {
 	type ChangelogConfig,
 	type ChangelogRestorationOptions,
@@ -10,4 +10,4 @@ export {
 } from '@/legacy/changelog/config.js'
 export { ChangelogPartitionMismatchError, CoPartitioningError, SourceTopicNotFoundError } from '@/changelog/errors.js'
 export { ChangelogWriter, windowedKeyCodec } from '@/legacy/changelog/writer.js'
-export { ChangelogRestorer } from '@/changelog/restorer.js'
+export { ChangelogRestorer } from '@/legacy/changelog/restorer.js'

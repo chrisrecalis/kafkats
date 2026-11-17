@@ -15,7 +15,7 @@ import {
 	TaskMigratedError,
 	TopologyError,
 } from '@/api/errors.js'
-import { ChangelogPartitionMismatchError, CoPartitioningError } from '@/changelog/errors.js'
+import { ChangelogDecodeError, ChangelogPartitionMismatchError, CoPartitioningError } from '@/changelog/errors.js'
 
 /** Restart backoff after a migration: doubles from the initial value up to the maximum. */
 export const RESTART_INITIAL_BACKOFF_MS = 500
@@ -82,6 +82,7 @@ const FATAL_SEND_CODES: ReadonlySet<number> = new Set([
 /** Errors no restart can fix: configuration, authorization, topology and user-code failures, bugs. */
 const FATAL_CLASSES = [
 	AssignmentError,
+	ChangelogDecodeError,
 	ChangelogPartitionMismatchError,
 	CoPartitioningError,
 	TopologyError,

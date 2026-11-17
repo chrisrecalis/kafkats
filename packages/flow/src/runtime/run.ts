@@ -4,8 +4,7 @@
  * (4.3). Created by FlowRuntime.start (and, from the recovery of a later build, by every recovery); never revived: a
  * Run ends once, gracefully (close) or abandoned (failure).
  *
- * This build restores nothing (its restorer only accepts changelogs with nothing to replay) and settles start
- * positions without pins.
+ * This build settles start positions without pins.
  */
 import type { Logger } from '@kafkats/client'
 import { IllegalStateError, NoOffsetResetError, StreamsError } from '@/api/errors.js'
@@ -13,13 +12,14 @@ import type { AppLifecycle } from '@/app/lifecycle.js'
 import { CommitCoordinator } from '@/runtime/commit.js'
 import type { ResolvedFlowConfig } from '@/runtime/config.js'
 import { errorMessage, type FailureSite } from '@/runtime/errors.js'
-import type { AdminPort, GroupConsumerHooks, GroupConsumerPort, ProducerPort, RuntimeIO } from '@/runtime/io.js'
+import type { GroupConsumerHooks, GroupConsumerPort, ProducerPort, RuntimeIO } from '@/runtime/io.js'
 import { SinkPartitionCounts } from '@/runtime/partition-count-cache.js'
 import { RecordCollector } from '@/runtime/record-collector.js'
-import type { StartPositionSettler, TaskRestorer } from '@/runtime/restore-pipelines.js'
+import type { StartPositionSettler } from '@/runtime/restore-pipelines.js'
+import { RestorationPool } from '@/runtime/restoration.js'
 import { Scheduler } from '@/runtime/scheduler.js'
 import { cap, raceSignal } from '@/runtime/signals.js'
-import { TaskIdRegistry, tpKey } from '@/runtime/task-id.js'
+import { TaskIdRegistry } from '@/runtime/task-id.js'
 import { TaskManager } from '@/runtime/task-manager.js'
 import type { Checkpoints } from '@/state/checkpoints.js'
 import type { StateDirectory } from '@/state/state-directory.js'
@@ -110,7 +110,14 @@ export class Run {
 				forTask: task => this.current.forTask(task),
 				ensureTransaction: signal => this.current.ensureTransaction(signal),
 			},
-			restorer: emptyChangelogsOnly(io.admin, deps.checkpoints),
+			restorer: new RestorationPool({
+				io,
+				checkpoints: deps.checkpoints,
+				options: config.restoration,
+				applicationId: config.applicationId,
+				commitIntervalMs: config.commitIntervalMs,
+				logger,
+			}),
 			startPositions: withoutPins,
 			exclusive: fn => this.scheduler.exclusive(fn),
 			commit: (reason, signal) => this.commits.commit(reason, signal),
@@ -350,37 +357,6 @@ export class Run {
 			counts: this.partitionCounts,
 			logger,
 		})
-	}
-}
-
-/**
- * The restorer of this build: a task restores nothing, so it may start only when none of its changelog partitions
- * has records its store may lack: the partition is empty, or its checkpoint is at the end (a task resumed after a
- * rebalance, 4.7.3). Otherwise its restore fails with a StreamsError, which stops the app.
- */
-function emptyChangelogsOnly(admin: Pick<AdminPort, 'listOffsets'>, checkpoints: Checkpoints): TaskRestorer {
-	return {
-		async restore(task, signal) {
-			const changelogs = task.stores.flatMap(({ changelog }) =>
-				changelog === undefined || changelog.skipRestoration ? [] : [changelog]
-			)
-			if (changelogs.length > 0) {
-				const [earliest, end] = await Promise.all([
-					admin.listOffsets(changelogs, 'earliest', 'read_committed', { signal }),
-					admin.listOffsets(changelogs, 'latest', 'read_uncommitted', { signal }),
-				])
-				for (const { topic, partition } of changelogs) {
-					const last = end.get(tpKey({ topic, partition }))
-					if (last === undefined || last === earliest.get(tpKey({ topic, partition }))) continue
-					if (last === (await checkpoints.get(topic, partition))) continue
-					throw new StreamsError(
-						`restoring state is not available in this build: changelog '${topic}' partition ${partition} has records up to offset ${last}`,
-						{ taskId: task.id }
-					)
-				}
-			}
-			return { storeTimes: new Map() }
-		},
 	}
 }
 

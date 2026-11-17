@@ -140,6 +140,7 @@ export {
 	DEFAULT_CHANGELOG_CONFIGS,
 	ChangelogWriter,
 	ChangelogRestorer,
+	ChangelogDecodeError,
 	ChangelogPartitionMismatchError,
 	CoPartitioningError,
 	SourceTopicNotFoundError,
