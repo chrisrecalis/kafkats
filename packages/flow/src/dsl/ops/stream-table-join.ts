@@ -1,7 +1,9 @@
 /**
  * Stream-table joins: inner and left (6.14). The stream is repartitioned first if its keys changed upstream; the
  * join processor reads the table through its value getter, whose stores it is connected to, so the stream and the
- * table end in one subtopology and their topics must be co-partitioned (4.1.3).
+ * table end in one subtopology and their topics must be co-partitioned (4.1.3). Any table can be looked up: a derived
+ * table's getter recomputes its values from its parent's (6.11). A left join joins null keys with null (KIP-962), so a
+ * repartition topic upstream keeps them (4.1.6).
  */
 import { TopologyError } from '@/api/errors.js'
 import type { KStream, ValueJoiner } from '@/api/kstream.js'
@@ -36,7 +38,8 @@ export function streamTableJoin<K, V, VT, VR>(
 		left: kind === 'left',
 	})
 	const prefix = kind === 'inner' ? NodePrefix.JOIN : NodePrefix.LEFT_JOIN
-	const node = self.ctx.processor(prefix, name, [self.node], supplier, valueGetter.storeNames)
+	const marks = kind === 'left' ? { relaxedNullKeyJoin: true as const } : {}
+	const node = self.ctx.processor(prefix, name, [self.node], supplier, valueGetter.storeNames, marks)
 	return new KStreamImpl<K, VR>(self.ctx, node, joinedFormat(self.format, key), false)
 }
 
