@@ -23,47 +23,44 @@ process.on('unhandledRejection', r => log('UNHANDLED_REJECTION', { message: (r a
 const t0 = Date.now()
 const client = new KafkaClient({ clientId: `r3-${process.pid}`, brokers: env('R3_BROKERS').split(',') })
 if (process.env.R3_TRACE) {
-	// Trace every producer transaction (no src changes): begin / sendOffsets / outcome.
+	// Trace every producer transaction (no src changes): begin / sends / sendOffsets / outcome.
+	const trace = (v: unknown) => JSON.stringify(v, (_k, x) => (typeof x === 'bigint' ? String(x) : x))
 	const original = client.producer.bind(client)
 	let n = 0
 	;(client as any).producer = (config: any) => {
 		const producer = original(config)
-		const tx0 = producer.transaction.bind(producer)
-		;(producer as any).transaction = async (fn: any, ...rest: any[]) => {
+		const begin = producer.beginTransaction.bind(producer)
+		;(producer as any).beginTransaction = async (...args: any[]) => {
+			const tx = await begin(...args)
 			const id = ++n
 			log('tx_begin', { id, t: Date.now() - t0 })
-			try {
-				const r = await tx0(
-					async (tx: any) => {
-						const so = tx.sendOffsets.bind(tx)
-						tx.sendOffsets = async (...a: any[]) => {
-							log('tx_sendOffsets', {
-								id,
-								t: Date.now() - t0,
-								offsets: JSON.stringify(a[1], (_k, v) => (typeof v === 'bigint' ? String(v) : v)),
-							})
-							return so(...a)
-						}
-						const send = tx.send.bind(tx)
-						tx.send = async (topic: string, ...a: any[]) => {
-							const res = await send(topic, ...a)
-							log('tx_send', {
-								id,
-								topic,
-								res: JSON.stringify(res, (_k, v) => (typeof v === 'bigint' ? String(v) : v)),
-							})
-							return res
-						}
-						return fn(tx)
-					},
-					...rest
-				)
-				log('tx_committed', { id, t: Date.now() - t0 })
-				return r
-			} catch (e) {
-				log('tx_failed', { id, t: Date.now() - t0, message: (e as Error).message })
-				throw e
+			const send = tx.send.bind(tx) as (...a: any[]) => Promise<unknown>
+			;(tx as any).send = async (topic: string, ...a: any[]) => {
+				const res = await send(topic, ...a)
+				log('tx_send', { id, topic, res: trace(res) })
+				return res
 			}
+			const sendOffsets = tx.sendOffsets.bind(tx) as (...a: any[]) => Promise<void>
+			;(tx as any).sendOffsets = async (...a: any[]) => {
+				log('tx_sendOffsets', { id, t: Date.now() - t0, offsets: trace(a[0]?.offsets ?? a[1]) })
+				return sendOffsets(...a)
+			}
+			const commit = tx.commit.bind(tx)
+			tx.commit = async options => {
+				try {
+					await commit(options)
+					log('tx_committed', { id, t: Date.now() - t0 })
+				} catch (e) {
+					log('tx_failed', { id, t: Date.now() - t0, message: (e as Error).message })
+					throw e
+				}
+			}
+			const abort = tx.abort.bind(tx)
+			tx.abort = async options => {
+				log('tx_abort', { id, t: Date.now() - t0 })
+				return abort(options)
+			}
+			return tx
 		}
 		return producer
 	}

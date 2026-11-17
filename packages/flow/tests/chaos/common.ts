@@ -1,9 +1,10 @@
 /**
  * Shared helpers for chaos harnesses (not runnable on its own).
- * Requires a broker at CHAOS_BROKERS (default 127.0.0.1:29092) - see top of kill-chaos.ts.
+ * Requires a broker at CHAOS_BROKERS (default 127.0.0.1:29092); run-all.sh starts it (brokers.sh).
  */
 import { spawn, type ChildProcess } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { parseArgs } from 'node:util'
 import path from 'node:path'
 import { KafkaClient } from '@kafkats/client'
 
@@ -17,6 +18,34 @@ const here = path.dirname(fileURLToPath(import.meta.url))
 const WORKER = path.join(here, 'worker.ts')
 export const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms))
 export const rnd = (a: number, b: number) => a + Math.random() * (b - a)
+
+/**
+ * The pipelines of worker.ts. The join modes join the input with a table (`table-join`, co-partitioned) or a global
+ * table (`global-join`) whose rows are versions written by a TableFeed; their outputs are `m:<value>|<version>`.
+ */
+export type Mode = 'stateless' | 'count' | 'regroup' | 'table-join' | 'global-join'
+export type Guarantee = 'at_least_once' | 'exactly_once'
+const MODES: readonly string[] = ['stateless', 'count', 'regroup', 'table-join', 'global-join']
+
+/** `--name value` flags with these defaults; an unknown flag (such as the removed `--threads`) fails fast. */
+export function flags<const T extends Record<string, string>>(defaults: T): { [K in keyof T]: string } {
+	const options = Object.fromEntries(
+		Object.entries(defaults).map(([name, value]) => [name, { type: 'string' as const, default: value }])
+	)
+	return parseArgs({ options, strict: true }).values as { [K in keyof T]: string }
+}
+
+export function guaranteeOf(flag: string): Guarantee {
+	if (flag !== 'alo' && flag !== 'eos') throw new Error(`--guarantee must be alo or eos, not ${flag}`)
+	return flag === 'eos' ? 'exactly_once' : 'at_least_once'
+}
+
+export function modeOf(flag: string): Mode {
+	if (!MODES.includes(flag)) throw new Error(`--mode must be one of ${MODES.join('|')}, not ${flag}`)
+	return flag as Mode
+}
+
+export const hasTable = (mode: Mode) => mode === 'table-join' || mode === 'global-join'
 
 export function uid(prefix: string) {
 	return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
@@ -45,6 +74,22 @@ export async function createTopics(client: KafkaClient, names: string[], partiti
 		await sleep(100)
 	}
 	throw new Error('topics not ready')
+}
+
+/** The topics of one scenario (each with the scenario's partition count) and its application id. */
+export interface Topics {
+	appId: string
+	input: string
+	output: string
+	/** The table (table-join) or global table (global-join) topic. */
+	table?: string
+}
+
+export async function scenarioTopics(client: KafkaClient, mode: Mode, partitions: number): Promise<Topics> {
+	const topics: Topics = { appId: uid('chaos-app'), input: uid('chaos-in'), output: uid('chaos-out') }
+	if (hasTable(mode)) topics.table = uid('chaos-table')
+	await createTopics(client, [topics.input, topics.output, ...(topics.table ? [topics.table] : [])], partitions)
+	return topics
 }
 
 export interface Rec {
@@ -156,23 +201,17 @@ export class Worker {
 	}
 }
 
-export function workerEnv(p: {
-	appId: string
-	input: string
-	output: string
-	mode: 'stateless' | 'count' | 'regroup'
-	guarantee: 'at_least_once' | 'exactly_once'
-	threads?: number
-}): Record<string, string> {
+/** Worker env of a scenario; CHAOS_BUFFERED_RECORDS and the other optional knobs pass through the inherited env. */
+export function workerEnv(p: Topics & { mode: Mode; guarantee: Guarantee }): Record<string, string> {
 	return {
 		CHAOS_BROKERS: BROKERS.join(','),
 		CHAOS_RF: String(REPLICATION_FACTOR),
 		CHAOS_APP_ID: p.appId,
 		CHAOS_IN: p.input,
 		CHAOS_OUT: p.output,
+		...(p.table ? { CHAOS_TABLE: p.table } : {}),
 		CHAOS_MODE: p.mode,
 		CHAOS_GUARANTEE: p.guarantee,
-		CHAOS_THREADS: String(p.threads ?? 1),
 	}
 }
 
@@ -203,70 +242,4 @@ export async function produceBatches(
 	await producer.disconnect()
 }
 
-export function summarizeStateless(inputs: Rec[], outs: Out[]) {
-	const want = new Map<string, number>()
-	for (const r of inputs) want.set(`m:${r.value}`, (want.get(`m:${r.value}`) ?? 0) + 1)
-	const seen = new Map<string, number>()
-	for (const o of outs) seen.set(o.value, (seen.get(o.value) ?? 0) + 1)
-	let missing = 0
-	let dupes = 0
-	let unexpected = 0
-	const missingSample: string[] = []
-	const dupSample: string[] = []
-	for (const [v, w] of want) {
-		const c = seen.get(v) ?? 0
-		if (c < w) {
-			missing += w - c
-			if (missingSample.length < 5) missingSample.push(v)
-		} else if (c > w) {
-			dupes += c - w
-			if (dupSample.length < 5) dupSample.push(`${v}x${c}`)
-		}
-	}
-	for (const v of seen.keys()) if (!want.has(v)) unexpected++
-	return { inputs: inputs.length, outputs: outs.length, missing, missingSample, dupes, dupSample, unexpected }
-}
-
-/** Per-key count sequences in output order, checked against the expected 1..perKey (per-key override: expectedByKey). */
-export function summarizeCount(
-	keys: number,
-	perKeyDefault: number,
-	outs: Out[],
-	expectedByKey?: Map<string, number>,
-	keyPrefix = 'k'
-) {
-	const byKey = new Map<string, number[]>()
-	for (const o of outs) {
-		const a = byKey.get(o.key) ?? []
-		a.push(Number(o.value))
-		byKey.set(o.key, a)
-	}
-	let exactKeys = 0
-	let belowKeys = 0
-	let lastBelowKeys = 0
-	let nonMonotonicKeys = 0
-	const problems: string[] = []
-	let maxBelow = 0
-	for (let k = 0; k < keys; k++) {
-		const a = byKey.get(`${keyPrefix}${k}`) ?? []
-		const perKey = expectedByKey?.get(`k${k}`) ?? perKeyDefault
-		const max = a.length ? Math.max(...a) : 0
-		const last = a[a.length - 1] ?? 0
-		const exact = a.length === perKey && a.every((v, i) => v === i + 1)
-		if (exact) exactKeys++
-		if (last < perKey) lastBelowKeys++
-		if (a.some((v, i) => i > 0 && v < a[i - 1]!)) nonMonotonicKeys++
-		if (max < perKey) {
-			belowKeys++
-			maxBelow = Math.max(maxBelow, perKey - max)
-		}
-		if (!exact && problems.length < 6)
-			problems.push(`k${k}: n=${a.length} max=${max} last=${last} seq=${compress(a)}`)
-	}
-	return { keys, perKey: perKeyDefault, exactKeys, belowKeys, lastBelowKeys, nonMonotonicKeys, maxBelow, problems }
-}
-
-function compress(a: number[]): string {
-	if (a.length <= 30) return a.join(',')
-	return a.slice(0, 12).join(',') + ',...,' + a.slice(-12).join(',')
-}
+export const json = (v: unknown) => JSON.stringify(v, (_, x) => (typeof x === 'bigint' ? x.toString() : x))
