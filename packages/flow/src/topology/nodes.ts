@@ -92,6 +92,8 @@ export interface StoreBuilder<S extends StateStore = StateStore> {
 	 * processors only. A builder is shared by every task, so it carries no per-task callback.
 	 */
 	readonly clock?: StoreClockSpec
+	/** Key-value stores: under at-least-once, deletes take effect once the task committed (`state/held-deletes.ts`). */
+	readonly holdDeletes?: boolean
 	/** The provider store (bottom of the stack). */
 	create(provider: StateStoreProvider, providerName: string): S
 	/** As seen by processors. */

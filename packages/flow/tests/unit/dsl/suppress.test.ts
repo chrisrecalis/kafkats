@@ -166,6 +166,16 @@ describe.each(GUARANTEES)('suppress until windows close (6.16; %s)', (_, config)
 		})
 	})
 
+	it('a buffer the same record brings back within bounds by closing windows is not full (KS enforceConstraints)', async () => {
+		const driver = new TestDriver(config)
+		const keys = finalCounts(driver, TimeWindows.ofSizeWithNoGrace(10), { ...FINAL, maxRecords: 1 })
+		await driver.run(async ctx => {
+			await send(ctx, 'in', 'a', 'v', 1)
+			await send(ctx, 'in', 'b', 'v', 12) // buffers [10,20) and closes [0,10)
+			expect(finals(ctx, keys)).toEqual([['a', 0, 10, 1, 1]])
+		})
+	})
+
 	it('takes the largest grace of the windowed aggregations upstream', async () => {
 		const driver = new TestDriver(config)
 		const counts = (topic: string, graceMs: number) =>
@@ -308,6 +318,20 @@ describe.each(GUARANTEES)('suppress until a time limit (6.16; %s)', (_, config) 
 			await send(ctx, 't', 'a', '1', 0)
 			await expect(send(ctx, 't', 'b', '2', 1)).rejects.toThrow(FailedProcessingError)
 			expect(written(ctx)).toEqual([])
+		})
+	})
+
+	it("a buffer the same record brings back within the limit is not full, whenFull 'shutdown' too", async () => {
+		const driver = new TestDriver(config)
+		driver
+			.table('t', S)
+			.suppress(limit(10, { maxRecords: 1, whenFull: 'shutdown' }))
+			.toStream()
+			.to('out', S)
+		await driver.run(async ctx => {
+			await send(ctx, 't', 'k1', 'a', 0)
+			await send(ctx, 't', 'k2', 'b', 20) // forwards k1 before the buffer is checked (KS enforceConstraints)
+			expect(written(ctx)).toEqual(['k1=a@0'])
 		})
 	})
 
@@ -494,6 +518,47 @@ describe('suppress across a restart', () => {
 			expect(h.producer.committedRecords('out').map(({ message }) => message.key?.toString())).toEqual(['j'])
 		})
 	}
+
+	it('at-least-once: a key evicted after the last commit is evicted again by the revived task', async () => {
+		const h = new TaskHarness({
+			build: builder => {
+				new DslContext(builder, { applicationId: APP })
+					.stream('in', S)
+					.groupByKey()
+					.windowedBy(TimeWindows.ofSizeWithNoGrace(10))
+					.count()
+					.suppress({ until: 'window-close', name: 'final' })
+					.toStream()
+					.to('out', { key: keys, value: num })
+			},
+		})
+		const emitted = () =>
+			h.producer.committedRecords('out').map(({ message }) => keys.decode(message.key!).window.start)
+		const tombstones = () =>
+			h.producer.sent.filter(
+				({ topic, message }) => topic === 'app-final-store-changelog' && message.value === null
+			)
+		const first = await h.start(h.task())
+		h.enqueue(first, 'in', [
+			{ key: 'k', value: 'v', timestamp: 5 },
+			{ key: 'k', value: 'v', timestamp: 15 }, // evicts [0,10)
+		])
+		await h.process(first)
+		expect(await h.commit()).toBe('committed')
+		expect(tombstones()).toHaveLength(1)
+
+		const evicting = { key: 'k', value: 'v', timestamp: 50 }
+		h.enqueue(first, 'in', [evicting]) // evicts [10,20): its delete waits for the commit
+		await h.process(first)
+		expect(tombstones()).toHaveLength(1)
+		// Revived as after a failed send: the store still has [10,20), and the replay evicts it again.
+		const revived = await h.revive(first)
+		h.enqueue(revived, 'in', [evicting])
+		await h.process(revived)
+		expect(emitted()).toEqual([0, 10, 10])
+		expect(await h.commit()).toBe('committed')
+		expect(tombstones()).toHaveLength(2)
+	})
 })
 
 describe('suppress topology', () => {

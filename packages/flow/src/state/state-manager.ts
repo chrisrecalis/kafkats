@@ -6,6 +6,7 @@ import type { TaskOutput } from '@/processor/output.js'
 import type { KeyValueStore, SessionStore, StateStore, WindowedKey, WindowStore } from '@/state.js'
 import type { Checkpoints } from '@/state/checkpoints.js'
 import { storeHandle } from '@/state/handles.js'
+import { HeldDeletesKeyValueStore } from '@/state/held-deletes.js'
 import {
 	ChangelogBackedKeyValueStore,
 	ChangelogBackedSessionStore,
@@ -38,6 +39,8 @@ export interface RegisteredStore {
 	readonly buffer?: TransactionalLayer
 	/** Window and session(-layout) stores with a clock, kept by the clipping layer on top of the stack (6.2). */
 	readonly clock?: StoreClock
+	/** At-least-once, the deletes of a store that holds them until the task committed. */
+	readonly held?: HeldDeletesKeyValueStore<unknown, unknown>
 	readonly changelog?: { readonly topic: string; readonly partition: number; readonly skipRestoration: boolean }
 }
 
@@ -164,6 +167,13 @@ export class TaskStateManager {
 		}
 	}
 
+	/** At-least-once, after a commit of the task: the deletes held for it take effect. */
+	async applyHeldDeletes(): Promise<void> {
+		for (const { held } of this.registered) {
+			await held?.applyHeld()
+		}
+	}
+
 	/**
 	 * Checkpoints the changelog partitions written since the last commit. `positions`: the offset of the last
 	 * acknowledged write per changelog partition (`<topic>:<partition>`). Under at-least-once the checkpoint is the
@@ -219,9 +229,13 @@ export class TaskStateManager {
 			)
 			changelog = { topic, partition: this.partition, skipRestoration }
 		}
-		const handle = storeHandle(layer, builder.kind, () => this.closed, `task ${this.task.key}`)
+		const held =
+			builder.holdDeletes && !this.deps.eos
+				? new HeldDeletesKeyValueStore(layer as KeyValue, builder.keyCodec)
+				: undefined
+		const handle = storeHandle(held ?? layer, builder.kind, () => this.closed, `task ${this.task.key}`)
 		if (builder.clock === undefined || layers.clocked === undefined) {
-			return { builder, raw, top: handle, buffer, changelog }
+			return { builder, raw, top: handle, buffer, held, changelog }
 		}
 		const retentionMs = retention(builder)
 		const clock = new TaskStoreClock(this.deps.metadata, builder.name, retentionMs, builder.clock.emitFinal)

@@ -5,8 +5,11 @@
  *
  * The buffer lives in memory and is written through to a key-value store of key bytes and entry bytes in the same
  * process() call (KS logs dirty keys when the buffer is flushed at a commit; flow has no flush hook before a commit), so
- * the store, its changelog and, under exactly-once, its transactional buffer match the memory at every commit. Each new
- * processor instance (task incarnation) loads it from the store.
+ * the store, its changelog and, under exactly-once, its transactional buffer match the memory at every commit. Under
+ * at-least-once, the store keeps an evicted key until the task committed (`state/held-deletes.ts`): a task revived from
+ * the last commit, whose evicted results may not have been delivered, loads it again and the replay evicts it again
+ * (KS restores such a key only if no flush logged its eviction yet). Each new processor instance (task incarnation)
+ * loads the buffer from the store.
  */
 import type { ChangelogDefaults } from '@/changelog/config.js'
 import { buffer, type Codec } from '@/codec.js'
@@ -26,9 +29,12 @@ export interface BufferCodecs<K, V> {
 	readonly value: Codec<V>
 }
 
-/** The store of a suppress buffer: key bytes of the table's key codec -> entry bytes (`suppress-entry.ts`). */
+/**
+ * The store of a suppress buffer: key bytes of the table's key codec -> entry bytes (`suppress-entry.ts`). Under
+ * at-least-once its deletes wait for the task's next commit.
+ */
 export function suppressBufferStoreBuilder(defaults: ChangelogDefaults, name: string): StoreBuilder<BufferStore> {
-	return keyValueStoreBuilder(defaults, { name, keyCodec: buffer(), valueCodec: buffer() })
+	return { ...keyValueStoreBuilder(defaults, { name, keyCodec: buffer(), valueCodec: buffer() }), holdDeletes: true }
 }
 
 /** A buffered key. */
@@ -77,7 +83,10 @@ export class SuppressBuffer<K, V> {
 		return this.order.peek()?.change.bufferTime ?? Number.POSITIVE_INFINITY
 	}
 
-	/** Loads what the store holds: the buffer as of the last commit (exactly-once) or the last write (at-least-once). */
+	/**
+	 * Loads what the store holds: the buffer as of the last commit (exactly-once), or as of the last write with the keys
+	 * evicted since the last commit (at-least-once).
+	 */
 	async load(): Promise<void> {
 		let read = 0
 		for await (const [keyBytes, bytes] of this.store.all()) {
