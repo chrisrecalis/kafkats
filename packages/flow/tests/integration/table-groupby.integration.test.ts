@@ -66,7 +66,6 @@ describe('KTable.groupBy aggregates across several consumers', () => {
 		const app = flow({
 			applicationId,
 			client,
-			numStreamThreads: threads,
 			processingGuarantee: mode,
 			commitIntervalMs: 100,
 			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 50 },

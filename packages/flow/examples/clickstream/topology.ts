@@ -41,8 +41,8 @@ export function buildTopology(app: FlowApp): void {
 	// Branching: Route by user tier
 	// ============================================
 	const [premiumEvents, freeEvents] = enrichedEvents.branch(
-		(_, e) => e.userTier === 'premium',
-		(_, e) => e.userTier === 'free'
+		(_, e) => e?.userTier === 'premium',
+		(_, e) => e?.userTier === 'free'
 	)
 
 	// Premium users go to priority topic
@@ -88,15 +88,26 @@ export function buildTopology(app: FlowApp): void {
 						? [...session.pages, event.page]
 						: session.pages,
 			}),
+			// Two sessions bridged by a new event become one
+			(key, a, b) => ({
+				userId: key,
+				sessionStart: Math.min(a.sessionStart, b.sessionStart),
+				sessionEnd: Math.max(a.sessionEnd, b.sessionEnd),
+				pageViews: a.pageViews + b.pageViews,
+				clicks: a.clicks + b.clicks,
+				pages: [...new Set([...a.pages, ...b.pages])],
+			}),
 			{ value: codec.json<SessionSummary>() }
 		)
 		.toStream()
-		.map((windowed: Windowed<string>, session): KeyValue<string, SessionSummary> => [
-			windowed.key,
+		// A session merged into a larger one is retracted with a null value
+		.filter((_, session) => session !== null)
+		.map((windowed: Windowed<string> | null, session): KeyValue<string, SessionSummary> => [
+			windowed!.key,
 			{
-				...session,
-				sessionStart: windowed.window.start,
-				sessionEnd: windowed.window.end,
+				...session!,
+				sessionStart: windowed!.window.start,
+				sessionEnd: windowed!.window.end,
 			},
 		])
 		.to(TOPICS.USER_SESSIONS, {
@@ -108,17 +119,17 @@ export function buildTopology(app: FlowApp): void {
 	// Tumbling Windows: Page view counts per minute
 	// ============================================
 	events
-		.filter((_, e) => e.type === 'page_view')
+		.filter((_, e) => e?.type === 'page_view')
 		.groupBy((_, e) => (e as { page: string }).page, { key: codec.string() })
 		.windowedBy(TimeWindows.of('1m'))
 		.count()
 		.toStream()
-		.map((windowed: Windowed<string>, count): KeyValue<string, PageStats> => [
-			windowed.key,
+		.map((windowed: Windowed<string> | null, count): KeyValue<string, PageStats> => [
+			windowed!.key,
 			{
-				page: windowed.key,
-				windowStart: windowed.window.start,
-				viewCount: count,
+				page: windowed!.key,
+				windowStart: windowed!.window.start,
+				viewCount: count ?? 0,
 			},
 		])
 		.to(TOPICS.PAGE_METRICS, {

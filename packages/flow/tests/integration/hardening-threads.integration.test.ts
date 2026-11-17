@@ -66,7 +66,6 @@ describe('hardening: multi-thread EOS topologies with commit failures', () => {
 			const app = flow({
 				applicationId,
 				client,
-				numStreamThreads: threads,
 				processingGuarantee: 'exactly_once',
 				commitIntervalMs: 100,
 				consumer: { autoOffsetReset: 'earliest', maxWaitMs: 50 },

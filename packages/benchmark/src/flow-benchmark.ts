@@ -18,7 +18,6 @@ import { uniqueName } from './utils.js'
  *
  *   KAFKA_BROKERS=localhost:9092 pnpm -C packages/benchmark bench:flow
  *   ... bench:flow -- --records 200000 --scenario count,restore --guarantee exactly_once --runs 3
- *   ... bench:flow -- --scenario stateless --threads 2
  *   ... bench:flow -- --scenario count,session-count --provider lmdb   (or rocksdb)
  */
 
@@ -28,7 +27,6 @@ interface Options {
 	records: number
 	keys: number
 	partitions: number
-	threads: number
 	valueBytes: number
 	runs: number
 	scenarios: string[]
@@ -195,7 +193,6 @@ function parseArgs(argv: string[]): Options {
 		records: Number(arg('records') ?? 200_000),
 		keys: Number(arg('keys') ?? 1_000),
 		partitions: Number(arg('partitions') ?? 4),
-		threads: Number(arg('threads') ?? 1),
 		valueBytes: Number(arg('value-bytes') ?? 100),
 		runs: Number(arg('runs') ?? 3),
 		scenarios: arg('scenario')?.split(',') ?? [...SCENARIOS.map(s => s.name), 'restore'],
@@ -263,7 +260,6 @@ function createApp(brokers: string[], applicationId: string, guarantee: Guarante
 		applicationId,
 		client: { brokers, clientId: 'flow-bench', logLevel: 'silent' },
 		processingGuarantee: guarantee,
-		numStreamThreads: options.threads,
 		consumer: { autoOffsetReset: 'earliest' },
 		...(stateDir
 			? { stateStoreProvider: options.provider === 'rocksdb' ? rocksdb({ stateDir }) : lmdb({ stateDir }) }
@@ -336,7 +332,6 @@ async function main(): Promise<void> {
 
 	console.log(
 		`flow benchmark: ${options.records} records, ${options.keys} keys, ${options.partitions} partitions, ` +
-			`${options.threads} stream thread(s), ` +
 			`~${options.valueBytes} byte values, ${options.provider} state, best of ${options.runs} runs\n`
 	)
 	const rows: Array<{ scenario: string; guarantee: string; 'records/s': string; runs: string }> = []

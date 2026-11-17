@@ -82,7 +82,6 @@ describe('EOS failure paths', () => {
 	const eosCfg = (applicationId: string, extra: Record<string, unknown> = {}) => ({
 		applicationId,
 		client,
-		numStreamThreads: 1,
 		processingGuarantee: 'exactly_once' as const,
 		commitIntervalMs: 300,
 		consumer: {

@@ -5,7 +5,7 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { KafkaClient, Producer } from '@kafkats/client'
-import { codec, flow, SessionWindows, type FlowApp } from '../../src/index.js'
+import { codec, flow, SessionWindows, type FlowApp, type Windowed } from '../../src/index.js'
 import {
 	createTopics,
 	injectCommitFailures,
@@ -66,10 +66,7 @@ describe('hardening: session windows under EOS', () => {
 		await admin.disconnect()
 	})
 
-	const keyOf = (_v: unknown, k: unknown) => {
-		const w = k as { key: string; window: { start: number; end: number } }
-		return `${w.key}@${w.window.start}-${w.window.end}`
-	}
+	const keyOf = (k: Windowed<string> | null) => `${k!.key}@${k!.window.start}-${k!.window.end}`
 
 	const build = (
 		applicationId: string,

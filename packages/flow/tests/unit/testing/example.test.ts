@@ -1,12 +1,14 @@
 /**
- * The stateless cases of testing-example.test.ts against the new TestDriver (the legacy copy keeps running until the
- * public switch). Adapted: the multi-threaded case (one consumer and one producer per app now).
+ * Examples of the testing infrastructure (the legacy testing-example suite on the task runtime's TestDriver). Adapted:
+ * the multi-threaded case (one consumer and one producer per app now); exactly-once commits at stop() with
+ * `commitEvery: 'stop'`.
  */
 import { describe, expect, it } from 'vitest'
 import { FlowConfigError } from '@/api/errors.js'
 import { codec } from '@/codec.js'
+import { TimeWindows } from '@/dsl/windows.js'
 import { TestDriver } from '@/testing/driver.js'
-import { quickTest, ResultCollector, testRecordSequence } from '@/testing/helpers.js'
+import { createFactory, quickTest, ResultCollector, testRecordSequence, timestamps } from '@/testing/helpers.js'
 
 describe('TestDriver basics', () => {
 	it('processes a simple map/filter pipeline', async () => {
@@ -34,9 +36,148 @@ describe('TestDriver basics', () => {
 			expect(results[0]!.value).toEqual({ id: 'o1', total: 250, large: true })
 		})
 	})
+
+	it('uses ResultCollector for stateful operations', async () => {
+		const driver = new TestDriver()
+		const results = new ResultCollector<string, number>()
+
+		driver
+			.input('events', { key: codec.string(), value: codec.json<{ type: string }>() })
+			.groupByKey()
+			.count()
+			.toStream()
+			.peek(results.collector())
+
+		await driver.run(async ({ send }) => {
+			await send('events', { type: 'click' }, { key: Buffer.from('user1') })
+			await send('events', { type: 'click' }, { key: Buffer.from('user1') })
+			await send('events', { type: 'click' }, { key: Buffer.from('user2') })
+
+			expect(results.length).toBe(3)
+			expect(results.values).toEqual([1, 2, 1])
+			expect(results.last?.value).toBe(1)
+		})
+	})
+})
+
+describe('stream-table joins with TestDriver', () => {
+	it('joins stream records with table lookups', async () => {
+		const driver = new TestDriver()
+		const results = new ResultCollector<string, { userId: string; action: string; userName: string }>()
+
+		type Event = { userId: string; action: string }
+		type User = { name: string }
+
+		const users = driver.table('users', { key: codec.string(), value: codec.json<User>() })
+
+		driver
+			.input('events', { key: codec.string(), value: codec.json<Event>() })
+			.join(users, (event, user) => ({
+				userId: event.userId,
+				action: event.action,
+				userName: user.name,
+			}))
+			.peek(results.collector())
+
+		await driver.run(async ({ send }) => {
+			// Populate table
+			await send('users', { name: 'Alice' }, { key: Buffer.from('user1') })
+			await send('users', { name: 'Bob' }, { key: Buffer.from('user2') })
+
+			// Send events
+			await send('events', { userId: 'user1', action: 'click' }, { key: Buffer.from('user1') })
+			await send('events', { userId: 'user3', action: 'buy' }, { key: Buffer.from('user3') })
+
+			// Only user1 event should join (inner join)
+			expect(results.length).toBe(1)
+			expect(results.first?.value).toEqual({
+				userId: 'user1',
+				action: 'click',
+				userName: 'Alice',
+			})
+		})
+	})
+})
+
+describe('windowed joins', () => {
+	it('joins streams within a time window', async () => {
+		const driver = new TestDriver()
+		const results = new ResultCollector<string, { page: string; ad: string }>()
+
+		type Click = { page: string }
+		type Impression = { ad: string }
+
+		const clicks = driver.input('clicks', { key: codec.string(), value: codec.json<Click>() })
+		const impressions = driver.input('impressions', { key: codec.string(), value: codec.json<Impression>() })
+
+		clicks
+			.join(
+				impressions,
+				(click, impression) => ({
+					page: click.page,
+					ad: impression.ad,
+				}),
+				{ within: TimeWindows.of('5s') }
+			)
+			.peek(results.collector())
+
+		await driver.run(async ({ send }) => {
+			const ts = timestamps()
+
+			// Impression at t=1000ms
+			await send('impressions', { ad: 'banner1' }, { key: Buffer.from('user1'), timestamp: ts.at('1s') })
+
+			// Click at t=2000ms (within 5s window)
+			await send('clicks', { page: 'home' }, { key: Buffer.from('user1'), timestamp: ts.at('2s') })
+
+			// Click at t=10000ms (outside 5s window)
+			await send('clicks', { page: 'about' }, { key: Buffer.from('user1'), timestamp: ts.at('10s') })
+
+			expect(results.some((_, v) => v.page === 'home' && v.ad === 'banner1')).toBe(true)
+		})
+	})
 })
 
 describe('factories and sequences', () => {
+	it('uses createFactory for test data generation', async () => {
+		type Order = { id: string; amount: number; customer: string }
+
+		const orderFactory = createFactory<Order>(index => ({
+			id: `order-${index}`,
+			amount: (index + 1) * 100,
+			customer: `customer-${index % 3}`,
+		}))
+
+		const driver = new TestDriver()
+		const results = new ResultCollector<string, number>()
+
+		driver
+			.input('orders', { key: codec.string(), value: codec.json<Order>() })
+			.groupBy(
+				(_, v) => {
+					if (v === null) {
+						throw new Error('unexpected tombstone in groupBy() test')
+					}
+					return v.customer
+				},
+				{ key: codec.string() }
+			)
+			.count()
+			.toStream()
+			.peek(results.collector())
+
+		await driver.run(async ({ send }) => {
+			// Generate and send 6 orders
+			const orders = orderFactory.createMany(6)
+			for (const order of orders) {
+				await send('orders', order, { key: Buffer.from(order.id) })
+			}
+
+			// Should have counts for 3 customers (2 orders each)
+			expect(results.length).toBe(6)
+		})
+	})
+
 	it('uses testRecordSequence for processor testing', () => {
 		type Event = { type: string }
 

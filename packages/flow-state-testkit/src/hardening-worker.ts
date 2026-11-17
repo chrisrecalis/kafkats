@@ -88,20 +88,14 @@ if (env('R3_MODE') === 'count') {
 		.windowedBy(SessionWindows.withInactivityGap(1_000))
 		.count({ storeName: 'scounts', value: num })
 		.toStream()
-		.selectKey((_v, k) => {
-			const w = k as unknown as { key: string; window: { start: number; end: number } }
-			return `${w.key}@${w.window.start}-${w.window.end}`
-		})
+		.selectKey(k => `${k!.key}@${k!.window.start}-${k!.window.end}`)
 		.to(env('R3_OUT'), { key: str, value: num })
 } else {
 	grouped
 		.windowedBy(TimeWindows.of(1_000))
 		.count({ storeName: 'wcounts', value: num })
 		.toStream()
-		.selectKey((_v, k) => {
-			const w = k as unknown as { key: string; window: { start: number } }
-			return `${w.key}@${w.window.start}`
-		})
+		.selectKey(k => `${k!.key}@${k!.window.start}`)
 		.to(env('R3_OUT'), { key: str, value: num })
 }
 process.on('SIGTERM', () => {

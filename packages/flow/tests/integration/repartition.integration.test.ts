@@ -55,10 +55,7 @@ describe('repartitioning keeps event time, totals and topic identity', () => {
 					.windowedBy(TimeWindows.of(hour))
 					.count({ storeName: 'win', value: numberCodec })
 					.toStream()
-					.selectKey(
-						(_v, k) =>
-							`${(k as unknown as { key: string }).key}@${(k as unknown as { window: { start: number } }).window.start}`
-					)
+					.selectKey(k => `${k!.key}@${k!.window.start}`)
 					.to(outWin, { key: stringCodec, value: numberCodec })
 				src.groupBy((_k, v) => `p${(v as number) % 2}`, { key: stringCodec, value: numberCodec })
 					.count({ storeName: 'par', key: stringCodec, value: numberCodec })
@@ -144,10 +141,7 @@ describe('repartitioning keeps event time, totals and topic identity', () => {
 			.windowedBy(SessionWindows.withInactivityGap(1_000))
 			.count({ storeName: 'sess', value: numberCodec })
 			.toStream()
-			.selectKey(
-				(_v, k) =>
-					`a@${(k as unknown as { window: { start: number } }).window.start - B}-${(k as unknown as { window: { end: number } }).window.end - B}`
-			)
+			.selectKey(k => `a@${k!.window.start - B}-${k!.window.end - B}`)
 			.to(output, { key: stringCodec, value: numberCodec })
 		try {
 			await app.start()
@@ -183,7 +177,7 @@ describe('repartitioning keeps event time, totals and topic identity', () => {
 		})
 		const regions = app.globalTable(table, { key: stringCodec, value: stringCodec })
 		app.stream(input, { key: stringCodec, value: stringCodec })
-			.selectKey(region => region!)
+			.selectKey((_k, region) => region!)
 			.join(regions, (_region, name) => name)
 			.groupByKey({ key: stringCodec, value: stringCodec })
 			.count({ storeName: 'per-region', key: stringCodec, value: numberCodec })

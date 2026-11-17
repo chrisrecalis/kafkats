@@ -79,7 +79,6 @@ describe('exactly-once stress', () => {
 				const app = flow({
 					applicationId,
 					client,
-					numStreamThreads: 1,
 					processingGuarantee: 'exactly_once',
 					commitIntervalMs: 50,
 					consumer: {

@@ -62,7 +62,6 @@ export function restartSuite(engine: EngineUnderTest): void {
 			const app = flow({
 				applicationId: appId,
 				client: { brokers: brokers!, clientId: uniq('state-restart-app') },
-				numStreamThreads: 1,
 				processingGuarantee: guarantee,
 				commitIntervalMs: 100,
 				consumer: { maxWaitMs: 100 },

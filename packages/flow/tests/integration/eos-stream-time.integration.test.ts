@@ -57,10 +57,7 @@ describe('stream time across aborted transactions', () => {
 			.windowedBy(TimeWindows.of(1_000))
 			.count({ storeName: 'w', value: numberCodec })
 			.toStream()
-			.selectKey(
-				(_v, k) =>
-					`${(k as unknown as { key: string }).key}@${(k as unknown as { window: { start: number } }).window.start}`
-			)
+			.selectKey(k => `${k!.key}@${k!.window.start}`)
 			.to(output, { key: stringCodec, value: numberCodec })
 		try {
 			await app.start()

@@ -366,7 +366,6 @@ describe('start() retry', () => {
 			applicationId,
 			client: newClient('r2-conc-app'),
 			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 50 },
-			consumerRun: { partitionConcurrency: P },
 		})
 		app.stream(input, { key: stringCodec, value: stringCodec })
 			.groupByKey()
@@ -406,7 +405,6 @@ describe('start() retry', () => {
 			applicationId: uniqueTopicName('r2-conc-merge-app'),
 			client: newClient('r2-conc-merge-app'),
 			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 50 },
-			consumerRun: { partitionConcurrency: 2 },
 		})
 		app.stream(left, { key: stringCodec, value: stringCodec })
 			.merge(app.stream(right, { key: stringCodec, value: stringCodec }))

@@ -44,7 +44,6 @@ describe('hardening: KTable.groupBy vs ground truth', () => {
 		const app = flow({
 			applicationId,
 			client,
-			numStreamThreads: threads,
 			processingGuarantee: guarantee,
 			commitIntervalMs: 100,
 			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 50 },

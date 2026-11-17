@@ -107,7 +107,6 @@ function makeApp(
 	const app = flow({
 		applicationId: appId,
 		client: { clientId, brokers: requireKafkaBrokers() },
-		numStreamThreads: 1,
 		consumer: {
 			autoOffsetReset: 'earliest',
 			maxWaitMs: 100,
@@ -270,7 +269,7 @@ describe('state/changelog partitioning', () => {
 				.windowedBy(TimeWindows.of(3_600_000))
 				.count({ storeName: 'wcounts', value: numberCodec })
 				.toStream()
-				.selectKey((_v, k) => (k as unknown as { key: string }).key)
+				.selectKey(k => k!.key)
 				.to(out, { key: stringCodec, value: numberCodec })
 
 		const collector = new MultiTopicCollector({

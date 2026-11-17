@@ -126,7 +126,6 @@ describe('changelog restorer', () => {
 		const app = flow({
 			applicationId: appId,
 			client,
-			numStreamThreads: 1,
 			consumer: { maxWaitMs: 100 },
 			stateStoreProvider: provider,
 			changelog: { restoration: RESTORE_FAST },
@@ -187,7 +186,6 @@ describe('changelog restorer', () => {
 		const app = flow({
 			applicationId: appId,
 			client,
-			numStreamThreads: 1,
 			consumer: { maxWaitMs: 100 },
 			changelog: { restoration: { consumerMaxWaitMs: 100 } },
 		})
@@ -350,7 +348,6 @@ describe('restart cycles with a persistent store and checkpoint store', () => {
 					const app = flow({
 						applicationId: appId,
 						client,
-						numStreamThreads: 1,
 						processingGuarantee: guarantee,
 						commitIntervalMs: 100,
 						consumer: { maxWaitMs: 100 },
@@ -399,7 +396,7 @@ describe('processing failures', () => {
 		})
 		await collector.start()
 		const build = (throwOn: number | null) => {
-			const app = flow({ applicationId: appId, client, numStreamThreads: 1, consumer: { maxWaitMs: 100 } })
+			const app = flow({ applicationId: appId, client, consumer: { maxWaitMs: 100 } })
 			app.stream(input, { key: stringCodec, value: numberCodec })
 				.mapValues(v => {
 					if (v === throwOn) throw new Error('boom')
@@ -442,9 +439,8 @@ describe('processing failures', () => {
 			const app = flow({
 				applicationId: appId,
 				client,
-				numStreamThreads: 1,
 				consumer: { maxWaitMs: 100 },
-				consumerRun: { autoCommitIntervalMs: 200 },
+				commitIntervalMs: 200,
 			})
 			app.stream(input, { key: stringCodec, value: numberCodec })
 				.mapValues(v => v)
@@ -490,7 +486,6 @@ describe('processing failures', () => {
 		const app = flow({
 			applicationId: appId,
 			client,
-			numStreamThreads: 1,
 			consumer: { maxWaitMs: 100 },
 			stateStoreProvider: provider,
 		})
@@ -614,7 +609,7 @@ describe('app lifecycle', () => {
 			topics: [{ topic: out, keyCodec: stringCodec, valueCodec: numberCodec }],
 		})
 		await collector.start()
-		const app = flow({ applicationId: appId, client, numStreamThreads: 1, consumer: { maxWaitMs: 100 } })
+		const app = flow({ applicationId: appId, client, consumer: { maxWaitMs: 100 } })
 		app.stream(input, { key: stringCodec, value: numberCodec })
 			.groupByKey()
 			.count({ storeName: 'counts', key: stringCodec, value: numberCodec })
@@ -646,7 +641,6 @@ describe('app lifecycle', () => {
 		const app = flow({
 			applicationId: appId,
 			client: { brokers: requireKafkaBrokers(), clientId: 'restore-close-restoring' },
-			numStreamThreads: 1,
 			consumer: { maxWaitMs: 100 },
 			stateStoreProvider: provider,
 			changelog: { restoration: { idleTimeoutMs: 30_000, initialIdleTimeoutMs: 30_000, consumerMaxWaitMs: 100 } },
@@ -676,7 +670,6 @@ describe('app lifecycle', () => {
 			const app = flow({
 				applicationId: appId,
 				client,
-				numStreamThreads: 1,
 				consumer: { maxWaitMs: 100, groupInstanceId: 'restore-fenced-static' },
 			})
 			app.stream(input, { key: stringCodec, value: numberCodec }).mapValues(v => v)
@@ -717,7 +710,7 @@ describe('app lifecycle', () => {
 			topics: [{ topic: out, keyCodec: stringCodec, valueCodec: numberCodec }],
 		})
 		await collector.start()
-		const app = flow({ applicationId: appId, client, numStreamThreads: 1, consumer: { maxWaitMs: 100 } })
+		const app = flow({ applicationId: appId, client, consumer: { maxWaitMs: 100 } })
 		app.stream(input, { key: stringCodec, value: numberCodec })
 			.mapValues(v => v)
 			.to(out, { key: stringCodec, value: numberCodec })
@@ -742,7 +735,6 @@ describe('app lifecycle', () => {
 		const app = flow({
 			applicationId: `restore-joinfail-${Date.now()}`,
 			client: { brokers: requireKafkaBrokers(), clientId: 'restore-joinfail' },
-			numStreamThreads: 1,
 			// Invalid session timeout (below broker group.min.session.timeout.ms) => join fails
 			consumer: { maxWaitMs: 100, sessionTimeoutMs: 1 },
 		})
@@ -770,7 +762,6 @@ describe('changelog topic creation', () => {
 				const app = flow({
 					applicationId: appId,
 					client: { brokers: requireKafkaBrokers(), clientId: 'restore-race' },
-					numStreamThreads: 1,
 					consumer: { maxWaitMs: 100 },
 				})
 				app.stream(input, { key: stringCodec, value: numberCodec })

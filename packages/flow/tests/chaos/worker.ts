@@ -7,7 +7,7 @@
  *   CHAOS_MODE=count CHAOS_GUARANTEE=exactly_once pnpm exec tsx tests/chaos/worker.ts
  *
  * Env: CHAOS_BROKERS, CHAOS_APP_ID, CHAOS_IN, CHAOS_OUT, CHAOS_MODE=stateless|count|regroup,
- *      CHAOS_GUARANTEE=at_least_once|exactly_once, CHAOS_THREADS (default 1),
+ *      CHAOS_GUARANTEE=at_least_once|exactly_once,
  *      CHAOS_SESSION_MS (default 6000), CHAOS_TXN_TIMEOUT_MS (default 10000),
  *      CHAOS_RESTORE_IDLE_MS (changelog restoration idleTimeoutMs, default 300 as in the repo's integration tests),
  *      CHAOS_RESTORE_DEFAULT=1 (use library default restoration options),
@@ -52,7 +52,6 @@ const app = flow({
 		brokers: env('CHAOS_BROKERS').split(','),
 		...(process.env.CHAOS_LOG_LEVEL ? { logLevel: process.env.CHAOS_LOG_LEVEL as any } : {}),
 	},
-	numStreamThreads: Number(env('CHAOS_THREADS', '1')),
 	processingGuarantee: guarantee,
 	commitIntervalMs: 100,
 	consumer: {

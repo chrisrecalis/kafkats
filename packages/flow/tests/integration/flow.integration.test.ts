@@ -89,7 +89,6 @@ describe('KStream operators', () => {
 		app = flow({
 			applicationId: appId,
 			client,
-			numStreamThreads: 1,
 			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 100 },
 		})
 
@@ -126,7 +125,7 @@ describe('KStream operators', () => {
 		streamA.filter((_k, v) => (v?.n ?? 0) > 0).to(outFilter)
 
 		// selectKey
-		streamA.selectKey((v, _k) => v?.type ?? 'unknown').to(outSelectKey, { key: stringCodec })
+		streamA.selectKey((_k, v) => v?.type ?? 'unknown').to(outSelectKey, { key: stringCodec })
 
 		// branch
 		const branches = streamA.branch(
@@ -332,7 +331,6 @@ describe('offsetReset policies', () => {
 		const app = flow({
 			applicationId: appId,
 			client,
-			numStreamThreads: 1,
 			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 100 },
 		})
 		app.stream(input, { key: stringCodec, value: jsonCodec, offsetReset: 'earliest' }).to(outputTopic)
@@ -364,7 +362,6 @@ describe('offsetReset policies', () => {
 		const app = flow({
 			applicationId: appId,
 			client,
-			numStreamThreads: 1,
 			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 100 },
 		})
 		app.stream(input, { key: stringCodec, value: jsonCodec, offsetReset: 'latest' }).to(outputTopic)
@@ -409,7 +406,6 @@ describe('grouping and aggregations', () => {
 		app = flow({
 			applicationId: appId,
 			client,
-			numStreamThreads: 1,
 			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 100 },
 		})
 
@@ -552,7 +548,6 @@ describe('stream-table joins', () => {
 		app = flow({
 			applicationId: appId,
 			client,
-			numStreamThreads: 1,
 			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 100 },
 		})
 
@@ -687,7 +682,6 @@ describe('stream-stream joins', () => {
 		app = flow({
 			applicationId: appId,
 			client,
-			numStreamThreads: 1,
 			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 100 },
 		})
 
@@ -810,7 +804,7 @@ describe('changelog topics and restoration', () => {
 
 		await createTopics(client, [{ name: input, partitions: 3 }, { name: outputTopic }])
 
-		const app = flow({ applicationId: appId, client, numStreamThreads: 1, consumer: { maxWaitMs: 100 } })
+		const app = flow({ applicationId: appId, client, consumer: { maxWaitMs: 100 } })
 		app.stream(input, { key: stringCodec, value: numberCodec })
 			.groupByKey()
 			.count({ storeName, key: stringCodec, value: numberCodec, changelog: { skipRestoration: true } })
@@ -833,7 +827,7 @@ describe('changelog topics and restoration', () => {
 
 		await createTopics(client, [{ name: a, partitions: 1 }, { name: b, partitions: 4 }, { name: outputTopic }])
 
-		const app = flow({ applicationId: appId, client, numStreamThreads: 1, consumer: { maxWaitMs: 100 } })
+		const app = flow({ applicationId: appId, client, consumer: { maxWaitMs: 100 } })
 		const s1 = app.stream(a, { key: stringCodec, value: numberCodec })
 		const s2 = app.stream(b, { key: stringCodec, value: numberCodec })
 
@@ -865,7 +859,7 @@ describe('changelog topics and restoration', () => {
 		])
 		await waitForTopicPartitionCount(changelogTopic, 1)
 
-		const app = flow({ applicationId: appId, client, numStreamThreads: 1, consumer: { maxWaitMs: 100 } })
+		const app = flow({ applicationId: appId, client, consumer: { maxWaitMs: 100 } })
 		app.stream(input, { key: stringCodec, value: numberCodec })
 			.groupByKey()
 			.count({ storeName, key: stringCodec, value: numberCodec, changelog: { skipRestoration: true } })
@@ -883,7 +877,7 @@ describe('changelog topics and restoration', () => {
 
 		await createTopics(client, [{ name: outputTopic }])
 
-		const app = flow({ applicationId: appId, client, numStreamThreads: 1, consumer: { maxWaitMs: 100 } })
+		const app = flow({ applicationId: appId, client, consumer: { maxWaitMs: 100 } })
 		app.stream(missing, { key: stringCodec, value: numberCodec })
 			.groupByKey()
 			.count({ storeName: 'counts', key: stringCodec, value: numberCodec, changelog: { skipRestoration: true } })
@@ -906,7 +900,6 @@ describe('changelog topics and restoration', () => {
 			const app = flow({
 				applicationId: appId,
 				client,
-				numStreamThreads: 1,
 				consumer: { maxWaitMs: 100 },
 				changelog: {
 					restoration: {
@@ -1117,7 +1110,6 @@ describe('changelog topics and restoration', () => {
 		const app = flow({
 			applicationId: appId,
 			client,
-			numStreamThreads: 1,
 			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 100 },
 			stateStoreProvider: provider,
 			changelog: {
@@ -1196,7 +1188,6 @@ describe('changelog topics and restoration', () => {
 		const app = flow({
 			applicationId: appId,
 			client,
-			numStreamThreads: 1,
 			processingGuarantee: 'exactly_once',
 			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 100 },
 			stateStoreProvider: provider,
@@ -1290,7 +1281,6 @@ describe('changelog topics and restoration', () => {
 		const app = flow({
 			applicationId: appId,
 			client,
-			numStreamThreads: 1,
 			processingGuarantee: 'exactly_once',
 			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 100 },
 			stateStoreProvider: provider,
@@ -1365,7 +1355,6 @@ describe('changelog topics and restoration', () => {
 					clientId,
 					brokers: requireKafkaBrokers(),
 				},
-				numStreamThreads: 1,
 				consumer: { autoOffsetReset: 'earliest', maxWaitMs: 100 },
 				changelog: {
 					restoration: {
