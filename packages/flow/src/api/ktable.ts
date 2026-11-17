@@ -15,9 +15,14 @@ import type { ValueTransformerWithKeySupplier } from '@/processor/api.js'
  * never see null values (tombstones are propagated without calling them).
  */
 export interface KTable<K, V> {
+	/** The entries the predicate accepts: an update it rejects deletes the key. */
 	filter(predicate: (key: K, value: V) => boolean, options?: TableOptions<K, V>): KTable<K, V>
+	/** The entries the predicate rejects: an update it accepts deletes the key. */
 	filterNot(predicate: (key: K, value: V) => boolean, options?: TableOptions<K, V>): KTable<K, V>
-	/** A null result deletes the key. */
+	/**
+	 * A null result deletes the key. A mapper declaring two parameters gets the key too (give a two-parameter lambda
+	 * explicit parameter types).
+	 */
 	mapValues<VR>(mapper: (value: V) => VR | null, options?: TableOptions<K, VR>): KTable<K, VR>
 	mapValues<VR>(mapper: (key: K, value: V) => VR | null, options?: TableOptions<K, VR>): KTable<K, VR>
 	/** One transformer result per update; tombstones reach the transformer. */

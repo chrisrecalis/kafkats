@@ -32,29 +32,50 @@ export type ValueJoiner<K, V, VO, VR> = ((value: V, otherValue: VO) => VR) | ((k
  * topic read as a table). Every callback takes `(key, value)`.
  */
 export interface KStream<K, V> {
+	/** The records the predicate accepts. */
 	filter(predicate: (key: K | null, value: V | null) => boolean, options?: NamedOptions): KStream<K, V>
+	/** The records the predicate rejects. */
 	filterNot(predicate: (key: K | null, value: V | null) => boolean, options?: NamedOptions): KStream<K, V>
 	/** Changes keys: a key-based operation downstream repartitions first. */
 	map<KR, VR>(mapper: (key: K | null, value: V | null) => KeyValue<KR, VR>, options?: NamedOptions): KStream<KR, VR>
+	/**
+	 * One new value per record; the key is kept. A mapper declaring two parameters gets the key too (ValueMapper:
+	 * give a two-parameter lambda explicit parameter types).
+	 */
 	mapValues<VR>(mapper: (value: V | null) => VR, options?: NamedOptions): KStream<K, VR>
 	mapValues<VR>(mapper: (key: K | null, value: V | null) => VR, options?: NamedOptions): KStream<K, VR>
-	/** Changes keys: a key-based operation downstream repartitions first. */
+	/** Zero or more records per record. Changes keys: a key-based operation downstream repartitions first. */
 	flatMap<KR, VR>(
 		mapper: (key: K | null, value: V | null) => Iterable<KeyValue<KR, VR>>,
 		options?: NamedOptions
 	): KStream<KR, VR>
+	/** Zero or more values per record, each with the record's key; the mapper's arity as for mapValues(). */
 	flatMapValues<VR>(mapper: (value: V | null) => Iterable<VR>, options?: NamedOptions): KStream<K, VR>
 	flatMapValues<VR>(mapper: (key: K | null, value: V | null) => Iterable<VR>, options?: NamedOptions): KStream<K, VR>
+	/** Calls the action for every record, then passes the record on. */
 	peek(action: (key: K | null, value: V | null) => void, options?: NamedOptions): KStream<K, V>
-	/** Terminal. */
+	/** Calls the action for every record. Terminal. */
 	foreach(action: (key: K | null, value: V | null) => void, options?: NamedOptions): void
 	/** Changes keys: a key-based operation downstream repartitions first. */
 	selectKey<KR>(mapper: (key: K | null, value: V | null) => KR, options?: NamedOptions): KStream<KR, V>
 	merge(other: KStream<K, V>, options?: NamedOptions): KStream<K, V>
-	/** Routes each record to the first branch whose predicate matches. */
+	/**
+	 * Splits the stream: each record goes to the first branch whose predicate matches, else to the default branch, if
+	 * any. Add branches with `branch()`, then end with `defaultBranch()` or `noDefaultBranch()`:
+	 * ```ts
+	 * const { 'kind-a': a, 'kind-other': other } = stream
+	 * 	.split({ name: 'kind-' })
+	 * 	.branch((key, value) => value?.type === 'a', { name: 'a' })
+	 * 	.defaultBranch({ name: 'other' })
+	 * ```
+	 */
 	split(options?: SplitOptions): BranchedKStream<K, V>
 	/** @deprecated Use split(): records go to the first matching predicate; unmatched records are dropped. */
 	branch(...predicates: ((key: K | null, value: V | null) => boolean)[]): KStream<K, V>[]
+	/**
+	 * Writes every record to `topic`, or to the topic the extractor names for the record. Codecs: `options` first,
+	 * then the stream's; without either, only Buffers can be written.
+	 */
 	to(topic: string | TopicNameExtractor<K | null, V | null>, options?: Produced<K, V>): void
 	/** @deprecated Use repartition(), or to() and stream(). Writes to a user topic and reads it back. */
 	through(topic: string, options?: Produced<K, V>): KStream<K, V>
@@ -168,11 +189,17 @@ export interface KStream<K, V> {
 	processValues<VR>(supplier: FixedKeyProcessorSupplier<K, V, VR>, options?: ProcessOptions): KStream<K, VR>
 }
 
-/** Built by `split()`: add branches, then end with defaultBranch() or noDefaultBranch(). */
+/**
+ * Built by `split()` (Kafka Streams' BranchedKStream): add branches, then end with `defaultBranch()` or
+ * `noDefaultBranch()`, which return the branches keyed `<split name><branch name>`. Without a split name, the prefix is
+ * the generated name of the split node (`KSTREAM-BRANCH-<n>`), as in Kafka Streams: name the split to destructure the
+ * result.
+ */
 export interface BranchedKStream<K, V> {
+	/** Adds a branch for the records the predicate matches that no earlier branch took. */
 	branch(predicate: (key: K | null, value: V | null) => boolean, options?: BranchOptions<K, V>): this
-	/** Records no predicate matched go to this branch. The result is keyed `<splitName><branchName>`. */
+	/** Ends the split with a branch for the records no predicate matched; returns the branches. */
 	defaultBranch(options?: BranchOptions<K, V>): Record<string, KStream<K, V>>
-	/** Records no predicate matched are dropped. The result is keyed `<splitName><branchName>`. */
+	/** Ends the split; records no predicate matched are dropped. Returns the branches. */
 	noDefaultBranch(): Record<string, KStream<K, V>>
 }

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { FailedProcessingError, TopologyError } from '@/api/errors.js'
 import { codec } from '@/codec.js'
+import type { KStream } from '@/api/kstream.js'
 import type { KStreamImpl } from '@/dsl/kstream.js'
 import type { KTableImpl } from '@/dsl/ktable.js'
 import type { Change } from '@/operators/change.js'
@@ -179,13 +180,43 @@ describe('stateless operators', () => {
 		stream
 			.flatMapValues((k: string | null, v: string | null) => [k ?? '', v ?? ''])
 			.to('flat', { key: str, value: str })
+		stream.flatMapValues(v => [v, v]).to('flat-values', { key: str, value: str })
+		// The documented caveat: a parameter with a default does not count in fn.length, so this mapper gets the value only.
+		stream.mapValues((v: string | null, suffix = '?') => `${v}${suffix}`).to('default', { key: str, value: str })
 		await driver.run(async ({ send, output }) => {
 			await send('in', 'v', { ...key('k'), codec: str })
 			const values = (topic: string) => output(topic, { value: str }).map(r => r.value)
 			expect(values('value-only')).toEqual(['v!'])
 			expect(values('with-key')).toEqual(['k=v'])
 			expect(values('flat')).toEqual(['k', 'v'])
+			expect(values('flat-values')).toEqual(['v', 'v'])
+			expect(values('default')).toEqual(['v?'])
 		})
+	})
+
+	it('flatMap flags the stream for repartitioning; filter, filterNot, flatMapValues and peek keep the flag (6.0)', async () => {
+		const driver = new TestDriver()
+		const stream = driver.input('in', { key: str, value: str })
+		const counts: unknown[] = []
+		const keepFlag = (s: KStream<string, string>) =>
+			s
+				.filter(() => true)
+				.filterNot(() => false)
+				.flatMapValues(v => [v])
+				.peek(() => {})
+		keepFlag(stream.flatMap((_k, v) => [[v!, v!] as const]))
+			.groupByKey({ key: str, value: str })
+			.count()
+			.toStream()
+			.foreach((k, count) => counts.push([k, count]))
+		keepFlag(stream).groupByKey().count()
+		await driver.run(async ({ send, producer }) => {
+			await send('in', 'v', { ...key('k'), codec: str })
+			expect(producer.messages.map(m => m.topic).filter(topic => topic.endsWith('-repartition'))).toEqual([
+				'test-app-repartition-0-repartition',
+			])
+		})
+		expect(counts).toEqual([['v', 1]])
 	})
 
 	it('peek and foreach see every record with its key and value, nulls included', async () => {
@@ -233,6 +264,32 @@ describe('stateless operators', () => {
 			expect(output('out-a').map(r => r.partition)).toEqual([0])
 			expect(output('out-b').map(r => r.partition)).toEqual([2])
 		})
+	})
+
+	it('a topic name extractor gets the metadata of the input record; a result that is no topic name fails the record', async () => {
+		const driver = new TestDriver()
+		const contexts: unknown[] = []
+		driver.input('in', { key: str, value: str }).to(
+			(_k, v, context) => {
+				contexts.push(context)
+				return v === 'none' ? '' : `out-${v}`
+			},
+			{ key: str, value: str }
+		)
+		await driver.run(async ({ send, output }) => {
+			await send('in', 'a', { ...key('k'), codec: str, partition: 1 })
+			expect(output('out-a', { key: str, value: str }).map(r => [r.key, r.value])).toEqual([['k', 'a']])
+			const failure = send('in', 'none', { codec: str })
+			await expect(failure).rejects.toThrow(FailedProcessingError)
+			const error = (await failure.catch((e: unknown) => e)) as Error
+			expect((error.cause as Error).message).toBe(
+				"the topic name extractor of sink 'KSTREAM-SINK-0000000001' returned '', not a topic name"
+			)
+		})
+		expect(contexts).toMatchObject([
+			{ topic: 'in', partition: 1, offset: 0n },
+			{ topic: 'in', partition: 0, offset: 0n },
+		])
 	})
 })
 
@@ -355,16 +412,30 @@ describe('table sources', () => {
 		expect(seen).toEqual([['k', 'keyed']])
 	})
 
-	it('toStream(mapper) re-keys the stream, so a key-based operation repartitions', async () => {
+	it('toStream(mapper) re-keys the stream with (key, new value), so a key-based operation repartitions', async () => {
 		const driver = new TestDriver()
+		const mapped: unknown[] = []
 		driver
 			.table('t', { key: str, value: str })
-			.toStream((k, v) => `${k}/${v}`)
+			.toStream((k, v) => {
+				mapped.push([k, v])
+				return `${k}/${v}`
+			})
 			.toTable({ key: str, value: str, storeName: 'rekeyed' })
-		await driver.run(async ({ send, getStateStore }) => {
+		await driver.run(async ({ send, output, getStateStore }) => {
 			await send('t', 'v', { ...key('k'), codec: str })
+			await send('t', null, key('k'))
 			expect((await getStateStore<Stored>('rekeyed').get('k/v'))?.value).toBe('v')
+			const repartitioned = output('test-app-repartition-0-repartition', { key: str, value: str })
+			expect(repartitioned.map(r => [r.key, r.value])).toEqual([
+				['k/v', 'v'],
+				['k/null', null],
+			])
 		})
+		expect(mapped).toEqual([
+			['k', 'v'],
+			['k', null],
+		])
 	})
 
 	it('sends old values once downstream asks for them; its value getter reads the latest value and timestamp', async () => {
