@@ -257,3 +257,69 @@ describe('FlowRuntime and Run', () => {
 		await current.stop()
 	})
 })
+
+describe('start positions and repartition purge', () => {
+	it("commits the start position of a 'latest' source before its task runs; without a commit it stays pinned", async () => {
+		const h = new Harness(app => app.stream('in', { ...strings, offsetReset: 'latest' }).to('out', strings))
+		const starting = h.start()
+		await h.joined()
+		h.consumer.steps.commit.next(new Error('coordinator loading'))
+		// The client resolved 'latest' to the end of the log.
+		await h.consumer.rebalance({ topic: 'in', partition: 0, offset: 4n, committed: null })
+		await starting
+		expect(h.committed()).toBeUndefined()
+
+		// Assigned again without a commit, now at a newer end: back to where the start began, before the task resumes.
+		h.consumer.calls.length = 0
+		await h.consumer.rebalance({ topic: 'in', partition: 0, offset: 9n, committed: null })
+		await vi.waitFor(() => expect(h.lifecycle.state).toBe('RUNNING'))
+		expect(h.consumer.calls.filter(call => !call.startsWith('pause'))).toEqual([
+			'seek in:0 4',
+			'commit in:0@4',
+			'resume in:0',
+		])
+		expect(h.committed()).toBe(4n)
+		h.consumer.deliver('in:0', [{ key: 'k', value: 'a' }])
+		await vi.waitFor(() => expect(h.output()).toEqual(['a']))
+		await h.stop()
+		expect(h.committed()).toBe(5n)
+	})
+
+	it('deletes the records of a repartition topic below its committed offset after commits, once per interval', async () => {
+		const h = new Harness(
+			app =>
+				app
+					.stream('in', strings)
+					.groupBy((_key, value) => value, strings)
+					.count()
+					.toStream()
+					.to('out'),
+			{ commitIntervalMs: 1000, repartitionPurgeIntervalMs: 2000 }
+		)
+		const repartition = [...h.topology.internalTopics.values()].find(spec => spec.kind === 'repartition')!.name
+		const starting = h.start()
+		await h.joined()
+		await h.consumer.rebalance('in:0', `${repartition}:0`)
+		await starting
+		/** Records the upstream task wrote, as the consumer fetches them. */
+		const fetched = (...values: string[]) => {
+			const records = values.map(value => ({ key: value, value }))
+			h.io.cluster.append(repartition, 0, ...records)
+			h.consumer.deliver(`${repartition}:0`, records)
+		}
+		const purges = () => h.io.admin.calls.filter(call => call.startsWith('deleteRecords'))
+
+		fetched('x', 'y', 'x')
+		await vi.waitFor(() => expect(h.output()).toHaveLength(3))
+		h.io.clock.advance(1000)
+		await vi.waitFor(() => expect(h.committed(`${repartition}:0`)).toBe(3n))
+		expect(purges()).toEqual([])
+
+		fetched('y')
+		await vi.waitFor(() => expect(h.output()).toHaveLength(4))
+		h.io.clock.advance(1000)
+		await vi.waitFor(() => expect(h.io.cluster.log(repartition, 0).start).toBe(4n))
+		expect(purges()).toEqual([`deleteRecords ${repartition}:0@4`])
+		await h.stop()
+	})
+})

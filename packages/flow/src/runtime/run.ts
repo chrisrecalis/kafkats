@@ -4,8 +4,7 @@
  * (4.3). Created by FlowRuntime.start (and, from the recovery of a later build, by every recovery); never revived: a
  * Run ends once, gracefully (close) or abandoned (failure).
  *
- * This build restores nothing (its restorer only accepts changelogs with nothing to replay) and settles start
- * positions without pins.
+ * This build restores nothing (its restorer only accepts changelogs with nothing to replay).
  */
 import type { Logger } from '@kafkats/client'
 import { IllegalStateError, NoOffsetResetError, StreamsError } from '@/api/errors.js'
@@ -15,10 +14,12 @@ import type { ResolvedFlowConfig } from '@/runtime/config.js'
 import { errorMessage, type FailureSite } from '@/runtime/errors.js'
 import type { AdminPort, GroupConsumerHooks, GroupConsumerPort, ProducerPort, RuntimeIO } from '@/runtime/io.js'
 import { SinkPartitionCounts } from '@/runtime/partition-count-cache.js'
+import { RepartitionPurger } from '@/runtime/purge.js'
 import { RecordCollector } from '@/runtime/record-collector.js'
-import type { StartPositionSettler, TaskRestorer } from '@/runtime/restore-pipelines.js'
+import type { TaskRestorer } from '@/runtime/restore-pipelines.js'
 import { Scheduler } from '@/runtime/scheduler.js'
 import { cap, raceSignal } from '@/runtime/signals.js'
+import type { StartPositions } from '@/runtime/start-positions.js'
 import { TaskIdRegistry, tpKey } from '@/runtime/task-id.js'
 import { TaskManager } from '@/runtime/task-manager.js'
 import type { Checkpoints } from '@/state/checkpoints.js'
@@ -44,6 +45,8 @@ export interface RunDeps {
 	readonly io: RuntimeIO
 	readonly stateDirectory: StateDirectory
 	readonly checkpoints: Checkpoints
+	/** The start's 'latest' pins (4.7.4): they outlive the run. */
+	readonly startPositions: StartPositions
 	/** The app state follows rebalances and restores (4.3.5). */
 	readonly lifecycle: Pick<AppLifecycle, 'setRunning' | 'setRebalancing'>
 	/** FlowRuntime.fail for this run. */
@@ -88,7 +91,14 @@ export class Run {
 			assignmentMetadata: () => this.tasks.assignmentMetadata,
 			eos: config.eos,
 			checkpoints: deps.checkpoints,
-			onCommitted: { noteCommitted: () => {} },
+			onCommitted: new RepartitionPurger({
+				admin: io.admin,
+				topics: new Set(deps.topology.subtopologies.flatMap(s => [...s.repartitionSourceTopics])),
+				intervalMs: config.repartitionPurgeIntervalMs,
+				clock: io.clock,
+				signal: this.hardStop.signal,
+				logger,
+			}),
 			failed: () => this.isFailed,
 			hardStop: this.hardStop.signal,
 			config,
@@ -111,7 +121,7 @@ export class Run {
 				ensureTransaction: signal => this.current.ensureTransaction(signal),
 			},
 			restorer: emptyChangelogsOnly(io.admin, deps.checkpoints),
-			startPositions: withoutPins,
+			startPositions: deps.startPositions.settler(this.consumer),
 			exclusive: fn => this.scheduler.exclusive(fn),
 			commit: (reason, signal) => this.commits.commit(reason, signal),
 			resetOutput: () => this.resetOutput(),
@@ -170,12 +180,11 @@ export class Run {
 		const { consumer, deps } = this
 		consumer.on('rebalancePending', () => deps.lifecycle.setRebalancing())
 		consumer.on('error', error => deps.logger.warn('the group consumer reported an error', errorFields(error)))
-		consumer.on('offsetReset', ({ reason, ...reset }) => {
+		consumer.on('offsetReset', ({ reason, topic, partition, from, to }) => {
+			// Offsets as strings: the client's logger writes JSON, which has no bigint.
 			deps.logger[reason === 'out-of-range' ? 'warn' : 'info'](
 				`a partition starts at its reset position (${reason})`,
-				{
-					...reset,
-				}
+				{ topic, partition, from: from?.toString() ?? null, to: to.toString() }
 			)
 		})
 		consumer.on('offsetOutOfRange', ({ topic, partition, offset }) => {
@@ -382,17 +391,6 @@ function emptyChangelogsOnly(admin: Pick<AdminPort, 'listOffsets'>, checkpoints:
 			return { storeTimes: new Map() }
 		},
 	}
-}
-
-/** Start positions of this build: where the client put each partition without a committed offset (no pins). */
-const withoutPins: StartPositionSettler = {
-	settle: task => {
-		const positions = new Map<string, bigint>()
-		for (const [key, start] of task.starts) {
-			if (start.committed === null) positions.set(key, start.resolved)
-		}
-		return Promise.resolve(positions)
-	},
 }
 
 function once<T>(fn: () => Promise<T>): () => Promise<T> {

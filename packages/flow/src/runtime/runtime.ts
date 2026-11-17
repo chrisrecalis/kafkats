@@ -15,6 +15,7 @@ import { classify, errorMessage, type FailureSite } from '@/runtime/errors.js'
 import type { RuntimeIO } from '@/runtime/io.js'
 import { Run } from '@/runtime/run.js'
 import { raceSignal } from '@/runtime/signals.js'
+import { StartPositions } from '@/runtime/start-positions.js'
 import type { Checkpoints } from '@/state/checkpoints.js'
 import type { StateDirectory } from '@/state/state-directory.js'
 import type { BuiltTopology } from '@/topology/built-topology.js'
@@ -49,6 +50,8 @@ export interface FlowRuntimeDeps {
 export class FlowRuntime {
 	/** Background waits of this start (connect, topics, the start wait, restore pipelines). Aborted at close start. */
 	readonly shutdown = new AbortController()
+	/** 'latest' pins of this start: every run of it settles start positions with them (4.7.4). */
+	private readonly startPositions: StartPositions
 	private run: Run | undefined
 	private connecting: Promise<void> | undefined
 	/** The first failure: it stops the app; later ones are only logged. */
@@ -57,7 +60,13 @@ export class FlowRuntime {
 	private starting: AbortController | undefined
 	private stopping: Promise<void> | undefined
 
-	constructor(private readonly deps: FlowRuntimeDeps) {}
+	constructor(private readonly deps: FlowRuntimeDeps) {
+		const { topology, config, logger } = deps
+		this.startPositions = new StartPositions({
+			policy: topic => topology.resetPolicy(topic, config.defaultResetPolicy),
+			logger,
+		})
+	}
 
 	/**
 	 * 4.2 steps 3-8: connects, resolves the partition counts and creates the internal topics, then joins the group
@@ -79,6 +88,7 @@ export class FlowRuntime {
 		const run: Run = new Run({
 			...this.deps,
 			counts,
+			startPositions: this.startPositions,
 			onFailure: (error, site) => this.fail(error, site, run),
 			shutdown: this.shutdown.signal,
 		})
