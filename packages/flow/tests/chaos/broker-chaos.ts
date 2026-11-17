@@ -1,12 +1,15 @@
 /**
  * Scenario C: broker restart / pause chaos (and E: unhandled rejections are logged by worker).
  *
- * Prereq: docker container `kafka-chaos` on 127.0.0.1:29092 (any single-broker Kafka; no start script is checked in). Uses docker restart/pause on it ONLY.
+ * Prereq: docker container `kafka-chaos` on 127.0.0.1:29092 (`tests/chaos/brokers.sh single`). Uses docker restart/pause on it ONLY.
  * Run (from packages/flow):
  *   pnpm exec tsx tests/chaos/broker-chaos.ts --guarantee eos --mode stateless --fault restart
  *   pnpm exec tsx tests/chaos/broker-chaos.ts --guarantee alo --mode count --fault pause --pause-s 25
- * Flags: --guarantee alo|eos --mode stateless|count --fault restart|pause|kill|rolling (multi-broker: CHAOS_RF=3 CHAOS_CONTAINER=<one> CHAOS_CONTAINERS=<all>) --pause-s 25 --keys 12 --per-key 100
+ * Flags: --guarantee alo|eos --mode stateless|count|regroup|table-join|global-join
+ *        --fault restart|pause|kill|rolling (multi-broker: CHAOS_RF=3 CHAOS_CONTAINER=<one> CHAOS_CONTAINERS=<all>)
+ *        --pause-s 25 --partitions 4 --keys 12 --per-key 100
  *        --recover-ms 120000 (how long to wait for self-recovery before declaring HANG)
+ * The join modes keep writing table versions before and after the fault (none in flight across it).
  * Timeline: produce; once worker is processing inject fault while producer keeps going; then watch the worker:
  *   state, processed counter progress, errors. Reports precise phases: stall start, broker back, resume (or never).
  * CHAOS_DEBUG=1 (+ KAFKA_TS_LOG_LEVEL=debug) prints the worker's raw log lines at the end.
@@ -17,29 +20,38 @@ import {
 	Worker,
 	workerEnv,
 	makeClient,
-	createTopics,
+	scenarioTopics,
 	genInput,
 	readAll,
-	uid,
 	sleep,
+	flags,
+	guaranteeOf,
+	modeOf,
+	json,
 	CONTAINER,
 	CONTAINERS,
-	summarizeStateless,
-	summarizeCount,
 	type Rec,
 } from './common.js'
+import { TableFeed } from './table-feed.js'
+import { passes, printFaults, summarize, workerFaults } from './verdict.js'
 
-const arg = (n: string, d: string) => {
-	const i = process.argv.indexOf(`--${n}`)
-	return i >= 0 ? process.argv[i + 1]! : d
-}
-const guarantee = arg('guarantee', 'alo') === 'eos' ? 'exactly_once' : 'at_least_once'
-const mode = arg('mode', 'stateless') as 'stateless' | 'count' | 'regroup'
-const fault = arg('fault', 'restart')
-const pauseS = Number(arg('pause-s', '25'))
-const keys = Number(arg('keys', '12'))
-const perKey = Number(arg('per-key', '100'))
-const recoverMs = Number(arg('recover-ms', '120000'))
+const opts = flags({
+	guarantee: 'alo',
+	mode: 'stateless',
+	fault: 'restart',
+	'pause-s': '25',
+	partitions: '4',
+	keys: '12',
+	'per-key': '100',
+	'recover-ms': '120000',
+})
+const guarantee = guaranteeOf(opts.guarantee)
+const mode = modeOf(opts.mode)
+const fault = opts.fault
+const pauseS = Number(opts['pause-s'])
+const keys = Number(opts.keys)
+const perKey = Number(opts['per-key'])
+const recoverMs = Number(opts['recover-ms'])
 const isolation = guarantee === 'exactly_once' ? 'read_committed' : 'read_uncommitted'
 const label = `${guarantee}/${mode}/${fault}${fault === 'pause' ? pauseS + 's' : ''}`
 const sh = (c: string) => execSync(c, { stdio: 'pipe' }).toString().trim()
@@ -47,12 +59,11 @@ const T0 = Date.now()
 const ev = (m: string) => console.log(`  [+${((Date.now() - T0) / 1000).toFixed(1)}s] ${m}`)
 
 let client = await makeClient()
-const input = uid('chaos-in')
-const output = uid('chaos-out')
-const appId = uid('chaos-app')
-await createTopics(client, [input, output], 4)
+const topics = await scenarioTopics(client, mode, Number(opts.partitions))
+const { input, output } = topics
 const inputs = genInput(keys, perKey)
 console.log(`== ${label}: ${inputs.length} records`)
+const feed = topics.table ? await TableFeed.start(client, topics.table, keys) : null
 
 // producer that survives broker outages: retries each batch on a fresh producer until it succeeds
 let sentCount = 0
@@ -89,7 +100,7 @@ const sendLoop = (async () => {
 	await pc.disconnect().catch(() => {})
 })()
 
-const w = new Worker('w0', workerEnv({ appId, input, output, mode, guarantee })).start()
+const w = new Worker('w0', workerEnv({ ...topics, mode, guarantee })).start()
 const sample = () => {
 	const s = w.last('status')
 	return {
@@ -103,6 +114,7 @@ for (let i = 0; i < 60 && sample().processed < 40; i++) await sleep(500)
 ev(`worker processing: ${JSON.stringify(sample())} sent=${sentCount}`)
 
 // inject fault
+await feed?.hold()
 const faultAt = Date.now()
 if (fault === 'restart') {
 	ev('docker restart ...')
@@ -130,6 +142,7 @@ if (fault === 'restart') {
 	ev('docker unpaused')
 }
 const brokerBackAt = Date.now()
+feed?.release()
 
 // observe recovery
 const timeline: string[] = []
@@ -167,8 +180,8 @@ while (Date.now() - obsStart < recoverMs) {
 	if (producerDoneAt && Date.now() - producerDoneAt > 25000) break
 }
 await sendLoop.catch(() => {})
+await feed?.stop()
 const final = sample()
-const unhandled = w.lines.filter(l => /UNHANDLED|UNCAUGHT/.test(l.type))
 const stderr = w.lines
 	.filter(l => l.type === 'stderr')
 	.map(l => l.line.trim())
@@ -182,35 +195,23 @@ const actualRecs: Rec[] = actualInput.map(o => ({ key: o.key, value: o.value }))
 const expectedByKey = new Map<string, number>()
 for (const r of actualRecs) expectedByKey.set(r.key, (expectedByKey.get(r.key) ?? 0) + 1)
 const dedupInput = new Set(actualRecs.map(r => r.value)).size !== actualRecs.length
-let outs = await readAll(client, output, isolation, { quietMs: 8000, maxMs: 60000 })
-const sum =
-	mode === 'stateless'
-		? summarizeStateless(actualRecs, outs)
-		: summarizeCount(keys, perKey, outs, expectedByKey, mode === 'regroup' ? 'nk' : 'k')
+const outs = await readAll(client, output, isolation, { quietMs: 8000, maxMs: 60000 })
+const sum = summarize(mode, actualRecs, outs, { keys, perKey, expectedByKey })
 
-// Is the app actually dead? Produce 1 sentinel per key and see if it still processes.
+// Is the app actually dead? Produce a sentinel (on a key the join modes' tables hold) and see if it still processes.
 let stillAlive = 'n/a'
 if (w.alive) {
 	const before = outs.length
 	const p = client.producer({ lingerMs: 0 })
-	await p.send(input, [{ key: 'sentinel', value: Buffer.from('sentinel#1') }])
+	await p.send(input, [{ key: 'k0', value: Buffer.from('sentinel#1') }])
 	await p.disconnect()
 	await sleep(15000)
 	const after = await readAll(client, output, isolation, { quietMs: 5000, maxMs: 30000 })
 	stillAlive = after.length > before ? 'yes (processed sentinel)' : 'NO (sentinel not processed in 15s)'
 }
 
-let pass: boolean
-if (guarantee === 'exactly_once') {
-	pass =
-		mode === 'stateless' ? (sum as any).missing === 0 && (sum as any).dupes === 0 : (sum as any).exactKeys === keys
-} else {
-	pass =
-		mode === 'stateless'
-			? (sum as any).missing === 0
-			: (sum as any).belowKeys === 0 && (sum as any).lastBelowKeys === 0
-}
-if (final.state === 'ERROR' || stillAlive.startsWith('NO')) pass = false
+const faults = workerFaults([w])
+const pass = passes(guarantee, sum) && faults.ok && final.state !== 'ERROR' && !stillAlive.startsWith('NO')
 console.log(`RESULT ${label}: ${pass ? 'PASS' : 'FAIL'}`)
 console.log(
 	'  fault->broker back:',
@@ -227,15 +228,9 @@ console.log(
 	stillAlive
 )
 console.log('  input harness dup:', dedupInput, 'actual input records:', actualRecs.length)
-console.log(
-	'  summary:',
-	JSON.stringify(sum, (_, v) => (typeof v === 'bigint' ? v.toString() : v))
-)
-console.log(
-	'  unhandled:',
-	unhandled.length,
-	unhandled.slice(0, 4).map(u => `${u.message} @ ${u.stack}`)
-)
+if (feed) console.log(`  table versions written: ${feed.version}`)
+console.log('  summary:', json(sum))
+printFaults(faults)
 console.log('  stderr:', stderr)
 console.log(
 	'  worker events (non-status):',
