@@ -3,6 +3,7 @@ import type { FlowApp } from '@/api/app.js'
 import type { KGroupedStream, SessionWindowedKStream, TimeWindowedKStream, Windowed } from '@/api/grouped.js'
 import type { KStream } from '@/api/kstream.js'
 import type { GlobalKTable, KTable } from '@/api/ktable.js'
+import { codec } from '@/codec.js'
 import type { JoinWindows, SessionWindows, TimeWindows } from '@/dsl/windows.js'
 
 /** Compile-time checks of the public overloads; never called. */
@@ -48,6 +49,24 @@ function overloads(
 
 	const grouped = stream.groupByKey()
 	expectTypeOf(grouped).toEqualTypeOf<KGroupedStream<string, number>>()
+	expectTypeOf(
+		grouped.aggregate(
+			() => 0,
+			(_key, value, sum) => sum + value
+		)
+	).toEqualTypeOf<KTable<string, number>>()
+	expectTypeOf(
+		grouped.aggregate(
+			() => '',
+			(_key, value, text) => text + value,
+			{ value: codec.string() }
+		)
+	).toEqualTypeOf<KTable<string, string>>()
+	grouped.aggregate(
+		// @ts-expect-error aggregates of another type than the values need their codec
+		() => '',
+		(_key, value, text) => text + value
+	)
 	expectTypeOf(grouped.windowedBy(windows.time)).toEqualTypeOf<TimeWindowedKStream<string, number>>()
 	expectTypeOf(grouped.windowedBy(windows.session)).toEqualTypeOf<SessionWindowedKStream<string, number>>()
 	expectTypeOf(

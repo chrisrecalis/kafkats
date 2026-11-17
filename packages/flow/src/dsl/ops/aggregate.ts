@@ -15,16 +15,16 @@ import { aggregateWith, KStreamAggregate, reduceWith, type Aggregation } from '@
 import { timestampedKeyValueStoreBuilder } from '@/state/store-builders.js'
 
 /**
- * Default codec of counts, also of the row counts of a KGroupedTable aggregate(): an 8-byte little-endian double
- * (today's format; WP3.10 switches to KS's int64).
+ * Default codec of counts, also of the row counts of a KGroupedTable aggregate(): an int64 big-endian (KS
+ * `Serdes.Long`, BC21).
  */
 export const COUNT_CODEC: Codec<number> = {
 	encode: count => {
-		const encoded = Buffer.alloc(8)
-		encoded.writeDoubleLE(count, 0)
+		const encoded = Buffer.allocUnsafe(8)
+		encoded.writeBigInt64BE(BigInt(count))
 		return encoded
 	},
-	decode: encoded => encoded.readDoubleLE(0),
+	decode: encoded => Number(encoded.readBigInt64BE()),
 }
 
 /** count(): +1 per record; merging two counts adds them. */
@@ -75,7 +75,9 @@ export function aggregate<K, V, A>(
 	aggregator: (key: K, value: V, aggregate: A) => A,
 	options: AggregateOptions<K, A> = {}
 ): KTable<K, A> {
-	const valueCodec = requireAggregateCodec(options.value, 'aggregate()')
+	// The API lets only aggregates of the value type go without a codec (6.3): the value codec keeps them.
+	const values = grouped.stream.format.valueCodec as Codec<A> | undefined
+	const valueCodec = requireAggregateCodec(options.value ?? values, 'aggregate()')
 	return materialize(grouped, 'aggregate', options, valueCodec, aggregateWith(initializer, aggregator))
 }
 

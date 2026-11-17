@@ -1,5 +1,6 @@
 import type { KTable } from '@/api/ktable.js'
 import type { AggregateOptions, WindowedAggregateOptions } from '@/api/options.js'
+import type { Codec } from '@/codec.js'
 import type { SessionWindows, SlidingWindows, TimeWindows } from '@/dsl/windows.js'
 
 /** A key and the window it was aggregated in: `[start, end)` for time windows, `[start, end]` for sessions and sliding windows. */
@@ -10,12 +11,20 @@ export interface Windowed<K> {
 
 /** A stream grouped by key, ready to be aggregated. Records with a null key or value are dropped. */
 export interface KGroupedStream<K, V> {
+	/** Counts are kept and sent as int64 big-endian (Kafka Streams' `Serdes.Long`) unless `options.value` is given. */
 	count(options?: AggregateOptions<K, number>): KTable<K, number>
 	reduce(reducer: (aggregate: V, value: V) => V, options?: AggregateOptions<K, V>): KTable<K, V>
+	/** Aggregates of the value type are kept with the value codec unless `options.value` is given. */
+	aggregate(
+		initializer: () => V,
+		aggregator: (key: K, value: V, aggregate: V) => V,
+		options?: AggregateOptions<K, V>
+	): KTable<K, V>
+	/** Aggregates of another type need their codec: `options.value`. */
 	aggregate<A>(
 		initializer: () => A,
 		aggregator: (key: K, value: V, aggregate: A) => A,
-		options?: AggregateOptions<K, A>
+		options: AggregateOptions<K, A> & { value: Codec<A> }
 	): KTable<K, A>
 	windowedBy(windows: TimeWindows): TimeWindowedKStream<K, V>
 	windowedBy(windows: SessionWindows): SessionWindowedKStream<K, V>

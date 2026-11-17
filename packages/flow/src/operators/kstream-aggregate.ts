@@ -1,6 +1,7 @@
 /**
- * KStream count, reduce and aggregate (KS KStreamAggregate, KStreamReduce; 6.3), ported with today's semantics: a
- * result carries the timestamp of the record that produced it (Stage 3 changes it to the max timestamp, WP3.10).
+ * KStream count, reduce and aggregate (KS KStreamAggregate, KStreamReduce; 6.3). A result carries the max timestamp
+ * of the records aggregated into it (`max(record, previous aggregate)`, KS `KStreamAggregate.java:127-133`), which is
+ * also the timestamp stored with the aggregate; headers are the triggering record's.
  *
  * Read-modify-write per record: under at-least-once a replayed record is aggregated again (KS behaves the same);
  * exactly-once commits the store writes with the offsets.
@@ -83,15 +84,16 @@ class KStreamAggregateProcessor<K, V, A> implements Processor<K | null, V | null
 		if (!aggregatable(this.context, this.storeName, record)) {
 			return
 		}
-		const { key, value, timestamp } = record
-		const old = (await this.store.get(key))?.value
-		const aggregate = this.aggregation(key, value, old)
+		const { key, value } = record
+		const old = await this.store.get(key)
+		const aggregate = this.aggregation(key, value, old?.value)
+		const timestamp = old === undefined ? record.timestamp : Math.max(record.timestamp, old.timestamp)
 		if (aggregate === null || aggregate === undefined) {
 			await this.store.delete(key)
 		} else {
 			await this.store.put(key, { value: aggregate, timestamp })
 		}
-		const oldValue = this.sendOldValues() ? (old ?? null) : null
-		await this.context.forward(record.withValue({ newValue: aggregate ?? null, oldValue }))
+		const oldValue = this.sendOldValues() ? (old?.value ?? null) : null
+		await this.context.forward(record.withValue({ newValue: aggregate ?? null, oldValue }).withTimestamp(timestamp))
 	}
 }

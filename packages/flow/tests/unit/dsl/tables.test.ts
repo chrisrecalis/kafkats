@@ -14,7 +14,7 @@ import { capture, processorDef, ProcessorHarness, sourceDef } from '../support/p
 
 const str = codec.string()
 const S = { key: str, value: str }
-/** Today's count codec: an 8-byte little-endian double. */
+/** The number codec these tests pass explicitly: an 8-byte little-endian double. */
 const num: Codec<number> = {
 	encode: n => {
 		const encoded = Buffer.alloc(8)
