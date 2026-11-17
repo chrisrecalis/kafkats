@@ -208,7 +208,17 @@ describe('RecordCollector at-least-once', () => {
 		})
 	}
 
-	for (const code of [ErrorCode.TopicAuthorizationFailed, ErrorCode.InvalidTopicException]) {
+	// KS RecordCollectorImpl.isFatalException: never handed to the production handler, under either guarantee (4.6.5).
+	for (const code of [
+		ErrorCode.TopicAuthorizationFailed,
+		ErrorCode.GroupAuthorizationFailed,
+		ErrorCode.ClusterAuthorizationFailed,
+		ErrorCode.TransactionalIdAuthorizationFailed,
+		ErrorCode.SaslAuthenticationFailed,
+		ErrorCode.SecurityDisabled,
+		ErrorCode.InvalidTopicException,
+		ErrorCode.OffsetMetadataTooLarge,
+	]) {
 		it(`${ErrorCode[code]} is fatal whatever the production handler says (KS)`, async () => {
 			let handled = 0
 			const h = new TaskHarness({

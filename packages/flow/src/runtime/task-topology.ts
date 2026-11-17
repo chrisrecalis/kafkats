@@ -31,7 +31,7 @@ export interface TopologyOwner {
 
 export interface TaskTopologyDeps {
 	/** The task's store stacks. */
-	readonly stores: Pick<TaskStateManager, 'store' | 'stores'>
+	readonly stores: Pick<TaskStateManager, 'stores' | 'stackClosed'>
 	/** The read-only view of a global store, which every processor may read without being connected (KS). */
 	readonly globalStore: (name: string) => StateStore
 	readonly output: TaskOutput
@@ -157,8 +157,9 @@ export class TaskTopology {
 	}
 
 	/**
-	 * A handle on the top of a task store's stack whose writes reject once this topology closed (one per store); the
-	 * read-only view of a global store, which belongs to no task.
+	 * A handle on the top of a task store's stack whose writes reject once this topology or the stack closed (one per
+	 * store; the stack closes first when a close takes the task while its processors' init() runs); the read-only view
+	 * of a global store, which belongs to no task.
 	 */
 	store(name: string): StateStore {
 		if (this.globals.has(name)) {
@@ -167,9 +168,9 @@ export class TaskTopology {
 		let handle = this.handles.get(name)
 		if (!handle) {
 			const { stores } = this.deps
-			const { kind } = stores.stores.find(store => store.builder.name === name)!.builder
+			const { builder, top } = stores.stores.find(store => store.builder.name === name)!
 			const owner = `processors of task ${this.context.options.taskId.key}`
-			handle = storeHandle(stores.store(name), kind, () => this.closed, owner)
+			handle = storeHandle(top, builder.kind, () => this.closed || stores.stackClosed, owner)
 			this.handles.set(name, handle)
 		}
 		return handle

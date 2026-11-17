@@ -517,8 +517,8 @@ describe('seeding from the commits (D5, KF7)', () => {
 		task.resume()
 		task.setStarts(
 			new Map([
-				['a:0', committed({ w: 100, 'w.observed': 80, removed: 7 }, 90)],
-				['b:0', committed({ w: 120 }, 130)],
+				['a:0', committed({ w: 120, 'w.observed': 80, removed: 7 }, 90)],
+				['b:0', committed({ w: 100 }, 130)],
 			])
 		)
 		const clock = giveClock(task)
@@ -584,7 +584,8 @@ describe('processing', () => {
 		const h = new TaskHarness({ build: b => pipe(b, { processor: supplier }) })
 		const task = await h.start(h.task())
 		h.enqueue(task, 'input', [{ key: 'k', value: 'v', timestamp: 42, headers: { h: Buffer.from('1') } }])
-		expect(await task.processOne(h.clock.now())).toBe(true)
+		// A synchronous subtree is processed without a promise (lean path, SI14).
+		expect(task.processOne(h.clock.now())).toBe(true)
 		expect(state.metadata).toEqual([expect.objectContaining({ topic: 'input', partition: 0, offset: 0n })])
 		expect(h.producer.sent[0]!.message).toMatchObject({ timestamp: new Date(42), headers: { h: Buffer.from('1') } })
 		expect(h.output('output')).toEqual([{ key: 'k', value: 'v', timestamp: 42 }])

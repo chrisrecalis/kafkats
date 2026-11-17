@@ -68,14 +68,20 @@ function stamped(record: ReturnType<RecordQueue['poll']>): StampedRecord {
 describe('RecordQueue', () => {
 	it('keeps delivered batches in order across many batches and reports its size', () => {
 		const { q } = queue()
+		// The batches the queue still references: read ones are released (no growth under a constant backlog).
+		const retained = () => (q as unknown as { batches: unknown[] }).batches.length
 		let polled = 0
+		let maxRetained = 0
 		// A backlog of 10 single-record batches while thousands pass through.
 		for (let b = 0; b < 3000; b++) {
 			expect(q.addRawRecords(batch(b, [b]))).toBe(b + 1 - polled)
 			if (b >= 10) expect(stamped(q.poll()).offset).toBe(BigInt(polled++))
+			maxRetained = Math.max(maxRetained, retained())
 		}
+		expect(maxRetained).toBeLessThanOrEqual(1024 + 11)
 		while (q.size > 0) expect(stamped(q.poll()).offset).toBe(BigInt(polled++))
 		expect(polled).toBe(3000)
+		expect(retained()).toBe(0)
 		expect(q.addRawRecords([])).toBe(0)
 		expect(q.head()).toBeNull()
 		expect(q.headOffset).toBeUndefined()

@@ -333,6 +333,19 @@ describe('TaskManager: eager rebalances (4.3)', () => {
 		])
 	})
 
+	it('a stateless task whose next assignment is a subset of its partitions is replaced, not resumed (R9)', async () => {
+		const h = await running({ build: stateless(['a', 'b']), counts: { a: 1, b: 1 } }, 'a:0', 'b:0')
+		const [before] = h.tasks()
+		await h.revoke('a:0', 'b:0')
+		await h.assign('a:0')
+		await h.settle()
+		expect(before!.state).toBe('CLOSED')
+		expect(h.tasks().map(task => [task.id.key, task.state, task.inputPartitions])).toEqual([
+			['0_0', 'RUNNING', [tp('a:0')]],
+		])
+		expect(h.manager.taskFor(tp('b:0'))).toBeUndefined()
+	})
+
 	it('CR16: a source topic of a stateful task that grew since start is fatal, and nothing is created', async () => {
 		const h = new Harness({ counts: { input: 2 } })
 		await h.assign('input:0', 'input:2')
@@ -494,6 +507,35 @@ describe('TaskManager: restore pipelines (4.7.1)', () => {
 		h.failed = true
 		h.restorer.job(task!).finish()
 		await h.settle()
+		expect(task!.state).toBe('RESTORING')
+		expect(h.consumer.calls).toEqual(['pause input:0'])
+		expect(h.allRunning).toEqual([false])
+	})
+
+	it('runtime§6.30: a run that fails while an exactly-once completion opens its transaction never runs init()', async () => {
+		let inits = 0
+		const counting: ProcessorSupplier<string, string, string, string> = () => ({
+			init: () => void inits++,
+			process: () => {},
+		})
+		const h = new Harness({ eos: true, build: stateful(['input'], counting) })
+		h.restorer.manual = true
+		await h.assign('input:0')
+		const [task] = h.tasks()
+		const gate = deferred()
+		const ensureTransaction = h.collector.ensureTransaction.bind(h.collector)
+		let opening = false
+		h.collector.ensureTransaction = async signal => {
+			opening = true
+			await gate.promise
+			return ensureTransaction(signal)
+		}
+		h.restorer.job(task!).finish()
+		while (!opening) await tick()
+		h.failed = true
+		gate.resolve()
+		await h.settle()
+		expect(inits).toBe(0)
 		expect(task!.state).toBe('RESTORING')
 		expect(h.consumer.calls).toEqual(['pause input:0'])
 		expect(h.allRunning).toEqual([false])

@@ -73,6 +73,22 @@ describe('stateless operators (copied from flow.test.ts)', () => {
 		})
 	})
 
+	it('routes a record that matches several predicates only to the first of them', async () => {
+		const driver = new TestDriver()
+		const num = codec.json<number>()
+		const [positive, even] = driver.input('in', { value: num }).branch(
+			(_key, value) => value! > 0,
+			(_key, value) => value! % 2 === 0
+		)
+		positive!.to('positive', { value: num })
+		even!.to('even', { value: num })
+		await driver.run(async ({ sendAll, output }) => {
+			await sendAll('in', [2, -2, -1])
+			expect(output('positive', { value: num }).map(r => r.value)).toEqual([2])
+			expect(output('even', { value: num }).map(r => r.value)).toEqual([-2])
+		})
+	})
+
 	it('merges streams from different topics', async () => {
 		const driver = new TestDriver()
 
@@ -188,6 +204,48 @@ describe('stateless operators', () => {
 		})
 	})
 
+	it('flatMapValues forwards each result once the previous one settled: an async count downstream sees them all', async () => {
+		const driver = new TestDriver()
+		const counts: unknown[] = []
+		driver
+			.input('lines', { key: str, value: str })
+			.flatMapValues(line => line?.split(' ') ?? [])
+			.groupByKey()
+			.count()
+			.toStream()
+			.peek((k, v) => counts.push([k, v]))
+		await driver.run(async ({ send }) => {
+			await send('lines', 'a b a', { ...key('k'), codec: str })
+		})
+		expect(counts).toEqual([
+			['k', 1],
+			['k', 2],
+			['k', 3],
+		])
+	})
+
+	it('flatMap forwards each result once the previous one settled: an async processor downstream sees them all', async () => {
+		const driver = new TestDriver()
+		const seen: unknown[] = []
+		const words = driver
+			.input('lines', { key: str, value: str })
+			.flatMap((k, line) => (line ?? '').split(' ').map(word => [`${k}-${word}`, word] as const))
+		const { ctx, node } = words as KStreamImpl<string, string>
+		ctx.processor('SLOW', undefined, [node], () => ({
+			process: async (record: StreamRecord<string, string>) => {
+				await new Promise(resolve => setImmediate(resolve))
+				seen.push([record.key, record.value])
+			},
+		}))
+		await driver.run(async ({ send }) => {
+			await send('lines', 'a b', { ...key('k'), codec: str })
+		})
+		expect(seen).toEqual([
+			['k-a', 'a'],
+			['k-b', 'b'],
+		])
+	})
+
 	it('peek and foreach see every record with its key and value, nulls included', async () => {
 		const driver = new TestDriver()
 		const peeked: unknown[] = []
@@ -253,6 +311,25 @@ describe('repartitioning', () => {
 			])
 		})
 		expect(seen).toEqual([['by-x', 'x']])
+	})
+
+	it('a repartition topic is read with failOnInvalid, never the default timestamp extractor (6.17)', async () => {
+		type Order = { id: string; createdAt: number }
+		const driver = new TestDriver({ defaultTimestampExtractor: record => (record.value as Order).createdAt })
+		driver
+			.input('orders', { key: str, value: codec.json<Order>() })
+			// The default extractor would find no createdAt in the new values read back from the repartition topic.
+			.map((_k, order) => [order!.id, { renamed: order!.id }] as const)
+			.groupByKey({ key: str, value: codec.json() })
+			.count()
+			.toStream()
+			.to('counts')
+		await driver.run(async ({ sendAll, producer }) => {
+			await sendAll('orders', [{ id: 'a', createdAt: 100 }], { timestamp: 5n })
+			await sendAll('orders', [{ id: 'a', createdAt: 200 }], { timestamp: 6n })
+			// The counts carry the timestamps the source extracted.
+			expect(producer.messagesFor('counts').map(r => r.timestamp)).toEqual([100n, 200n])
+		})
 	})
 
 	it('a named toTable() names its repartition topic', async () => {

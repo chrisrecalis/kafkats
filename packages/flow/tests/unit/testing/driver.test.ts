@@ -5,7 +5,7 @@ import { codec } from '@/codec.js'
 import { KStreamImpl } from '@/dsl/kstream.js'
 import type { InternalProcessorContext, ProcessorContext, ProcessorSupplier } from '@/processor/api.js'
 import { TimestampExtractors } from '@/processor/timestamps.js'
-import type { KeyValueStore } from '@/state.js'
+import type { KeyValueStore, ValueAndTimestamp } from '@/state.js'
 import { keyValueStoreBuilder } from '@/state/store-builders.js'
 import { TestDriver, type TestDriverConfig } from '@/testing/driver.js'
 
@@ -141,6 +141,33 @@ describe('TestDriver', () => {
 			await send('in', Buffer.from('v'), { timestamp: 30n })
 		})
 		expect(seen).toEqual([10, 20])
+	})
+
+	it("feeds a record sent without a partition back to its key's partition (murmur2), to 0 without a key", async () => {
+		const driver = new TestDriver({ partitions: { mid: 2 } })
+		const seen: unknown[] = []
+		const mid = driver
+			.input('in', { key: str, value: str })
+			.selectKey((_k, v) => (v === 'none' ? null : v))
+			.through('mid', { key: str, value: str })
+		processWith(mid, () => {
+			let context: ProcessorContext<never, never>
+			return {
+				init: ctx => {
+					context = ctx
+				},
+				process: record => void seen.push([record.key, context.recordMetadata()?.partition]),
+			}
+		})
+		await driver.run(async ({ sendAll }) => {
+			await sendAll('in', ['a', 'k0', 'none'], { codec: str })
+		})
+		// The Java client puts 'a' on partition 0 and 'k0' on partition 1 of 2.
+		expect(seen).toEqual([
+			['a', 0],
+			['k0', 1],
+			[null, 0],
+		])
 	})
 
 	it('creates the tasks of partition 0 at start, the others for the first record of their partition', async () => {
@@ -291,6 +318,26 @@ describe('TestDriver', () => {
 		expect(atStop.consumers[0]!.committed.get('in:0')?.offset).toBe(2n)
 	})
 
+	for (const processingGuarantee of ['at_least_once', 'exactly_once'] as const) {
+		it(`${processingGuarantee}: a store write of test code is logged and committed like a processor's`, async () => {
+			const driver = new TestDriver({ processingGuarantee })
+			driver.table('users', { key: str, value: str, materialized: { storeName: 'users' } })
+			await driver.run(async ({ send, getStateStore, advanceWallClockTime, producer }) => {
+				await send('users', 'Alice', { ...key('u1'), codec: str })
+				const store = getStateStore<KeyValueStore<string, ValueAndTimestamp<string>>>('users')
+				await store.put('u2', { value: 'Bob', timestamp: 6 })
+				expect(await store.get('u2')).toEqual({ value: 'Bob', timestamp: 6 })
+				await advanceWallClockTime(0)
+				const changelog = producer.messagesFor('test-app-users-changelog')
+				expect(changelog.map(r => r.key?.toString())).toEqual(['u1', 'u2'])
+				if (processingGuarantee === 'exactly_once') {
+					expect(producer.transactions.at(-1)!.messages).toEqual([changelog[1]])
+				}
+				expect(await store.get('u2')).toEqual({ value: 'Bob', timestamp: 6 })
+			})
+		})
+	}
+
 	it('gives processors the configured emit interval, 0 by default', async () => {
 		const intervals: number[] = []
 		for (const config of [{}, { emitIntervalMs: 250 }]) {
@@ -360,6 +407,27 @@ describe('TestDriver', () => {
 			expect(await store.approximateNumEntries()).toBe(1)
 		})
 		expect(handled).toEqual([['users', 0n, '{not json']])
+	})
+
+	it("decodes and timestamps global records like a task's record queue", async () => {
+		const driver = new TestDriver()
+		driver.input('in')
+		driver.globalTable('users', {
+			key: str,
+			value: codec.json<string | null>(),
+			timestampExtractor: TimestampExtractors.usePartitionTimeOnInvalid,
+			materialized: { storeName: 'users' },
+		})
+		await driver.run(async ({ send, getStateStore }) => {
+			const store = getStateStore<KeyValueStore<string, ValueAndTimestamp<string>>>('users')
+			await send('users', Buffer.from('"Alice"'), { ...key('u1'), timestamp: 5n })
+			// A value that decodes to null is a tombstone, not the raw bytes.
+			await send('users', Buffer.from('null'), { ...key('u1'), timestamp: 4n })
+			expect(await store.get('u1')).toBeUndefined()
+			// The extractor sees the partition time of the global partition.
+			await send('users', Buffer.from('"Bob"'), { ...key('u2'), timestamp: -1n })
+			expect(await store.get('u2')).toEqual({ value: 'Bob', timestamp: 5 })
+		})
 	})
 
 	it('grows topics without a configured count together, so co-partitioned topics stay assignable', async () => {

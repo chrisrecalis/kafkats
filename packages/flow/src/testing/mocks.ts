@@ -12,12 +12,16 @@ import type {
 	TransactionPort,
 } from '@/runtime/io.js'
 import { tpKey } from '@/runtime/task-id.js'
+import { defaultPartition } from '@/testing/partitioner.js'
 
 export interface TestRecord<K = unknown, V = unknown> {
 	topic: string
 	key: K | null
 	value: V | null
-	/** Set when a partitioner picked one; otherwise the record went to partition 0. */
+	/**
+	 * Set when a partitioner picked one; otherwise the producer's default partitioning placed the record: murmur2 of
+	 * the key, partition 0 without a key.
+	 */
 	partition?: number
 	timestamp?: bigint
 	headers?: RecordHeaders
@@ -39,8 +43,8 @@ export class MockProducer implements ProducerPort {
 	constructor(
 		/** Partition count per topic. */
 		private readonly partitions: (topic: string) => number,
-		/** Told about every send (the driver feeds records of topics the topology reads back to it). */
-		private readonly onSend: (record: TestRecord<Buffer, Buffer>) => void,
+		/** Told about every send and its partition (the driver feeds records of topics the topology reads back to it). */
+		private readonly onSend: (record: TestRecord<Buffer, Buffer>, partition: number) => void,
 		/** Told about the offsets of every committed transaction. */
 		private readonly onCommit: (offsets: readonly OffsetAndMetadata[]) => void
 	) {}
@@ -55,10 +59,10 @@ export class MockProducer implements ProducerPort {
 			timestamp: message.timestamp === undefined ? undefined : BigInt(message.timestamp.getTime()),
 			headers: message.headers,
 		}
+		const partition = message.partition ?? defaultPartition(message.key, this.partitions(topic))
 		this.messages.push(record)
 		this.open?.messages.push(record)
-		this.onSend(record)
-		const partition = message.partition ?? 0
+		this.onSend(record, partition)
 		const key = tpKey({ topic, partition })
 		const offset = this.offsets.get(key) ?? 0n
 		this.offsets.set(key, offset + 1n)

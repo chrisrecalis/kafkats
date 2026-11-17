@@ -1,7 +1,7 @@
 /**
  * A stream task (KS `StreamTask`): subtopology x partition. It owns its input queues, its processor graph while
- * RUNNING, its stores, stream time, consumed and committed offsets and its processor metadata, and follows Kafka
- * Streams' lifecycle CREATED -> RESTORING -> RUNNING -> SUSPENDED -> CLOSED (4.4).
+ * RUNNING, its stores, stream time, consumed and committed offsets (TaskOffsets) and its processor metadata, and
+ * follows Kafka Streams' lifecycle CREATED -> RESTORING -> RUNNING -> SUSPENDED -> CLOSED (4.4).
  */
 import type { Logger, Message, TopicPartition } from '@kafkats/client'
 import { IllegalStateError } from '@/api/errors.js'
@@ -11,10 +11,11 @@ import type { TaskOutput } from '@/processor/output.js'
 import type { TimestampExtractor } from '@/processor/timestamps.js'
 import type { ResolvedHandlers } from '@/runtime/config.js'
 import { errorMessage } from '@/runtime/errors.js'
-import type { Clock, CommittedOffset, OffsetAndMetadata } from '@/runtime/io.js'
+import type { Clock, OffsetAndMetadata } from '@/runtime/io.js'
 import { PartitionGroup } from '@/runtime/partition-group.js'
 import { isSkipMarker, RecordQueue } from '@/runtime/record-queue.js'
 import { tpKey } from '@/runtime/task-id.js'
+import { TaskOffsets, type PartitionStart } from '@/runtime/task-offsets.js'
 import { TaskTopology } from '@/runtime/task-topology.js'
 import type { StateStore } from '@/state.js'
 import type { Checkpoints } from '@/state/checkpoints.js'
@@ -24,11 +25,7 @@ import type { Subtopology } from '@/topology/built-topology.js'
 
 export type TaskState = 'CREATED' | 'RESTORING' | 'RUNNING' | 'SUSPENDED' | 'CLOSED'
 
-/** What the assignment says about one input partition. */
-export interface PartitionStart {
-	readonly committed: CommittedOffset | null
-	readonly resolved: bigint
-}
+export type { PartitionStart } from '@/runtime/task-offsets.js'
 
 export interface TaskConfig {
 	readonly applicationId: string
@@ -69,8 +66,8 @@ export class StreamTask {
 	private readonly config: TaskConfig
 	private readonly logger: Logger
 	private readonly queues: readonly RecordQueue[]
-	private readonly inputKeys: ReadonlySet<string>
 	private readonly group: PartitionGroup
+	private readonly offsets: TaskOffsets
 	private readonly metadata = new ProcessorMetadataImpl()
 	private readonly output: TaskOutput
 	private readonly stateManager: TaskStateManager
@@ -79,12 +76,6 @@ export class StreamTask {
 	private commitNeeded = false
 	private userCommitRequested = false
 	private drained = false
-	/** Offset of the last record processed per input partition since the last commit. */
-	private readonly consumedOffsets = new Map<RecordQueue, bigint>()
-	private startsByKey: ReadonlyMap<string, PartitionStart> = new Map()
-	private readonly lastCommittedOffsets = new Map<string, bigint>()
-	/** The last successful commit per input partition (offset and metadata), for a revive in place. */
-	private readonly lastCommits = new Map<string, OffsetAndMetadata>()
 	/** Partitions the TaskManager paused because their queue grew beyond `bufferedRecordsPerPartition`. */
 	private readonly pausedForSize = new Set<RecordQueue>()
 	private toResume: TopicPartition[] = []
@@ -112,8 +103,8 @@ export class StreamTask {
 					id
 				)
 		)
-		this.inputKeys = new Set(inputPartitions.map(tpKey))
 		this.group = new PartitionGroup(this.queues, config.maxTaskIdleMs)
+		this.offsets = new TaskOffsets(this.queues)
 		this.output = deps.outputFor(this)
 		this.stateManager = new TaskStateManager(id, id.partition, this.subtopology.stores, {
 			stateDirectory: deps.stateDirectory,
@@ -163,38 +154,16 @@ export class StreamTask {
 
 	/** The assignment payload (created or resumed task): the committed offsets become the last committed ones. */
 	setStarts(starts: ReadonlyMap<string, PartitionStart>): void {
-		this.startsByKey = starts
-		this.lastCommittedOffsets.clear()
-		this.lastCommits.clear()
-		for (const [key, start] of starts) {
-			if (start.committed) {
-				this.lastCommittedOffsets.set(key, start.committed.offset)
-			}
-		}
+		this.offsets.setStarts(starts)
 	}
 
 	get starts(): ReadonlyMap<string, PartitionStart> {
-		return this.startsByKey
+		return this.offsets.starts
 	}
 
-	/**
-	 * Starts of the next incarnation after a dirty close in place: per input partition the last successful commit of
-	 * this task if any (else the assignment's), resolved at the last committed offset (else the assignment's).
-	 */
+	/** Starts of the next incarnation after a dirty close in place (TaskOffsets.restartStarts). */
 	restartStarts(): ReadonlyMap<string, PartitionStart> {
-		const starts = new Map<string, PartitionStart>()
-		for (const queue of this.queues) {
-			const key = tpKey(queue.tp)
-			const start = this.startsByKey.get(key)
-			const resolved = this.lastCommittedOffsets.get(key) ?? start?.resolved
-			if (resolved === undefined) {
-				continue
-			}
-			const commit = this.lastCommits.get(key)
-			const committed = commit ? { offset: commit.offset, metadata: commit.metadata } : (start?.committed ?? null)
-			starts.set(key, { committed, resolved })
-		}
-		return starts
+		return this.offsets.restartStarts()
 	}
 
 	get stores(): readonly RegisteredStore[] {
@@ -216,11 +185,7 @@ export class StreamTask {
 
 	/** Settled start positions of partitions without a commit become their last committed offsets. */
 	setSettledPositions(positions: ReadonlyMap<string, bigint>): void {
-		for (const [key, offset] of positions) {
-			if (!this.lastCommittedOffsets.has(key)) {
-				this.lastCommittedOffsets.set(key, offset)
-			}
-		}
+		this.offsets.setSettledPositions(positions)
 	}
 
 	/**
@@ -279,7 +244,7 @@ export class StreamTask {
 		this.topology = undefined
 		this.taskState = 'SUSPENDED'
 		this.group.clear()
-		this.consumedOffsets.clear()
+		this.offsets.clearConsumed()
 		this.pausedForSize.clear()
 		this.toResume = []
 		await topology?.close()
@@ -372,14 +337,14 @@ export class StreamTask {
 			return false
 		}
 		if (isSkipMarker(record)) {
-			return this.processed(record.queue, record.offset)
+			return this.processed(record.queue)
 		}
 		const result = topology.process(record, now)
 		if (result === undefined) {
-			return this.processed(record.queue, record.offset)
+			return this.processed(record.queue)
 		}
 		return result.then(
-			() => this.topology === topology && this.processed(record.queue, record.offset),
+			() => this.topology === topology && this.processed(record.queue),
 			(error: unknown) => this.orphaned(topology, error)
 		)
 	}
@@ -453,40 +418,20 @@ export class StreamTask {
 
 	/** Work to commit, or an empty partition whose fetch position moved past the last commit (markers). */
 	needsCommit(next: Lag): boolean {
-		if (this.commitNeeded || this.metadata.needsCommit) {
-			return true
-		}
-		return this.queues.some(queue => this.movedPastCommit(queue, next))
+		return this.commitNeeded || this.metadata.needsCommit || this.offsets.anyMovedPastCommit(next)
 	}
 
 	/**
 	 * Offsets to commit (KS `committableOffsetsAndMetadata`, KIP-1094): every input partition when the processor
-	 * metadata changed, else the consumed ones and those whose fetch position moved past the last commit. The offset
-	 * is the head of the queue, else the next offset the consumer delivers; never past a queued record.
+	 * metadata changed, else the consumed ones and those whose fetch position moved past the last commit.
 	 */
 	committableOffsets(next: Lag): OffsetAndMetadata[] {
 		if (this.taskState !== 'RUNNING') {
 			return []
 		}
-		const all = this.metadata.needsCommit
-		const offsets: OffsetAndMetadata[] = []
-		for (const queue of this.queues) {
-			if (!all && !this.consumedOffsets.has(queue) && !this.movedPastCommit(queue, next)) {
-				continue
-			}
-			const offset = queue.headOffset ?? next(queue.tp)
-			if (offset === undefined) {
-				continue
-			}
-			const { topic, partition } = queue.tp
-			offsets.push({
-				topic,
-				partition,
-				offset,
-				metadata: encodeCommitMetadata(queue.partitionTime, this.metadata),
-			})
-		}
-		return offsets
+		return this.offsets.committable(this.metadata.needsCommit, next, queue =>
+			encodeCommitMetadata(queue.partitionTime, this.metadata)
+		)
 	}
 
 	/**
@@ -496,21 +441,14 @@ export class StreamTask {
 	async postCommit(positions: ReadonlyMap<string, bigint>, committed: readonly OffsetAndMetadata[]): Promise<void> {
 		this.commitNeeded = false
 		this.userCommitRequested = false
-		this.consumedOffsets.clear()
 		this.metadata.clearNeedsCommit()
-		for (const offset of committed) {
-			const key = tpKey(offset)
-			if (this.inputKeys.has(key)) {
-				this.lastCommittedOffsets.set(key, offset.offset)
-				this.lastCommits.set(key, offset)
-			}
-		}
+		this.offsets.committed(committed)
 		await this.stateManager.checkpoint(positions, this.config.eos)
 	}
 
 	/** The offset a partition restarts from after a dirty close in place. */
 	lastCommitted(tp: TopicPartition): bigint | undefined {
-		return this.lastCommittedOffsets.get(tpKey(tp))
+		return this.offsets.lastCommitted(tp)
 	}
 
 	// ---------------------------------------------------------------------------------------------------------
@@ -532,7 +470,7 @@ export class StreamTask {
 	private seed(restoredStoreTimes: ReadonlyMap<string, number>): void {
 		const committed: ReadonlyMap<string, number>[] = []
 		for (const queue of this.queues) {
-			const metadata = this.startsByKey.get(tpKey(queue.tp))?.committed?.metadata
+			const metadata = this.offsets.starts.get(tpKey(queue.tp))?.committed?.metadata
 			if (metadata === undefined || metadata === null) {
 				continue
 			}
@@ -559,19 +497,10 @@ export class StreamTask {
 		}
 	}
 
-	private movedPastCommit(queue: RecordQueue, next: Lag): boolean {
-		if (queue.size > 0) {
-			return false
-		}
-		const last = this.lastCommittedOffsets.get(tpKey(queue.tp))
-		const position = last === undefined ? undefined : next(queue.tp)
-		return position !== undefined && position > last!
-	}
-
-	/** The record (or the skipped ones) settled: its offset is consumed and its record context cleared. */
-	private processed(queue: RecordQueue, offset: bigint): true {
+	/** The record (or the skipped ones) settled: its partition consumed and its record context cleared. */
+	private processed(queue: RecordQueue): true {
 		this.topology!.context.input = null
-		this.consumedOffsets.set(queue, offset)
+		this.offsets.markConsumed(queue)
 		this.commitNeeded = true
 		if (queue.size === 0) {
 			this.drained = true

@@ -22,6 +22,7 @@ import { Checkpoints } from '@/state/checkpoints.js'
 import { StateDirectory } from '@/state/state-directory.js'
 import { GlobalStores } from '@/testing/globals.js'
 import { MockConsumer, MockProducer, type SendOptions, type TestRecord } from '@/testing/mocks.js'
+import { writesInTransaction } from '@/testing/store-writes.js'
 import { TestClock, TestConsumer, TestPartitions, type InputRecord } from '@/testing/test-io.js'
 import type { BuiltTopology } from '@/topology/built-topology.js'
 
@@ -54,8 +55,8 @@ export class TestLoop {
 	private readonly signal = new AbortController().signal
 	/** The cumulative assignment. */
 	private readonly assigned = new Map<string, TopicPartition>()
-	/** Records written to topics the topology reads, not fed back yet (in production order). */
-	private readonly produced: TestRecord<Buffer, Buffer>[] = []
+	/** Records written to topics the topology reads and their partitions, not fed back yet (in production order). */
+	private readonly produced: { readonly record: TestRecord<Buffer, Buffer>; readonly partition: number }[] = []
 	private commitRequested = false
 	private failure: { readonly error: unknown } | undefined
 
@@ -75,8 +76,8 @@ export class TestLoop {
 		this.stateDirectory = new StateDirectory(this.settings.applicationId, stateStoreProvider, checkpoints, logger)
 		this.producer = new MockProducer(
 			topic => this.partitions.reported(topic),
-			record => {
-				if (this.reads(record.topic)) this.produced.push(record)
+			(record, partition) => {
+				if (this.reads(record.topic)) this.produced.push({ record, partition })
 			},
 			offsets => this.ports.record(offsets)
 		)
@@ -177,18 +178,23 @@ export class TestLoop {
 		await this.processAll()
 	}
 
-	/** The store `name` of the task of `partition` (top of its stack), or the global store of that name. */
+	/**
+	 * The store `name` of the task of `partition` (top of its stack), or the global store of that name. Under
+	 * exactly-once a write opens the driver's transaction first, so it is logged and committed like a processor's.
+	 */
 	store<S extends StateStore>(name: string, partition = 0): S {
-		const store =
-			this.globals?.store(name) ??
-			this.tasks
-				.tasks()
-				.find(task => task.partition === partition && task.subtopology.stores.some(s => s.name === name))
-				?.store(name)
+		const global = this.globals?.store(name)
+		if (global !== undefined) {
+			return global as S
+		}
+		const store = this.tasks
+			.tasks()
+			.find(task => task.partition === partition && task.subtopology.stores.some(s => s.name === name))
+			?.store(name)
 		if (store === undefined) {
 			throw new Error(`No task of partition ${partition} has a state store named '${name}'`)
 		}
-		return store as S
+		return (this.settings.eos ? writesInTransaction(store, () => this.ensureTransaction()) : store) as S
 	}
 
 	/** Commits and closes every task clean; after a failure, closes them dirty. Closes the stores. */
@@ -235,9 +241,10 @@ export class TestLoop {
 	}
 
 	private async feedBack(): Promise<void> {
-		for (let record = this.produced.shift(); record !== undefined; record = this.produced.shift()) {
+		for (let next = this.produced.shift(); next !== undefined; next = this.produced.shift()) {
+			const { record, partition } = next
 			await this.enqueue(record.topic, {
-				partition: record.partition ?? 0,
+				partition,
 				key: record.key,
 				value: record.value,
 				timestamp: record.timestamp === undefined ? this.clock.now() : Number(record.timestamp),

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { codec } from '@/codec.js'
+import { YIELD_AFTER_MS } from '@/runtime/signals.js'
 import type { KeyValueStore } from '@/state.js'
 import { InMemoryKeyValueStore, InMemorySessionStore, InMemoryWindowStore } from '@/state/memory.js'
 import { TaskStateManager } from '@/state/state-manager.js'
@@ -409,6 +410,30 @@ describe('Transactional stores - applying a committed buffer', () => {
 		await committed
 		expect(outcome).toBe('disk full')
 		expect(await raw.get('b')).toBe('2')
+	})
+
+	it('a write that fails while the issue loop yields is not an unhandled rejection; the commit fails with it', async () => {
+		const raw = new InMemoryKeyValueStore<string, string>('kv', { keyCodec: str, valueCodec: str })
+		let writes = 0
+		const store = Object.assign(Object.create(raw) as InMemoryKeyValueStore<string, string>, {
+			put: (key: string, value: string) =>
+				writes++ === 0 ? Promise.reject(new Error('disk full')) : raw.put(key, value),
+		})
+		const buf = new TransactionalKeyValueStore<string, string>(store, str, str)
+		for (let i = 0; i < 2_500; i++) await buf.put(`k${i}`, `v${i}`)
+		const unhandled: unknown[] = []
+		const listener = (reason: unknown) => unhandled.push(reason)
+		process.on('unhandledRejection', listener)
+		try {
+			// Past the yield interval: the issue loop yields to the event loop after its first 1000 writes.
+			await new Promise(resolve => setTimeout(resolve, YIELD_AFTER_MS + 5))
+			await expect(buf.commitBuffer()).rejects.toThrow('disk full')
+			await new Promise(resolve => setImmediate(resolve))
+		} finally {
+			process.off('unhandledRejection', listener)
+		}
+		expect(unhandled).toEqual([])
+		expect(writes).toBe(2_500)
 	})
 
 	it('keeps writes made while the buffer is applied for the next commit', async () => {

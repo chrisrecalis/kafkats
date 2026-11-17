@@ -59,6 +59,16 @@ describe('decodeCommitMetadata', () => {
 		expect(decodeCommitMetadata(fromHex(`02${int64(42)}`))).toEqual({ partitionTime: 42, metadata: new Map() })
 	})
 
+	it('reads text that is not base64 as unknown, also when its lenient decoding would be valid metadata', () => {
+		// Leniently decoded, these bytes are magic 1 with partition time 42.
+		expect(Buffer.from('AQAAAAAAAAAq!', 'base64').toString('hex')).toBe(`01${int64(42)}`)
+		expect(decodeCommitMetadata('AQAAAAAAAAAq!')).toEqual({
+			partitionTime: -1,
+			metadata: new Map(),
+			invalid: 'not base64',
+		})
+	})
+
 	it.each([
 		['not base64', 'garbage!'],
 		['an unknown version', fromHex(`03${int64(42)}`)],
@@ -95,11 +105,11 @@ describe('ProcessorMetadataImpl', () => {
 		meta.replaceAll(
 			[
 				new Map([
-					['a', 1],
+					['a', 3],
 					['b', 5],
 				]),
 				new Map([
-					['a', 3],
+					['a', 1],
 					['removed', 9],
 				]),
 			],

@@ -1,14 +1,13 @@
 /**
  * The records of one input partition of a task (KS `RecordQueue`): a FIFO of the delivered batches, decoded lazily
- * at the head, where the timestamp is extracted and records that cannot be processed are skipped.
+ * at the head by a RecordDecoder, which extracts the timestamp and skips records that cannot be processed.
  */
 import type { Message, TopicPartition } from '@kafkats/client'
-import { IllegalStateError, InvalidTimestampError, StreamsError } from '@/api/errors.js'
-import type { Codec } from '@/codec.js'
-import type { DroppedReason, TaskId } from '@/processor/api.js'
-import { applyHandler } from '@/processor/node.js'
-import { builtInRule, type TimestampExtractor, type TimestampRule } from '@/processor/timestamps.js'
+import { IllegalStateError } from '@/api/errors.js'
+import type { TaskId } from '@/processor/api.js'
+import type { TimestampExtractor } from '@/processor/timestamps.js'
 import type { ResolvedDeserializationHandler } from '@/runtime/config.js'
+import { RecordDecoder, type DropListener } from '@/runtime/record-decoder.js'
 import type { SourceDef } from '@/topology/nodes.js'
 
 /** A decoded record at the head of its queue, with its extracted timestamp. */
@@ -40,13 +39,8 @@ export function isSkipMarker(record: StampedRecord | SkipMarker): record is Skip
 	return (record as SkipMarker).skipped === true
 }
 
-/** Reports a dropped record: reason, source node, details for the log. */
-export type DropListener = (reason: DroppedReason, source: string, detail: Readonly<Record<string, unknown>>) => void
-
 /** Delivered batches are kept as they are; the array of batches is compacted once this many were read. */
 const COMPACT_AFTER_BATCHES = 1024
-
-type Decoded = Pick<StampedRecord, 'key' | 'value' | 'more'>
 
 export class RecordQueue {
 	/** Max timestamp polled from this partition, -1 unknown. */
@@ -58,20 +52,20 @@ export class RecordQueue {
 	/** Delivered messages not yet taken to the head. */
 	private pending = 0
 	private headRecord: StampedRecord | SkipMarker | null = null
-	private readonly rule: TimestampRule | undefined
+	private readonly decoder: RecordDecoder
 
 	constructor(
 		readonly tp: TopicPartition,
-		private readonly sources: readonly SourceDef[],
-		private readonly extractor: TimestampExtractor,
-		private readonly handler: ResolvedDeserializationHandler,
-		private readonly onDrop: DropListener,
-		private readonly taskId: TaskId
+		sources: readonly SourceDef[],
+		extractor: TimestampExtractor,
+		handler: ResolvedDeserializationHandler,
+		onDrop: DropListener,
+		taskId: TaskId
 	) {
 		if (sources.length === 0) {
 			throw new IllegalStateError(`no source node reads '${tp.topic}'`)
 		}
-		this.rule = builtInRule(extractor)
+		this.decoder = new RecordDecoder(sources, extractor, handler, onDrop, taskId)
 	}
 
 	/** O(1): the batch is kept, not copied. Returns the queue size after the add. */
@@ -153,122 +147,17 @@ export class RecordQueue {
 		let lastSkipped: Message<Buffer, Buffer> | undefined
 		while (this.pending > 0) {
 			const message = this.take()
-			const decoded = this.decode(message)
+			const decoded = this.decoder.decode(message, this.partitionTime)
 			if (decoded === undefined) {
 				lastSkipped = message
 				continue
 			}
-			const timestamp = this.extract(message, decoded)
-			if (timestamp < 0) {
-				this.onDrop('negative-timestamp', this.sources[0]!.name, { ...position(message), timestamp })
-				lastSkipped = message
-				continue
-			}
-			this.headRecord = {
-				queue: this,
-				message,
-				offset: message.offset,
-				timestamp,
-				key: decoded.key,
-				value: decoded.value,
-				more: decoded.more,
-			}
+			const { key, value, timestamp, more } = decoded
+			this.headRecord = { queue: this, message, offset: message.offset, timestamp, key, value, more }
 			return
 		}
 		if (lastSkipped !== undefined) {
 			this.headRecord = { skipped: true, queue: this, offset: lastSkipped.offset }
 		}
 	}
-
-	/**
-	 * Decodes for every source node of the topic, each its own objects (a processor may mutate what it gets).
-	 * Undefined: the deserialization handler answered 'continue' (the record is skipped).
-	 */
-	private decode(message: Message<Buffer, Buffer>): Decoded | undefined {
-		const { sources } = this
-		let source = sources[0]!
-		try {
-			const key = decode(message.key, source.keyCodec)
-			const value = decode(message.value, source.valueCodec)
-			if (sources.length === 1) {
-				return { key, value }
-			}
-			const more: { key: unknown; value: unknown }[] = []
-			for (let i = 1; i < sources.length; i++) {
-				source = sources[i]!
-				more.push({
-					key: decode(message.key, source.keyCodec),
-					value: decode(message.value, source.valueCodec),
-				})
-			}
-			return { key, value, more }
-		} catch (error) {
-			const ctx = {
-				...position(message),
-				headers: message.headers,
-				timestamp: Number(message.timestamp),
-				processorNodeId: source.name,
-				taskId: this.taskId,
-				sourceRawKey: message.key,
-				sourceRawValue: message.value,
-			}
-			applyHandler(
-				() => this.handler(ctx, message, error),
-				error,
-				`deserialization of ${describe(message)} failed in '${source.name}'`,
-				this.taskId
-			)
-			this.onDrop('deserialization', source.name, {
-				...position(message),
-				error: error instanceof Error ? error.message : String(error),
-			})
-			return undefined
-		}
-	}
-
-	private extract(message: Message<Buffer, Buffer>, decoded: Decoded): number {
-		const recordTimestamp = Number(message.timestamp)
-		let timestamp: number
-		try {
-			if (this.rule) {
-				return this.rule(recordTimestamp, this.partitionTime, message)
-			}
-			const record = {
-				...position(message),
-				key: decoded.key,
-				value: decoded.value,
-				timestamp: recordTimestamp,
-				headers: message.headers,
-			}
-			timestamp = this.extractor(record, this.partitionTime)
-		} catch (error) {
-			if (error instanceof StreamsError) {
-				throw error
-			}
-			throw new StreamsError(`the timestamp extractor failed for ${describe(message)}`, {
-				cause: error,
-				taskId: this.taskId,
-			})
-		}
-		if (!Number.isSafeInteger(timestamp)) {
-			throw new InvalidTimestampError(
-				`the timestamp extractor returned ${timestamp} for ${describe(message)}, not an integer`,
-				{ taskId: this.taskId }
-			)
-		}
-		return timestamp
-	}
-}
-
-/** No codec: the raw Buffer; null stays null. */
-function decode(data: Buffer | null, codec: Codec<unknown> | undefined): unknown {
-	return data === null || codec === undefined ? data : codec.decode(data)
-}
-
-function position(message: Message<Buffer, Buffer>): { topic: string; partition: number; offset: bigint } {
-	return { topic: message.topic, partition: message.partition, offset: message.offset }
-}
-
-function describe(message: Message<Buffer, Buffer>): string {
-	return `${message.topic}-${message.partition}@${message.offset}`
 }

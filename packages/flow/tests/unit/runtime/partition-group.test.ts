@@ -146,6 +146,20 @@ describe('PartitionGroup readiness (KIP-695)', () => {
 		expect(g.readyToProcess(700, lag)).toBe(false)
 		expect(g.nextIdleDeadline()).toBe(800)
 	})
+
+	it('a partition whose records arrive and drain between two readiness checks idles again afresh', () => {
+		const { g, add, lag, lags } = group(1000)
+		add(A, 10, 20, 30)
+		lags.set(tpKey(B), 0n)
+		expect(g.readyToProcess(0, lag)).toBe(false)
+		expect(g.readyToProcess(1000, lag)).toBe(true)
+		// Within one slice (readiness is not checked again until a queue drains): B gets a record and drains.
+		add(B, 5)
+		expect(g.nextRecord()).toMatchObject({ queue: { tp: B }, timestamp: 5 })
+		// B's deadline of the last idle period is gone: it idles for maxTaskIdleMs again.
+		expect(g.readyToProcess(1001, lag)).toBe(false)
+		expect(g.nextIdleDeadline()).toBe(2001)
+	})
 })
 
 describe('PartitionGroup selection and time', () => {

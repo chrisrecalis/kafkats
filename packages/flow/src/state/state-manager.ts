@@ -26,7 +26,7 @@ export interface RegisteredStore {
 	readonly builder: StoreBuilder
 	/** The provider store, below every layer: what restoration writes. */
 	readonly raw: StateStore
-	/** What processors get. */
+	/** The top layer: what processors reach through the store handles of their TaskTopology. */
 	readonly top: StateStore
 	/** The exactly-once write buffer. */
 	readonly buffer?: TransactionalLayer
@@ -89,11 +89,12 @@ function retention(builder: StoreBuilder): number {
 /**
  * The stores of one task (Kafka Streams' ProcessorStateManager). For every store of its subtopology it leases the
  * provider store of the task's partition and stacks on it: under exactly-once a write buffer, then changelog logging
- * to the changelog partition of the task's partition, then a handle that rejects writes once the stack is closed.
+ * to the changelog partition of the task's partition.
  */
 export class TaskStateManager {
 	private registered: RegisteredStore[] = []
-	private readonly byName = new Map<string, RegisteredStore>()
+	/** Per store, a handle on its top that rejects writes once the stack is closed. */
+	private readonly handles = new Map<string, StateStore>()
 	/** The stores leased from the state directory. */
 	private leased: string[] = []
 	private closed = false
@@ -116,13 +117,17 @@ export class TaskStateManager {
 
 	/** Leases the task's provider stores and builds their stacks. On failure the stores leased so far are released. */
 	async register(): Promise<void> {
+		const owner = `task ${this.task.key}`
 		try {
 			for (const builder of this.builders) {
 				const raw = await this.deps.stateDirectory.lease(this.task, builder, this.partition)
 				this.leased.push(builder.name)
 				const store = this.stack(builder, raw)
 				this.registered.push(store)
-				this.byName.set(builder.name, store)
+				this.handles.set(
+					builder.name,
+					storeHandle(store.top, builder.kind, () => this.closed, owner)
+				)
 			}
 		} catch (error) {
 			await this.release()
@@ -130,13 +135,16 @@ export class TaskStateManager {
 		}
 	}
 
-	/** The top of a store's stack. */
+	/**
+	 * A handle on the top of a store's stack whose writes reject once the stack is closed: for references held outside
+	 * the task's processors (the TestDriver's getStateStore). Processors write through their TaskTopology's handles.
+	 */
 	store(name: string): StateStore {
-		const store = this.byName.get(name)
-		if (store === undefined) {
+		const handle = this.handles.get(name)
+		if (handle === undefined) {
 			throw new IllegalStateError(`Task ${this.task.key} has no state store '${name}'`)
 		}
-		return store.top
+		return handle
 	}
 
 	/** Exactly-once: applies the write buffers of every store; all of them settle, then the first failure is thrown. */
@@ -176,12 +184,16 @@ export class TaskStateManager {
 		this.closed = true
 	}
 
+	get stackClosed(): boolean {
+		return this.closed
+	}
+
 	/** Returns the provider stores to the state directory (`wipe`: invalidated and cleared first). */
 	async release(options?: { wipe?: boolean }): Promise<void> {
 		const leased = this.leased
 		this.leased = []
 		this.registered = []
-		this.byName.clear()
+		this.handles.clear()
 		const results = await Promise.allSettled(
 			leased.map(store => this.deps.stateDirectory.release(this.task, store, this.partition, options))
 		)
@@ -208,7 +220,6 @@ export class TaskStateManager {
 			)
 			changelog = { topic, partition: this.partition, skipRestoration }
 		}
-		const top = storeHandle(layer, builder.kind, () => this.closed, `task ${this.task.key}`)
-		return { builder, raw, top, buffer, changelog }
+		return { builder, raw, top: layer, buffer, changelog }
 	}
 }
