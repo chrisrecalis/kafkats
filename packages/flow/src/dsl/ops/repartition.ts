@@ -25,8 +25,8 @@ export interface RepartitionOptions<K, V> {
 /**
  * The stream a key-based operator works on: `stream` itself unless its keys changed upstream. Then its records are
  * written to a repartition topic and read back from it, so that each key is processed in the partition it hashes
- * to (null keys are dropped by the sink unless a relaxed join is downstream, 4.1.6). The read-back is a new stream
- * that needs no repartitioning.
+ * to; a windowed key in the partition of its base key (6.9). Null keys are dropped by the sink unless a relaxed join
+ * is downstream (4.1.6). The read-back is a new stream that needs no repartitioning.
  */
 export function repartitionIfRequired<K, V>(
 	stream: KStreamImpl<K, V>,
