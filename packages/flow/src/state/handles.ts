@@ -1,5 +1,6 @@
 import { IllegalStateError } from '@/api/errors.js'
 import type { KeyValueStore, SessionStore, StateStore, WindowedKey, WindowStore } from '@/state.js'
+import { ClockedSessionStore, ClockedWindowStore } from '@/state/time-clipping.js'
 import type { StoreBuilder } from '@/topology/nodes.js'
 
 /**
@@ -13,6 +14,13 @@ export function storeHandle(
 	closed: () => boolean,
 	owner: string
 ): StateStore {
+	// The clipping layer of a store with a clock stays on top (6.2): reads are clipped, expiry follows the clock.
+	if (store instanceof ClockedWindowStore) {
+		return store.over(inner => new WindowHandle(inner, closed, owner))
+	}
+	if (store instanceof ClockedSessionStore) {
+		return store.over(inner => new SessionHandle(inner, closed, owner))
+	}
 	switch (kind) {
 		case 'key-value':
 			return new KeyValueHandle(store as KeyValueStore<unknown, unknown>, closed, owner)
