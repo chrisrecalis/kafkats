@@ -63,7 +63,7 @@ selected() {
 
 # scenario <line> [VAR=value...]: runs one scenario line with the extra env, prints its verdict and evidence.
 scenario() {
-	local kind name rest script word start code verdict
+	local kind name rest script word start code result verdict
 	local -a env=("${@:2}") args=()
 	read -r kind name rest <<<"$1"
 	for word in $rest; do
@@ -78,10 +78,15 @@ scenario() {
 	cc) script=close-chaos ;;
 	esac
 	start=$(date +%s)
-	# timeout signals the whole process group (the harness and its workers); fd 9 (the lock) stays with this shell.
-	env "${env[@]}" timeout -k 30 600 pnpm exec tsx "tests/chaos/$script.ts" "${args[@]}" >"$logs/$name.log" 2>&1 9>&-
+	# timeout runs in a process group of its own with the harness and its workers, and signals all of them; fd 9
+	# (the lock) stays with this shell. In the background, so that an interrupt reaches the traps at once.
+	env "${env[@]}" timeout -k 30 600 pnpm exec tsx "tests/chaos/$script.ts" "${args[@]}" >"$logs/$name.log" 2>&1 9>&- &
+	child=$!
+	wait $child
 	code=$?
-	if [ $code -eq 0 ]; then
+	child=
+	result=$(grep -m1 '^RESULT' "$logs/$name.log" | cut -c1-110)
+	if [ $code -eq 0 ] && [[ $result == *': PASS'* ]]; then
 		verdict=PASS
 		passed+=("$name")
 	else
@@ -89,8 +94,7 @@ scenario() {
 		[ $code -eq 124 ] && verdict='FAIL (timeout 600s)'
 		failed+=("$name")
 	fi
-	printf '%-28s %-5s %4ss  %s\n' "$name" "$verdict" $(($(date +%s) - start)) \
-		"$(grep -m1 '^RESULT' "$logs/$name.log" | cut -c1-110)"
+	printf '%-28s %-5s %4ss  %s\n' "$name" "$verdict" $(($(date +%s) - start)) "$result"
 	grep -E '^  (summary|unhandled|workers in ERROR|ALO duplicate gate|fault->broker)|\] close: ' "$logs/$name.log" |
 		cut -c1-240 | sed 's/^ */    /'
 }
@@ -133,6 +137,9 @@ available_mb() {
 patterns=("$@")
 passed=()
 failed=()
+child=
+# An interrupt ends the running scenario's process group too.
+trap '[ -z "$child" ] || kill -TERM -- -"$child" 2>/dev/null; exit 130' INT TERM
 docker info >/dev/null 2>&1 || {
 	echo 'docker is not available'
 	exit 2
@@ -167,8 +174,9 @@ if wanted 3b; then
 			[[ $name == 3b-* ]] && selected "$name" && failed+=("$name")
 		done
 	else
+		# Stops again the containers this run starts, also when the run is interrupted.
+		trap '[ ${#stopped[@]} -eq 0 ] || docker stop "${stopped[@]}" >/dev/null' EXIT
 		section 3b cluster "${CLUSTER_ENV[@]}"
-		[ ${#stopped[@]} -eq 0 ] || docker stop "${stopped[@]}" >/dev/null
 	fi
 fi
 

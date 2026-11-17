@@ -36,14 +36,15 @@ ensure() {
 
 # wait_ready <since> <name...>: waits until each broker logged its start after <since> (unix seconds).
 wait_ready() {
-	local since=$1 name
+	local since=$1 deadline=$((SECONDS + 120)) name
 	shift
 	for name in "$@"; do
-		for _ in $(seq 1 90); do
-			docker logs --since "$since" "$name" 2>&1 | grep -q 'Kafka Server started' && continue 2
+		while [ $SECONDS -lt $deadline ]; do
+			# not grep -q: under pipefail, docker logs dying of SIGPIPE would fail the match
+			docker logs --since "$since" "$name" 2>&1 | grep 'Kafka Server started' >/dev/null && continue 2
 			sleep 1
 		done
-		echo "$name did not start within 90s" >&2
+		echo "$name did not start within 120s" >&2
 		docker logs --tail 20 "$name" >&2
 		exit 1
 	done

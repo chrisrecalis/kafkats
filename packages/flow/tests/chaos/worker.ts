@@ -29,6 +29,9 @@ const t0 = Date.now()
 const log = (type: string, extra: Record<string, unknown> = {}) =>
 	process.stdout.write(JSON.stringify({ t: Date.now() - t0, pid: process.pid, type, ...extra }) + '\n')
 
+// The harness reads stdout: once it is gone (EPIPE) nobody watches this worker, which stops like a crash (logging the
+// write error as an uncaught exception would fail again, forever).
+process.stdout.on('error', () => process.exit(1))
 process.on('unhandledRejection', (reason: unknown) => {
 	const r = reason as Error
 	log('UNHANDLED_REJECTION', {
