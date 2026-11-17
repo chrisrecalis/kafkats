@@ -494,7 +494,7 @@ export class StreamTask {
 	 * offsets of this task's partitions, then checkpoints the changelog positions written since the last commit.
 	 */
 	async postCommit(positions: ReadonlyMap<string, bigint>, committed: readonly OffsetAndMetadata[]): Promise<void> {
-		// Their sends only repeat what this commit covers: they need no commit of their own (the next flush sends them).
+		// Their sends repeat what this commit covers: they need no commit of their own (the next flush sends them).
 		await this.stateManager.applyHeldDeletes()
 		this.commitNeeded = false
 		this.userCommitRequested = false

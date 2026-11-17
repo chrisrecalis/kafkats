@@ -86,7 +86,7 @@ export abstract class WindowedAggregateProcessor<
 		}
 	}
 
-	/** Aggregates a record of a key; returns the close time it was judged by, or undefined when it was dropped unseen. */
+	/** Aggregates a record of a key; returns the close time it was judged by, undefined when it was dropped unseen. */
 	protected abstract aggregate(record: StreamRecord<K, V | null>): Promise<number | undefined>
 
 	/**

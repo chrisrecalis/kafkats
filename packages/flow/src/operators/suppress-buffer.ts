@@ -84,8 +84,8 @@ export class SuppressBuffer<K, V> {
 	}
 
 	/**
-	 * Loads what the store holds: the buffer as of the last commit (exactly-once), or as of the last write with the keys
-	 * evicted since the last commit (at-least-once).
+	 * Loads what the store holds: the buffer as of the last commit (exactly-once), or as of the last write with the
+	 * keys evicted since the last commit (at-least-once).
 	 */
 	async load(): Promise<void> {
 		let read = 0

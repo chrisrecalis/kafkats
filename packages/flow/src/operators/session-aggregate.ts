@@ -9,9 +9,10 @@
  * Unless the merged session is the record's own `[ts, ts]`, every session found is removed and retracted, also one with
  * the merged bounds (BC23); then the merged session is stored and forwarded, without an old value. A `[ts, ts]` session
  * found is updated in place instead, its aggregate the old value (what Kafka Streams' record cache sends,
- * `CachingSessionStore.putAndMaybeForward`). A session's results carry its end as their timestamp (KS). Null keys are dropped; null values reach the aggregator. Results carry the
- * headers of the record (KS forwards session updates without headers). With emit on window close, only the final
- * result of each session is forwarded (`operators/emit-final.ts`).
+ * `CachingSessionStore.putAndMaybeForward`). A session's results carry its end as their timestamp (KS). Null keys are
+ * dropped; null values reach the aggregator. Results carry the headers of the record (KS forwards session updates
+ * without headers). With emit on window close, only the final result of each session is forwarded
+ * (`operators/emit-final.ts`).
  */
 import type { Windowed } from '@/api/grouped.js'
 import type { Change } from '@/operators/change.js'
