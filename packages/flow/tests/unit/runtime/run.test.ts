@@ -11,6 +11,7 @@ import { FlowRuntime } from '@/runtime/runtime.js'
 import { Checkpoints } from '@/state/checkpoints.js'
 import { inMemory } from '@/state/memory.js'
 import { StateDirectory } from '@/state/state-directory.js'
+import { valueAndTimestampCodec } from '@/state/timestamped.js'
 import type { BuiltTopology } from '@/topology/built-topology.js'
 import { FakeIO, type FakeGroupConsumer, type FakeProducer } from '../support/fake-io.js'
 import { RecordingLogger } from '../support/task-harness.js'
@@ -237,23 +238,28 @@ describe('FlowRuntime and Run', () => {
 		expect(h.connection.disconnected).toBe(1)
 	})
 
-	it('restores nothing: a changelog with records fails the start unless its checkpoint is at its end', async () => {
-		const changelog = (h: Harness) =>
-			[...h.topology.internalTopics.values()].find(spec => spec.kind === 'changelog')!.name
+	it('restores the changelog before the task runs; a resumed task with its checkpoint at the end needs no restore consumer', async () => {
+		const h = new Harness(counting)
+		const changelog = [...h.topology.internalTopics.values()].find(spec => spec.kind === 'changelog')!.name
+		const stored = valueAndTimestampCodec(COUNT_CODEC)
+		h.io.cluster.createTopic(changelog, 1)
+		h.io.cluster.log(changelog, 0).append({
+			key: Buffer.from('k'),
+			value: stored.encode({ value: 5, timestamp: 0 }),
+			timestamp: 0n,
+			headers: {},
+		})
 
-		const failing = new Harness(counting)
-		failing.io.cluster.createTopic(changelog(failing), 1)
-		failing.io.cluster.append(changelog(failing), 0, { key: 'k', value: 'x' })
-		const starting = failing.start()
-		await failing.joined()
-		await failing.consumer.rebalance('in:0')
-		await expect(starting).rejects.toThrow('restoring state is not available in this build')
+		await h.started()
+		expect(h.io.created.restoreConsumers.map(c => c.groupId)).toEqual([
+			expect.stringMatching(/^app-restore-0_0-\d+$/),
+		])
+		h.consumer.deliver('in:0', [{ key: 'k', value: 'a' }])
+		await vi.waitFor(() => expect(h.output(COUNT_CODEC.decode)).toEqual([6]))
 
-		const current = new Harness(counting)
-		current.io.cluster.createTopic(changelog(current), 1)
-		current.io.cluster.append(changelog(current), 0, { key: 'k', value: 'x' })
-		await current.checkpoints.set(changelog(current), 0, 1n)
-		await current.started()
-		await current.stop()
+		await h.consumer.rebalance('in:0')
+		await vi.waitFor(() => expect(h.lifecycle.state).toBe('RUNNING'))
+		expect(h.io.created.restoreConsumers).toHaveLength(1)
+		await h.stop()
 	})
 })
