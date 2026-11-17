@@ -60,9 +60,14 @@ interface Partition {
 	applying: boolean
 	maxKeyTime: number
 	done: boolean
+	/** The last stable offset at which an open transaction held this partition at the last stall check. */
+	heldAt: bigint | undefined
 }
 
 type Outcome = { readonly failure?: unknown }
+
+/** Why a replay makes no progress (see `openTransactions`). */
+type Stall = 'held' | 'released' | 'stalled'
 
 export class Replay {
 	private readonly partitions = new Map<string, Partition>()
@@ -101,6 +106,7 @@ export class Replay {
 				applying: false,
 				maxKeyTime: -1,
 				done: false,
+				heldAt: undefined,
 			})
 		}
 	}
@@ -249,13 +255,18 @@ export class Replay {
 			return
 		}
 		this.stallCheckRunning = true
-		void this.heldByOpenTransaction()
-			.catch(() => false)
-			.then(held => {
+		void this.openTransactions()
+			.catch((): Stall => 'stalled')
+			.then(stall => {
 				this.stallCheckRunning = false
 				if (this.over) return
-				if (held && Date.now() - this.startedAt < MAX_OPEN_TRANSACTION_WAIT_MS) {
+				if (stall === 'held' && Date.now() - this.startedAt < MAX_OPEN_TRANSACTION_WAIT_MS) {
 					this.waitForOpenTransaction()
+					return
+				}
+				if (stall === 'released') {
+					// The consumer's fetch of the records the transaction's end made stable may still be in flight.
+					this.lastProgressAt = Date.now()
 					return
 				}
 				const pending = this.pending().map(p => tpKey(p.tp))
@@ -267,8 +278,12 @@ export class Replay {
 			})
 	}
 
-	/** Every partition not caught up consumed all stable records and waits behind an open transaction (LSO < end). */
-	private async heldByOpenTransaction(): Promise<boolean> {
+	/**
+	 * 'held': every partition not caught up consumed all stable records and waits behind an open transaction (LSO <
+	 * end). 'released': not held, but the LSO of a partition held at the previous check moved since (its transaction
+	 * ended in between). Else 'stalled'.
+	 */
+	private async openTransactions(): Promise<Stall> {
 		const pending = this.pending()
 		const stable = await this.io.admin.listOffsets(
 			pending.map(p => p.tp),
@@ -276,11 +291,18 @@ export class Replay {
 			'read_committed',
 			{ signal: cap(this.options.signal, LIST_OFFSETS_TIMEOUT_MS) }
 		)
-		return pending.every(p => {
+		let held = true
+		let released = false
+		for (const p of pending) {
 			const lastStable = stable.get(tpKey(p.tp))
 			const position = this.consumer?.position(p.tp)
-			return lastStable !== undefined && position !== undefined && lastStable < p.end && position >= lastStable
-		})
+			released ||= p.heldAt !== undefined && lastStable !== undefined && lastStable > p.heldAt
+			const waiting =
+				lastStable !== undefined && position !== undefined && lastStable < p.end && position >= lastStable
+			p.heldAt = waiting ? lastStable : undefined
+			held &&= waiting
+		}
+		return held ? 'held' : released ? 'released' : 'stalled'
 	}
 
 	/** Not a stall: the broker aborts the dangling transaction at its timeout, then the remaining records arrive. */

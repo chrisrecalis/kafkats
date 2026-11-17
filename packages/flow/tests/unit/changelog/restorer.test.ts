@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { OffsetOutOfRangeError } from '@kafkats/client'
 import { ChangelogDecodeError } from '@/changelog/errors.js'
 import { restoreChangelogs, restoreTarget, type RestoreTarget } from '@/changelog/restorer.js'
@@ -290,6 +290,55 @@ describe('restoreChangelogs: replay (4.7.2)', () => {
 
 		expect(await entries(store)).toEqual(['"a"="2"', '"b"="1"'])
 		expect(h.logger.warnings).toEqual(['a changelog restore is waiting for an open transaction to complete'])
+	})
+
+	it('a stall check right after an open transaction ended gives the fetch of the released records an idle timeout', async () => {
+		const h = new Harness()
+		h.write('c', 0, ['a', '1'])
+		const producer = new FakeProducer(h.cluster)
+		const signal = new AbortController().signal
+		const dangling = await producer.beginTransaction({ signal })
+		await dangling.send('c', { key: Buffer.from('a'), value: Buffer.from('uncommitted'), partition: 0 })
+		h.write('c', 0, ['b', '1'])
+		const log = h.cluster.log('c', 0)
+		// A consumer whose fetch of what the abort released is still in flight at the next stall check (the real one
+		// long-polls at the last stable offset): it delivers only when the test says so.
+		let position = 0n
+		let deliver!: Parameters<RestoreConsumerPort['run']>[0]
+		const running = deferred()
+		h.consumer = () => ({
+			assign: () => {},
+			run: onBatch => {
+				deliver = onBatch
+				running.resolve()
+				return new Promise<void>(() => {})
+			},
+			pause: () => {},
+			position: () => position,
+			stop: () => Promise.resolve(),
+		})
+		const releasedCheck = deferred()
+		h.admin.steps.listOffsets.always(() => {
+			const stallCheck = h.admin.calls.at(-1)?.startsWith('listOffsets latest read_committed')
+			if (stallCheck && log.lastStable === log.end) releasedCheck.resolve()
+			return 'ok'
+		})
+		const store = await kvStore()
+
+		const restoring = h.restore([kv(store)], { idleTimeoutMs: 30 })
+		await running.promise
+		await deliver({ topic: 'c', partition: 0 }, log.read(0n, 'read_committed').messages)
+		position = 1n
+		await vi.waitFor(() => expect(h.logger.warnings).toHaveLength(1), { interval: 1 })
+		await dangling.abort({ signal })
+		// The first stall check that sees the transaction ended, then the fetch completes.
+		await releasedCheck.promise
+		await new Promise(resolve => setTimeout(resolve, 0))
+		await deliver({ topic: 'c', partition: 0 }, log.read(1n, 'read_committed').messages)
+		position = log.end
+
+		await restoring
+		expect(await entries(store)).toEqual(['"a"="1"', '"b"="1"'])
 	})
 
 	it('a store write blocked longer than the idle timeout is not a stall', async () => {
