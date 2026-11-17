@@ -24,6 +24,35 @@ export type {
 	Joined,
 } from '@/legacy/flow.js'
 
+// Processor API
+export { Stores } from '@/state/store-builders.js'
+export type {
+	StoreDefinition,
+	StoreOptions,
+	WindowStoreDefinitionOptions,
+	SessionStoreDefinitionOptions,
+	StoresFactory,
+} from '@/api/stores.js'
+export type { ConnectedStores, ProcessOptions, TransformValuesOptions } from '@/api/options.js'
+export { StreamRecord, FixedKeyRecord } from '@/processor/record.js'
+export type { RecordHeaders } from '@/processor/record.js'
+export type {
+	Processor,
+	ProcessorSupplier,
+	ProcessorContext,
+	FixedKeyProcessor,
+	FixedKeyProcessorSupplier,
+	FixedKeyProcessorContext,
+	ValueTransformerWithKey,
+	ValueTransformerWithKeySupplier,
+	ForwardingDisabledContext,
+	RecordMetadata,
+	TaskId,
+	Punctuator,
+	PunctuationType,
+	Cancellable,
+} from '@/processor/api.js'
+
 // Codecs
 export { codec, string, json, buffer } from '@/codec.js'
 export type { Codec } from '@/codec.js'
@@ -46,9 +75,13 @@ export {
 export type {
 	StateStoreProvider,
 	ChangelogCheckpointStore,
+	StateStore,
 	KeyValueStore,
 	WindowStore,
 	SessionStore,
+	TimestampedKeyValueStore,
+	TimestampedWindowStore,
+	ValueAndTimestamp,
 	KeyValueStoreOptions,
 	WindowStoreOptions,
 	SessionStoreOptions,

@@ -139,7 +139,11 @@ export interface FlowApp {
 		source: string | Topic<K, V>,
 		options?: Consumed<K, V> & { materialized?: Materialized<K, V> }
 	): GlobalKTable<K, V>
-	/** Registers a Processor API store; processors connect to it through `process(..., { stores })`. */
+	/**
+	 * Registers a store made by `Stores` (Kafka Streams' `addStateStore()`), so that processors connect to it by name in
+	 * `process(supplier, { stores: [name] })`. Naming the definition itself in `stores` registers it too; registering
+	 * it again has no effect. Another store of the same name is a TopologyError.
+	 */
 	addStateStore(definition: StoreDefinition<StateStore>): this
 	/**
 	 * Builds the topology and describes it. Building freezes it, as start() does: later DSL calls throw TopologyError,

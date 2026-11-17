@@ -25,7 +25,13 @@ export interface KTable<K, V> {
 	 */
 	mapValues<VR>(mapper: (value: V) => VR | null, options?: TableOptions<K, VR>): KTable<K, VR>
 	mapValues<VR>(mapper: (key: K, value: V) => VR | null, options?: TableOptions<K, VR>): KTable<K, VR>
-	/** One transformer result per update; tombstones reach the transformer. */
+	/**
+	 * Kafka Streams' `transformValues()`: every task creates a transformer with `supplier()` (which must return a new
+	 * one per call) and calls `transform(key, value)` once per update, tombstones included (`value` null); the result
+	 * is the key's new value, null deleting it. The transformer's context reads the stores of `options.stores` and
+	 * schedules punctuators, but cannot forward. Without a materialized store, a lookup of the result table (a join)
+	 * transforms the parent's current value with a transformer instance of its own.
+	 */
 	transformValues<VR>(
 		supplier: ValueTransformerWithKeySupplier<K, V, VR>,
 		options?: TransformValuesOptions<K, VR>

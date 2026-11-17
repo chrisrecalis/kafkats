@@ -90,16 +90,26 @@ export interface TableOptions<K, V> extends NamedOptions {
 	materialized?: Materialized<K, V>
 }
 
+/**
+ * The stores a processor or transformer uses: definitions made by `Stores` (registered with the app the first time one
+ * is named) or the names of registered stores (`app.addStateStore()`, a `Materialized.storeName`). Processors sharing
+ * a store run in one task per partition, so the topics they read must be co-partitioned.
+ */
+export type ConnectedStores = readonly (StoreDefinition<StateStore> | string)[]
+
 /** Options of KTable.transformValues. */
 export interface TransformValuesOptions<K, V> extends TableOptions<K, V> {
-	/** Stores the transformer may use. */
-	stores?: readonly string[]
+	/**
+	 * The stores the transformer reads through its context. A table that is not materialized is read by running another
+	 * transformer instance in the processors that look it up (joins): they are connected to these stores too.
+	 */
+	stores?: ConnectedStores
 }
 
 /** Options of process() and processValues(). */
 export interface ProcessOptions extends NamedOptions {
-	/** Stores the processor may use. */
-	stores?: readonly StoreDefinition<StateStore>[] | readonly string[]
+	/** The stores the processor reads and writes through its context. */
+	stores?: ConnectedStores
 }
 
 /**

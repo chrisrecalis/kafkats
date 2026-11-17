@@ -252,7 +252,8 @@ export class InternalTopologyBuilder {
 	}
 }
 
-function checkSupplier(name: NodeName, supplier: () => unknown): void {
+/** KS `ApiUtils.checkSupplier`: a supplier must create a new instance per call (the node's per-task instances). */
+export function checkSupplier(name: NodeName, supplier: () => unknown): void {
 	if (supplier() === supplier()) {
 		throw new TopologyError(
 			`The supplier of '${name}' returned the same processor twice; it must create a new one per call`

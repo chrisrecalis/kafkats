@@ -3,12 +3,25 @@
  * every task of its subtopology; the provider store it creates is the bottom of one task's store stack. Window and
  * session stores of time-based processors take a `clock` (6.2): their stack then gets the clipping layer of
  * `state/time-clipping.ts`; their retention comes from the DSL's retention model (`dsl/retention.ts`).
+ *
+ * `Stores` makes the store definitions of the Processor API (6.21); a definition becomes a builder once it is
+ * registered with an app, whose changelog defaults it resolves against.
  */
+import { TopologyError } from '@/api/errors.js'
+import type {
+	SessionStoreDefinitionOptions,
+	StoreDefinition,
+	StoreOptions,
+	StoresFactory,
+	WindowStoreDefinitionOptions,
+} from '@/api/stores.js'
 import { resolveStoreChangelog, type ChangelogConfig, type ChangelogDefaults } from '@/changelog/config.js'
 import type { Codec } from '@/codec.js'
+import { durationMs } from '@/dsl/windows.js'
 import type {
 	KeyValueStore,
 	SessionStore,
+	StateStore,
 	TimestampedKeyValueStore,
 	TimestampedWindowStore,
 	ValueAndTimestamp,
@@ -121,4 +134,58 @@ export function timestampedSessionStoreBuilder<K, V>(
 ): StoreBuilder<SessionStore<K, ValueAndTimestamp<V>>> {
 	const valueCodec = valueAndTimestampCodec(options.valueCodec)
 	return { ...sessionStoreBuilder(defaults, { ...options, valueCodec }), timestamped: true }
+}
+
+/** How the store of each definition `Stores` made is built for an app. */
+const definitions = new WeakMap<StoreDefinition<StateStore>, (defaults: ChangelogDefaults) => StoreBuilder>()
+
+function define<O extends StoreBuilderOptions<unknown, unknown>, S extends StateStore>(
+	options: O,
+	builder: (defaults: ChangelogDefaults, options: O) => StoreBuilder<S>
+): StoreDefinition<S> {
+	const definition: StoreDefinition<S> = Object.freeze({ name: options.name })
+	definitions.set(definition, defaults => builder(defaults, options))
+	return definition
+}
+
+/** The builder of a store `Stores` defined, for the app of `defaults`; a TopologyError for any other object. */
+export function definedStoreBuilder(
+	definition: StoreDefinition<StateStore>,
+	defaults: ChangelogDefaults
+): StoreBuilder {
+	const build = definitions.get(definition)
+	if (build === undefined) {
+		throw new TopologyError(`The store definition '${definition.name}' was not made by Stores`)
+	}
+	return build(defaults)
+}
+
+function builderOptions<K, V>(options: StoreOptions<K, V>): StoreBuilderOptions<K, V> {
+	return { name: options.name, keyCodec: options.key, valueCodec: options.value, logging: options.logging }
+}
+
+/** Kafka Streams' checks (`Stores.persistentWindowStore`): neither negative, the size within the retention. */
+function windowOptions<K, V>(options: WindowStoreDefinitionOptions<K, V>): WindowStoreBuilderOptions<K, V> {
+	const retentionMs = durationMs(options.retention, `The retention of window store '${options.name}'`)
+	const windowSizeMs = durationMs(options.windowSize, `The window size of window store '${options.name}'`)
+	if (windowSizeMs > retentionMs) {
+		throw new TopologyError(
+			`The retention of window store '${options.name}' (${retentionMs} ms) must be at least its window size (${windowSizeMs} ms)`
+		)
+	}
+	return { ...builderOptions(options), retentionMs, windowSizeMs }
+}
+
+function sessionOptions<K, V>(options: SessionStoreDefinitionOptions<K, V>): SessionStoreBuilderOptions<K, V> {
+	const retentionMs = durationMs(options.retention, `The retention of session store '${options.name}'`)
+	return { ...builderOptions(options), retentionMs }
+}
+
+/** Store definitions for the Processor API (6.21): `process(supplier, { stores: [Stores.keyValueStore({ ... })] })`. */
+export const Stores: StoresFactory = {
+	keyValueStore: options => define(builderOptions(options), keyValueStoreBuilder),
+	timestampedKeyValueStore: options => define(builderOptions(options), timestampedKeyValueStoreBuilder),
+	windowStore: options => define(windowOptions(options), windowStoreBuilder),
+	timestampedWindowStore: options => define(windowOptions(options), timestampedWindowStoreBuilder),
+	sessionStore: options => define(sessionOptions(options), sessionStoreBuilder),
 }

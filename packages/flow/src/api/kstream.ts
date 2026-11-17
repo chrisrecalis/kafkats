@@ -198,10 +198,23 @@ export interface KStream<K, V> {
 		options: Joined<K, V, VO>
 	): KStream<K, VR>
 
-	/** Processor API. The processor may change keys: a key-based operation downstream repartitions first. */
-	process<KR, VR>(supplier: ProcessorSupplier<K, V, KR, VR>, options?: ProcessOptions): KStream<KR, VR>
-	/** Processor API with the key kept. */
-	processValues<VR>(supplier: FixedKeyProcessorSupplier<K, V, VR>, options?: ProcessOptions): KStream<K, VR>
+	/**
+	 * Runs a processor of the Processor API (Kafka Streams' `process()`): every task creates its own instance with
+	 * `supplier()` (which must return a new processor per call), calls `init(context)`, then `process(record)` for each
+	 * record, and `close()` when the task closes. Through its context the processor forwards any number of records, reads
+	 * and writes the stores of `options.stores`, schedules stream-time and wall-clock punctuators, and requests commits.
+	 * The processor may change keys, so a key-based operation downstream repartitions first, and neither codec is known
+	 * downstream.
+	 */
+	process<KR, VR>(supplier: ProcessorSupplier<K | null, V | null, KR, VR>, options?: ProcessOptions): KStream<KR, VR>
+	/**
+	 * Like `process()`, with a processor that cannot change keys: it forwards FixedKeyRecords derived from its input
+	 * (`withValue()`, `withTimestamp()`, `withHeaders()`), so the key codec and the repartition flag are kept.
+	 */
+	processValues<VR>(
+		supplier: FixedKeyProcessorSupplier<K | null, V | null, VR>,
+		options?: ProcessOptions
+	): KStream<K, VR>
 }
 
 /**

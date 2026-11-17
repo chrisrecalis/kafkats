@@ -5,6 +5,9 @@ import type { KStream } from '@/api/kstream.js'
 import type { GlobalKTable, KTable } from '@/api/ktable.js'
 import { codec } from '@/codec.js'
 import type { JoinWindows, SessionWindows, SlidingWindows, TimeWindows } from '@/dsl/windows.js'
+import type { FixedKeyProcessor, Processor } from '@/processor/api.js'
+import type { KeyValueStore, StateStore, TimestampedWindowStore } from '@/state.js'
+import { Stores } from '@/state/store-builders.js'
 
 /** Compile-time checks of the public overloads; never called. */
 function overloads(
@@ -125,6 +128,32 @@ function overloads(
 	app.globalTable('dates').toStream()
 	// @ts-expect-error a key-value lambda needs explicit parameter types to pick the keyed overload
 	stream.mapValues((key, value) => [key, value])
+
+	// Processor API: typed stores and processors.
+	const counts = Stores.keyValueStore({ name: 'counts', key: codec.string(), value: codec.json<number>() })
+	const windowStore = Stores.timestampedWindowStore({
+		name: 'windows',
+		key: codec.string(),
+		value: codec.string(),
+		retention: '1h',
+		windowSize: '1m',
+	})
+	const process: Processor<string | null, number | null, boolean, string> = {
+		init(context) {
+			expectTypeOf(context.getStateStore(counts)).toEqualTypeOf<KeyValueStore<string, number>>()
+			expectTypeOf(context.getStateStore(windowStore)).toEqualTypeOf<TimestampedWindowStore<string, string>>()
+			expectTypeOf(context.getStateStore('counts')).toEqualTypeOf<StateStore>()
+		},
+		process() {},
+	}
+	expectTypeOf(stream.process(() => process, { stores: [counts, 'other'] })).toEqualTypeOf<KStream<boolean, string>>()
+	expectTypeOf(
+		stream.processValues((): FixedKeyProcessor<string | null, number | null, Date> => ({ process() {} }))
+	).toEqualTypeOf<KStream<string, Date>>()
+	expectTypeOf(
+		table.transformValues(() => ({ transform: (key, value) => `${key}${value?.getTime()}` }))
+	).toEqualTypeOf<KTable<string, string>>()
+	expectTypeOf(app.addStateStore(counts)).toEqualTypeOf<FlowApp>()
 }
 
 describe('public API types', () => {
