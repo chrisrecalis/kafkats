@@ -13,6 +13,7 @@ function overloads(
 	other: KStream<string, boolean>,
 	table: KTable<string, Date>,
 	global: GlobalKTable<number, Date>,
+	byName: GlobalKTable<string, Date>,
 	windows: { join: JoinWindows; time: TimeWindows; session: SessionWindows; sliding: SlidingWindows }
 ) {
 	expectTypeOf(stream.mapValues(value => String(value))).toEqualTypeOf<KStream<string, string>>()
@@ -43,6 +44,21 @@ function overloads(
 			(value, globalValue) => globalValue.getTime() + value
 		)
 	).toEqualTypeOf<KStream<string, number>>()
+	expectTypeOf(
+		stream.leftJoin(
+			global,
+			(_key, value) => value,
+			(key: string | null, value: number, globalValue: Date | null) => [key, value, globalValue] as const
+		)
+	).toEqualTypeOf<KStream<string, readonly [string | null, number, Date | null]>>()
+	const recordKey = (key: string | null) => key
+	// @ts-expect-error the selector must pick a key of the global table
+	stream.join(global, recordKey, (value: number) => value)
+	expectTypeOf(stream.leftJoin(byName, (_value, globalValue) => globalValue)).toEqualTypeOf<
+		KStream<string, Date | null>
+	>()
+	// @ts-expect-error the deprecated form needs a global table keyed like the stream
+	stream.join(global, (value: number) => value)
 	expectTypeOf(
 		stream.outerJoin(other, (value, otherValue) => [value, otherValue] as const, windows.join)
 	).toEqualTypeOf<KStream<string, readonly [number | null, boolean | null]>>()

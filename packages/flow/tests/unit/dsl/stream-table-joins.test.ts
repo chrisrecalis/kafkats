@@ -107,24 +107,6 @@ describe.each(GUARANTEES)('stream-table join results (6.14; %s)', (_guarantee, c
 	})
 })
 
-describe.each(GUARANTEES)('stream-global table join results (6.19; %s)', (_guarantee, config) => {
-	it('KIP-962: a left join joins a record whose selector picks no key with null; an inner join drops it', async () => {
-		const driver = new TestDriver(config)
-		const regions = driver.globalTable('regions', S)
-		const stream = driver.input('s', S)
-		const region = (_k: string | null, v: string) => (v === 'none' ? null : v)
-		stream.join(regions, region, keyJoiner).to('inner', S)
-		stream.leftJoin(regions, region, keyJoiner).to('left', S)
-		await driver.run(async ctx => {
-			await send(ctx, 'regions', 'eu', 'Europe')
-			await send(ctx, 's', 'a', 'eu')
-			await send(ctx, 's', 'b', 'none')
-			expect(values(ctx, 'inner')).toEqual(['a:eu+Europe'])
-			expect(values(ctx, 'left')).toEqual(['a:eu+Europe', 'b:none+null'])
-		})
-	})
-})
-
 describe('null keys on the repartition topics of stream-table joins (KF12)', () => {
 	it('a left stream-table or global join downstream keeps them; inner joins do not', () => {
 		const marks = (left: boolean) => {

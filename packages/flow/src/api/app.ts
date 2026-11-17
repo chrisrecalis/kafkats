@@ -114,6 +114,10 @@ export interface FlowApp {
 		source: string | Topic<K, V>,
 		options?: Consumed<K, V> & { materialized?: Materialized<K, V> }
 	): KTable<K, V>
+	/**
+	 * A table every instance reads in full: loaded before processing starts, then followed, in a store without a
+	 * changelog (the topic is one). Only usable as the lookup side of `KStream.join/leftJoin`.
+	 */
 	globalTable<K = Buffer, V = Buffer>(
 		source: string | Topic<K, V>,
 		options?: Consumed<K, V> & { materialized?: Materialized<K, V> }

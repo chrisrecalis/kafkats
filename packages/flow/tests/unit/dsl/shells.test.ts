@@ -98,7 +98,7 @@ describe('DSL shells delegate every method to its operator builder', () => {
 
 	it('KStream joins dispatch on the other side: stream, table or global table', () => {
 		const other = new KStreamImpl<string, number>(ctx, 'other', {}, false)
-		const global = new GlobalKTableImpl<string, number>(ctx, 'global-store', {})
+		const global = new GlobalKTableImpl<string, number>(ctx, 'global-store')
 		const windows = instance(JoinWindows)
 		const inner = (value: number, otherValue: number) => value + otherValue
 		const left = (value: number, otherValue: number | null) => value + (otherValue ?? 0)
