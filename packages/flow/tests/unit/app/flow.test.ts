@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+import { KafkaClient } from '@kafkats/client'
 import { FlowConfigError, StreamsError, TopologyError } from '@/api/errors.js'
 import { flow } from '@/app/flow.js'
 import { internals } from '@/app/internal.js'
@@ -39,17 +40,29 @@ describe('flow()', () => {
 		])
 	})
 
-	it('start() builds the topology, then fails: this build has no Kafka runtime', async () => {
-		const app = flow({ applicationId: 'app', client })
+	it('start() builds the topology, then fails when the cluster cannot be reached; it may be retried', async () => {
+		const unreachable = new KafkaClient(client)
+		const connect = vi.spyOn(unreachable, 'connect').mockRejectedValue(new Error('unreachable'))
+		const disconnect = vi.spyOn(unreachable, 'disconnect')
+		const app = flow({ applicationId: 'app', client: unreachable })
 		const stream = app.stream('in')
-		const starting = app.start()
-		await expect(starting).rejects.toThrow(StreamsError)
-		await expect(starting).rejects.toThrow('not available in this build')
+		await expect(app.start()).rejects.toThrow('unreachable')
 		expect(app.state()).toBe('ERROR')
-		expect(app.getError()).toBeInstanceOf(StreamsError)
+		expect(app.getError()?.message).toBe('unreachable')
 		expect(() => stream.to('late')).toThrow(TopologyError)
+		await expect(app.start()).rejects.toThrow('unreachable')
+		expect(connect).toHaveBeenCalledTimes(2)
 		await app.close()
 		expect(app.state()).toBe('STOPPED')
+		// The user's own client stays as it is.
+		expect(disconnect).not.toHaveBeenCalled()
+	})
+
+	it('start() rejects a topology with global tables in this build', async () => {
+		const app = flow({ applicationId: 'app', client })
+		app.globalTable('users', { key: codec.string(), value: codec.string() })
+		await expect(app.start()).rejects.toThrow(StreamsError)
+		await app.close()
 	})
 
 	it('start() rejects with the TopologyError of an invalid topology', async () => {
