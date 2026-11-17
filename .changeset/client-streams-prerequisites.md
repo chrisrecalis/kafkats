@@ -36,6 +36,10 @@
 
 - `admin.deleteRecords(records, { timeoutMs, signal })` moves partitions' log start offsets forward (DeleteRecords API), retrying moved leaders and returning failures per partition.
 
+**Connections**
+
+- A broker counts as connected only once its API versions are negotiated, and concurrent connects share one attempt. A request to a broker that another request was still connecting (e.g. offsets of several partitions led by the same broker, listed in parallel) no longer fails with `UnsupportedVersionError` ("API 2 version 0 not supported").
+
 **Exports**
 
 - The package root now exports `CommitFailedError`, `OffsetOutOfRangeError`, `NoOffsetForPartitionError`, `ProducerFencedError`, `InvalidTxnStateError`, `TransactionAbortedError`, and the types of the APIs above (`CommitOffset`, `CommittedOffset`, `AssignedPartition`, `OffsetResetPolicy`, `OffsetResetEvent`, `ConsumerEvents`, `TransactionHandle`, `ProducerTransaction`, `TransactionState`, `TransactionOffset` (the offsets `sendOffsets()` takes, with metadata), `DeleteRecordsResult`, ...).

@@ -252,6 +252,7 @@ export class Broker {
 	private readonly controlOnly: boolean
 	private apiVersions: Map<ApiKey, VersionRange> = new Map()
 	private versionsFetchedAt: number = 0
+	private connecting: Promise<void> | null = null
 	private readonly logger: Logger
 	private readonly requestTimeoutMs: number
 
@@ -294,15 +295,30 @@ export class Broker {
 		this.fetchConnection = new Connection(this.fetchConnectionOptions)
 	}
 
+	/**
+	 * Usable: the connections are open and the API versions negotiated. A broker whose sockets are open but whose
+	 * ApiVersions exchange is still in flight is not connected yet: every request would throw UnsupportedVersionError.
+	 */
 	get isConnected(): boolean {
-		return this.connection.isConnected && (this.controlOnly || this.fetchConnection.isConnected)
+		return (
+			this.apiVersions.size > 0 &&
+			this.connection.isConnected &&
+			(this.controlOnly || this.fetchConnection.isConnected)
+		)
 	}
 
+	/** Concurrent calls share one attempt. */
 	async connect(): Promise<void> {
 		if (this.isConnected) {
 			return
 		}
+		this.connecting ??= this.doConnect().finally(() => {
+			this.connecting = null
+		})
+		return this.connecting
+	}
 
+	private async doConnect(): Promise<void> {
 		this.logger.debug('connecting', { host: this.host, port: this.port })
 		await Promise.all([this.connection.connect(), this.controlOnly ? undefined : this.fetchConnection.connect()])
 		try {
