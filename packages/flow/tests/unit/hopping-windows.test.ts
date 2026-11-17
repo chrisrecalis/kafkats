@@ -68,6 +68,18 @@ describe('hopping windows', () => {
 		])
 	})
 
+	it('no window starts before 0: a record near the epoch is only in its windows from 0 on (Kafka Streams)', async () => {
+		// size=10, advance=3: a record at 4 would also be in [-3, 7).
+		const out = await updates(
+			driver => grouped(driver).windowedBy(TimeWindows.of(10).advanceBy(3)).count(),
+			[[1, 4]]
+		)
+		expect(out).toEqual([
+			{ start: 0, end: 10, value: 1 },
+			{ start: 3, end: 13, value: 1 },
+		])
+	})
+
 	it('throws a TopologyError at the aggregation when advanceBy is greater than the window size', () => {
 		// Larger advances would silently drop the records that fall between windows.
 		const driver = new TestDriver()

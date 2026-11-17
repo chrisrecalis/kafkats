@@ -278,6 +278,10 @@ describe('windowed/session store changelog wiring (copied from flow.test.ts)', (
 		const { store, subtopology } = storeOf(topologyOf(driver), 'session-counts')
 		expect(store.kind).toBe('session')
 		expect(subtopology.changelogTopics.get('session-counts')).toBe('test-app-session-counts-changelog')
+		// delete,compact with the store's retention (24 gaps of 30 s), like a window store.
+		if (!store.logging.enabled) throw new Error('not logged')
+		expect(store.logging.configs['cleanup.policy']).toBe('delete,compact')
+		expect(store.logging.configs['retention.ms']).toBe(String(30_000 * 24))
 	})
 
 	it('co-partitions windowedBy state with its source or repartition topic', () => {
@@ -566,14 +570,26 @@ describe('aggregations', () => {
 		grouped.count().toStream().to('counts', { key: str, value: num })
 		grouped.windowedBy(TimeWindows.of(10)).count().toStream().to('windows', { value: num })
 		grouped.windowedBy(SessionWindows.withInactivityGap(10)).count().toStream().to('sessions', { value: num })
-		const headers = { trace: Buffer.from('t1') }
+		const first = { trace: Buffer.from('t1') }
+		const second = { trace: Buffer.from('t2') }
 		await driver.run(async ({ send, producer }) => {
-			await send('in', 'x', { ...at('k', 15), headers })
-			for (const topic of ['counts', 'windows', 'sessions']) {
-				const [record] = producer.messagesFor(topic)
-				expect(record?.timestamp).toBe(15n)
-				expect(record?.headers).toEqual(headers)
-			}
+			await send('in', 'x', { ...at('k', 15), headers: first })
+			await send('in', 'x', { ...at('k', 18), headers: second })
+			const sent = (topic: string) => producer.messagesFor(topic).map(r => [r.timestamp, r.headers])
+			expect(sent('counts')).toEqual([
+				[15n, first],
+				[18n, second],
+			])
+			expect(sent('windows')).toEqual([
+				[15n, first],
+				[18n, second],
+			])
+			// The record at 18 merges [15,15] into [15,18]: the retraction of [15,15] is its result too.
+			expect(sent('sessions')).toEqual([
+				[15n, first],
+				[18n, second],
+				[18n, second],
+			])
 		})
 	})
 
@@ -954,19 +970,29 @@ describe('aggregations', () => {
 			])
 		})
 
-		it('without the request, changes carry no old value', async () => {
+		it('without the request, changes carry no old value (session retractions neither)', async () => {
 			const driver = new TestDriver()
-			const table = driver.input('in', { key: str, value: str }).groupByKey().count() as KTableImpl<
-				string,
-				number
-			>
-			const changes = changesOf(table)
+			const grouped = driver.input('in', { key: str, value: str }).groupByKey()
+			const changes = changesOf(grouped.count() as KTableImpl<string, number>)
+			const windowChanges = changesOf(
+				grouped.windowedBy(TimeWindows.of(10)).count() as KTableImpl<Windowed<string>, number>
+			)
+			const sessionChanges = changesOf(
+				grouped.windowedBy(SessionWindows.withInactivityGap(10)).count() as KTableImpl<Windowed<string>, number>
+			)
 			await driver.run(async ({ send }) => {
 				await send('in', 'x', at('k', 1))
-				await send('in', 'x', at('k', 2))
+				await send('in', 'x', at('k', 2)) // merges session [1,1] into [1,2]
 			})
-			expect(changes).toEqual([
+			const updates = [
 				{ newValue: 1, oldValue: null },
+				{ newValue: 2, oldValue: null },
+			]
+			expect(changes).toEqual(updates)
+			expect(windowChanges).toEqual(updates)
+			expect(sessionChanges).toEqual([
+				{ newValue: 1, oldValue: null },
+				{ newValue: null, oldValue: null },
 				{ newValue: 2, oldValue: null },
 			])
 		})
