@@ -71,7 +71,7 @@ describe('RecordCollector at-least-once', () => {
 			},
 		])
 		expect(task.needsCommit(() => undefined)).toBe(true)
-		expect(await h.collector.flush(signal())).toEqual({ corrupted: new Set() })
+		await expect(h.collector.flush(signal())).resolves.toBeUndefined()
 	})
 
 	it('changelog records report their acked offsets per task until taken', async () => {
@@ -88,7 +88,7 @@ describe('RecordCollector at-least-once', () => {
 		expect(h.collector.takeChangelogOffsets(b)).toEqual(new Map([['app-s-changelog:1', 0n]]))
 	})
 
-	it('a retriable failure corrupts only the task that sent the record', async () => {
+	it('a retriable failure corrupts only the task that sent the record, for good; its changelog acks are dropped', async () => {
 		const { h, pending, ackAll } = manual()
 		const a = await running(h, 0)
 		const b = await running(h, 0)
@@ -96,8 +96,13 @@ describe('RecordCollector at-least-once', () => {
 		send(h, b, 'sink')
 		pending[0]!.answer(new ConnectionError('broker', 9092))
 		ackAll()
-		expect((await h.collector.flush(signal())).corrupted).toEqual(new Set([a]))
-		expect((await h.collector.flush(signal())).corrupted).toEqual(new Set())
+		await h.collector.flush(signal())
+		expect([a.corrupted, b.corrupted]).toEqual([true, false])
+		send(h, a, 'changelog', changelog())
+		ackAll()
+		await h.collector.flush(signal())
+		expect(a.corrupted).toBe(true)
+		expect(h.collector.takeChangelogOffsets(a)).toEqual(new Map())
 	})
 
 	for (const error of [new TimeoutError('produce', 30_000), new KafkaProtocolError(ErrorCode.NotLeaderOrFollower)]) {
@@ -106,7 +111,8 @@ describe('RecordCollector at-least-once', () => {
 			h.producer.steps.send.always(error)
 			const task = await running(h)
 			send(h, task, 'sink')
-			expect((await h.collector.flush(signal())).corrupted).toEqual(new Set([task]))
+			await expect(h.collector.flush(signal())).resolves.toBeUndefined()
+			expect(task.corrupted).toBe(true)
 		})
 	}
 
@@ -125,7 +131,8 @@ describe('RecordCollector at-least-once', () => {
 		h.producer.steps.send.always(tooLarge)
 		const task = await running(h)
 		send(h, task, 'sink')
-		expect(await h.collector.flush(signal())).toEqual({ corrupted: new Set() })
+		await expect(h.collector.flush(signal())).resolves.toBeUndefined()
+		expect(task.corrupted).toBe(false)
 		expect(seen).toHaveLength(1)
 		const [ctx, record, error, origin] = seen[0]!
 		expect(ctx).toMatchObject({
@@ -184,7 +191,7 @@ describe('RecordCollector at-least-once', () => {
 			await expect(h.collector.flush(signal())).rejects.toThrow(FailedProcessingError)
 			await expect(h.collector.flush(signal())).rejects.toThrow(FailedProcessingError)
 			h.collector.discard()
-			await expect(h.collector.flush(signal())).resolves.toEqual({ corrupted: new Set() })
+			await expect(h.collector.flush(signal())).resolves.toBeUndefined()
 		})
 	}
 
@@ -234,8 +241,21 @@ describe('RecordCollector at-least-once', () => {
 		const [ack, failure] = pending
 		ack!.answer()
 		failure!.answer(new RecordTooLargeError('output', 0, 2, 1))
-		await expect(h.collector.flush(signal())).resolves.toEqual({ corrupted: new Set() })
+		await expect(h.collector.flush(signal())).resolves.toBeUndefined()
 		expect(h.collector.takeChangelogOffsets(task)).toEqual(new Map())
+	})
+
+	it('a flush whose sends were given up meanwhile (discard, close) fails: nothing may be committed for them', async () => {
+		for (const giveUp of ['discard', 'close'] as const) {
+			const { h, pending } = manual()
+			const task = await running(h)
+			send(h, task, 'sink')
+			const flushed = h.collector.flush(signal())
+			h.collector[giveUp]()
+			pending[0]!.answer(new ConnectionError('broker', 9092))
+			await expect(flushed).rejects.toThrow(TaskMigratedError)
+			expect(task.corrupted).toBe(false)
+		}
 	})
 
 	it('flush waits for every send, also those tracked while flushing, bounded by its signal', async () => {
@@ -385,6 +405,32 @@ describe('RecordCollector exactly-once', () => {
 		expect(transaction!.state).toBe('committed')
 	})
 
+	it('an abort while the sends are flushed fails the flush and any commit of the offsets alone (F2)', async () => {
+		const { h, pending } = manual({ eos: true })
+		const task = await running(h)
+		send(h, task, 'sink')
+		const flushed = h.collector.flush(signal())
+		const aborted = h.collector.abortTransaction(signal())
+		pending[0]!.answer()
+		await expect(flushed).rejects.toThrow(TaskMigratedError)
+		await aborted
+		const offsets = [{ topic: 'input', partition: 0, offset: 1n, metadata: 'm' }]
+		for (const committed of [offsets, []]) {
+			await expect(h.collector.commitTransaction(committed, h.assignment!, signal())).rejects.toThrow(
+				TaskMigratedError
+			)
+		}
+		expect(h.producer.transactions.map(t => [t.state, t.calls])).toEqual([['aborted', ['send', 'abort']]])
+	})
+
+	it('a closed collector commits no offsets', async () => {
+		const h = new TaskHarness({ build: b => pipe(b, { processor: passThrough }), eos: true })
+		h.collector.close()
+		const offsets = [{ topic: 'input', partition: 0, offset: 1n, metadata: 'm' }]
+		await expect(h.collector.commitTransaction(offsets, h.assignment!, signal())).rejects.toThrow(TaskMigratedError)
+		expect(h.producer.transactions).toHaveLength(0)
+	})
+
 	it('changelog offsets are those of the open transaction; an abort drops them', async () => {
 		const h = new TaskHarness({ build: b => pipe(b, { processor: passThrough }), eos: true })
 		const task = await running(h)
@@ -414,7 +460,7 @@ describe('RecordCollector exactly-once', () => {
 		expect(transaction!.calls).toEqual(['send', 'send', 'abort'])
 		expect(h.collector.transactionOpen).toBe(false)
 		expect(h.collector.takeChangelogOffsets(task)).toEqual(new Map())
-		await expect(h.collector.flush(signal())).resolves.toEqual({ corrupted: new Set() })
+		await expect(h.collector.flush(signal())).resolves.toBeUndefined()
 	})
 
 	it('abort never throws', async () => {

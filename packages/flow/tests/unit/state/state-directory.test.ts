@@ -122,6 +122,25 @@ describe('StateDirectory', () => {
 		await expect(dir.lease(T1, counts, 0)).resolves.toBe(store)
 	})
 
+	it('released() resolves once no store is leased any more: released, failed to lease, or closed (4.10.2)', async () => {
+		const { directory: dir } = directory()
+		await expect(dir.released()).resolves.toBeUndefined()
+		await dir.lease(T0, counts, 0)
+		await dir.lease(T1, counts, 1)
+		let released = false
+		const all = dir.released().then(() => (released = true))
+		await dir.release(T0, 'counts', 0)
+		await Promise.resolve()
+		expect(released).toBe(false)
+		await dir.release(T1, 'counts', 1)
+		await all
+
+		await dir.lease(T0, counts, 0)
+		const closing = dir.released()
+		await dir.close()
+		await expect(closing).resolves.toBeUndefined()
+	})
+
 	describe('unowned in-memory state', () => {
 		it('unleased() lists the instances no task holds, only for in-process checkpoints', async () => {
 			const { directory: dir } = directory()

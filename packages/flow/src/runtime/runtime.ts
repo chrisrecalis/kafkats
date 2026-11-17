@@ -71,8 +71,11 @@ export class FlowRuntime {
 	private counts: PartitionCounts | undefined
 	/** The current run: the live one, or the failed one until its recovery replaced it. */
 	private run: Run | undefined
-	/** Stream processing waits for a global table loaded again (4.12 step 3). */
-	private paused = false
+	/**
+	 * Global tables being loaded again (4.12 step 3): stream processing waits until the last of them is, so a count of
+	 * pauses, not a flag (each table reloads on its own).
+	 */
+	private pauses = 0
 	private connecting: Promise<void> | undefined
 	/** The first fatal failure: the app halted. */
 	private fatal: { readonly error: unknown } | undefined
@@ -202,11 +205,11 @@ export class FlowRuntime {
 
 	/**
 	 * The gate of a global table loaded again (4.12 step 3, CR10): the RUNNING tasks are committed, then no slice
-	 * starts until resumeProcessing(); commits go on meanwhile.
+	 * starts until every pause was matched by a resumeProcessing(); commits go on meanwhile.
 	 */
 	async pauseProcessing(): Promise<void> {
 		const pause = (): void => {
-			this.paused = true
+			this.pauses++
 		}
 		if (this.run === undefined) {
 			pause()
@@ -216,12 +219,14 @@ export class FlowRuntime {
 	}
 
 	resumeProcessing(): void {
-		this.paused = false
-		this.run?.scheduler.wake()
+		this.pauses--
+		if (this.pauses === 0) {
+			this.run?.scheduler.wake()
+		}
 	}
 
 	get processingPaused(): boolean {
-		return this.paused
+		return this.pauses > 0
 	}
 
 	// ---------------------------------------------------------------------------------------------------------
@@ -233,7 +238,7 @@ export class FlowRuntime {
 			counts: this.counts!,
 			startPositions: this.startPositions,
 			globalStore: name => this.globals!.store(name),
-			paused: () => this.paused,
+			paused: () => this.processingPaused,
 			onFailure: (error, site) => this.fail(error, site, run),
 			shutdown: this.shutdown.signal,
 		})
@@ -243,11 +248,13 @@ export class FlowRuntime {
 
 	/**
 	 * Task migration (4.10.2, KS `handleTaskMigrated`): the failed run is abandoned (its tasks close dirty, its
-	 * consumer leaves the group), then a new run joins after the backoff, from the committed offsets. A close or a
-	 * fatal failure during the backoff ends the recovery there.
+	 * consumer leaves the group), then a new run joins after the backoff, from the committed offsets. The abandon
+	 * stops waiting for a task close that takes long (a store being wiped, a processor's close): the new run starts
+	 * only once every store was released, so that no store is leased, restored or wiped by two tasks at once (KS
+	 * retries its state directory lock; runtime§6.31). A close or a fatal failure meanwhile ends the recovery there.
 	 */
 	private async recover(failed: Run, error: unknown, site: FailureSite): Promise<void> {
-		const { lifecycle, io, logger } = this.deps
+		const { lifecycle, io, stateDirectory, logger } = this.deps
 		lifecycle.setRebalancing()
 		lifecycle.recordError(error)
 		this.attempt = failed.commits.committedOnce ? 1 : this.attempt + 1
@@ -257,8 +264,10 @@ export class FlowRuntime {
 		)
 		logger.warn(`the app joins the group again in ${backoff} ms after a failure`, fields(site, error))
 		await failed.abandon(abandonSignal(failed))
+		const interrupted = AbortSignal.any([this.shutdown.signal, this.recoveryAbort.signal])
 		try {
-			await delay(io.clock, backoff, AbortSignal.any([this.shutdown.signal, this.recoveryAbort.signal]))
+			await raceSignal(stateDirectory.released(), interrupted)
+			await delay(io.clock, backoff, interrupted)
 		} catch {
 			return
 		}

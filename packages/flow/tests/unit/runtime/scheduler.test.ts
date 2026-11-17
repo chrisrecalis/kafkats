@@ -250,6 +250,43 @@ describe('Scheduler: slices (4.5.5, 4.13)', () => {
 		expect(punctuations).toEqual([1100, 1200])
 	})
 
+	it('a busy task does not hold up the wall-clock punctuations and idle deadlines of the others (KS checks every task each runOnce)', async () => {
+		let f!: Fixture
+		const punctuated: number[] = []
+		const idled: number[] = []
+		let busy = 0
+		const body: Body = (record, context) => {
+			if (context.taskId.partition === 0) {
+				idled.push(f.h.clock.now())
+				return
+			}
+			// One record per slice, longer than a yield: the slice ends during the loop's yield, which wakes it.
+			const until = performance.now() + 11
+			while (performance.now() < until) {
+				/* busy */
+			}
+			f.h.clock.advance(10)
+			busy++
+		}
+		const init = (ctx: Ctx) => {
+			if (ctx.taskId.partition === 0) ctx.schedule(100, 'wall-clock', time => void punctuated.push(time))
+		}
+		f = new Fixture({ partitions: 2, maxTaskIdleMs: 50, build: twoTopics(processor(body, init)) })
+		const [idle, loaded] = await f.tasks(2)
+		// 0_0 idles on its empty b:0 (lag 0) until 1050; 0_1 keeps a record on b:1 while a:1 drains, so it never idles.
+		f.h.consumer.partition('b:0').end = 0n
+		f.deliver(loaded!, values(...Array.from({ length: 40 }, (_, i) => `${i}`)), 'a')
+		f.deliver(loaded!, values('b'), 'b')
+		f.deliver(idle!, values('x'), 'a')
+		await f.start()
+		await vi.waitFor(() => expect(busy).toBe(40), { timeout: 5000, interval: 5 })
+
+		// Due while the other task still had about 30 records to go.
+		expect(idled).toHaveLength(1)
+		expect(idled[0]).toBeLessThan(1100)
+		expect(punctuated.slice(0, 3)).toEqual([1100, 1200, 1300])
+	})
+
 	it('resumes a partition paused for backpressure after the slice that drained it to the limit', async () => {
 		let f!: Fixture
 		const body: Body = (record, context) => {

@@ -35,6 +35,8 @@ export class StateDirectory {
 	private readonly instances = new Map<string, Instance>()
 	private readonly leases = new Map<string, TaskId>()
 	private readonly globals = new Map<string, Opened>()
+	/** Callers of released() waiting for the last lease to end. */
+	private waiters: (() => void)[] = []
 
 	constructor(
 		private readonly applicationId: string,
@@ -70,7 +72,7 @@ export class StateDirectory {
 			await this.init(instance)
 			return instance.store
 		} catch (error) {
-			this.leases.delete(id)
+			this.endLease(id)
 			throw error
 		}
 	}
@@ -90,8 +92,16 @@ export class StateDirectory {
 		try {
 			if (options?.wipe) await this.wipe(instance)
 		} finally {
-			this.leases.delete(id)
+			this.endLease(id)
 		}
+	}
+
+	/**
+	 * Resolves once no store is leased: every task that held one released it (a run that ended without waiting for
+	 * its task closes, 4.10.2).
+	 */
+	released(): Promise<void> {
+		return this.leases.size === 0 ? Promise.resolve() : new Promise(resolve => this.waiters.push(resolve))
 	}
 
 	/**
@@ -146,6 +156,7 @@ export class StateDirectory {
 		this.instances.clear()
 		this.leases.clear()
 		this.globals.clear()
+		this.notifyReleased()
 		try {
 			await this.provider.close()
 		} catch (error) {
@@ -164,6 +175,18 @@ export class StateDirectory {
 		}
 		this.instances.set(id, instance)
 		return instance
+	}
+
+	private endLease(id: string): void {
+		this.leases.delete(id)
+		this.notifyReleased()
+	}
+
+	private notifyReleased(): void {
+		if (this.leases.size > 0) return
+		const waiters = this.waiters
+		this.waiters = []
+		for (const resolve of waiters) resolve()
 	}
 
 	private init(opened: Opened): Promise<void> {

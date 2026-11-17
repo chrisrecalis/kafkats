@@ -541,6 +541,35 @@ describe('TaskManager: restore pipelines (4.7.1)', () => {
 		expect(h.allRunning).toEqual([false])
 	})
 
+	it("runtime§6.30: a completion queued before the lost hook's op neither runs init(), resumes nor counts the lost task", async () => {
+		for (const eos of [false, true]) {
+			let inits = 0
+			const counting: ProcessorSupplier<string, string, string, string> = () => ({
+				init: () => void inits++,
+				process: () => {},
+			})
+			const h = new Harness({ eos, build: stateful(['input'], counting), counts: { input: 2 } })
+			h.restorer.manual = true
+			await h.assign('input:0', 'input:1')
+			const [restoring, other] = h.tasks()
+			h.restorer.job(other!).finish()
+			await h.settle()
+			inits = 0
+			const gate = deferred()
+			void h.exclusive.run(() => gate.promise)
+			h.restorer.job(restoring!).finish()
+			await tick()
+			const lost = h.lose('input:0', 'input:1')
+			gate.resolve()
+			await lost
+			await h.settle()
+			expect(inits).toBe(0)
+			expect(h.consumer.calls).not.toContain('resume input:0')
+			expect(h.allRunning).not.toContain(true)
+			expect(restoring!.state).toBe('CLOSED')
+		}
+	})
+
 	it('a restore failure is reported at the restore site and fails the start', async () => {
 		const h = new Harness()
 		h.restorer.manual = true
@@ -689,14 +718,97 @@ describe('TaskManager: revive in place (4.7.5)', () => {
 		expect(h.tasks()[0]!.state).toBe('RUNNING')
 	})
 
-	it('skips tasks that were suspended or replaced meanwhile', async () => {
+	it('only closes a task suspended meanwhile: the next assignment re-creates it from its commit (F1)', async () => {
 		const h = await running()
 		const [task] = h.tasks()
 		await h.revoke('input:0')
-		await h.revive([task!])
-		expect(h.tasks()).toEqual([task])
-		expect(task!.state).toBe('SUSPENDED')
+		await h.revive([task!], true)
+		expect(h.tasks()).toEqual([])
+		expect(task!.state).toBe('CLOSED')
 		expect(h.restorer.restored).toEqual([task])
+		await h.assign('input:0')
+		await h.settle()
+		const [created] = h.tasks()
+		expect(created).not.toBe(task)
+		expect(created!.state).toBe('RUNNING')
+	})
+
+	it('skips tasks that were replaced meanwhile', async () => {
+		const h = await running()
+		const [task] = h.tasks()
+		await h.revive([task!])
+		const [revived] = h.tasks()
+		await h.settle()
+		h.clock.advance(60_000)
+		await h.revive([task!])
+		expect(h.tasks()).toEqual([revived])
+		expect(h.failures).toEqual([])
+	})
+})
+
+describe('TaskManager: an op that outlives the end of its run (Run.end closes the tasks beside it, F3)', () => {
+	/** What Run.end does once an op held exclusive too long: the run failed, every task closed dirty beside the op. */
+	async function endBeside(h: Harness): Promise<void> {
+		h.failed = true
+		await h.manager.closeAll('dirty', h.hardStop.signal)
+	}
+
+	it('a revival whose close outlives the end re-creates and leases nothing', async () => {
+		const h = await running({ counts: { input: 2 } }, 'input:0', 'input:1')
+		const [, task] = h.tasks()
+		const wiped = deferred()
+		const release = h.stateDirectory.release.bind(h.stateDirectory)
+		vi.spyOn(h.stateDirectory, 'release').mockImplementation(async (owner, store, partition, options) => {
+			if (options?.wipe) await wiped.promise
+			return release(owner, store, partition, options)
+		})
+		const reviving = h.revive([task!], true)
+		await tick()
+		await endBeside(h)
+		let released = false
+		const allReleased = h.stateDirectory.released().then(() => (released = true))
+		await tick()
+		expect(released).toBe(false)
+		wiped.resolve()
+		await reviving
+		await allReleased
+		expect(h.tasks()).toEqual([])
+		expect(h.failures).toEqual([])
+	})
+
+	it('an assignment whose task initializes past the end closes that task again', async () => {
+		const h = new Harness()
+		const initialized = deferred()
+		const lease = h.stateDirectory.lease.bind(h.stateDirectory)
+		vi.spyOn(h.stateDirectory, 'lease').mockImplementation(async (...args) => {
+			await initialized.promise
+			return lease(...args)
+		})
+		const assigning = h.assign('input:0')
+		await tick()
+		await endBeside(h)
+		initialized.resolve()
+		await assigning
+		await h.stateDirectory.released()
+		expect(h.tasks()).toEqual([])
+		expect(h.restorer.restored).toEqual([])
+		expect(h.failures).toEqual([])
+	})
+
+	it('a revocation whose commit outlives the end suspends nothing, resets nothing and reports nothing', async () => {
+		const h = await running({ counts: { input: 2 } }, 'input:0', 'input:1')
+		const tasks = h.tasks()
+		h.enqueue('input:0', { key: 'k', value: 'v' })
+		await h.process(tasks[0]!)
+		h.consumer.steps.commit.always('hang')
+		const revoking = h.revoke('input:0', 'input:1')
+		await tick()
+		await endBeside(h)
+		h.consumer.steps.commit.answerAll(new Error('the group consumer stopped'))
+		await revoking
+		expect(tasks.map(task => task.state)).toEqual(['CLOSED', 'CLOSED'])
+		expect(h.events).not.toContain('resetOutput')
+		expect(h.failures).toEqual([])
 	})
 })
 

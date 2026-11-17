@@ -64,4 +64,20 @@ describe('bulk writes to a store', () => {
 		expect(stats.mostInFlight).toBe(500)
 		expect(await store.approximateNumEntries()).toBe(0)
 	})
+
+	it('stops a wipe between two rounds of removals once its signal aborts (a restore stopped meanwhile)', async () => {
+		const { store } = trackedStore()
+		const entries = Array.from({ length: 10_001 }, (_, i) => ({
+			key: Buffer.from(`k${i}`),
+			value: Buffer.from('v'),
+		}))
+		await writeChanges(store, str, str, entries)
+		const stopped = new AbortController()
+		const remove = store.delete.bind(store)
+		store.delete = key => (stopped.abort(), remove(key))
+
+		await expect(clearStore(store, stopped.signal)).rejects.toThrow(expect.objectContaining({ name: 'AbortError' }))
+
+		expect(await store.approximateNumEntries()).toBe(1)
+	})
 })

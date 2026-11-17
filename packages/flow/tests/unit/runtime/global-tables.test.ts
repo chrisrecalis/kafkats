@@ -467,4 +467,64 @@ describe('GlobalStateManager in the FlowRuntime: the re-bootstrap gate', () => {
 		await lifecycle.close(() => runtime.stop(io.clock.now() + 20_000))
 		expect(io.created.globalConsumers.every(c => c.calls.includes('stop'))).toBe(true)
 	})
+
+	it('two tables loaded again at once: processing waits for the last of them (F4)', async () => {
+		const io = new FakeIO({ groupId: APP })
+		const lifecycle = new AppLifecycle()
+		const logger = new RecordingLogger()
+		const checkpoints = new Checkpoints(undefined, () => {})
+		for (const topic of ['in', 'out', 'users', 'orgs']) io.cluster.createTopic(topic, 1)
+		io.cluster.append('users', 0, { key: 'k1', value: 'alice' })
+		io.cluster.append('orgs', 0, { key: 'k1', value: 'acme' })
+		const app = flow({ applicationId: APP, client, commitIntervalMs: 60_000 })
+		const users = app.globalTable('users', { ...strings, materialized: { storeName: 'users' } })
+		const orgs = app.globalTable('orgs', { ...strings, materialized: { storeName: 'orgs' } })
+		app.stream('in', strings)
+			.join(users, (value, user) => `${value}:${user}`)
+			.join(orgs, (value, org) => `${value}:${org}`)
+			.to('out', strings)
+		const runtime = new FlowRuntime({
+			topology: internals(app).build(),
+			config: { ...internals(app).settings, processId: 'p' },
+			io,
+			connection: { connect: async () => {}, disconnect: async () => {} },
+			lifecycle,
+			stateDirectory: new StateDirectory(APP, inMemory(), checkpoints, logger),
+			checkpoints,
+			topics: {},
+			logger,
+		})
+		const output = () =>
+			io.cluster
+				.log('out', 0)
+				.read(0n, 'read_committed')
+				.messages.map(m => m.value.toString())
+		const starting = lifecycle.start(() => runtime.start(runtime.shutdown.signal))
+		await vi.waitFor(() => expect(io.created.consumers).toHaveLength(1))
+		const consumer = io.created.consumers[0]!
+		await consumer.rebalance('in:0')
+		await starting
+		consumer.deliver('in:0', [{ key: 'k1', value: 'a' }])
+		await vi.waitFor(() => expect(output()).toEqual(['a:alice:acme']))
+
+		// Both followers fall behind their log start; the load of orgs hangs, the one of users completes.
+		io.admin.steps.listOffsets.always(() => (io.admin.calls.at(-1)!.includes('orgs:0') ? 'hang' : 'ok'))
+		io.cluster.append('orgs', 0, { key: 'k9', value: 'x' }, { key: 'k1', value: 'globex' })
+		io.cluster.log('orgs', 0).deleteBefore(2n)
+		await vi.waitFor(() => expect(io.admin.steps.listOffsets.hung.length).toBeGreaterThan(0))
+		io.cluster.append('users', 0, { key: 'k9', value: 'x' }, { key: 'k1', value: 'bob' })
+		io.cluster.log('users', 0).deleteBefore(2n)
+		// users is loaded again by a new consumer of its own (the third global consumer); orgs still waits.
+		await vi.waitFor(() => expect(io.created.globalConsumers).toHaveLength(3))
+		await new Promise(resolve => setTimeout(resolve, 20))
+		expect(runtime.processingPaused).toBe(true)
+		consumer.deliver('in:0', [{ key: 'k1', value: 'b' }])
+		await new Promise(resolve => setTimeout(resolve, 20))
+		expect(output()).toEqual(['a:alice:acme'])
+
+		io.admin.steps.listOffsets.always('ok').answerAll()
+		await vi.waitFor(() => expect(output()).toEqual(['a:alice:acme', 'b:bob:globex']))
+		expect(runtime.processingPaused).toBe(false)
+		await lifecycle.close(() => runtime.stop(io.clock.now() + 20_000))
+	})
 })

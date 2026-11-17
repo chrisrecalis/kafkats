@@ -75,7 +75,7 @@ export async function restoreChangelogs(
 	// Invalidated first: a rebuild cut short must never be taken for the state its old checkpoint described (CR3).
 	await Promise.all(rebuilt.map(({ target }) => checkpoints.invalidate(target.topic, target.partition)))
 	for (const store of new Set(rebuilt.map(({ target }) => target.store))) {
-		await clearStore(store)
+		await clearStore(store, signal)
 	}
 	if (signal.aborted) {
 		throw abortError(signal)

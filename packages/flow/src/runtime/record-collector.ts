@@ -67,8 +67,6 @@ export class RecordCollector {
 	private aborted = false
 	/** Last acked offset per changelog partition, per task, since the last take. */
 	private readonly changelogOffsets = new Map<StreamTask, Map<string, bigint>>()
-	/** Tasks whose sends failed with a retriable error under at-least-once since the last flush. */
-	private corrupted = new Set<StreamTask>()
 
 	constructor(
 		private readonly producer: ProducerPort,
@@ -104,18 +102,20 @@ export class RecordCollector {
 	}
 
 	/**
-	 * Awaits every send made so far, including those made while flushing. Throws the first run-wide failure; returns
-	 * the tasks whose sends failed with a task-scoped retriable error under at-least-once.
+	 * Awaits every send made so far, including those made while flushing. Throws the first run-wide failure, and
+	 * TaskMigratedError when the sends were given up meanwhile (an abort, a discard or a close): their outcome is
+	 * void, so nothing may be committed for them. A send that failed with a task-scoped retriable error under
+	 * at-least-once marked its task corrupted instead (StreamTask.corrupted).
 	 */
-	async flush(signal: AbortSignal): Promise<{ corrupted: ReadonlySet<StreamTask> }> {
+	async flush(signal: AbortSignal): Promise<void> {
 		const { generation } = this
 		await raceSignal(generation.settled(), signal)
+		if (generation !== this.generation) {
+			throw new TaskMigratedError('the sends were given up while they were flushed')
+		}
 		if (generation.failure) {
 			throw generation.failure.error
 		}
-		const { corrupted } = this
-		this.corrupted = new Set()
-		return { corrupted }
 	}
 
 	/** Last acked changelog offset per changelog partition written by `task` since the last take. */
@@ -125,19 +125,25 @@ export class RecordCollector {
 		return offsets
 	}
 
-	/** Exactly-once: sends the offsets in the transaction (opening one if none is) and commits it. */
+	/**
+	 * Exactly-once: sends the offsets in the transaction (opening one for offsets alone if none is) and commits it.
+	 * Throws TaskMigratedError when an abort or a close took the transaction meanwhile: its records are void, so are
+	 * the offsets of the records that sent them.
+	 */
 	async commitTransaction(
 		offsets: readonly OffsetAndMetadata[],
 		group: ConsumerGroupMetadata,
 		signal: AbortSignal
 	): Promise<void> {
-		if (this.transaction === undefined && offsets.length === 0) {
+		if (!this.aborted && this.transaction === undefined && offsets.length === 0) {
 			return
 		}
-		await this.ensureTransaction(signal)
+		if (!this.aborted) {
+			await this.ensureTransaction(signal)
+		}
 		const { transaction } = this
 		if (transaction === undefined) {
-			throw new IllegalStateError('the record collector is closed')
+			throw new TaskMigratedError('the transaction was aborted or closed while it was committed')
 		}
 		if (offsets.length > 0) {
 			await raceSignal(transaction.sendOffsets({ consumerGroupMetadata: group, offsets }), signal)
@@ -206,7 +212,6 @@ export class RecordCollector {
 		const ended = this.generation
 		this.generation = new Generation()
 		this.changelogOffsets.clear()
-		this.corrupted = new Set()
 		return ended.settled()
 	}
 
@@ -255,7 +260,8 @@ export class RecordCollector {
 		generation.sent()
 		sent.then(
 			result => {
-				if (kind === 'changelog' && generation === this.generation) {
+				// A corrupted task is never checkpointed again: its next incarnation restores from the last commit.
+				if (kind === 'changelog' && generation === this.generation && !task.corrupted) {
 					this.changelogAcked(task, result)
 				}
 				generation.answered()
@@ -318,7 +324,7 @@ export class RecordCollector {
 			if (eos) {
 				throw new TaskMigratedError(`sending to '${record.topic}' failed under exactly-once`, { cause: error })
 			}
-			this.corrupted.add(task)
+			task.markCorrupted()
 			return
 		}
 		if (eos) {

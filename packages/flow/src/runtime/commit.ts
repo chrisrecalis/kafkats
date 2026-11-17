@@ -66,7 +66,8 @@ export class CommitCoordinator {
 
 	/**
 	 * Commits every RUNNING task that is not lost. MUST run at a scheduler barrier or inside exclusive. Rethrows the
-	 * original error after the cleanup; throws TaskCorruptedError for tasks whose at-least-once sends failed.
+	 * original error after the cleanup; throws TaskCorruptedError for tasks whose at-least-once sends failed. Commits
+	 * nothing once the run failed, also when it fails while the sends are flushed (fail-stop, runtime§6.1).
 	 */
 	async commit(reason: CommitReason, signal: AbortSignal): Promise<CommitOutcome> {
 		if (this.deps.failed()) {
@@ -87,9 +88,8 @@ export class CommitCoordinator {
 	): Promise<CommitOutcome> {
 		const { consumer } = this.deps
 		const collector = this.deps.collector()
-		let flushed: { corrupted: ReadonlySet<StreamTask> }
 		try {
-			flushed = await collector.flush(signal)
+			await collector.flush(signal)
 		} catch (error) {
 			// Only the commit's own deadline passed: the sends stay pending, the next interval waits for them again.
 			if (isPeriodic(reason) && timedOut(signal)) {
@@ -97,14 +97,18 @@ export class CommitCoordinator {
 			}
 			throw error
 		}
-		// Their local state is revived from the last commit: no checkpoint. A task closed or lost since its send
-		// failed is not reported: its next incarnation or owner redoes its work anyway.
-		for (const task of flushed.corrupted) {
+		if (this.deps.failed()) {
+			return 'nothing'
+		}
+		// A corrupted task stays out of every commit until it is revived or closed, whichever commit finds it first
+		// (KS TaskCorruptedException): its offsets never pass the records whose sends failed. Its local state is
+		// revived from the last commit, so its changelog positions are never checkpointed either.
+		const corrupted = tasks.filter(task => task.corrupted)
+		for (const task of corrupted) {
 			collector.takeChangelogOffsets(task)
 		}
-		const corrupted = tasks.filter(task => flushed.corrupted.has(task))
 		const next = this.next
-		const committing = tasks.filter(task => !flushed.corrupted.has(task) && task.needsCommit(next))
+		const committing = tasks.filter(task => !task.corrupted && task.needsCommit(next))
 		const offsets = committing.flatMap(task => task.committableOffsets(next))
 		let acknowledged = offsets
 		if (offsets.length > 0) {
@@ -113,7 +117,7 @@ export class CommitCoordinator {
 			} catch (error) {
 				const outcome = this.offsetCommitFailed(reason, error, signal, committing)
 				if (outcome === 'deferred') {
-					// The flush reported the corruption once: it must not wait for the next interval.
+					// The corruption must not wait for the next interval.
 					throwIfCorrupted(corrupted)
 				}
 				if (outcome !== undefined) {
@@ -201,6 +205,10 @@ export class CommitCoordinator {
 		// A loss during the flush: nothing of this transaction may commit.
 		if ((await this.checkFencing()) === 'lost') {
 			return 'lost'
+		}
+		// The run failed during the flush: its end aborts the transaction.
+		if (this.deps.failed()) {
+			return 'nothing'
 		}
 		try {
 			await collector.commitTransaction(offsets, group, signal)

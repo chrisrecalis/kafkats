@@ -258,10 +258,14 @@ export class Run {
 	/**
 	 * Inside exclusive: abort (EOS) or discard (ALOS) the output, close every task dirty, then continue on a new
 	 * collector (EOS: on a new producer with the same transactional id, whose first transaction fences the old one;
-	 * the old producer closes in the background). After a loss or a failed revocation commit (4.3.1, 4.3.3).
+	 * the old producer closes in the background). After a loss or a failed revocation commit (4.3.1, 4.3.3). A run
+	 * that failed or closed meanwhile keeps its output: its end closes it.
 	 */
 	async resetOutput(): Promise<void> {
 		await this.closeDirty(this.hardStop.signal)
+		if (!this.acknowledges) {
+			return
+		}
 		this.current.close()
 		if (this.deps.config.eos) {
 			const replaced = this.producer
@@ -334,7 +338,15 @@ export class Run {
 		this.pruneTimer.disarm()
 	}
 
+	/**
+	 * A failed run reports nothing more: what fails in it later (an op that outlived its end, a commit the end voided)
+	 * follows from the first failure or from the end.
+	 */
 	private fail(error: unknown, site: FailureSite): void {
+		if (this.isFailed) {
+			this.deps.logger.debug('a later failure of a failed run is ignored', { site, ...errorFields(error) })
+			return
+		}
 		this.deps.onFailure(error, site)
 	}
 

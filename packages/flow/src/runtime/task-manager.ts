@@ -5,7 +5,9 @@
  *
  * `handleAssignment`, `handleRevocation`, `handleLost`, `revive` and `closeAll` run inside the scheduler's exclusive
  * section (the caller wraps them; `resetOutput` calls back into `closeAll`). A failed run acknowledges nothing more:
- * its hooks, revivals and restore completions do nothing (fail-stop, runtime§6.1).
+ * its hooks, revivals and restore completions do nothing (fail-stop, runtime§6.1). They also stop at the first await
+ * after which the run failed: the end of a run closes the tasks without waiting for an op that takes too long
+ * (Run.end), so an op that outlives it must not create, lease, resume or suspend anything.
  */
 import type { ConsumerGroupMetadata, Logger, Message, TopicPartition } from '@kafkats/client'
 import { TaskMigratedError } from '@/api/errors.js'
@@ -163,6 +165,7 @@ export class TaskManager {
 				const next = plan.get(task.id)
 				if (next === undefined || !samePartitions(task.inputPartitions, next.partitions)) {
 					await this.closeTask(task, task.state === 'SUSPENDED' ? 'clean' : 'dirty')
+					if (this.deps.failed()) return
 				}
 			}
 			// Before any fetch: the client holds new partitions until this hook returns (runtime§6.30).
@@ -172,6 +175,7 @@ export class TaskManager {
 			}
 			for (const [id, next] of plan) {
 				const task = this.byId.get(id) ?? (await this.create(id, next.subtopology, next.partitions))
+				if (task === undefined) return
 				if (task.state === 'SUSPENDED') {
 					task.resume()
 				}
@@ -193,6 +197,7 @@ export class TaskManager {
 	 * Revocation (4.3.1): commits every task (the coordinator answers 'nothing' when none needs it), then suspends the
 	 * tasks of the revoked partitions. A failed commit resets the output (every task closes dirty) and lets the
 	 * rebalance proceed: the next assignment re-creates the tasks from the last commit. Only a fatal one is reported.
+	 * A run that failed meanwhile is left to its end.
 	 */
 	async handleRevocation(revoked: readonly TopicPartition[]): Promise<void> {
 		if (this.deps.failed()) {
@@ -202,6 +207,7 @@ export class TaskManager {
 		try {
 			await this.deps.commit('revocation', cap(this.deps.hardStop, bound))
 		} catch (error) {
+			if (this.deps.failed()) return
 			await this.deps.resetOutput()
 			if (classify(error, 'commit') === 'fatal') {
 				this.fail(error, 'commit')
@@ -212,11 +218,15 @@ export class TaskManager {
 			}
 			return
 		}
+		if (this.deps.failed()) {
+			return
+		}
 		const keys = new Set(revoked.map(tpKey))
 		const failures: unknown[] = []
 		for (const task of this.tasks()) {
 			if (task.state !== 'SUSPENDED' && holds(task, keys)) {
 				await this.pipelines.stop(task)
+				if (this.deps.failed()) return
 				await task.suspend().catch((error: unknown) => failures.push(error))
 			}
 		}
@@ -247,14 +257,15 @@ export class TaskManager {
 	/**
 	 * Closes the tasks dirty and re-creates them in place without leaving the group (4.7.5, KS closeDirtyAndRevive):
 	 * from their last commit, partitions paused and rewound to it, through the restore pipeline. A task corrupted again
-	 * within 60 s escalates to a migration. Tasks replaced or suspended meanwhile are skipped.
+	 * within 60 s escalates to a migration. A task suspended meanwhile is only closed: its partitions were revoked, so
+	 * the next assignment re-creates it from its commit. Tasks replaced meanwhile are skipped.
 	 */
 	async revive(tasks: readonly StreamTask[], options: { wipe: boolean }): Promise<void> {
 		if (this.deps.failed()) {
 			return
 		}
 		const now = this.deps.clock.now()
-		const current = tasks.filter(task => this.byId.get(task.id) === task && task.state !== 'SUSPENDED')
+		const current = tasks.filter(task => this.byId.get(task.id) === task)
 		const again = current.find(task => now - (this.revivedAt.get(task.id) ?? -Infinity) < CORRUPTION_WINDOW_MS)
 		if (again !== undefined) {
 			const window = CORRUPTION_WINDOW_MS / 1000
@@ -266,6 +277,7 @@ export class TaskManager {
 		}
 		try {
 			for (const task of current) {
+				if (this.deps.failed()) return
 				this.revivedAt.set(task.id, now)
 				await this.reviveTask(task, options.wipe)
 			}
@@ -277,10 +289,14 @@ export class TaskManager {
 	/**
 	 * Closes every task: 'clean' suspends a task first (a lost one closes dirty); a task whose clean close fails closes
 	 * dirty, and the first such failure is thrown once all are closed. 'dirty' never throws. Waits for each close until
-	 * `signal` aborts; the rest then close in the background.
+	 * `signal` aborts; the rest then close in the background. Every task is forgotten first, so that an op running
+	 * beside it (Run.end) or a second closeAll finds none to close again.
 	 */
 	async closeAll(mode: 'clean' | 'dirty', signal: AbortSignal): Promise<void> {
 		const tasks = this.tasks()
+		for (const task of tasks) {
+			this.forget(task)
+		}
 		this.changeAllRunning(false)
 		const failures: unknown[] = []
 		for (const task of tasks) {
@@ -326,13 +342,19 @@ export class TaskManager {
 
 	// ---------------------------------------------------------------------------------------------------------
 
-	/** A new task, owned from now on, initialized (CREATED -> RESTORING: its stores are leased). */
+	/**
+	 * A new task, initialized (CREATED -> RESTORING: its stores are leased), then owned. Undefined once the run failed:
+	 * a task that initialized meanwhile is closed again, since the run's end closed the others without it.
+	 */
 	private async create(
 		id: TaskId,
 		subtopology: Subtopology,
 		inputPartitions: readonly TopicPartition[]
-	): Promise<StreamTask> {
+	): Promise<StreamTask | undefined> {
 		const { deps } = this
+		if (deps.failed()) {
+			return undefined
+		}
 		const task = new StreamTask(
 			{
 				subtopology,
@@ -348,12 +370,16 @@ export class TaskManager {
 			id,
 			inputPartitions
 		)
+		await task.initialize()
+		if (deps.failed()) {
+			await task.close('dirty')
+			return undefined
+		}
 		this.byId.set(id, task)
 		for (const tp of inputPartitions) {
 			this.byPartition.set(tpKey(tp), task)
 		}
 		this.ordered = undefined
-		await task.initialize()
 		return task
 	}
 
@@ -387,16 +413,28 @@ export class TaskManager {
 		await task.close('clean')
 	}
 
+	/** One task of revive(): a suspended one is only closed, its partitions are no longer this member's. */
 	private async reviveTask(task: StreamTask, wipe: boolean): Promise<void> {
 		const { consumer } = this.deps
+		if (task.state === 'SUSPENDED') {
+			this.forget(task)
+			await task.close('dirty', { wipe })
+			return
+		}
 		// First: nothing more of these partitions reaches either incarnation (C5).
 		consumer.pause(task.inputPartitions)
 		this.changeAllRunning(false)
 		await this.pipelines.stop(task)
+		if (this.deps.failed()) {
+			return
+		}
 		const starts = task.restartStarts()
 		this.forget(task)
 		await task.close('dirty', { wipe })
 		const revived = await this.create(task.id, task.subtopology, task.inputPartitions)
+		if (revived === undefined) {
+			return
+		}
 		revived.setStarts(starts)
 		for (const tp of revived.inputPartitions) {
 			const start = starts.get(tpKey(tp))
@@ -429,9 +467,18 @@ export class TaskManager {
 		this.maybeAllRunning()
 	}
 
-	/** Same incarnation in the expected state, pipeline not stopped, run neither failed nor stopping (runtime§6.30). */
+	/**
+	 * Same incarnation in the expected state and not lost, pipeline not stopped, run neither failed nor stopping: its
+	 * partitions resume only while it still holds them (runtime§6.30).
+	 */
 	private completes(task: StreamTask, signal: AbortSignal, state: TaskState): boolean {
-		return !signal.aborted && !this.deps.failed() && this.byId.get(task.id) === task && task.state === state
+		return (
+			!signal.aborted &&
+			!this.deps.failed() &&
+			!task.lost &&
+			this.byId.get(task.id) === task &&
+			task.state === state
+		)
 	}
 
 	private maybeAllRunning(): void {

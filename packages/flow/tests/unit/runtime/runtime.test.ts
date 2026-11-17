@@ -14,7 +14,7 @@ import { codec } from '@/codec.js'
 import { COUNT_CODEC } from '@/dsl/ops/aggregate.js'
 import { producerConfig, type KafkaIOOptions } from '@/runtime/kafka-io.js'
 import { valueAndTimestampCodec } from '@/state/timestamped.js'
-import type { FakeIO } from '../support/fake-io.js'
+import { deferred, type FakeIO } from '../support/fake-io.js'
 import { RuntimeHarness as Harness } from '../support/runtime-harness.js'
 
 /** flow() apps of the last describe block run on fake IO; the options their start passed are kept. */
@@ -153,6 +153,41 @@ describe('recovery (task migration, 4.10.2)', () => {
 		expect(h.committed()).toBeUndefined()
 	})
 
+	it('the next run waits for the stores a task of the failed run still releases; an op that outlived the run creates nothing (F3)', async () => {
+		const h = new Harness(counting, { commitIntervalMs: 1000 }, { partitions: { in: 2, out: 1 } })
+		await h.started('in:0', 'in:1')
+		const released = deferred()
+		const release = h.stateDirectory.release.bind(h.stateDirectory)
+		vi.spyOn(h.stateDirectory, 'release').mockImplementation(async (owner, store, partition, options) => {
+			if (partition === 1) await released.promise
+			return release(owner, store, partition, options)
+		})
+		h.producer.steps.send.next(new TimeoutError('produce', 30_000))
+		h.consumer.deliver('in:1', [{ key: 'k', value: 'a' }])
+		await vi.waitFor(() => expect(h.producer.sent).toHaveLength(2))
+		// The commit finds task 0_1 corrupted; its revival holds the scheduler while the old incarnation's store is
+		// released (a slow wipe, say). The run fails meanwhile: its end stops waiting for the revival after 5 s.
+		h.io.clock.advance(1000)
+		await vi.waitFor(() => expect(h.logger.warnings).toContain('tasks are revived from their last commit'))
+		h.consumer.fail(connectionReset())
+		await vi.waitFor(() => expect(h.producer.closed).toBe(true), { timeout: 8000 })
+		await settle()
+		h.io.clock.advance(60_000)
+		await settle()
+		expect(h.io.created.consumers).toHaveLength(1)
+
+		released.resolve()
+		await settle()
+		h.io.clock.advance(500)
+		await h.joined(2)
+		await h.consumer.rebalance('in:0', 'in:1')
+		await vi.waitFor(() => expect(h.lifecycle.state).toBe('RUNNING'))
+		h.consumer.deliver('in:1', [{ key: 'k', value: 'a' }])
+		await vi.waitFor(() => expect(h.output(COUNT_CODEC.decode)).toEqual([1]))
+		await h.stop()
+		expect(h.lifecycle.state).toBe('STOPPED')
+	}, 15_000)
+
 	it('a close during the backoff ends the recovery: no new run', async () => {
 		const h = new Harness(stateless)
 		await h.started()
@@ -238,6 +273,35 @@ describe('revive in place (4.7.5)', () => {
 		await h.stop()
 		expect(h.committed()).toBe(3n)
 		expect(h.io.created.consumers).toHaveLength(1)
+	})
+
+	it('at-least-once: a revocation queued before the revive commits nothing of the corrupted task (F1)', async () => {
+		const h = new Harness(stateless, { commitIntervalMs: 1000 })
+		await h.started()
+		h.consumer.deliver('in:0', [{ key: 'k', value: 'a' }])
+		await vi.waitFor(() => expect(h.output()).toEqual(['A']))
+		h.io.clock.advance(1000)
+		await vi.waitFor(() => expect(h.committed()).toBe(1n))
+
+		h.producer.steps.send.next('hang')
+		h.consumer.deliver('in:0', [{ key: 'k', value: 'b' }])
+		await vi.waitFor(() => expect(h.producer.steps.send.hung).toHaveLength(1))
+		// The interval commit waits for the send; meanwhile a rebalance queues the revocation op.
+		h.io.clock.advance(1000)
+		await settle()
+		const rebalance = h.consumer.rebalance('in:0')
+		await settle()
+		h.producer.steps.send.hung[0]!.answer(new TimeoutError('produce', 30_000))
+		await rebalance
+		expect(h.consumer.calls.filter(call => call.startsWith('commit'))).toEqual(['commit in:0@1'])
+		expect(h.committed()).toBe(1n)
+
+		// The next incarnation starts at the record whose output was lost.
+		await vi.waitFor(() => expect(h.lifecycle.state).toBe('RUNNING'))
+		h.consumer.deliver('in:0', [{ key: 'k', value: 'b' }])
+		await vi.waitFor(() => expect(h.output()).toEqual(['A', 'B']))
+		await h.stop()
+		expect(h.committed()).toBe(2n)
 	})
 
 	it('a second corruption of a task within 60 s migrates', async () => {
@@ -353,6 +417,27 @@ describe('close (4.11)', () => {
 		expect(h.output()).toEqual([])
 		expect(h.committed()).toBeUndefined()
 	})
+
+	it('exactly-once: a commit that outlives the 5 s wait of the close commits nothing beside its dirty close (F2)', async () => {
+		const h = new Harness(counting, { processingGuarantee: 'exactly_once' })
+		await h.started()
+		h.producer.steps.send.always('hang')
+		h.consumer.deliver('in:0', [{ key: 'k', value: 'a' }])
+		await vi.waitFor(() => expect(h.producer.steps.send.hung).toHaveLength(2))
+		// The revocation commit waits for the sends (a slow broker); the close waits 5 s for it, then aborts and
+		// closes the tasks dirty beside it. The sends are answered after that, which ends the commit's flush.
+		const rebalance = h.consumer.rebalance('in:0')
+		await settle()
+		const closing = h.stop()
+		await new Promise(resolve => setTimeout(resolve, 5500))
+		h.producer.steps.send.answerAll()
+		await closing
+		await rebalance
+		expect(h.producer.transactions.map(t => t.state)).toEqual(['aborted'])
+		expect(h.committed()).toBeUndefined()
+		expect(h.output(COUNT_CODEC.decode)).toEqual([])
+		expect(h.lifecycle.state).toBe('STOPPED')
+	}, 15_000)
 
 	it('during the start: commits the tasks that run and releases everything once (CR14)', async () => {
 		const h = new Harness(counting, {}, { partitions: { in: 2, out: 1 } })

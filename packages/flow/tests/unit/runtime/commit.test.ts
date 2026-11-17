@@ -169,11 +169,7 @@ describe('CommitCoordinator at-least-once (4.8.1)', () => {
 	it('tasks whose sends failed are left out and reported as corrupted after the others committed (KF5)', async () => {
 		const { h, tasks } = await setup({ tasks: 2 })
 		const [a, b] = tasks as [StreamTask, StreamTask]
-		const flush = h.collector.flush
-		h.collector.flush = async signal => {
-			await flush(signal)
-			return { corrupted: new Set([a]) }
-		}
+		a.markCorrupted()
 		const failure = await h.commit().catch((e: unknown) => e)
 		expect(failure).toBeInstanceOf(TaskCorruptedError)
 		expect((failure as TaskCorruptedError).tasks).toEqual([a.id])
@@ -182,14 +178,28 @@ describe('CommitCoordinator at-least-once (4.8.1)', () => {
 		expect(h.state(b).checkpoints).toHaveLength(1)
 	})
 
-	it('a deferred commit reports the corrupted tasks at once: the flush reported them only once', async () => {
+	it('a corrupted task stays out of every later commit until revived: an op queued before the revive commits none of its offsets (F1)', async () => {
+		const { h, tasks } = await setup({ tasks: 2 })
+		const [a, b] = tasks as [StreamTask, StreamTask]
+		a.markCorrupted()
+		await expect(h.commit()).rejects.toThrow(TaskCorruptedError)
+		for (const task of tasks) {
+			h.enqueue(task, 'input', [{ key: 'k', value: 'again', timestamp: 2 }])
+			await h.process(task)
+		}
+		for (const reason of ['revocation', 'user', 'close'] as const) {
+			const failure = await h.commit(reason).catch((e: unknown) => e)
+			expect((failure as TaskCorruptedError).tasks).toEqual([a.id])
+		}
+		expect(h.consumer.commits.flat().map(o => `${o.partition}@${o.offset}`)).toEqual(['1@1', '1@2'])
+		expect(h.state(a).checkpoints).toEqual([])
+		expect(b.needsCommit(tp => h.consumer.nextOffset(tp))).toBe(false)
+	})
+
+	it('a deferred commit reports the corrupted tasks at once', async () => {
 		const { h, tasks } = await setup({ tasks: 2 })
 		const [a] = tasks as [StreamTask, StreamTask]
-		const flush = h.collector.flush
-		h.collector.flush = async signal => {
-			await flush(signal)
-			return { corrupted: new Set([a]) }
-		}
+		a.markCorrupted()
 		h.consumer.steps.commit.always(new TimeoutError('commit', 10_000))
 		const start = h.commits.lastSuccessAt
 		h.clock.advance(10)
@@ -205,15 +215,25 @@ describe('CommitCoordinator at-least-once (4.8.1)', () => {
 	it('a task lost or suspended since its sends failed is not reported as corrupted', async () => {
 		const { h, tasks } = await setup({ tasks: 3 })
 		const [a, b, c] = tasks as [StreamTask, StreamTask, StreamTask]
-		const flush = h.collector.flush
-		h.collector.flush = async signal => {
-			await flush(signal)
-			return { corrupted: new Set([b, c]) }
-		}
+		b.markCorrupted()
+		c.markCorrupted()
 		b.markLost()
 		await c.suspend()
 		expect(await h.commit()).toBe('committed')
 		expect(h.consumer.commits).toEqual([[expect.objectContaining({ partition: a.partition })]])
+	})
+
+	it('a run that fails while the sends are flushed commits nothing (F2, runtime§6.1)', async () => {
+		const { h } = await setup()
+		const flush = h.collector.flush.bind(h.collector)
+		h.collector.flush = async signal => {
+			await flush(signal)
+			h.failed = true
+		}
+		h.events.length = 0
+		expect(await h.commit('revocation')).toBe('nothing')
+		expect(h.events).toEqual(['flush'])
+		expect(h.consumer.commits).toEqual([])
 	})
 
 	it('a revocation commits a task whose fetch position moved past its last commit (CR13, markers)', async () => {
@@ -278,6 +298,18 @@ describe('CommitCoordinator exactly-once (4.8.2)', () => {
 		expect(await h.commit('revocation')).toBe('nothing')
 		expect(h.events).toEqual([])
 		expect(transactionCalls(h)).toEqual([['send']])
+	})
+
+	it('a run that fails while the sends are flushed commits no transaction; its end aborts it (F2, runtime§6.1)', async () => {
+		const { h, tasks } = await setup({ eos: true })
+		const flush = h.collector.flush.bind(h.collector)
+		h.collector.flush = async signal => {
+			await flush(signal)
+			h.failed = true
+		}
+		expect(await h.commit('revocation')).toBe('nothing')
+		expect(transactionCalls(h)).toEqual([['send']])
+		expect(h.state(tasks[0]!).checkpoints).toEqual([])
 	})
 
 	it("a lost task: abort, every buffer dropped, 'lost'", async () => {

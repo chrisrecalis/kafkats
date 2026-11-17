@@ -62,6 +62,7 @@ export class StreamTask {
 	private taskState: TaskState = 'CREATED'
 	private closedAs: 'clean' | 'dirty' | undefined
 	private isLost = false
+	private isCorrupted = false
 	private isInitializing = false
 	private readonly config: TaskConfig
 	private readonly logger: Logger
@@ -121,6 +122,14 @@ export class StreamTask {
 
 	get lost(): boolean {
 		return this.isLost
+	}
+
+	/**
+	 * A send of this incarnation failed with a retriable error under at-least-once (KF5): its offsets are never
+	 * committed again, until a revive or a close replaces it (4.7.5).
+	 */
+	get corrupted(): boolean {
+		return this.isCorrupted
 	}
 
 	/** Its processors' init() is running and no close took the task meanwhile: the task's output accepts sends. */
@@ -286,6 +295,11 @@ export class StreamTask {
 	/** Synchronous, from the lost hook: no further record, punctuation or send of this task. */
 	markLost(): void {
 		this.isLost = true
+	}
+
+	/** From the collector: a send failed after the producer's retries (at-least-once). Sticky. */
+	markCorrupted(): void {
+		this.isCorrupted = true
 	}
 
 	// ---------------------------------------------------------------------------------------------------------

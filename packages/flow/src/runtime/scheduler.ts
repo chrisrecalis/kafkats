@@ -49,6 +49,10 @@ type Op = () => Promise<void>
 
 const byTaskId = (a: StreamTask, b: StreamTask): number => TaskIdRegistry.compare(a.id, b.id)
 
+/** When the task's next wall-clock punctuation or idle deadline is due (Infinity: none). */
+const dueAt = (task: StreamTask): number =>
+	Math.min(task.nextWallClockDue() ?? Infinity, task.nextIdleDeadline() ?? Infinity)
+
 export class Scheduler {
 	private state: 'created' | 'running' | 'stopped' = 'created'
 	/** Tasks that may have work: records, a due punctuation or idle deadline (enqueue, RUNNING, timers). */
@@ -158,6 +162,7 @@ export class Scheduler {
 					this.committing = undefined
 					continue
 				}
+				this.markDue(now)
 				const awaitingFetch = !this.deps.paused() && (await this.startSlices())
 				await this.idle(awaitingFetch)
 				await yieldIfDue()
@@ -368,7 +373,7 @@ export class Scheduler {
 			return
 		}
 		const now = this.deps.clock.now()
-		const at = Math.min(awaitingFetch ? now + FETCH_RECHECK_MS : Infinity, this.nextDue(now))
+		const at = Math.min(awaitingFetch ? now + FETCH_RECHECK_MS : Infinity, this.nextDue())
 		if (this.woken || at <= now) {
 			return
 		}
@@ -379,20 +384,24 @@ export class Scheduler {
 	}
 
 	/**
-	 * The earliest due time ahead: the next commit, and the wall-clock punctuations and idle deadlines of the tasks
-	 * outside the work set. Those already due are marked (the timer of 4.9 only marks tasks).
+	 * Every loop iteration, woken or not (KS punctuates and checks the readiness of every task in each `runOnce`): the
+	 * tasks outside the work set whose wall-clock punctuation or idle deadline is due join it (4.9: what the timer
+	 * marks). A busy loop never idles, so the timer alone would leave them waiting until the others ran out of work.
 	 */
-	private nextDue(now: number): number {
+	private markDue(now: number): void {
+		for (const task of this.deps.tasks.tasks()) {
+			if (!this.work.has(task) && dueAt(task) <= now) {
+				this.work.add(task)
+			}
+		}
+	}
+
+	/** The earliest due time: the next commit, and the wall-clock punctuations and idle deadlines outside the work set. */
+	private nextDue(): number {
 		let next = this.commitDueAt()
 		for (const task of this.deps.tasks.tasks()) {
-			if (this.work.has(task)) {
-				continue
-			}
-			const due = Math.min(task.nextWallClockDue() ?? Infinity, task.nextIdleDeadline() ?? Infinity)
-			if (due <= now) {
-				this.markWork(task)
-			} else if (due < next) {
-				next = due
+			if (!this.work.has(task)) {
+				next = Math.min(next, dueAt(task))
 			}
 		}
 		return next
