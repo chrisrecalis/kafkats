@@ -13,6 +13,7 @@ import { COUNT_CODEC } from '../../src/dsl/ops/aggregate.js'
 import {
 	collectUnhandledRejections,
 	createTopics,
+	fetchCommitted,
 	MultiTopicCollector,
 	newClient,
 	sleep,
@@ -51,17 +52,6 @@ async function until(label: string, cond: () => Promise<boolean>, timeoutMs = 30
 		if (Date.now() > deadline) throw new Error(`Timed out waiting for: ${label}`)
 		await sleep(100)
 	}
-}
-
-/** The group's committed offset of partition 0 of `topic`, -1 without one. */
-async function committed(groupId: string, topic: string): Promise<bigint> {
-	const coordinator = await client.cluster.getCoordinator('GROUP', groupId)
-	const response = await coordinator.offsetFetch({
-		groupId,
-		topics: [{ name: topic, partitions: [{ partitionIndex: 0 }] }],
-		requireStable: true,
-	})
-	return response.topics[0]!.partitions[0]!.committedOffset
 }
 
 describe('internal topics', () => {
@@ -107,7 +97,9 @@ describe('internal topics', () => {
 					return (await logStart(repartition)) > 0n
 				})
 				await output.waitForCount(out, () => true, sent, 15_000)
-				expect(await logStart(repartition)).toBeLessThanOrEqual(await committed(applicationId, repartition))
+				expect(await logStart(repartition)).toBeLessThanOrEqual(
+					(await fetchCommitted(client, applicationId, repartition)).offset
+				)
 			} finally {
 				await app.close()
 				await output.stop()
@@ -134,7 +126,7 @@ describe('internal topics', () => {
 			for (const word of WORDS) await producer.send(input, { key: Buffer.from(word), value: Buffer.from(word) })
 			await until(
 				'3 repartition records committed',
-				async () => (await committed(applicationId, repartition)) === 3n
+				async () => (await fetchCommitted(client, applicationId, repartition)).offset === 3n
 			)
 			await sleep(1500)
 			expect(await logStart(repartition)).toBe(0n)
