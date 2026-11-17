@@ -19,7 +19,10 @@ import { emitKey, observedKey } from '@/processor/metadata.js'
 import type { KeyValueStore, SessionStore, WindowedKey, WindowStore } from '@/state.js'
 import type { EmitFinalWindows } from '@/topology/nodes.js'
 
-/** The key time of a store entry: its window end. */
+/**
+ * The key time of a store entry: its window end, for every kind of window. A restore reports the max key time it
+ * applied to a store with this (4.7.2), which seeds the store's clock.
+ */
 export const keyTime = (key: WindowedKey<unknown>): number => key.windowEnd
 
 /**
