@@ -77,17 +77,21 @@ export function buildTopology(app: FlowApp): void {
 				clicks: 0,
 				pages: [],
 			}),
-			(key, event, session) => ({
-				userId: key,
-				sessionStart: session.sessionStart || event.timestamp,
-				sessionEnd: event.timestamp,
-				pageViews: session.pageViews + (event.type === 'page_view' ? 1 : 0),
-				clicks: session.clicks + (event.type === 'click' ? 1 : 0),
-				pages:
-					event.type === 'page_view' && !session.pages.includes(event.page)
-						? [...session.pages, event.page]
-						: session.pages,
-			}),
+			// A record with a null value reaches the aggregator too: it changes nothing here
+			(key, event, session) =>
+				event === null
+					? session
+					: {
+							userId: key,
+							sessionStart: session.sessionStart || event.timestamp,
+							sessionEnd: event.timestamp,
+							pageViews: session.pageViews + (event.type === 'page_view' ? 1 : 0),
+							clicks: session.clicks + (event.type === 'click' ? 1 : 0),
+							pages:
+								event.type === 'page_view' && !session.pages.includes(event.page)
+									? [...session.pages, event.page]
+									: session.pages,
+						},
 			// Two sessions bridged by a new event become one
 			(key, a, b) => ({
 				userId: key,
