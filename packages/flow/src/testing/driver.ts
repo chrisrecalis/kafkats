@@ -8,6 +8,7 @@ import type { FlowApp, FlowConfig } from '@/api/app.js'
 import type { KStream } from '@/api/kstream.js'
 import type { GlobalKTable, KTable } from '@/api/ktable.js'
 import type { Consumed, Materialized } from '@/api/options.js'
+import type { StoreDefinition } from '@/api/stores.js'
 import { flow } from '@/app/flow.js'
 import { internals } from '@/app/internal.js'
 import type { Codec } from '@/codec.js'
@@ -86,7 +87,11 @@ export interface TestContextApi {
 	): Promise<DecodedRecord<K, V>[]>
 	/** Moves the mock wall clock: wall-clock punctuations run, then whatever became processable. */
 	advanceWallClockTime(ms: number): Promise<void>
-	/** A state store of the task of `partition` (default 0), or a global store. */
+	/**
+	 * A state store of the task of `partition` (default 0), or a global store. A store definition (`Stores`) gives it
+	 * its type.
+	 */
+	getStateStore<S extends StateStore>(store: StoreDefinition<S>, partition?: number): S
 	getStateStore<S extends StateStore>(name: string, partition?: number): S
 	readonly producer: MockProducer
 	readonly consumer: MockConsumer
@@ -266,7 +271,10 @@ class TestContextImpl implements TestContextApi {
 
 	advanceWallClockTime = (ms: number): Promise<void> => this.loop.advanceWallClockTime(ms)
 
-	getStateStore = <S extends StateStore>(name: string, partition?: number): S => this.loop.store<S>(name, partition)
+	getStateStore: TestContextApi['getStateStore'] = <S extends StateStore>(
+		store: string | StoreDefinition<S>,
+		partition?: number
+	): S => this.loop.store<S>(typeof store === 'string' ? store : store.name, partition)
 
 	clear = (): void => {
 		this.producer.clear()

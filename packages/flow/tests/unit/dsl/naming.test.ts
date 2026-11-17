@@ -236,8 +236,9 @@ describe('explicit names (6.22)', () => {
 		const topology = topologyOf(driver)
 		const nodes = nodeNames(topology)
 
-		// table() and globalTable(): the source, then the table's processor.
-		expect(nodes).toEqual(expect.arrayContaining(['users-table-source', 'regions-table-source']))
+		// table() and globalTable(): the source `<name>-source`, then the table's processor `<name>` (KS).
+		expect(nodes).toEqual(expect.arrayContaining(['users-source', 'users', 'regions-source', 'regions']))
+		expect(nodes).not.toContain('users-table-source')
 		// Repartitions: the topic and its sink and source (KS createRepartitionedSource).
 		for (const name of ['repartition', 'to-table', 'group-by', 'grouped', 'enrich', 'enrich-left', 'regrouped']) {
 			expect(nodes).toEqual(expect.arrayContaining([`${name}-repartition-sink`, `${name}-repartition-source`]))
@@ -401,6 +402,24 @@ describe('name conflicts are TopologyErrors at the DSL call', () => {
 		// suppress() keeps its buffer in `<name>-store`.
 		driver.table('u', S).suppress({ until: 'time-limit', timeLimit: 10, name: 'held' })
 		expect(() => grouped.count({ storeName: 'held-store' })).toThrow("State store 'held-store' already exists")
+	})
+
+	it('B5 before B4: a store name reused by an unnamed grouping that repartitions (its topic is named after it)', () => {
+		const driver = new TestDriver()
+		const exists = "State store 'totals' already exists; every store needs its own name"
+		rekeyed(driver).groupByKey({ key: str }).count({ storeName: 'totals' })
+		expect(() => rekeyed(driver, 'b').groupByKey({ key: str }).count({ storeName: 'totals' })).toThrow(exists)
+		const windowed = rekeyed(driver, 'c').groupByKey({ key: str }).windowedBy(TimeWindows.ofSizeWithNoGrace(10))
+		expect(() => windowed.count({ storeName: 'totals' })).toThrow(
+			"State store 'totals' already exists as a key-value store and cannot be used as a window store"
+		)
+		const grouped = rekeyed(driver, 'd').groupByKey({ key: str })
+		grouped.count({ storeName: 'own' })
+		expect(() => grouped.reduce((a, b) => a + b, { storeName: 'own' })).toThrow(
+			"State store 'own' already exists; every store needs its own name"
+		)
+		const regrouped = driver.table('t', S).groupBy((k, v) => [v, k] as const, S)
+		expect(() => regrouped.count({ storeName: 'totals' })).toThrow(exists)
 	})
 })
 

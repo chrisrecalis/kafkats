@@ -166,7 +166,7 @@ describe('Stores: the store definitions of the Processor API (6.21)', () => {
 		})
 	})
 
-	it('timestamped, window and session stores, with durations in ms or with a unit', () => {
+	it('timestamped, window and session stores, with durations in ms or with a unit; windows and sessions have a clock', () => {
 		const timestamped = definedStoreBuilder(
 			Stores.timestampedKeyValueStore({ name: 'ts', key: str, value: str }),
 			DEFAULTS
@@ -181,18 +181,19 @@ describe('Stores: the store definitions of the Processor API (6.21)', () => {
 			timestamped: false,
 			retentionMs: 60_000,
 			windowSizeMs: 10_000,
-			clock: undefined,
+			clock: {},
 		})
 		expect(definedStoreBuilder(Stores.timestampedWindowStore({ name: 'tw', ...windows }), DEFAULTS)).toMatchObject({
 			kind: 'window',
 			timestamped: true,
 			retentionMs: 60_000,
+			clock: {},
 		})
 		const session = definedStoreBuilder(
 			Stores.sessionStore({ name: 's', key: str, value: str, retention: '1h' }),
 			DEFAULTS
 		)
-		expect(session).toMatchObject({ kind: 'session', timestamped: false, retentionMs: 3_600_000, clock: undefined })
+		expect(session).toMatchObject({ kind: 'session', timestamped: false, retentionMs: 3_600_000, clock: {} })
 		expect(session.logging.enabled && session.logging.configs['cleanup.policy']).toBe('delete,compact')
 	})
 

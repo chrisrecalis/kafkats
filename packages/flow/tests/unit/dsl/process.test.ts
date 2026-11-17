@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { TopologyError } from '@/api/errors.js'
+import { internals } from '@/app/internal.js'
 import { codec } from '@/codec.js'
 import type {
 	FixedKeyProcessorContext,
@@ -9,7 +10,6 @@ import type {
 	RecordMetadata,
 } from '@/processor/api.js'
 import { StreamRecord } from '@/processor/record.js'
-import type { KeyValueStore, SessionStore, TimestampedKeyValueStore, WindowStore } from '@/state.js'
 import { Stores } from '@/state/store-builders.js'
 import { TestDriver, type TestContextApi } from '@/testing/driver.js'
 import { GUARANTEES } from '../support/guarantees.js'
@@ -42,6 +42,14 @@ function send(ctx: TestContextApi, topic: string, k: string, value: string, time
 
 const records = (ctx: TestContextApi, topic = 'out') => ctx.output(topic, S).map(r => [r.key, r.value])
 const topics = (ctx: TestContextApi) => [...new Set(ctx.producer.messages.map(m => m.topic))]
+/** The repartition topics of the topology built so far. */
+const repartitionTopics = (driver: TestDriver) =>
+	[...internals(driver.flow).build().internalTopics.values()].filter(spec => spec.kind === 'repartition')
+const all = async <T>(entries: AsyncIterable<T>) => {
+	const found: T[] = []
+	for await (const entry of entries) found.push(entry)
+	return found
+}
 
 describe('KStream.process (6.21, KS KStreamImpl.process)', () => {
 	it('forwards any number of records per input, with new keys: a key-based operation downstream repartitions', async () => {
@@ -135,6 +143,31 @@ describe('KStream.process (6.21, KS KStreamImpl.process)', () => {
 		])
 	})
 
+	it('a processor whose init() did not run or threw is never closed (KS)', async () => {
+		const driver = new TestDriver()
+		const events: string[] = []
+		const node = (name: string, init: () => void) => () => ({
+			init: () => {
+				events.push(`${name}.init`)
+				init()
+			},
+			process() {},
+			close: () => void events.push(`${name}.close`),
+		})
+		driver
+			.input('in', S)
+			.process(node('a', () => {}))
+			.process(
+				node('b', () => {
+					throw new Error('boom')
+				})
+			)
+			.process(node('c', () => {}))
+		await expect(driver.start()).rejects.toThrow("failed to initialize processor 'KSTREAM-PROCESSOR-0000000002'")
+		await driver.stop()
+		expect(events).toEqual(['a.init', 'b.init', 'a.close'])
+	})
+
 	it('SI9: a supplier returning the same processor twice is a TopologyError', () => {
 		const driver = new TestDriver()
 		const shared = { process: () => {} }
@@ -189,6 +222,42 @@ describe('KStream.processValues (6.21, KS KStreamImpl.processValues)', () => {
 	})
 })
 
+describe('the stream format and repartition flag after process() and processValues() (6.0, KS KStreamImpl)', () => {
+	const pass = <V>() =>
+		processor<string | null, V | null, string, V>((context, record) =>
+			context.forward(record.withKey(record.key!).withValue(record.value!))
+		)
+	const passValues = () => ({ process() {} })
+
+	it('process(): both codecs are dropped and a key-based operation downstream repartitions', () => {
+		const driver = new TestDriver()
+		const processed = driver.input('in', S).process(pass<string>())
+		expect(() => processed.groupByKey().count()).toThrow(
+			new TopologyError('count() needs a key codec: the keys were changed upstream, so pass one in its options')
+		)
+		expect(() => processed.groupByKey({ key: str }).reduce((a, b) => a + b)).toThrow('reduce() needs a value codec')
+		processed.groupByKey({ key: str, value: str }).count()
+		expect(repartitionTopics(driver)).toHaveLength(1)
+	})
+
+	it('processValues(): the key codec is kept, the value codec dropped; the repartition flag is kept', () => {
+		const driver = new TestDriver()
+		const processed = driver.input('in', S).processValues<string>(passValues)
+		expect(() => processed.groupByKey().reduce((a, b) => a + b)).toThrow('reduce() needs a value codec')
+		processed.groupByKey().count()
+		expect(repartitionTopics(driver)).toEqual([])
+
+		const rekeyed = new TestDriver()
+		rekeyed
+			.input('in', S)
+			.selectKey(value => value)
+			.processValues<string>(passValues)
+			.groupByKey({ key: str, value: str })
+			.count()
+		expect(repartitionTopics(rekeyed)).toHaveLength(1)
+	})
+})
+
 describe('Stores and connected stores (6.21)', () => {
 	it('a processor reads and writes its typed store, logged to its changelog with the store codecs', async () => {
 		const driver = new TestDriver()
@@ -218,7 +287,7 @@ describe('Stores and connected stores (6.21)', () => {
 				{ key: 'a', value: 2 },
 				{ key: 'b', value: 1 },
 			])
-			expect(await ctx.getStateStore<KeyValueStore<string, number>>('seen').get('a')).toBe(2)
+			expect(await ctx.getStateStore(seen).get('a')).toBe(2)
 		})
 	})
 
@@ -245,12 +314,38 @@ describe('Stores and connected stores (6.21)', () => {
 			const [logged] = ctx.producer.messagesFor('latest-log')
 			expect(logged?.value).toEqual(Buffer.from([0, 0, 0, 0, 0, 0, 1, 2, 0x76]))
 			expect(topics(ctx)).toEqual(['latest-log'])
-			const store = ctx.getStateStore<TimestampedKeyValueStore<string, string>>('latest')
-			expect(await store.get('k')).toEqual({ value: 'v', timestamp: 258 })
+			expect(await ctx.getStateStore(latest).get('k')).toEqual({ value: 'v', timestamp: 258 })
 		})
 	})
 
-	it('window and session stores: the processor writes, reads and expires them (here from a punctuator)', async () => {
+	it('window and session stores: reads keep to the retention without any expiry, as in Kafka Streams', async () => {
+		const driver = new TestDriver()
+		const windows = Stores.windowStore({ name: 'w', key: str, value: str, retention: 20, windowSize: 10 })
+		const sessions = Stores.sessionStore({ name: 's', key: str, value: str, retention: 20 })
+		driver.input('in', S).process(
+			processor<string | null, string | null>(async (context, record) => {
+				const window = { key: record.key!, windowStart: record.timestamp, windowEnd: record.timestamp + 10 }
+				await context.getStateStore(windows).put(window, record.value!)
+				const session = { key: record.key!, windowStart: record.timestamp, windowEnd: record.timestamp }
+				await context.getStateStore(sessions).put(session, record.value!)
+			}),
+			{ stores: [windows, sessions] }
+		)
+		await driver.run(async ctx => {
+			await send(ctx, 'in', 'k', 'old', 0)
+			await send(ctx, 'in', 'k', 'new', 100_000)
+			expect(await all(ctx.getStateStore(windows).fetch('k', 0, 200_000))).toEqual([
+				[{ key: 'k', windowStart: 100_000, windowEnd: 100_010 }, 'new'],
+			])
+			expect(await all(ctx.getStateStore(sessions).findSessions('k', 0, 200_000))).toEqual([
+				[{ key: 'k', windowStart: 100_000, windowEnd: 100_000 }, 'new'],
+			])
+			// Not deleted: no processor expired them.
+			expect(await ctx.getStateStore(windows).approximateNumEntries()).toBe(2)
+		})
+	})
+
+	it('window and session stores: expireOldWindows / expireOldSessions reclaim space (here from a punctuator)', async () => {
 		const driver = new TestDriver()
 		const windows = Stores.windowStore({
 			name: 'windows',
@@ -260,6 +355,7 @@ describe('Stores and connected stores (6.21)', () => {
 			windowSize: 10,
 		})
 		const sessions = Stores.sessionStore({ name: 'sessions', key: str, value: str, retention: '20ms' })
+		const expired: [number, number][] = []
 		driver.input('in', S).process(
 			processor<string | null, string | null>(
 				async (context, record) => {
@@ -273,27 +369,24 @@ describe('Stores and connected stores (6.21)', () => {
 				},
 				context =>
 					void context.schedule(10, 'stream-time', async streamTime => {
-						await context.getStateStore(windows).expireOldWindows(streamTime)
-						await context.getStateStore(sessions).expireOldSessions(streamTime)
+						const windowCount = await context.getStateStore(windows).expireOldWindows(streamTime)
+						const sessionKeys = await context.getStateStore(sessions).expireOldSessions(streamTime)
+						expired.push([windowCount, sessionKeys.length])
 					})
 			),
 			{ stores: [windows, sessions] }
 		)
 		await driver.run(async ctx => {
 			for (const timestamp of [0, 5, 15]) await send(ctx, 'in', 'k', `v${timestamp}`, timestamp)
-			const windowStore = ctx.getStateStore<WindowStore<string, number>>('windows')
-			const sessionStore = ctx.getStateStore<SessionStore<string, string>>('sessions')
-			const all = async <T>(entries: AsyncIterable<T>) => {
-				const found: T[] = []
-				for await (const entry of entries) found.push(entry)
-				return found
-			}
+			const windowStore = ctx.getStateStore(windows)
+			const sessionStore = ctx.getStateStore(sessions)
 			expect(await all(windowStore.fetch('k', 0, 100))).toEqual([
 				[{ key: 'k', windowStart: 0, windowEnd: 10 }, 2],
 				[{ key: 'k', windowStart: 10, windowEnd: 20 }, 1],
 			])
 			expect(await all(sessionStore.findSessions('k', 0, 100))).toHaveLength(3)
 
+			// Window end 50, session end 45: the older ones are past the retention, though not deleted yet.
 			await send(ctx, 'in', 'k', 'v45', 45)
 			expect(await all(windowStore.fetch('k', 0, 100))).toEqual([
 				[{ key: 'k', windowStart: 40, windowEnd: 50 }, 1],
@@ -301,6 +394,17 @@ describe('Stores and connected stores (6.21)', () => {
 			expect(await all(sessionStore.findSessions('k', 0, 100))).toEqual([
 				[{ key: 'k', windowStart: 45, windowEnd: 45 }, 'v45'],
 			])
+			expect(await windowStore.approximateNumEntries()).toBe(3)
+
+			// Expiry deletes what the reads stopped returning as of the last commit.
+			await send(ctx, 'in', 'k', 'v55', 55)
+			expect(expired).toEqual([
+				[0, 0],
+				[0, 0],
+				[0, 0],
+				[2, 3],
+			])
+			expect(await windowStore.approximateNumEntries()).toBe(2)
 			// The changelog keys are windowed: [key][start int64BE][end int64BE].
 			const [first] = ctx.producer.messagesFor('test-app-windows-changelog')
 			expect(first?.key).toEqual(
@@ -340,6 +444,33 @@ describe('Stores and connected stores (6.21)', () => {
 				['u1', '?:login'],
 				['u1', 'ann:logout'],
 			])
+		})
+	})
+
+	it('a store shared on both sides of a repartition: one subtopology writes and reads the topic, sized by its input', async () => {
+		const driver = new TestDriver({ partitions: { in: 2 } })
+		const seen = Stores.keyValueStore({ name: 'seen', key: str, value: str })
+		const swap = processor<string | null, string | null, string, string>(async (context, record) => {
+			await context.getStateStore(seen).put(record.key!, record.value!)
+			await context.forward(record.withKey(record.value!).withValue(record.key!))
+		})
+		driver
+			.input('in', S)
+			.process(swap, { stores: [seen] })
+			.repartition(S)
+			.process(swap, { stores: [seen] })
+			.to('out', S)
+		const [subtopology, ...others] = driver.flow.describe().subtopologies
+		expect(others).toEqual([])
+		expect(subtopology!.nodes.filter(node => node.stores.includes('seen'))).toHaveLength(2)
+		await driver.run(async ctx => {
+			await send(ctx, 'in', 'k', 'v')
+			await send(ctx, 'in', 'j', 'w', 1)
+			expect(records(ctx)).toEqual([
+				['k', 'v'],
+				['j', 'w'],
+			])
+			expect(topics(ctx).filter(topic => topic.endsWith('-repartition'))).toHaveLength(1)
 		})
 	})
 
@@ -443,7 +574,7 @@ describe.each(GUARANTEES)('punctuation and commits (4.9; %s)', (_guarantee, conf
 				BigInt(START + 350),
 				BigInt(START + 400),
 			])
-			expect(await ctx.getStateStore<KeyValueStore<string, number>>('ticks').get('ticks')).toBe(3)
+			expect(await ctx.getStateStore(seen).get('ticks')).toBe(3)
 		})
 	})
 

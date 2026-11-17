@@ -262,29 +262,37 @@ describe('StreamTask lifecycle (4.4)', () => {
 		expect(releases).toBe(2)
 	})
 
-	it('a failing init() closes the new processors and leaves the task RESTORING', async () => {
-		let closes = 0
+	it('a failing init() closes only the processors initialized before it and leaves the task RESTORING (KS)', async () => {
+		const events: string[] = []
+		const node =
+			(name: string, init = () => {}): ProcessorSupplier<unknown, unknown, unknown, unknown> =>
+			() => ({
+				init: () => {
+					events.push(`${name}.init`)
+					init()
+				},
+				process() {},
+				close: () => void events.push(`${name}.close`),
+			})
+		const failing = () => {
+			throw new Error('init failed')
+		}
 		const h = new TaskHarness({
-			build: b =>
-				pipe(b, {
-					processor: () => ({
-						init() {
-							throw new Error('init failed')
-						},
-						process() {},
-						close() {
-							closes++
-						},
-					}),
-				}),
+			build: b => {
+				b.addSource({ name: 'source', topics: ['input'], internal: false })
+				b.addProcessor({ name: 'a', parents: ['source'], stores: [], supplier: node('a') })
+				b.addProcessor({ name: 'b', parents: ['a'], stores: [], supplier: node('b', failing) })
+				b.addProcessor({ name: 'c', parents: ['b'], stores: [], supplier: node('c') })
+			},
 		})
 		const task = h.task()
 		await task.initialize()
 		await expect(task.completeRestoration(new Map())).rejects.toThrow('failed to initialize processor')
 		expect(task.state).toBe('RESTORING')
 		expect(task.initializing).toBe(false)
-		expect(closes).toBe(1)
+		expect(events).toEqual(['a.init', 'b.init', 'a.close'])
 		expect(await task.close('dirty')).toBe('dirty')
+		expect(events).toHaveLength(3)
 	})
 })
 
@@ -411,7 +419,7 @@ describe('incarnation boundary (CR9)', () => {
 		expect(await punctuated.task.close('clean')).toBe('clean')
 	})
 
-	it('processors whose init() outlived a close that did not wait for it are closed; their failure counts for nothing', async () => {
+	it('processors whose init() outlived a close that did not wait for it are closed once initialized; their failure counts for nothing', async () => {
 		const start = async (init: (store: KeyValueStore<string, string>) => Promise<void>) => {
 			let release!: () => void
 			let closes = 0
@@ -444,15 +452,16 @@ describe('incarnation boundary (CR9)', () => {
 			await completing
 			expect(task.state).toBe('CLOSED')
 			expect(task.hasWork(h.clock.now(), h.consumer.lag)).toBe(false)
-			expect(closes).toBe(1)
-			return h
+			return { h, closes }
 		}
-		// A store write the close forbade: no failure.
+		// A store write the close forbade: no failure, and no close() of the processor whose init() failed.
 		const failed = await start(store => store.put('k', 'v'))
-		expect(failed.logger.warnings).toContain('ignoring a failure of processors closed meanwhile')
+		expect(failed.h.logger.warnings).toContain('ignoring a failure of processors closed meanwhile')
+		expect(failed.closes).toBe(0)
 		// An init() that succeeds after the close: the task stays CLOSED, without processors.
 		const succeeded = await start(async () => {})
-		expect(succeeded.logger.warnings).toEqual([])
+		expect(succeeded.h.logger.warnings).toEqual([])
+		expect(succeeded.closes).toBe(1)
 	})
 
 	it('records delivered to a suspended task are dropped', async () => {

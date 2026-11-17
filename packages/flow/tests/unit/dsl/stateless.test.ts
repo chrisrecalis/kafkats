@@ -5,10 +5,11 @@ import type { KStream } from '@/api/kstream.js'
 import type { KStreamImpl } from '@/dsl/kstream.js'
 import type { KTableImpl } from '@/dsl/ktable.js'
 import type { Change } from '@/operators/change.js'
-import type { InternalProcessorContext, ProcessorContext } from '@/processor/api.js'
-import type { StreamRecord } from '@/processor/record.js'
+import type { FixedKeyProcessorContext, InternalProcessorContext, ProcessorContext } from '@/processor/api.js'
+import type { FixedKeyRecord, StreamRecord } from '@/processor/record.js'
 import type { KeyValueStore, ValueAndTimestamp } from '@/state.js'
 import { TestDriver } from '@/testing/driver.js'
+import type { TopicNameExtractorContext } from '@/topology/nodes.js'
 
 const str = codec.string()
 const key = (k: string) => ({ key: Buffer.from(k) })
@@ -266,9 +267,9 @@ describe('stateless operators', () => {
 		})
 	})
 
-	it('a topic name extractor gets the metadata of the input record; a result that is no topic name fails the record', async () => {
+	it('a topic name extractor gets the origin of the input record; a result that is no topic name fails the record', async () => {
 		const driver = new TestDriver()
-		const contexts: unknown[] = []
+		const contexts: TopicNameExtractorContext[] = []
 		driver.input('in', { key: str, value: str }).to(
 			(_k, v, context) => {
 				contexts.push(context)
@@ -277,7 +278,7 @@ describe('stateless operators', () => {
 			{ key: str, value: str }
 		)
 		await driver.run(async ({ send, output }) => {
-			await send('in', 'a', { ...key('k'), codec: str, partition: 1 })
+			await send('in', 'a', { ...key('k'), codec: str, partition: 1, timestamp: 5 })
 			expect(output('out-a', { key: str, value: str }).map(r => [r.key, r.value])).toEqual([['k', 'a']])
 			const failure = send('in', 'none', { codec: str })
 			await expect(failure).rejects.toThrow(FailedProcessingError)
@@ -287,8 +288,47 @@ describe('stateless operators', () => {
 			)
 		})
 		expect(contexts).toMatchObject([
-			{ topic: 'in', partition: 1, offset: 0n },
+			{ topic: 'in', partition: 1, offset: 0n, timestamp: 5 },
 			{ topic: 'in', partition: 0, offset: 0n },
+		])
+		expect(Object.keys(contexts[0]!).sort()).toEqual(['headers', 'offset', 'partition', 'timestamp', 'topic'])
+	})
+
+	it("a topic name extractor gets the timestamp and headers of the record it routes, as Kafka Streams' RecordContext", async () => {
+		const driver = new TestDriver({ initialWallClockTimeMs: 1_000 })
+		const contexts: TopicNameExtractorContext[] = []
+		let tick!: FixedKeyRecord<string | null, string | null>
+		driver
+			.input('in', { key: str, value: str })
+			.processValues<string | null>(() => {
+				let context!: FixedKeyProcessorContext<string | null, string | null>
+				return {
+					init: c => {
+						context = c
+						context.schedule(100, 'wall-clock', now => context.forward(tick.withTimestamp(now)))
+					},
+					process: record => {
+						tick = record
+						return context.forward(record.withHeaders({ tenant: Buffer.from('beta') }).withTimestamp(99))
+					},
+				}
+			})
+			.to(
+				(_k, _v, context) => {
+					contexts.push(context)
+					return `orders-${context.headers.tenant ?? 'none'}`
+				},
+				{ key: str, value: str }
+			)
+		await driver.run(async ({ send, output, advanceWallClockTime }) => {
+			await send('in', 'a', { ...key('k'), codec: str, timestamp: 5, headers: { tenant: Buffer.from('acme') } })
+			await advanceWallClockTime(100)
+			expect(output('orders-beta')).toHaveLength(1)
+			expect(output('orders-acme')).toHaveLength(1)
+		})
+		expect(contexts).toEqual([
+			{ topic: 'in', partition: 0, offset: 0n, timestamp: 99, headers: { tenant: Buffer.from('beta') } },
+			{ topic: null, partition: -1, offset: -1n, timestamp: 1_100, headers: { tenant: Buffer.from('acme') } },
 		])
 	})
 })

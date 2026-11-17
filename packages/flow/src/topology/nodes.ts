@@ -1,5 +1,6 @@
 import type { Codec } from '@/codec.js'
-import type { ProcessorSupplier, RecordMetadata } from '@/processor/api.js'
+import type { ProcessorSupplier } from '@/processor/api.js'
+import type { RecordHeaders } from '@/processor/record.js'
 import type { TimestampExtractor } from '@/processor/timestamps.js'
 import type { StateStore, StateStoreProvider } from '@/state.js'
 
@@ -33,10 +34,20 @@ export interface ProcessorDef {
 /** Picks the partition of a record; undefined: the producer's default partitioning of the encoded key. */
 export type StreamPartitioner<K, V> = (topic: string, key: K, value: V, partitionCount: number) => number | undefined
 /**
- * Picks the topic of a record (Kafka Streams' TopicNameExtractor). `context`: the metadata of the input record being
- * processed, null in punctuators.
+ * What a TopicNameExtractor knows of the record it routes (Kafka Streams' RecordContext): where the task's input record
+ * comes from (`topic` null, `partition` -1 and `offset` -1n in punctuators), and the timestamp and headers of the record
+ * at the sink.
  */
-export type TopicNameExtractor<K, V> = (key: K, value: V, context: RecordMetadata | null) => string
+export interface TopicNameExtractorContext {
+	readonly topic: string | null
+	readonly partition: number
+	readonly offset: bigint
+	readonly timestamp: number
+	readonly headers: RecordHeaders
+}
+
+/** Picks the topic of a record (Kafka Streams' TopicNameExtractor). */
+export type TopicNameExtractor<K, V> = (key: K, value: V, context: TopicNameExtractorContext) => string
 
 export interface SinkDef {
 	readonly kind: 'sink'

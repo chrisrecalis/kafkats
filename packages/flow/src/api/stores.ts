@@ -43,9 +43,11 @@ export interface StoreOptions<K, V> {
 }
 
 /**
- * A window store. Its windows are kept until a processor expires them with `expireOldWindows(time)`, which deletes the
- * windows ending before `time - retention` (from a stream-time punctuator, say); the changelog drops them once they are
- * `retention` + 1 day old (`cleanup.policy=delete,compact`).
+ * A window store. As in Kafka Streams, reads return only the windows ending less than `retention` ms before the newest
+ * window end written to (or deleted from) the store. A processor reclaims the space of older windows with
+ * `expireOldWindows(time)` (from a stream-time punctuator, say), which deletes the windows ending before
+ * `time - retention` from the task's store, but never one that reads may still return; the changelog drops them once
+ * they are `retention` + 1 day old (`cleanup.policy=delete,compact`).
  */
 export interface WindowStoreDefinitionOptions<K, V> extends StoreOptions<K, V> {
 	/** How long windows are kept, at least `windowSize`. */
@@ -55,8 +57,10 @@ export interface WindowStoreDefinitionOptions<K, V> extends StoreOptions<K, V> {
 }
 
 /**
- * A session store. Its sessions are kept until a processor expires them with `expireOldSessions(time)`, which deletes
- * the sessions ending before `time - retention`; the changelog drops them once they are `retention` + 1 day old.
+ * A session store. As in Kafka Streams, reads return only the sessions ending less than `retention` ms before the
+ * newest session end written to (or deleted from) the store. A processor reclaims the space of older sessions with
+ * `expireOldSessions(time)`, which deletes the sessions ending before `time - retention` from the task's store, but
+ * never one that reads may still return; the changelog drops them once they are `retention` + 1 day old.
  */
 export interface SessionStoreDefinitionOptions<K, V> extends StoreOptions<K, V> {
 	/** How long sessions are kept after they end. */

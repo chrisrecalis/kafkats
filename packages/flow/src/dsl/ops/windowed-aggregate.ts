@@ -197,8 +197,9 @@ function sessionWindowed<K, V, A>(
 }
 
 /**
- * Registers the aggregation's store and processor (after the repartitioning its input needs); returns its table,
- * keyed by `Windowed<K>`. Its options are validated before anything is registered.
+ * Registers the aggregation's store, then the repartitioning its input needs (whose topic may be named after the store:
+ * a duplicate store name is reported as such, B5) and its processor; returns its table, keyed by `Windowed<K>`. Its
+ * options are validated before anything is registered.
  */
 export function materialize<K, V, A>(
 	grouped: KGroupedStreamImpl<K, V>,
@@ -214,8 +215,8 @@ export function materialize<K, V, A>(
 	const [storePrefix, nodePrefix] = PREFIXES[kind]
 	const store = storeName(ctx.builder, storePrefix, options.storeName)
 	const { builder, node, resultKeyCodec, graceMs } = create(ctx, store, keyCodec)
-	const input = aggregationInput(grouped, keyCodec, options.storeName)
 	ctx.builder.addStateStore(builder)
+	const input = aggregationInput(grouped, keyCodec, options.storeName)
 	const processor = ctx.processor(nodePrefix, options.name, [input.node], node.supplier, [store])
 	ctx.windowGraces.set(processor, graceMs)
 	const format = { keyCodec: resultKeyCodec, valueCodec, windowed }

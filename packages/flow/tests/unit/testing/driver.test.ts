@@ -180,35 +180,11 @@ describe('TestDriver', () => {
 		expect(counts).toEqual([4, 1])
 	})
 
-	it('runs wall-clock punctuations when the mock wall clock advances, with the current wall clock', async () => {
-		const driver = new TestDriver({ initialWallClockTimeMs: START })
-		const fired: number[] = []
-		driver.input('in').process(() => ({
-			init: ctx => void ctx.schedule(100, 'wall-clock', now => void fired.push(now)),
-			process: () => {},
-		}))
-		await driver.run(async ({ advanceWallClockTime }) => {
-			await advanceWallClockTime(99)
-			expect(fired).toEqual([])
-			await advanceWallClockTime(151)
-			expect(fired).toEqual([START + 250])
+	// Punctuators and commit requests through the driver: 'punctuation and commits' in tests/unit/dsl/process.test.ts.
+	it('advanceWallClockTime() rejects a negative step', async () => {
+		await upperCase().run(async ({ advanceWallClockTime }) => {
 			await expect(advanceWallClockTime(-1)).rejects.toThrow(RangeError)
 		})
-	})
-
-	it('runs stream-time punctuations as records advance the stream time', async () => {
-		const driver = new TestDriver()
-		const fired: number[] = []
-		driver.input('in').process(() => ({
-			init: ctx => void ctx.schedule(10, 'stream-time', time => void fired.push(time)),
-			process: () => {},
-		}))
-		await driver.run(async ({ send }) => {
-			await send('in', Buffer.from('a'), { timestamp: 5 })
-			await send('in', Buffer.from('b'), { timestamp: 8 })
-			await send('in', Buffer.from('c'), { timestamp: 25 })
-		})
-		expect(fired).toEqual([5, 25])
 	})
 
 	it('commits only when it stops with commitEvery: stop', async () => {
@@ -229,27 +205,6 @@ describe('TestDriver', () => {
 			expect(consumer.committed.size).toBe(0)
 			await advanceWallClockTime(1)
 			expect(consumer.committed.get('in:0')?.offset).toBe(1n)
-		})
-	})
-
-	it('commits at the next step when a processor requests it', async () => {
-		const driver = new TestDriver({ commitEvery: 'stop' })
-		driver.input('in').process(() => {
-			let context: ProcessorContext
-			return {
-				init: ctx => {
-					context = ctx
-				},
-				process: record => {
-					if (record.value?.toString() === 'commit') context.commit()
-				},
-			}
-		})
-		await driver.run(async ({ send, consumer }) => {
-			await send('in', Buffer.from('a'))
-			expect(consumer.committed.size).toBe(0)
-			await send('in', Buffer.from('commit'))
-			expect(consumer.committed.get('in:0')?.offset).toBe(2n)
 		})
 	})
 

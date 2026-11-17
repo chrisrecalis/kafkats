@@ -5,7 +5,8 @@
  * `state/time-clipping.ts`; their retention comes from the DSL's retention model (`dsl/retention.ts`).
  *
  * `Stores` makes the store definitions of the Processor API (6.21); a definition becomes a builder once it is
- * registered with an app, whose changelog defaults it resolves against.
+ * registered with an app, whose changelog defaults it resolves against. Its window and session stores have a clock
+ * too, so that reads honour their retention as in Kafka Streams.
  */
 import { TopologyError } from '@/api/errors.js'
 import type {
@@ -173,12 +174,12 @@ function windowOptions<K, V>(options: WindowStoreDefinitionOptions<K, V>): Windo
 			`The retention of window store '${options.name}' (${retentionMs} ms) must be at least its window size (${windowSizeMs} ms)`
 		)
 	}
-	return { ...builderOptions(options), retentionMs, windowSizeMs }
+	return { ...builderOptions(options), retentionMs, windowSizeMs, clock: {} }
 }
 
 function sessionOptions<K, V>(options: SessionStoreDefinitionOptions<K, V>): SessionStoreBuilderOptions<K, V> {
 	const retentionMs = durationMs(options.retention, `The retention of session store '${options.name}'`)
-	return { ...builderOptions(options), retentionMs }
+	return { ...builderOptions(options), retentionMs, clock: {} }
 }
 
 /** Store definitions for the Processor API (6.21): `process(supplier, { stores: [Stores.keyValueStore({ ... })] })`. */

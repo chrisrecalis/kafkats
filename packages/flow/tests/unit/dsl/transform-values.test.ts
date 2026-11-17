@@ -3,7 +3,7 @@ import { TopologyError } from '@/api/errors.js'
 import { codec } from '@/codec.js'
 import type { KTableImpl } from '@/dsl/ktable.js'
 import type { ForwardingDisabledContext, ValueTransformerWithKeySupplier } from '@/processor/api.js'
-import type { KeyValueStore, TimestampedKeyValueStore } from '@/state.js'
+import type { TimestampedKeyValueStore } from '@/state.js'
 import { Stores } from '@/state/store-builders.js'
 import { TestDriver, type TestContextApi } from '@/testing/driver.js'
 import { GUARANTEES } from '../support/guarantees.js'
@@ -156,8 +156,25 @@ describe.each(GUARANTEES)('KTable.transformValues (6.12, KS KTableTransformValue
 				['k', 'early + none by enrich (no record)'],
 				['k', 'late + v by enrich (no record)'],
 			])
-			const store = ctx.getStateStore<KeyValueStore<string, number>>('calls')
+			const store = ctx.getStateStore(calls)
 			expect([await store.get('tv'), await store.get('enrich')]).toEqual([1, 2])
+		})
+	})
+
+	it('KF9: such a lookup has the timestamp of the parent value (KS KTableTransformValuesGetter)', async () => {
+		const driver = new TestDriver(config)
+		const upper = driver.table('r', S).transformValues(upperCase([]))
+		driver
+			.table('l', S)
+			.join(upper, (value, other) => `${value}+${other}`)
+			.toStream()
+			.to('out', S)
+		await driver.run(async ctx => {
+			await send(ctx, 'r', 'k', 'x', 200)
+			await send(ctx, 'l', 'k', 'y', 100)
+			expect(records(ctx)).toEqual([['k', 'y+X']])
+			// A table-table join result has the max timestamp of both sides.
+			expect(ctx.producer.messagesFor('out').map(m => m.timestamp)).toEqual([200n])
 		})
 	})
 
@@ -169,9 +186,14 @@ describe.each(GUARANTEES)('KTable.transformValues (6.12, KS KTableTransformValue
 		const transformed = table.transformValues(upperCase(transformedCalls)) as KTableImpl<string, string>
 		expect(transformed.table.enableSendingOldValues(true)).toBe(true)
 		const transformedUpdates = updatesOf(transformed)
-		const materialized = table.transformValues(upperCase([]), {
-			materialized: { storeName: 'upper', value: str },
-		}) as KTableImpl<string, string>
+		// A transformer whose results differ per call: an old value transformed again would not be the one stored.
+		const materializedCalls: (string | null)[] = []
+		const materialized = table.transformValues<string>(
+			() => ({
+				transform: (_key, value) => `${value}#${materializedCalls.push(value)}`,
+			}),
+			{ materialized: { storeName: 'numbered', value: str } }
+		) as KTableImpl<string, string>
 		expect(materialized.table.enableSendingOldValues(true)).toBe(true)
 		const materializedUpdates = updatesOf(materialized)
 		await driver.run(async ctx => {
@@ -179,14 +201,18 @@ describe.each(GUARANTEES)('KTable.transformValues (6.12, KS KTableTransformValue
 			await send(ctx, 't', 'k', 'b')
 		})
 		expect(oldValues(tableUpdates)).toEqual([null, 'a'])
-		const expected = [
+		expect(changes(transformedUpdates)).toEqual([
 			['k', 'A', null],
 			['k', 'B', 'A'],
-		]
-		expect(changes(transformedUpdates)).toEqual(expected)
-		expect(changes(materializedUpdates)).toEqual(expected)
+		])
 		// Each update's new and old value, tombstones included.
 		expect(transformedCalls).toEqual(['a', null, 'b', 'a'])
+		// The old value is the stored result; the transformer only sees new values.
+		expect(changes(materializedUpdates)).toEqual([
+			['k', 'a#1', null],
+			['k', 'b#2', 'a#1'],
+		])
+		expect(materializedCalls).toEqual(['a', 'b'])
 	})
 
 	it('KF19: a groupBy downstream gets the old values it needs to retract', async () => {

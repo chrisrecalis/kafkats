@@ -119,6 +119,12 @@ function overloads(
 		(_key, value, text) => `${text}${value}`
 	)
 
+	// Deletes reach transformValues() and toStream(mapper) as null values, no other table callback.
+	table.filter((_key, value) => value.getTime() > 0)
+	table.mapValues(value => value.getTime())
+	// @ts-expect-error the mapper of toStream() gets the null value of a delete
+	table.toStream((_key, value: Date) => value.getTime())
+	table.transformValues(() => ({ transform: (_key, value) => expectTypeOf(value).toEqualTypeOf<Date | null>() }))
 	expectTypeOf(table.toStream()).toEqualTypeOf<KStream<string, Date>>()
 	expectTypeOf(table.toStream((key, value) => `${key}${value?.getTime()}`)).toEqualTypeOf<KStream<string, Date>>()
 	expectTypeOf(table.groupBy((key, value) => [value.getTime(), key] as const)).toMatchTypeOf<unknown>()

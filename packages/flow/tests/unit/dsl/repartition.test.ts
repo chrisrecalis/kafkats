@@ -3,14 +3,14 @@ import { TopologyError } from '@/api/errors.js'
 import type { Windowed } from '@/api/grouped.js'
 import { codec, type Codec } from '@/codec.js'
 import { WindowedCodecs } from '@/operators/windowed.js'
-import type { RecordMetadata } from '@/processor/api.js'
 import { TestDriver } from '@/testing/driver.js'
+import type { TopicNameExtractorContext } from '@/topology/nodes.js'
 
 const str = codec.string()
 const num = codec.json<number>()
 const key = (k: string) => ({ key: Buffer.from(k) })
 /** A topic name extractor that names the partition a record was read from: `out-<partition>`. */
-const byPartition = (_key: unknown, _value: unknown, metadata: RecordMetadata | null) => `out-${metadata?.partition}`
+const byPartition = (_key: unknown, _value: unknown, context: TopicNameExtractorContext) => `out-${context.partition}`
 
 /** The repartition topics written to, in order of first use. */
 function repartitionTopics(messages: readonly { topic: string }[]): string[] {

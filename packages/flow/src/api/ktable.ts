@@ -11,8 +11,10 @@ import type {
 import type { ValueTransformerWithKeySupplier } from '@/processor/api.js'
 
 /**
- * A changelog stream read as a table: the latest value per key; a null value deletes the key. Callbacks
- * never see null values (tombstones are propagated without calling them).
+ * A changelog stream read as a table: the latest value per key; a null value deletes the key. Deletes are propagated
+ * without calling the callbacks of `filter()`, `filterNot()`, `mapValues()`, `groupBy()` and the joins (a joiner gets
+ * null only for a side that has no value, as its type says). `transformValues()` and `toStream(mapper)` get them, as a
+ * null value (Kafka Streams).
  */
 export interface KTable<K, V> {
 	/** The entries the predicate accepts: an update it rejects deletes the key. */

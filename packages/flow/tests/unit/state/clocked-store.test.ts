@@ -217,6 +217,23 @@ describe('clocked window store (6.2)', () => {
 		expect(output.changelog().map(record => record.value)).toEqual(['below', 'at the floor', 'newest'])
 	})
 
+	it("expireOldWindows(time) (Processor API) deletes by the caller's time, never below the expiry cutoff", async () => {
+		const { state, registered, metadata: meta } = await stack(windows())
+		const store = state.store('w') as ClockedWindowStore<string, string>
+		const raw = registered.raw as WindowStore<string, string>
+		await store.put(w('k', 0, 10), 'a')
+		await store.put(w('k', 50, 60), 'b')
+		await store.put(w('k', 190, 200), 'c')
+		// Nothing committed yet: the cutoff (-100) keeps everything.
+		expect(await store.expireOldWindows(1_000)).toBe(0)
+		meta.markCommitted()
+		// Cutoff 101: the caller's time 150 deletes the windows ending before 50 only.
+		expect(await store.expireOldWindows(150)).toBe(1)
+		expect(ends(await collect(raw.fetch('k', 0, 1_000)))).toEqual([60, 200])
+		expect(await store.expireOldWindows(1_000)).toBe(1)
+		expect(ends(await collect(raw.fetch('k', 0, 1_000)))).toEqual([200])
+	})
+
 	it('KF1: emit on window close, expiry keeps the windows the next scan has not emitted', async () => {
 		const {
 			state,
@@ -297,6 +314,21 @@ describe('clocked session store (6.2)', () => {
 		const store = state.store('s') as ClockedSessionStore<string, string>
 		await store.put(w('k', 100, 100), 'first')
 		expect(await collect(store.findSessions('k', 100, 100))).toEqual([[w('k', 100, 100), 'first']])
+	})
+
+	it("expireOldSessions(time) (Processor API) deletes by the caller's time, never below the expiry cutoff", async () => {
+		const { state, registered, metadata: meta } = await stack(sessions(10))
+		const store = state.store('s') as ClockedSessionStore<string, string>
+		const raw = registered.raw as SessionStore<string, string>
+		await store.put(w('k', 0, 0), 'a')
+		await store.put(w('k', 50, 50), 'b')
+		await store.put(w('k', 100, 100), 'c')
+		expect(await store.expireOldSessions(1_000)).toEqual([])
+		meta.markCommitted()
+		// Cutoff 91: the caller's time 20 deletes the sessions ending before 10 only.
+		expect(await store.expireOldSessions(20)).toEqual([w('k', 0, 0)])
+		expect(await store.expireOldSessions(1_000)).toEqual([w('k', 50, 50)])
+		expect(await collect(raw.all())).toEqual([[w('k', 100, 100), 'c']])
 	})
 
 	it('remove() logs a tombstone for every session of the key, clipped ones included; expire() logs none', async () => {

@@ -80,7 +80,10 @@ const PREFIXES: Readonly<Record<AggregationKind, readonly [store: string, node: 
 	aggregate: [StorePrefix.TABLE_AGGREGATE, NodePrefix.TABLE_AGGREGATE],
 }
 
-/** Registers the aggregation's timestamped store and processor after the repartitioning of the groups' changes. */
+/**
+ * Registers the aggregation's timestamped store, then the repartitioning of the groups' changes (whose topic may be
+ * named after the store: a duplicate store name is reported as such, B5) and its processor.
+ */
 function aggregateGroups<K, V, A>(
 	grouped: KGroupedTableImpl<K, V>,
 	kind: AggregationKind,
@@ -90,13 +93,13 @@ function aggregateGroups<K, V, A>(
 ): KTable<K, A> {
 	const { ctx } = grouped
 	const keyCodec = options.key ?? grouped.codecs.keyCodec
-	const input = groupChanges(grouped, options.storeName, `${kind}()`)
 	const [storePrefix, nodePrefix] = PREFIXES[kind]
 	const store = storeName(ctx.builder, storePrefix, options.storeName)
 	const logging = options.changelog
 	ctx.builder.addStateStore(
 		timestampedKeyValueStoreBuilder(ctx.changelog, { name: store, keyCodec, valueCodec, logging })
 	)
+	const input = groupChanges(grouped, options.storeName, `${kind}()`)
 	const node = new KTableAggregate<K, V, A>(store, aggregator)
 	const processor = ctx.processor(nodePrefix, options.name, [input.node], node.supplier, [store])
 	return new KTableImpl<K, A>(ctx, processor, { keyCodec, valueCodec }, node)

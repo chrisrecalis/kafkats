@@ -133,7 +133,8 @@ export type SessionStoreReads<K, V> = Pick<SessionStore<K, V>, KeyValueReads | '
 
 /**
  * The top of the stack of a store with a clock: what its processor gets. Writes advance the clock once the layer below
- * took them; reads are clipped at the clock's read floor; the clock, not the caller, decides what `expire()` deletes.
+ * took them; reads are clipped at the clock's read floor; the clock, not the caller, decides what `expire()` deletes,
+ * and bounds what the Processor API's `expireOldWindows()` and `expireOldSessions()` delete.
  */
 abstract class ClockedStore<K, V, S extends KeyValueStore<WindowedKey<K>, V>> implements KeyValueStore<
 	WindowedKey<K>,
@@ -209,10 +210,7 @@ abstract class ClockedStore<K, V, S extends KeyValueStore<WindowedKey<K>, V>> im
 	}
 }
 
-export class ClockedWindowStore<K, V>
-	extends ClockedStore<K, V, WindowStore<K, V>>
-	implements Omit<WindowStore<K, V>, 'expireOldWindows'>
-{
+export class ClockedWindowStore<K, V> extends ClockedStore<K, V, WindowStore<K, V>> implements WindowStore<K, V> {
 	fetch(key: K, timeFrom: number, timeTo: number): AsyncIterable<[WindowedKey<K>, V]> {
 		return this.clip(this.inner.fetch(key, timeFrom, timeTo))
 	}
@@ -233,12 +231,14 @@ export class ClockedWindowStore<K, V>
 	async expire(): Promise<void> {
 		await this.inner.expireOldWindows(this.expiryTime)
 	}
+
+	/** Deletes the windows ending before `currentTime - retention`, as `expire()` does and never below its cutoff. */
+	expireOldWindows(currentTime: number): Promise<number> {
+		return this.inner.expireOldWindows(Math.min(currentTime, this.expiryTime))
+	}
 }
 
-export class ClockedSessionStore<K, V>
-	extends ClockedStore<K, V, SessionStore<K, V>>
-	implements Omit<SessionStore<K, V>, 'expireOldSessions'>
-{
+export class ClockedSessionStore<K, V> extends ClockedStore<K, V, SessionStore<K, V>> implements SessionStore<K, V> {
 	/** The sessions of `key` ending at `earliestEnd` (and the read floor) or later and starting at `latestStart` or earlier. */
 	findSessions(key: K, earliestEnd: number, latestStart: number): AsyncIterable<[WindowedKey<K>, V]> {
 		return this.inner.findSessions(key, Math.max(earliestEnd, this.clock.readFloor), latestStart)
@@ -255,5 +255,10 @@ export class ClockedSessionStore<K, V>
 
 	async expire(): Promise<void> {
 		await this.inner.expireOldSessions(this.expiryTime)
+	}
+
+	/** Deletes the sessions ending before `currentTime - retention`, as `expire()` does and never below its cutoff. */
+	expireOldSessions(currentTime: number): Promise<WindowedKey<K>[]> {
+		return this.inner.expireOldSessions(Math.min(currentTime, this.expiryTime))
 	}
 }

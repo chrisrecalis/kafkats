@@ -72,14 +72,28 @@ describe('resolvePartitionCounts', () => {
 		expect(counts(b, { a: 3 }).get(repartitionTopic('orphan'))).toBe(1)
 	})
 
-	it('throws when a repartition topic depends on itself', () => {
+	it('sizes a repartition topic its own writer reads by the counts known of its other upstream topics (KS)', () => {
 		const b = builder()
 		const owner = {}
 		b.addSource({ name: 'a', topics: ['a'], internal: false })
 		const loop = repartition(b, 'a', 'loop', { owner })
 		const topic = b.addRepartitionTopic('loop', owner)
 		b.addSink({ name: 'back', parents: [loop], topic, internal: 'repartition' })
-		expect(() => counts(b, { a: 3 })).toThrow(`Repartition topic '${topic}' depends on itself`)
+		repartition(b, loop, 'after')
+		const result = counts(b, { a: 3 })
+		expect(result.get(topic)).toBe(3)
+		expect(result.get(repartitionTopic('after'))).toBe(3)
+	})
+
+	it('throws when no topic upstream of a repartition topic has a known count', () => {
+		const b = builder()
+		chain(b, 'a', ['a'], 'p')
+		const topic = b.addRepartitionTopic('loop', {})
+		b.addSource({ name: 'loop', topics: [topic], internal: 'repartition' })
+		b.addSink({ name: 'back', parents: ['loop'], topic, internal: 'repartition' })
+		expect(() => counts(b, { a: 3 })).toThrow(
+			`The partition count of repartition topic '${topic}' is unknown: no topic upstream of it has a known count`
+		)
 	})
 
 	it('lets stateless subtopologies read topics with different counts', () => {

@@ -18,10 +18,10 @@ import { timestampedKeyValueStoreBuilder } from '@/state/store-builders.js'
 
 export type TableConsumed<K, V> = Consumed<K, V> & { materialized?: Materialized<K, V> }
 
-/** `app.table()`: the source node, then the table's KTableSource (`<name>-table-source` when the source is named). */
+/** `app.table()`: the source node `<name>-source`, then the table's KTableSource `<name>` (KS). */
 export function table<K, V>(ctx: DslContext, topic: string, options: TableConsumed<K, V> = {}): KTable<K, V> {
-	const source = ctx.source(topic, options)
-	const name = suffixed(options.name, 'table-source')
+	const { name } = options
+	const source = ctx.source(topic, { ...options, name: suffixed(name, 'source') })
 	const store = storeName(ctx.builder, StorePrefix.table(topic), options.materialized?.storeName)
 	return materialize(ctx, source, store, name, NodePrefix.TABLE_SOURCE, sourceFormat(options), options.materialized)
 }
@@ -43,15 +43,15 @@ export function toTable<K, V>(
 
 /**
  * `app.globalTable()`: every instance reads the whole topic into `<applicationId>.<store>` outside the consumer group
- * (no changelog: the topic is one); only usable as the lookup side of a stream join.
+ * (no changelog: the topic is one); only usable as the lookup side of a stream join. Named like `table()`.
  */
 export function globalTable<K, V>(ctx: DslContext, topic: string, options: TableConsumed<K, V> = {}) {
 	const { builder } = ctx
 	const format = sourceFormat(options)
 	const store = storeName(builder, StorePrefix.globalTable(topic), options.materialized?.storeName)
 	const codecs = storeCodecs(format, options.materialized)
-	const sourceName = builder.nodeName(NodePrefix.SOURCE, options.name)
-	const processorName = builder.nodeName(NodePrefix.TABLE_SOURCE, suffixed(options.name, 'table-source'))
+	const sourceName = builder.nodeName(NodePrefix.SOURCE, suffixed(options.name, 'source'))
+	const processorName = builder.nodeName(NodePrefix.TABLE_SOURCE, options.name)
 	builder.addGlobalStore({
 		topic,
 		sourceName,

@@ -91,7 +91,10 @@ export function aggregate<K, V, A>(
 	return materialize(grouped, 'aggregate', options, valueCodec, aggregateWith(initializer, aggregator))
 }
 
-/** Registers the aggregation's store and processor (after the repartitioning its input needs); returns its table. */
+/**
+ * Registers the aggregation's store, then the repartitioning its input needs (whose topic may be named after the store:
+ * a duplicate store name is reported as such, B5) and its processor; returns its table.
+ */
 function materialize<K, V, A>(
 	grouped: KGroupedStreamImpl<K, V>,
 	kind: AggregationKind,
@@ -101,14 +104,14 @@ function materialize<K, V, A>(
 ): KTable<K, A> {
 	const operator = `${kind}()`
 	const keyCodec = requireCodec(options.key, grouped.stream.format.keyCodec, 'key', operator)
-	const input = aggregationInput(grouped, keyCodec, options.storeName)
-	const { ctx } = input
+	const { ctx } = grouped.stream
 	const [storePrefix, nodePrefix] = PREFIXES[kind]
 	const store = storeName(ctx.builder, storePrefix, options.storeName)
 	const logging = options.changelog
 	ctx.builder.addStateStore(
 		timestampedKeyValueStoreBuilder(ctx.changelog, { name: store, keyCodec, valueCodec, logging })
 	)
+	const input = aggregationInput(grouped, keyCodec, options.storeName)
 	const node = new KStreamAggregate<K, V, A>(store, aggregation)
 	const processor = ctx.processor(nodePrefix, options.name, [input.node], node.supplier, [store])
 	return new KTableImpl<K, A>(ctx, processor, { keyCodec, valueCodec }, node)

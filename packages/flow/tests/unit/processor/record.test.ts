@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, expectTypeOf, it } from 'vitest'
 import { FixedKeyRecord, StreamRecord } from '@/processor/record.js'
 
 describe('StreamRecord', () => {
@@ -19,8 +19,19 @@ describe('StreamRecord', () => {
 
 describe('FixedKeyRecord', () => {
 	it('keeps its key and validates timestamps', () => {
-		const record = new FixedKeyRecord('k', 1, 10)
+		const headers = { h: Buffer.from('v') }
+		const record = FixedKeyRecord.from(new StreamRecord('k', 1, 10, headers))
+		expect(record).toMatchObject({ key: 'k', value: 1, timestamp: 10, headers })
 		expect(record.withValue('v').withTimestamp(11)).toMatchObject({ key: 'k', value: 'v', timestamp: 11 })
 		expect(() => record.withTimestamp(-1)).toThrow(TypeError)
+	})
+
+	it('is derived from received records only, never constructed (Kafka Streams)', async () => {
+		expect('FixedKeyRecord' in (await import('@/index.js'))).toBe(false)
+		// @ts-expect-error the constructor is private: a record built from scratch could carry another key
+		const construct = () => new FixedKeyRecord('other', 1, 10, {})
+		expectTypeOf(construct).toBeFunction()
+		type LookAlike = Pick<FixedKeyRecord<string, number>, keyof FixedKeyRecord<string, number>>
+		expectTypeOf<LookAlike>().not.toMatchTypeOf<FixedKeyRecord<string, number>>()
 	})
 })

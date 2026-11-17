@@ -94,12 +94,10 @@ class KeyValueHandle<K, V, S extends KeyValueStore<K, V>> implements KeyValueSto
 	}
 }
 
-/** What window stores with and without a clock have in common: all but their expiry. */
-type WindowLayer<K, V> = Omit<WindowStore<K, V>, 'expireOldWindows'>
-/** What session stores with and without a clock have in common: all but their expiry. */
-type SessionLayer<K, V> = Omit<SessionStore<K, V>, 'expireOldSessions'>
-
-class WindowLayerHandle<K, V, S extends WindowLayer<K, V>> extends KeyValueHandle<WindowedKey<K>, V, S> {
+class WindowHandle<K, V, S extends WindowStore<K, V> = WindowStore<K, V>>
+	extends KeyValueHandle<WindowedKey<K>, V, S>
+	implements WindowStore<K, V>
+{
 	fetch(key: K, timeFrom: number, timeTo: number): AsyncIterable<[WindowedKey<K>, V]> {
 		return this.inner.fetch(key, timeFrom, timeTo)
 	}
@@ -111,15 +109,13 @@ class WindowLayerHandle<K, V, S extends WindowLayer<K, V>> extends KeyValueHandl
 	fetchRange(keyFrom: K, keyTo: K, timeFrom: number, timeTo: number): AsyncIterable<[WindowedKey<K>, V]> {
 		return this.inner.fetchRange(keyFrom, keyTo, timeFrom, timeTo)
 	}
-}
 
-class WindowHandle<K, V> extends WindowLayerHandle<K, V, WindowStore<K, V>> implements WindowStore<K, V> {
 	expireOldWindows(currentTime: number): Promise<number> {
 		return this.closed() ? this.rejectClosed() : this.inner.expireOldWindows(currentTime)
 	}
 }
 
-class ClockedWindowHandle<K, V> extends WindowLayerHandle<K, V, ClockedWindowStore<K, V>> {
+class ClockedWindowHandle<K, V> extends WindowHandle<K, V, ClockedWindowStore<K, V>> {
 	get unclipped(): WindowStoreReads<K, V> {
 		return this.inner.unclipped
 	}
@@ -129,7 +125,10 @@ class ClockedWindowHandle<K, V> extends WindowLayerHandle<K, V, ClockedWindowSto
 	}
 }
 
-class SessionLayerHandle<K, V, S extends SessionLayer<K, V>> extends KeyValueHandle<WindowedKey<K>, V, S> {
+class SessionHandle<K, V, S extends SessionStore<K, V> = SessionStore<K, V>>
+	extends KeyValueHandle<WindowedKey<K>, V, S>
+	implements SessionStore<K, V>
+{
 	findSessions(key: K, earliestStart: number, latestEnd: number): AsyncIterable<[WindowedKey<K>, V]> {
 		return this.inner.findSessions(key, earliestStart, latestEnd)
 	}
@@ -137,15 +136,13 @@ class SessionLayerHandle<K, V, S extends SessionLayer<K, V>> extends KeyValueHan
 	remove(key: K): Promise<void> {
 		return this.closed() ? this.rejectClosed() : this.inner.remove(key)
 	}
-}
 
-class SessionHandle<K, V> extends SessionLayerHandle<K, V, SessionStore<K, V>> implements SessionStore<K, V> {
 	expireOldSessions(currentTime: number): Promise<WindowedKey<K>[]> {
 		return this.closed() ? this.rejectClosed() : this.inner.expireOldSessions(currentTime)
 	}
 }
 
-class ClockedSessionHandle<K, V> extends SessionLayerHandle<K, V, ClockedSessionStore<K, V>> {
+class ClockedSessionHandle<K, V> extends SessionHandle<K, V, ClockedSessionStore<K, V>> {
 	get unclipped(): SessionStoreReads<K, V> {
 		return this.inner.unclipped
 	}

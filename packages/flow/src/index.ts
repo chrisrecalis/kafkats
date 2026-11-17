@@ -34,8 +34,8 @@ export type {
 	StoresFactory,
 } from '@/api/stores.js'
 export type { ConnectedStores, ProcessOptions, TransformValuesOptions } from '@/api/options.js'
-export { StreamRecord, FixedKeyRecord } from '@/processor/record.js'
-export type { RecordHeaders } from '@/processor/record.js'
+export { StreamRecord } from '@/processor/record.js'
+export type { FixedKeyRecord, RecordHeaders } from '@/processor/record.js'
 export type {
 	Processor,
 	ProcessorSupplier,

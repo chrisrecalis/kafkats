@@ -27,8 +27,7 @@ class FixedKeyProcessorAdapter<K, VIn, VOut> implements Processor<K, VIn, K, VOu
 	}
 
 	process(record: StreamRecord<K, VIn>): MaybePromise<void> {
-		const { key, value, timestamp, headers } = record
-		return this.processor.process(new FixedKeyRecord(key, value, timestamp, headers))
+		return this.processor.process(FixedKeyRecord.from(record))
 	}
 
 	close(): MaybePromise<void> {

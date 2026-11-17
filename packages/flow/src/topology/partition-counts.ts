@@ -59,7 +59,12 @@ function externalCount(external: ReadonlyMap<string, number>, topic: string, nee
 	return count
 }
 
-/** Pinned topics keep their count; every other repartition topic is computed from its upstream topics. */
+/**
+ * Pinned topics keep their count; every other repartition topic takes the max count of its upstream topics once they
+ * are all known. A topic its own writer reads (processors sharing a store on both sides of a repartition) never gets
+ * there: when no topic resolves that way, the pending ones take the max of the upstream counts known, as Kafka Streams
+ * does (`RepartitionTopics.computePartitionCount` skips unknown repartition candidates).
+ */
 function resolveRepartitionCounts(
 	upstream: ReadonlyMap<string, ReadonlySet<string>>,
 	pinned: ReadonlyMap<string, number>,
@@ -75,19 +80,19 @@ function resolveRepartitionCounts(
 			counts.set(topic, count)
 		}
 	}
+	const known = (topic: string): number[] => [...upstream.get(topic)!].flatMap(source => counts.get(source) ?? [])
 	while (pending.length > 0) {
-		const unresolved: string[] = []
-		for (const topic of pending) {
-			const sources = [...(upstream.get(topic) ?? [])]
-			if (sources.some(source => !counts.has(source))) unresolved.push(topic)
-			else counts.set(topic, Math.max(1, ...sources.map(source => counts.get(source) ?? 0)))
-		}
-		if (unresolved.length === pending.length) {
+		let ready = pending.filter(topic => known(topic).length === upstream.get(topic)!.size)
+		if (ready.length === 0) ready = pending.filter(topic => known(topic).length > 0)
+		if (ready.length === 0) {
 			throw new TopologyError(
-				`Repartition topic '${unresolved[0]}' depends on itself: its partition count is unknown`
+				`The partition count of repartition topic '${pending[0]}' is unknown: ` +
+					'no topic upstream of it has a known count'
 			)
 		}
-		pending = unresolved
+		const resolved = new Map(ready.map(topic => [topic, Math.max(1, ...known(topic))]))
+		for (const [topic, count] of resolved) counts.set(topic, count)
+		pending = pending.filter(topic => !resolved.has(topic))
 	}
 }
 
