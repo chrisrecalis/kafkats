@@ -42,6 +42,18 @@ export function requireAggregateCodec<A>(codec: Codec<A> | undefined, operator: 
 	return codec
 }
 
+/**
+ * The codec of the aggregates of a grouped stream's aggregate(), windowed or not: Materialized.value, else the value
+ * codec, which the API lets only aggregates of the value type go without (6.3).
+ */
+export function aggregateCodec<K, V, A>(
+	grouped: KGroupedStreamImpl<K, V>,
+	codec: Codec<A> | undefined,
+	operator: string
+): Codec<A> {
+	return requireAggregateCodec(codec ?? (grouped.stream.format.valueCodec as Codec<A> | undefined), operator)
+}
+
 /** count(), reduce() or aggregate(). */
 export type AggregationKind = 'count' | 'reduce' | 'aggregate'
 
@@ -75,9 +87,7 @@ export function aggregate<K, V, A>(
 	aggregator: (key: K, value: V, aggregate: A) => A,
 	options: AggregateOptions<K, A> = {}
 ): KTable<K, A> {
-	// The API lets only aggregates of the value type go without a codec (6.3): the value codec keeps them.
-	const values = grouped.stream.format.valueCodec as Codec<A> | undefined
-	const valueCodec = requireAggregateCodec(options.value ?? values, 'aggregate()')
+	const valueCodec = aggregateCodec(grouped, options.value, 'aggregate()')
 	return materialize(grouped, 'aggregate', options, valueCodec, aggregateWith(initializer, aggregator))
 }
 

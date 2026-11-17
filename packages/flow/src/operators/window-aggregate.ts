@@ -5,7 +5,7 @@
  * store's name. It is advanced by each record before its late check: a record updates each of its windows that ends
  * after `streamTime - grace` and is dropped for the others, so a hopping record may update its newer windows only. A
  * window keeps the max timestamp of its records, which every result of it carries. Null keys are dropped; null values
- * reach the aggregator, whatever its declared value type (count counts them, KS). With emit on window close, only the
+ * reach the aggregator (count counts them, KS), which the API types as `V | null`. With emit on window close, only the
  * final result of each window is forwarded (`operators/emit-final.ts`).
  */
 import type { Windowed } from '@/api/grouped.js'

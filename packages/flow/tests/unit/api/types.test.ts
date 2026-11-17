@@ -4,7 +4,7 @@ import type { KGroupedStream, SessionWindowedKStream, TimeWindowedKStream, Windo
 import type { KStream } from '@/api/kstream.js'
 import type { GlobalKTable, KTable } from '@/api/ktable.js'
 import { codec } from '@/codec.js'
-import type { JoinWindows, SessionWindows, TimeWindows } from '@/dsl/windows.js'
+import type { JoinWindows, SessionWindows, SlidingWindows, TimeWindows } from '@/dsl/windows.js'
 
 /** Compile-time checks of the public overloads; never called. */
 function overloads(
@@ -13,7 +13,7 @@ function overloads(
 	other: KStream<string, boolean>,
 	table: KTable<string, Date>,
 	global: GlobalKTable<number, Date>,
-	windows: { join: JoinWindows; time: TimeWindows; session: SessionWindows }
+	windows: { join: JoinWindows; time: TimeWindows; session: SessionWindows; sliding: SlidingWindows }
 ) {
 	expectTypeOf(stream.mapValues(value => String(value))).toEqualTypeOf<KStream<string, string>>()
 	expectTypeOf(stream.mapValues((key: string | null, value: number | null) => [key, value])).toEqualTypeOf<
@@ -69,13 +69,36 @@ function overloads(
 	)
 	expectTypeOf(grouped.windowedBy(windows.time)).toEqualTypeOf<TimeWindowedKStream<string, number>>()
 	expectTypeOf(grouped.windowedBy(windows.session)).toEqualTypeOf<SessionWindowedKStream<string, number>>()
+	// Time and session windows pass null values on (Kafka Streams); sliding windows drop them.
+	expectTypeOf(
+		grouped.windowedBy(windows.time).aggregate(
+			() => 0,
+			(_key, value: number | null, sum) => sum + (value ?? 0)
+		)
+	).toEqualTypeOf<KTable<Windowed<string>, number>>()
 	expectTypeOf(
 		grouped.windowedBy(windows.session).aggregate(
 			() => 0,
-			(_key, value, aggregate) => aggregate + value,
+			(_key, value: number | null, aggregate) => aggregate + (value ?? 0),
 			(_key, a, b) => a + b
 		)
 	).toEqualTypeOf<KTable<Windowed<string>, number>>()
+	expectTypeOf(
+		grouped.windowedBy(windows.time).reduce((sum, value: number | null) => sum + (value ?? 0))
+	).toEqualTypeOf<KTable<Windowed<string>, number>>()
+	// @ts-expect-error a time-window reducer receives null values
+	grouped.windowedBy(windows.session).reduce((sum: number, value: number) => sum + value)
+	expectTypeOf(
+		grouped.windowedBy(windows.sliding).aggregate(
+			() => 0,
+			(_key, value: number, sum) => sum + value
+		)
+	).toEqualTypeOf<KTable<Windowed<string>, number>>()
+	grouped.windowedBy(windows.time).aggregate(
+		// @ts-expect-error windowed aggregates of another type than the values need their codec too
+		() => '',
+		(_key, value, text) => `${text}${value}`
+	)
 
 	expectTypeOf(table.toStream()).toEqualTypeOf<KStream<string, Date>>()
 	expectTypeOf(table.toStream((key, value) => `${key}${value?.getTime()}`)).toEqualTypeOf<KStream<string, Date>>()

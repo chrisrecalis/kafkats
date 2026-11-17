@@ -11,7 +11,7 @@ import type { KTable } from '@/api/ktable.js'
 import type { WindowedAggregateOptions } from '@/api/options.js'
 import type { Codec } from '@/codec.js'
 import { requireCodec, type WindowedFormat } from '@/dsl/format.js'
-import { COUNT_CODEC, counting, requireAggregateCodec, type AggregationKind } from '@/dsl/ops/aggregate.js'
+import { aggregateCodec, COUNT_CODEC, counting, type AggregationKind } from '@/dsl/ops/aggregate.js'
 import { materialize } from '@/dsl/ops/windowed-aggregate.js'
 import { aggregationRetentionMs } from '@/dsl/retention.js'
 import type { SlidingWindowedKStreamImpl } from '@/dsl/sliding-windowed-kstream.js'
@@ -48,7 +48,7 @@ export function slidingWindowedAggregate<K, V, A>(
 	aggregator: (key: K, value: V, aggregate: A) => A,
 	options: WindowedAggregateOptions<K, A> = {}
 ): KTable<Windowed<K>, A> {
-	const valueCodec = requireAggregateCodec(options.value, 'windowed aggregate()')
+	const valueCodec = aggregateCodec(windowed.grouped, options.value, 'windowed aggregate()')
 	return slidingWindowed(windowed, 'aggregate', options, valueCodec, aggregateWith(initializer, aggregator))
 }
 

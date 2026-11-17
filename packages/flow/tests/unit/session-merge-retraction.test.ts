@@ -19,10 +19,10 @@ function sessionSums(driver: TestDriver, kind: 'reduce' | 'aggregate'): void {
 		.windowedBy(SessionWindows.ofInactivityGapAndGrace(10, 100))
 	const table =
 		kind === 'reduce'
-			? windowed.reduce((a, b) => a + b)
+			? windowed.reduce((a, b) => a + (b ?? 0))
 			: windowed.aggregate(
 					() => 0,
-					(_k, v, agg) => agg + v,
+					(_k, v, agg) => agg + (v ?? 0),
 					(_k, a, b) => a + b,
 					{ value: num }
 				)

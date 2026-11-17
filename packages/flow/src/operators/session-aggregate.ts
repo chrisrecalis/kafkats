@@ -43,9 +43,15 @@ export function sessionAggregateWith<K, V, A>(
 		)
 }
 
-/** reduce(): the reducer over the sessions' aggregates, then over the record's value. */
-export function sessionReduceWith<V>(reducer: (aggregate: V, value: V) => V): SessionMerge<unknown, V, V> {
-	return (_key, value, sessions) => [...sessions, value].reduce((merged, next) => reducer(merged, next))
+/**
+ * reduce(): the reducer over the sessions' aggregates, then over the record's value, which may be null (the result is
+ * null when no session was found: no session is kept).
+ */
+export function sessionReduceWith<V>(
+	reducer: (aggregate: V, value: V | null) => V
+): SessionMerge<unknown, V | null, V> {
+	// Only the record's value can be null, and it comes last: `merged` never is.
+	return (_key, value, sessions) => [...sessions, value].reduce((merged, next) => reducer(merged!, next))
 }
 
 export interface SessionWindowSpec {

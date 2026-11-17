@@ -616,7 +616,11 @@ describe('sliding-window aggregation store and results', () => {
 
 	it('validates its options before registering anything', () => {
 		const driver = new TestDriver()
-		const windowed = driver.input('in', S).groupByKey().windowedBy(SlidingWindows.ofTimeDifferenceAndGrace(10, 5))
+		const windowed = driver
+			.input('in', S)
+			.mapValues(value => value?.length ?? 0) // drops the value codec
+			.groupByKey()
+			.windowedBy(SlidingWindows.ofTimeDifferenceAndGrace(10, 5))
 		expect(() => windowed.count({ storeName: 'w', retention: 24 })).toThrow(
 			new TopologyError(
 				"The retention of state store 'w' must be no smaller than twice the time difference (10 ms) plus the " +

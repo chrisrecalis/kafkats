@@ -26,8 +26,11 @@ export function aggregateWith<K, V, A>(
 	return (key, value, current) => aggregator(key, value, current === undefined ? initializer() : current)
 }
 
-/** reduce(): the first value as it is, then the reducer over the current aggregate. */
-export function reduceWith<V>(reducer: (aggregate: V, value: V) => V): Aggregation<unknown, V, V> {
+/**
+ * reduce(): the first value as it is, then the reducer over the current aggregate. Values may be null where the
+ * aggregation passes null values on (time and session windows): a first null value keeps no aggregate.
+ */
+export function reduceWith<A, V extends A | null>(reducer: (aggregate: A, value: V) => A): Aggregation<unknown, V, A> {
 	return (_key, value, current) => (current === undefined ? value : reducer(current, value))
 }
 

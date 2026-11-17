@@ -38,7 +38,7 @@ async function run(node: KTableNode<unknown, unknown>, store: StateStore, metada
 	return { process, metadata: harness.metadata }
 }
 
-const add = (a: number, b: number) => a + b
+const add = (a: number, b: number | null) => a + (b ?? 0)
 
 describe('windowed/session reduce + session aggregate retention', () => {
 	it('a time-window reduce expires its store once its clock moved past the cleanup interval', async () => {

@@ -15,7 +15,7 @@ import { requireCodec, type WindowedFormat } from '@/dsl/format.js'
 import type { KGroupedStreamImpl } from '@/dsl/kgrouped-stream.js'
 import { KTableImpl } from '@/dsl/ktable.js'
 import { NodePrefix, storeName, StorePrefix } from '@/dsl/naming.js'
-import { COUNT_CODEC, counting, requireAggregateCodec, type AggregationKind } from '@/dsl/ops/aggregate.js'
+import { aggregateCodec, COUNT_CODEC, counting, type AggregationKind } from '@/dsl/ops/aggregate.js'
 import { aggregationInput } from '@/dsl/ops/grouping.js'
 import { aggregationRetentionMs } from '@/dsl/retention.js'
 import type { SessionWindowedKStreamImpl } from '@/dsl/session-windowed-kstream.js'
@@ -64,13 +64,13 @@ export function timeWindowedCount<K, V>(
 	windowed: TimeWindowedKStreamImpl<K, V>,
 	options: WindowedAggregateOptions<K, number> = {}
 ): KTable<Windowed<K>, number> {
-	const aggregation = aggregateWith<K, V, number>(counting.initializer, counting.aggregator)
+	const aggregation = aggregateWith<K, V | null, number>(counting.initializer, counting.aggregator)
 	return timeWindowed(windowed, 'count', options, options.value ?? COUNT_CODEC, aggregation)
 }
 
 export function timeWindowedReduce<K, V>(
 	windowed: TimeWindowedKStreamImpl<K, V>,
-	reducer: (aggregate: V, value: V) => V,
+	reducer: (aggregate: V, value: V | null) => V,
 	options: WindowedAggregateOptions<K, V> = {}
 ): KTable<Windowed<K>, V> {
 	const valueCodec = requireCodec(
@@ -85,10 +85,10 @@ export function timeWindowedReduce<K, V>(
 export function timeWindowedAggregate<K, V, A>(
 	windowed: TimeWindowedKStreamImpl<K, V>,
 	initializer: () => A,
-	aggregator: (key: K, value: V, aggregate: A) => A,
+	aggregator: (key: K, value: V | null, aggregate: A) => A,
 	options: WindowedAggregateOptions<K, A> = {}
 ): KTable<Windowed<K>, A> {
-	const valueCodec = requireAggregateCodec(options.value, 'windowed aggregate()')
+	const valueCodec = aggregateCodec(windowed.grouped, options.value, 'windowed aggregate()')
 	return timeWindowed(windowed, 'aggregate', options, valueCodec, aggregateWith(initializer, aggregator))
 }
 
@@ -96,13 +96,13 @@ export function sessionWindowedCount<K, V>(
 	windowed: SessionWindowedKStreamImpl<K, V>,
 	options: WindowedAggregateOptions<K, number> = {}
 ): KTable<Windowed<K>, number> {
-	const merge = sessionAggregateWith<K, V, number>(counting.initializer, counting.aggregator, counting.merger)
+	const merge = sessionAggregateWith<K, V | null, number>(counting.initializer, counting.aggregator, counting.merger)
 	return sessionWindowed(windowed, 'count', options, options.value ?? COUNT_CODEC, merge)
 }
 
 export function sessionWindowedReduce<K, V>(
 	windowed: SessionWindowedKStreamImpl<K, V>,
-	reducer: (aggregate: V, value: V) => V,
+	reducer: (aggregate: V, value: V | null) => V,
 	options: WindowedAggregateOptions<K, V> = {}
 ): KTable<Windowed<K>, V> {
 	const valueCodec = requireCodec(
@@ -117,12 +117,12 @@ export function sessionWindowedReduce<K, V>(
 export function sessionWindowedAggregate<K, V, A>(
 	windowed: SessionWindowedKStreamImpl<K, V>,
 	initializer: () => A,
-	aggregator: (key: K, value: V, aggregate: A) => A,
+	aggregator: (key: K, value: V | null, aggregate: A) => A,
 	merger: SessionMergerArg<K, A>,
 	options?: WindowedAggregateOptions<K, A>
 ): KTable<Windowed<K>, A> {
 	const resolved = (typeof merger === 'function' ? options : merger) ?? {}
-	const valueCodec = requireAggregateCodec(resolved.value, 'windowed aggregate()')
+	const valueCodec = aggregateCodec(windowed.grouped, resolved.value, 'windowed aggregate()')
 	const merge = sessionAggregateWith(initializer, aggregator, sessionMerger(merger))
 	return sessionWindowed(windowed, 'aggregate', resolved, valueCodec, merge)
 }
@@ -148,7 +148,7 @@ function timeWindowed<K, V, A>(
 	kind: AggregationKind,
 	options: WindowedAggregateOptions<K, A>,
 	valueCodec: Codec<A>,
-	aggregation: Aggregation<K, V, A>
+	aggregation: Aggregation<K, V | null, A>
 ): KTable<Windowed<K>, A> {
 	const { windows } = windowed
 	const format: WindowedFormat = { kind: 'time', sizeMs: windows.sizeMs }
@@ -175,7 +175,7 @@ function sessionWindowed<K, V, A>(
 	kind: AggregationKind,
 	options: WindowedAggregateOptions<K, A>,
 	valueCodec: Codec<A>,
-	merge: SessionMerge<K, V, A>
+	merge: SessionMerge<K, V | null, A>
 ): KTable<Windowed<K>, A> {
 	const { windows } = windowed
 	const format: WindowedFormat = { kind: 'session' }

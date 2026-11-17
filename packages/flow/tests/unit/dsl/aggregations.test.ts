@@ -6,7 +6,7 @@ import { windowedKeyCodec } from '@/changelog/writer.js'
 import { codec, type Codec } from '@/codec.js'
 import type { KStreamImpl } from '@/dsl/kstream.js'
 import type { KTableImpl } from '@/dsl/ktable.js'
-import { SessionWindows, TimeWindows } from '@/dsl/windows.js'
+import { SessionWindows, SlidingWindows, TimeWindows } from '@/dsl/windows.js'
 import type { Change } from '@/operators/change.js'
 import type { InternalProcessorContext, ProcessorContext } from '@/processor/api.js'
 import type { StreamRecord } from '@/processor/record.js'
@@ -641,7 +641,7 @@ describe('aggregations', () => {
 	it('a null windowed aggregate deletes its window or session and is forwarded as a tombstone', async () => {
 		const driver = new TestDriver()
 		const out: unknown[] = []
-		const reset = (agg: string, v: string) => (v === 'reset' ? (null as unknown as string) : agg + v)
+		const reset = (agg: string, v: string | null) => (v === 'reset' ? (null as unknown as string) : agg + v)
 		const grouped = driver.input('in', { key: str, value: str }).groupByKey()
 		grouped
 			.windowedBy(TimeWindows.of(10))
@@ -822,26 +822,61 @@ describe('aggregations', () => {
 			})
 		})
 
-		it('aggregate() needs a codec for its aggregates', () => {
+		it('aggregate() keeps aggregates of the value type with the value codec, windowed or not', async () => {
 			const driver = new TestDriver()
 			const grouped = driver.input('in', { key: str, value: str }).groupByKey()
-			// Aggregates of the value type are kept with the value codec, which a value-changing operator drops.
+			const append = (_k: string, v: string | null, text: string) => text + v
+			grouped
+				.aggregate(() => '', append)
+				.toStream()
+				.to('texts')
+			grouped
+				.windowedBy(TimeWindows.ofSizeWithNoGrace(10))
+				.aggregate(() => '', append)
+				.toStream()
+				.to('windows')
+			grouped
+				.windowedBy(SessionWindows.ofInactivityGapWithNoGrace(10))
+				.aggregate(
+					() => '',
+					append,
+					(_k, a, b) => a + b
+				)
+				.toStream()
+				.to('sessions')
+			grouped
+				.windowedBy(SlidingWindows.ofTimeDifferenceWithNoGrace(10))
+				.aggregate(() => '', append)
+				.toStream()
+				.to('slides')
+			await driver.run(async ({ send, producer }) => {
+				await send('in', 'a', at('k', 15))
+				await send('in', 'b', at('k', 16))
+				const last = (topic: string) => producer.messagesFor(topic).at(-1)?.value?.toString()
+				expect(['texts', 'windows', 'sessions', 'slides'].map(last)).toEqual(['ab', 'ab', 'ab', 'ab'])
+			})
+		})
+
+		it('aggregate() needs a codec for its aggregates once a value-changing operator dropped the value codec', () => {
+			const driver = new TestDriver()
 			const lengths = driver
 				.input('lengths', { key: str, value: str })
 				.mapValues(v => v?.length ?? 0)
 				.groupByKey()
-			expect(() =>
-				lengths.aggregate(
-					() => 0,
-					(_k, v, agg) => agg + v
-				)
-			).toThrow('aggregate() needs a codec for its aggregates')
-			expect(() =>
-				grouped.windowedBy(TimeWindows.of(10)).aggregate(
-					() => 0,
-					() => 1
-				)
-			).toThrow('aggregate() needs a codec for its aggregates')
+			const add = (_k: string, v: number | null, sum: number) => sum + (v ?? 0)
+			expect(() => lengths.aggregate(() => 0, add)).toThrow('aggregate() needs a codec for its aggregates')
+			for (const windowed of [
+				() => lengths.windowedBy(TimeWindows.of(10)).aggregate(() => 0, add),
+				() =>
+					lengths.windowedBy(SessionWindows.withInactivityGap(10)).aggregate(
+						() => 0,
+						add,
+						(_k, a, b) => a + b
+					),
+				() => lengths.windowedBy(SlidingWindows.ofTimeDifferenceWithNoGrace(10)).aggregate(() => 0, add),
+			]) {
+				expect(windowed).toThrow('windowed aggregate() needs a codec for its aggregates')
+			}
 		})
 
 		it('reduce() needs a value codec once the values changed upstream', () => {
@@ -879,8 +914,8 @@ describe('aggregations', () => {
 		it("unnamed aggregations keep today's store names, which name their changelogs", () => {
 			const driver = new TestDriver()
 			const grouped = driver.input('in', { key: str, value: str }).groupByKey()
-			const concat = (a: string, b: string) => a + b
-			const append = (_k: string, v: string, agg: string) => agg + v
+			const concat = (a: string, b: string | null) => a + b
+			const append = (_k: string, v: string | null, agg: string) => agg + v
 			grouped.count()
 			grouped.reduce(concat)
 			grouped.aggregate(() => '', append, { value: str })

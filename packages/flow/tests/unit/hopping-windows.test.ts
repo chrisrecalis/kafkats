@@ -38,7 +38,7 @@ describe('hopping windows', () => {
 					.windowedBy(TimeWindows.ofSizeWithNoGrace(1000).advanceBy(500))
 					.aggregate(
 						() => 0,
-						(_k, v, agg) => agg + v,
+						(_k, v, agg) => agg + (v ?? 0),
 						{ value: num }
 					),
 			[[5, 750]]
@@ -54,7 +54,7 @@ describe('hopping windows', () => {
 			driver =>
 				grouped(driver)
 					.windowedBy(TimeWindows.ofSizeWithNoGrace(1000).advanceBy(500))
-					.reduce((a, b) => a + b),
+					.reduce((a, b) => a + (b ?? 0)),
 			[
 				[7, 750],
 				[1, 900],

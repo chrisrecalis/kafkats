@@ -15,13 +15,16 @@ export class TimeWindowedKStreamImpl<K, V> implements TimeWindowedKStream<K, V> 
 		return timeWindowedCount(this, options)
 	}
 
-	reduce(reducer: (aggregate: V, value: V) => V, options?: WindowedAggregateOptions<K, V>): KTable<Windowed<K>, V> {
+	reduce(
+		reducer: (aggregate: V, value: V | null) => V,
+		options?: WindowedAggregateOptions<K, V>
+	): KTable<Windowed<K>, V> {
 		return timeWindowedReduce(this, reducer, options)
 	}
 
 	aggregate<A>(
 		initializer: () => A,
-		aggregator: (key: K, value: V, aggregate: A) => A,
+		aggregator: (key: K, value: V | null, aggregate: A) => A,
 		options?: WindowedAggregateOptions<K, A>
 	): KTable<Windowed<K>, A> {
 		return timeWindowedAggregate(this, initializer, aggregator, options)

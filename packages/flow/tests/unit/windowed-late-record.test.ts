@@ -15,7 +15,7 @@ type Update = { key: string; start: number; end: number; value: number | null }
 function windowedSums(driver: TestDriver, windows: TimeWindows | SessionWindows, retention?: WindowDuration): Update[] {
 	const updates: Update[] = []
 	const grouped = driver.input('in', { key: str, value: num }).groupByKey()
-	const sum = (a: number, b: number) => a + b
+	const sum = (a: number, b: number | null) => a + (b ?? 0)
 	const table =
 		windows instanceof SessionWindows
 			? grouped.windowedBy(windows).reduce(sum, { retention })
