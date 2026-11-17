@@ -170,6 +170,40 @@ describe('TestDriver', () => {
 		])
 	})
 
+	it("re-keyed records reach their key's partition of a repartition topic as wide as the inputs: joins", async () => {
+		const driver = new TestDriver()
+		const customers = driver.table('customers', { key: str, value: str })
+		const joined: unknown[] = []
+		driver
+			.input('orders', { key: str, value: str })
+			.selectKey(() => 'k0')
+			.join(customers, (order, customer) => `${order}@${customer}`, { key: str, value: str })
+			.peek((k, v) => joined.push([k, v]))
+		await driver.run(async ({ send }) => {
+			// Partition 1 widens the inputs, hence the repartition topic, to 2 partitions; 'k0' hashes to partition 1.
+			await send('customers', 'Ann', { ...key('k0'), partition: 1, codec: str })
+			await send('orders', 'o1', { ...key('x'), codec: str })
+		})
+		expect(joined).toEqual([['k0', 'o1@Ann']])
+	})
+
+	it("re-keyed records reach their key's partition of a repartition topic as wide as the inputs: stores", async () => {
+		const driver = new TestDriver()
+		driver
+			.input('in', { key: str, value: str })
+			.groupBy((_k, v) => v!, { key: str, value: str })
+			.count({ storeName: 'counts' })
+		await driver.run(async ({ send, getStateStore }) => {
+			await send('in', 'k0', { ...key('x'), partition: 1, codec: str })
+			await send('in', 'a', { ...key('y'), partition: 1, codec: str })
+			const counts = (partition: number) =>
+				getStateStore<KeyValueStore<string, ValueAndTimestamp<number>>>('counts', partition)
+			expect(await counts(1).get('k0')).toMatchObject({ value: 1 })
+			expect(await counts(0).get('k0')).toBeUndefined()
+			expect(await counts(0).get('a')).toMatchObject({ value: 1 })
+		})
+	})
+
 	it('creates the tasks of partition 0 at start, the others for the first record of their partition', async () => {
 		const driver = new TestDriver()
 		const stream = driver.input('in', { key: str, value: str })
