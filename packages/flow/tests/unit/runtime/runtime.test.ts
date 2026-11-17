@@ -144,7 +144,9 @@ describe('recovery (task migration, 4.10.2)', () => {
 			expect(h.lifecycle.state).toBe('RUNNING')
 		}
 		h.io.clock.advance(1000)
-		await vi.waitFor(() => expect(h.lifecycle.error?.message).toBe('offset commits failed for more than taskTimeoutMs'))
+		await vi.waitFor(() =>
+			expect(h.lifecycle.error?.message).toBe('offset commits failed for more than taskTimeoutMs')
+		)
 		expect(h.lifecycle.state).toBe('REBALANCING')
 		await backoff(h, 500, 2)
 		await h.stop()
