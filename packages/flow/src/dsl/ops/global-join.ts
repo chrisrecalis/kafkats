@@ -1,7 +1,8 @@
 /**
  * Stream-global table joins: inner and left, on the key a selector picks (6.19). Every instance holds the whole
  * global table, so the stream is not repartitioned (a pending repartition stays pending) and its topics need no
- * co-partitioning; the join processor reads the global store without being connected to it.
+ * co-partitioning; the join processor reads the global store without being connected to it. A left join joins records
+ * whose selector picks no key with null (KIP-962), so a repartition topic upstream keeps null keys (4.1.6).
  */
 import { TopologyError } from '@/api/errors.js'
 import type { KStream, ValueJoiner } from '@/api/kstream.js'
@@ -39,6 +40,7 @@ export function globalJoin<K, V, GK, GV, VR>(
 		left: kind === 'left',
 	})
 	const prefix = kind === 'inner' ? NodePrefix.JOIN : NodePrefix.LEFT_JOIN
-	const node = stream.ctx.processor(prefix, options?.name, [stream.node], supplier)
+	const marks = kind === 'left' ? { relaxedNullKeyJoin: true as const } : {}
+	const node = stream.ctx.processor(prefix, options?.name, [stream.node], supplier, [], marks)
 	return new KStreamImpl<K, VR>(stream.ctx, node, withNewValues(stream.format), stream.repartitionRequired)
 }

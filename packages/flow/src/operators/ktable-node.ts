@@ -24,7 +24,12 @@ export interface KTableValueGetterSupplier<K, V> {
 export interface KTableNode<K, V> {
 	/** Its input: the parent table's changes, the records of a source, or the grouped records an aggregation reads. */
 	readonly supplier: ProcessorSupplier<unknown, unknown, K, Change<V>>
-	/** Kafka Streams' enableSendingOldValues: false if old values need a store this node does not have and !force. */
+	/**
+	 * Kafka Streams' enableSendingOldValues (6.11, KF19): once it answered true, the node forwards old values. Source
+	 * tables, aggregations and a materialized filter or mapValues read them from their store; a filter or mapValues
+	 * without one passes the request on to its parent and gives its answer; a join result forces both inputs. False when
+	 * old values need a store this node does not have and !force; every table root has one, so no table answers false.
+	 */
 	enableSendingOldValues(force: boolean): boolean
 	readonly valueGetter: KTableValueGetterSupplier<K, V>
 }

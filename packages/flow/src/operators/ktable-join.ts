@@ -1,12 +1,15 @@
 /**
- * Table-table joins (KS KTableKTableInnerJoin, LeftJoin, RightJoin, OuterJoin and KTableKTableJoinMerger; 6.13): an
- * update of one side reads the other side's value of its key through that side's value getter, and a merger node
- * forwards the results of both sides (storing them first when the result is materialized).
+ * Table-table joins (KS KTableKTableInnerJoin, LeftJoin, RightJoin, OuterJoin and KTableKTableJoinMerger; 6.13,
+ * ksdsl§10): an update of one side reads the other side's value of its key through that side's value getter, and a
+ * merger node forwards the results of both sides (storing them first when the result is materialized).
  *
- * Ported with today's semantics: an update forwards the result that exists after it; a tombstone only when a result
- * existed before it, which the side decides from its old value (requested from it at build time), so a delete never
- * retracts a result that was never emitted. A joiner returning null is no result. Results carry the timestamp and
- * headers of the update that produced them (Stage 3: the max timestamp of both sides). Null keys are dropped.
+ * An update `Change(new, old)` that finds the other side's value `vB` (absent: null) forwards nothing if `vB` is absent
+ * and the side has no result without it, or has one but neither `new` nor `old` exists. Otherwise it forwards
+ * `Change(new', old')`: `new'` / `old'` join `new` / `old` with `vB` where the join has a result for them, and are null
+ * elsewhere (`old'` only when old values are sent), at `max(ts, tB)` (`ts` without `vB`) with the update's headers.
+ * So a delete is forwarded whenever `vB` exists, with or without old values: as `vB` joined with null where the join
+ * has a result without the deleted value (a right delete in a left join, any delete in an outer join), else as a
+ * tombstone. A joiner returning null deletes the result. Null keys are dropped.
  */
 import type { Change } from '@/operators/change.js'
 import {
@@ -23,7 +26,7 @@ import type {
 	ProcessorContext,
 	ProcessorSupplier,
 } from '@/processor/api.js'
-import type { StreamRecord } from '@/processor/record.js'
+import { StreamRecord } from '@/processor/record.js'
 import type { TimestampedKeyValueStore } from '@/state.js'
 
 export type TableJoinKind = 'inner' | 'left' | 'outer'
@@ -31,13 +34,13 @@ export type TableJoinKind = 'inner' | 'left' | 'outer'
 /** The joiner of the left and right values; null for a side without a value (left and outer joins). */
 export type TableJoiner<V, VO, VR> = (value: V | null, otherValue: VO | null) => VR
 
-/** Whether a result exists while only this side, or only the other side, has a value. */
+/** Whether a side's join has a result while only it, or only the other side, has a value. */
 interface Outer {
 	readonly self: boolean
 	readonly other: boolean
 }
 
-/** The left side's view; the right side's is mirrored. */
+/** The left side's view; the right side's is mirrored (the right side of a left join is KS's KTableKTableRightJoin). */
 const LEFT_OUTER: Readonly<Record<TableJoinKind, Outer>> = {
 	inner: { self: false, other: false },
 	left: { self: true, other: false },
@@ -83,10 +86,12 @@ export class KTableJoin<K, V, VO, VR> implements KTableNode<K, VR> {
 			storeName === undefined
 				? joinValueGetter(left.valueGetter, right.valueGetter, outer, joiner)
 				: storeValueGetter(storeName)
-		// A side's old value decides whether a result existed before its update, except on the right side of a left
-		// join, where the left value alone decides.
-		left.enableSendingOldValues(true)
-		if (kind !== 'left') {
+		// A side with results of its own tells by its old value whether a delete retracts one (KS forces it at the join):
+		// the left side of left joins, both sides of outer joins.
+		if (outer.self) {
+			left.enableSendingOldValues(true)
+		}
+		if (outer.other) {
 			right.enableSendingOldValues(true)
 		}
 	}
@@ -100,7 +105,10 @@ export class KTableJoin<K, V, VO, VR> implements KTableNode<K, VR> {
 	}
 }
 
-/** The getter of a result that is not materialized: the join of both sides' current values. */
+/**
+ * The getter of a result that is not materialized: the join of both sides' current values (ksdsl§10.3), at the max
+ * timestamp of the values it joins. The right side is not read when the left side alone rules out a result.
+ */
 function joinValueGetter<K, V, VO, VR>(
 	left: KTableValueGetterSupplier<K, V>,
 	right: KTableValueGetterSupplier<K, VO>,
@@ -119,6 +127,9 @@ function joinValueGetter<K, V, VO, VR>(
 				},
 				get: async key => {
 					const leftValue = await leftValues.get(key)
+					if (leftValue === null && !outer.other) {
+						return null
+					}
 					const rightValue = await rightValues.get(key)
 					const value = leftValue?.value ?? null
 					const otherValue = rightValue?.value ?? null
@@ -154,19 +165,23 @@ class KTableJoinProcessor<K, V, VO, VR> implements Processor<K, Change<V>, K, Ch
 	}
 
 	async process(record: StreamRecord<K, Change<V>>): Promise<void> {
-		const { key } = record
+		const { key, timestamp } = record
 		if (key === null || key === undefined) {
 			this.context.recordDropped('null-key')
 			return
 		}
-		const otherValue = (await this.otherValues.get(key))?.value ?? null
+		const other = await this.otherValues.get(key)
 		const { newValue, oldValue } = record.value
-		const result = this.join(newValue, otherValue)
-		if (result === null && !joined(this.outer, oldValue, otherValue)) {
+		if (other === null && !(this.outer.self && (newValue !== null || oldValue !== null))) {
 			return
 		}
-		const oldResult = this.sendOldValues() ? this.join(oldValue, otherValue) : null
-		await this.context.forward(record.withValue({ newValue: result, oldValue: oldResult }))
+		const otherValue = other?.value ?? null
+		const change: Change<VR> = {
+			newValue: this.join(newValue, otherValue),
+			oldValue: this.sendOldValues() ? this.join(oldValue, otherValue) : null,
+		}
+		const resultTimestamp = other === null ? timestamp : Math.max(timestamp, other.timestamp)
+		await this.context.forward(new StreamRecord(key, change, resultTimestamp, record.headers))
 	}
 
 	close(): MaybePromise<void> {
@@ -178,7 +193,7 @@ class KTableJoinProcessor<K, V, VO, VR> implements Processor<K, Change<V>, K, Ch
 	}
 }
 
-/** Forwards both sides' results; a materialized result is stored first. */
+/** Forwards both sides' results; a materialized result is stored first (a null result deletes the key). */
 class KTableJoinMerger<K, VR> implements Processor<K, Change<VR>, K, Change<VR>> {
 	private context!: ProcessorContext<K, Change<VR>>
 	private store: TimestampedKeyValueStore<K, VR> | undefined

@@ -106,15 +106,16 @@ describe('table-table joins (copied from flow.test.ts)', () => {
 		})
 	})
 
-	it('inner join: no spurious tombstone without a prior join result', async () => {
+	it('inner join: a delete forwards a tombstone whenever the other table has the key (KS)', async () => {
 		const { driver, emitted } = usersJoinAccounts('join')
 		await driver.run(async ({ send }) => {
-			// Accounts has 'k' but users never did: a users tombstone for 'k' must not retract.
+			// Accounts has 'k' but users never did: an inner join asks for no old values, so it cannot tell.
 			await send('accounts', { balance: 50 }, key('k'))
 			await send('users', null, key('k'))
-			expect(emitted).toHaveLength(0)
+			expect(emitted).toEqual([{ key: 'k', value: null }])
 
-			// A real result, then a duplicate delete: only the first delete retracts.
+			// A real result, then a duplicate delete: each delete forwards a tombstone.
+			emitted.length = 0
 			await send('users', { name: 'Ann' }, key('u'))
 			await send('accounts', { balance: 10 }, key('u'))
 			expect(emitted).toEqual([{ key: 'u', value: { name: 'Ann', balance: 10 } }])
@@ -122,7 +123,10 @@ describe('table-table joins (copied from flow.test.ts)', () => {
 			emitted.length = 0
 			await send('users', null, key('u'))
 			await send('users', null, key('u'))
-			expect(emitted).toEqual([{ key: 'u', value: null }])
+			expect(emitted).toEqual([
+				{ key: 'u', value: null },
+				{ key: 'u', value: null },
+			])
 		})
 	})
 
@@ -158,15 +162,16 @@ describe('table-table joins (copied from flow.test.ts)', () => {
 		})
 	})
 
-	it('inner join: right-side deletes retract precisely', async () => {
+	it('inner join: a right-side delete forwards a tombstone whenever the left table has the key (KS)', async () => {
 		const { driver, emitted } = usersJoinAccounts('join')
 		await driver.run(async ({ send }) => {
-			// A users row exists but accounts never did: an accounts tombstone must not retract.
+			// A users row exists but accounts never did: the delete still forwards a tombstone.
 			await send('users', { name: 'Ghost' }, key('ghost'))
 			await send('accounts', null, key('ghost'))
-			expect(emitted).toHaveLength(0)
+			expect(emitted).toEqual([{ key: 'ghost', value: null }])
 
-			// Real result, then a right-side delete retracts; a duplicate right delete must not re-emit.
+			// Real result, then a right-side delete retracts it; a duplicate right delete forwards another tombstone.
+			emitted.length = 0
 			await send('users', { name: 'Ann' }, key('u'))
 			await send('accounts', { balance: 10 }, key('u'))
 			expect(emitted).toEqual([{ key: 'u', value: { name: 'Ann', balance: 10 } }])
@@ -174,7 +179,10 @@ describe('table-table joins (copied from flow.test.ts)', () => {
 			emitted.length = 0
 			await send('accounts', null, key('u'))
 			await send('accounts', null, key('u'))
-			expect(emitted).toEqual([{ key: 'u', value: null }])
+			expect(emitted).toEqual([
+				{ key: 'u', value: null },
+				{ key: 'u', value: null },
+			])
 		})
 	})
 
@@ -748,7 +756,7 @@ describe('table-table joins', () => {
 		return records
 	}
 
-	it('results carry the timestamp and headers of the update that produced them', async () => {
+	it('results carry the max timestamp of the joined values and the headers of the update', async () => {
 		const driver = new TestDriver()
 		const joined = driver.table('a', S).join(driver.table('b', S), (x, y) => `${x}+${y}`)
 		const records = recordsOf<string, string>(joined)
@@ -758,12 +766,12 @@ describe('table-table joins', () => {
 			await ctx.send('a', Buffer.from('x2'), { ...key('k'), timestamp: 7 })
 		})
 		expect(records.map(r => [r.value.newValue, r.timestamp, r.headers.h?.toString()])).toEqual([
-			['x+y', 5, 'b'],
+			['x+y', 10, 'b'],
 			['x2+y', 7, undefined],
 		])
 	})
 
-	it('a joiner returning null is no result: a tombstone is forwarded only if a result existed', async () => {
+	it('a joiner returning null deletes the result: it is forwarded as a tombstone (KS)', async () => {
 		const driver = new TestDriver()
 		driver
 			.table('a', S)
@@ -773,10 +781,10 @@ describe('table-table joins', () => {
 		await driver.run(async ctx => {
 			await send(ctx, 'b', 'k', 'y')
 			await send(ctx, 'a', 'k', 'none')
-			expect(values(ctx)).toEqual([])
+			expect(values(ctx)).toEqual([null])
 			await send(ctx, 'a', 'k', 'x')
 			await send(ctx, 'a', 'k', 'none')
-			expect(values(ctx)).toEqual(['x+y', null])
+			expect(values(ctx)).toEqual([null, 'x+y', null])
 		})
 	})
 

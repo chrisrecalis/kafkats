@@ -426,7 +426,7 @@ describe('stream-table joins', () => {
 		})
 	})
 
-	it('drops stream records with a null key or a null value, also in a left join', async () => {
+	it('drops stream records with a null value; a left join joins a null key with null (KIP-962)', async () => {
 		const driver = new TestDriver()
 		driver
 			.input('s', S)
@@ -435,7 +435,7 @@ describe('stream-table joins', () => {
 		await driver.run(async ctx => {
 			await ctx.send('s', Buffer.from('S'), { timestamp: 1 })
 			await send(ctx, 's', 'k', null, 2)
-			expect(values(ctx)).toEqual([])
+			expect(values(ctx)).toEqual(['S+null'])
 		})
 	})
 
@@ -499,7 +499,7 @@ describe('stream-global table joins', () => {
 		})
 	})
 
-	it('the deprecated two-argument form looks up the record key; null keys and values are dropped', async () => {
+	it('the deprecated two-argument form looks up the record key; a left join joins null keys with null', async () => {
 		const driver = new TestDriver()
 		const users = driver.globalTable('users', S)
 		driver
@@ -512,7 +512,7 @@ describe('stream-global table joins', () => {
 			await send(ctx, 'events', 'u2', 'view', 3)
 			await ctx.send('events', Buffer.from('nokey'), { timestamp: 4 })
 			await send(ctx, 'events', 'u1', null, 5)
-			expect(values(ctx)).toEqual(['click+Alice', 'view+null'])
+			expect(values(ctx)).toEqual(['click+Alice', 'view+null', 'nokey+null'])
 		})
 	})
 
