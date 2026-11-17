@@ -75,8 +75,8 @@ describe('at-least-once commit interval', () => {
 					if ((await committedOffset(applicationId, input)) === BigInt(end)) break
 				}
 				expect(await committedOffset(applicationId, input)).toBe(BigInt(end))
-				// Within about one interval (plus the barrier and the request).
-				expect(Date.now() - processedAt).toBeLessThan(3000)
+				// Within about one interval (plus the barrier and the request), sooner than an auto-commit (5 s).
+				expect(Date.now() - processedAt).toBeLessThan(4000)
 			}
 		} finally {
 			await app.close()

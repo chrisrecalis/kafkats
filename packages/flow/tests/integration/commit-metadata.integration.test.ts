@@ -143,8 +143,12 @@ describe('commit metadata', () => {
 					)
 				})
 			}
-			const end = await logEnd(input)
-			expect(end).toBe(18n)
+			// The broker writes the markers after the commits returned: the log ends past the last one soon.
+			const end = 18n
+			for (const deadline = Date.now() + 10_000; (await logEnd(input)) < end && Date.now() < deadline;) {
+				await sleep(100)
+			}
+			expect(await logEnd(input)).toBe(end)
 			await app.start()
 			for (const deadline = Date.now() + 30_000; Date.now() < deadline; await sleep(200)) {
 				if ((await readAllCommitted(client, out, 500)).length >= 15) break
