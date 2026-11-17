@@ -2,7 +2,7 @@
 	"node": "v22.23.4",
 	"records": 1000000,
 	"nsPerRecord": {
-		"stateless": 1007,
-		"count": 2979
+		"stateless": 865,
+		"count": 2315
 	}
 }
