@@ -13,6 +13,9 @@ import type { Windowed } from '@/api/grouped.js'
 import type { Change } from '@/operators/change.js'
 import type { InternalProcessorContext } from '@/processor/api.js'
 import { StreamRecord, type RecordHeaders } from '@/processor/record.js'
+import { yieldIfDue } from '@/runtime/signals.js'
+import type { SessionStoreReads } from '@/state/time-clipping.js'
+import type { ValueAndTimestamp } from '@/state.js'
 
 /** The final result of one window. */
 export interface FinalResult<K, A> {
@@ -61,4 +64,31 @@ export class EmitFinal<K, A> {
 		}
 		this.context.metadata.put(this.progressKey, closeTime)
 	}
+}
+
+/** Entries a scan of a whole store reads between two yields to the event loop. */
+const YIELD_EVERY = 1000
+
+/**
+ * The final results of the windows of a session(-layout) store ending in `[lowerEnd, upperEnd]`, by end, each stored
+ * value given as a value and timestamp by `read`. Such stores are ordered by key, so this scans all of it (B16), below
+ * its read floor too, yielding to the event loop on the way.
+ */
+export async function scanClosedWindows<K, S, A>(
+	store: Pick<SessionStoreReads<K, S>, 'all'>,
+	lowerEnd: number,
+	upperEnd: number,
+	read: (stored: S, window: Windowed<K>['window']) => ValueAndTimestamp<A>
+): Promise<FinalResult<K, A>[]> {
+	const closed: FinalResult<K, A>[] = []
+	let scanned = 0
+	for await (const [{ key, windowStart: start, windowEnd: end }, stored] of store.all()) {
+		if (end >= lowerEnd && end <= upperEnd) {
+			const window = { start, end }
+			closed.push({ key: { key, window }, ...read(stored, window) })
+		}
+		if (++scanned % YIELD_EVERY === 0) await yieldIfDue()
+	}
+	// By end, as Kafka Streams' time-ordered session stores return them.
+	return closed.sort((a, b) => a.key.window.end - b.key.window.end)
 }

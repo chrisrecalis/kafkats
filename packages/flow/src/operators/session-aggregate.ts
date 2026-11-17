@@ -14,14 +14,13 @@
  */
 import type { Windowed } from '@/api/grouped.js'
 import type { Change } from '@/operators/change.js'
-import { EmitFinal, type FinalResult } from '@/operators/emit-final.js'
+import { EmitFinal, scanClosedWindows, type FinalResult } from '@/operators/emit-final.js'
 import type { KTableNode, KTableValueGetterSupplier } from '@/operators/ktable-node.js'
 import { windowedValueGetter, type Window } from '@/operators/window-aggregate.js'
 import type { InternalProcessorContext, Processor, ProcessorContext, ProcessorSupplier } from '@/processor/api.js'
 import { StreamRecord, type RecordHeaders } from '@/processor/record.js'
 import { ObservedStreamTime } from '@/processor/time-tracker.js'
-import { yieldIfDue } from '@/runtime/signals.js'
-import type { WindowedKey } from '@/state.js'
+import type { ValueAndTimestamp, WindowedKey } from '@/state.js'
 import type { ClockedSessionStore } from '@/state/time-clipping.js'
 
 /**
@@ -55,8 +54,8 @@ export interface SessionWindowSpec {
 	readonly graceMs: number
 }
 
-/** Entries an emit-on-window-close scan reads between two yields to the event loop. */
-const YIELD_EVERY = 1000
+/** A session's aggregate as a result: at the session's end (KS). */
+const atEnd = <A>(value: A, window: Window): ValueAndTimestamp<A> => ({ value, timestamp: window.end })
 
 export class SessionWindowAggregate<K, V, A> implements KTableNode<Windowed<K>, A> {
 	readonly supplier: ProcessorSupplier<K | null, V | null, Windowed<K>, Change<A>>
@@ -66,10 +65,7 @@ export class SessionWindowAggregate<K, V, A> implements KTableNode<Windowed<K>, 
 	constructor(storeName: string, windows: SessionWindowSpec, merge: SessionMerge<K, V, A>, emitFinal: boolean) {
 		this.supplier = () =>
 			new SessionWindowAggregateProcessor(storeName, windows, merge, emitFinal, () => this.sendOldValues)
-		this.valueGetter = windowedValueGetter<K, A, A>(storeName, (value, window) => ({
-			value,
-			timestamp: window.end,
-		}))
+		this.valueGetter = windowedValueGetter<K, A, A>(storeName, atEnd)
 	}
 
 	/** Always materialized: the store has the old values. */
@@ -175,25 +171,11 @@ class SessionWindowAggregateProcessor<K, V, A> implements Processor<K | null, V 
 
 	/**
 	 * The sessions of every key that ended since the last emission: ends in `[last, closeTime - 1]` (from 0 before the
-	 * first; KS `emitRangeLowerBound`, `emitRangeUpperBound`, `shouldRangeFetch`). Found by scanning the whole store
-	 * (B16), below its read floor too, yielding to the event loop on the way.
+	 * first; KS `emitRangeLowerBound`, `emitRangeUpperBound`, `shouldRangeFetch`).
 	 */
 	private closedSessions(last: number, closeTime: number): Promise<FinalResult<K, A>[]> | undefined {
 		const lower = Math.max(0, last)
 		const upper = closeTime - 1
-		return upper < 0 || upper < lower ? undefined : this.scan(lower, upper)
-	}
-
-	private async scan(lower: number, upper: number): Promise<FinalResult<K, A>[]> {
-		const closed: FinalResult<K, A>[] = []
-		let scanned = 0
-		for await (const [{ key, windowStart: start, windowEnd: end }, value] of this.store.unclipped.all()) {
-			if (end >= lower && end <= upper) {
-				closed.push({ key: { key, window: { start, end } }, value, timestamp: end })
-			}
-			if (++scanned % YIELD_EVERY === 0) await yieldIfDue()
-		}
-		// By end, as Kafka Streams' time-ordered session stores return them.
-		return closed.sort((a, b) => a.key.window.end - b.key.window.end)
+		return upper < 0 || upper < lower ? undefined : scanClosedWindows(this.store.unclipped, lower, upper, atEnd)
 	}
 }
