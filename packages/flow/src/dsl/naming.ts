@@ -57,7 +57,6 @@ export const StorePrefix = {
 	TABLE_REDUCE: 'table-reduce-store',
 	TABLE_AGGREGATE: 'table-aggregate-store',
 	TO_TABLE: 'toTable-store',
-	GROUP_BY_MAPPING: 'groupby-mapping',
 	STREAM_JOIN: 'stream-join',
 	STREAM_LEFT_JOIN: 'stream-left-join',
 	STREAM_OUTER_JOIN: 'stream-outer-join',
