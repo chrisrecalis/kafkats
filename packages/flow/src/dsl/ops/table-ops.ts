@@ -1,30 +1,103 @@
-/** Table filter, filterNot and mapValues (6.12). */
+/**
+ * Table filter, filterNot and mapValues (6.12), and what every derived table shares with table-table joins: its codecs
+ * (Materialized first, then the parent's; the value codec only where values are unchanged) and its store, registered
+ * only when Materialized names one (6.11).
+ */
 import type { ValueMapper } from '@/api/kstream.js'
 import type { KTable } from '@/api/ktable.js'
-import type { TableOptions } from '@/api/options.js'
-import type { KTableImpl } from '@/dsl/ktable.js'
-import { notImplemented } from '@/dsl/not-implemented.js'
+import type { Materialized, TableOptions } from '@/api/options.js'
+import type { DslContext } from '@/dsl/context.js'
+import { requireCodec, type StreamFormat } from '@/dsl/format.js'
+import { KTableImpl } from '@/dsl/ktable.js'
+import { NodePrefix } from '@/dsl/naming.js'
+import { ktableFilter } from '@/operators/ktable-filter.js'
+import { KTableMapValues } from '@/operators/ktable-map-values.js'
+import type { KTableNode } from '@/operators/ktable-node.js'
+import { withKey } from '@/operators/stateless.js'
+import { timestampedKeyValueStoreBuilder } from '@/state/store-builders.js'
 
 export function filter<K, V>(
-	_table: KTableImpl<K, V>,
-	_predicate: (key: K, value: V) => boolean,
-	_options?: TableOptions<K, V>
+	table: KTableImpl<K, V>,
+	predicate: (key: K, value: V) => boolean,
+	options?: TableOptions<K, V>
 ): KTable<K, V> {
-	return notImplemented('KTable.filter')
+	return filtered(table, predicate, false, options)
 }
 
 export function filterNot<K, V>(
-	_table: KTableImpl<K, V>,
-	_predicate: (key: K, value: V) => boolean,
-	_options?: TableOptions<K, V>
+	table: KTableImpl<K, V>,
+	predicate: (key: K, value: V) => boolean,
+	options?: TableOptions<K, V>
 ): KTable<K, V> {
-	return notImplemented('KTable.filterNot')
+	return filtered(table, predicate, true, options)
 }
 
+/** The mapper gets the key when it declares two parameters (6.20). */
 export function mapValues<K, V, VR>(
-	_table: KTableImpl<K, V>,
-	_mapper: ValueMapper<K, V, VR | null>,
-	_options?: TableOptions<K, VR>
+	table: KTableImpl<K, V>,
+	mapper: ValueMapper<K, V, VR | null>,
+	options: TableOptions<K, VR> = {}
 ): KTable<K, VR> {
-	return notImplemented('KTable.mapValues')
+	const format = derivedFormat(table.format, options.materialized, false)
+	const storeName = materializedStore(table.ctx, options.materialized, format, 'mapValues()')
+	const node = new KTableMapValues(table.table, withKey(mapper), { storeName })
+	return derived(table, NodePrefix.TABLE_MAP_VALUES, options.name, node, format, storeName)
+}
+
+function filtered<K, V>(
+	table: KTableImpl<K, V>,
+	predicate: (key: K, value: V) => boolean,
+	negate: boolean,
+	options: TableOptions<K, V> = {}
+): KTable<K, V> {
+	const operator = negate ? 'filterNot()' : 'filter()'
+	const format = derivedFormat(table.format, options.materialized, true)
+	const storeName = materializedStore(table.ctx, options.materialized, format, operator)
+	const node = ktableFilter(table.table, predicate, negate, storeName)
+	return derived(table, NodePrefix.TABLE_FILTER, options.name, node, format, storeName)
+}
+
+/** Registers the processor of a table derived from `table` (connected to its own store, if any). */
+function derived<K, V, VR>(
+	table: KTableImpl<K, V>,
+	prefix: string,
+	name: string | undefined,
+	node: KTableNode<K, VR>,
+	format: StreamFormat,
+	storeName: string | undefined
+): KTable<K, VR> {
+	const stores = storeName === undefined ? [] : [storeName]
+	const processor = table.ctx.processor(prefix, name, [table.node], node.supplier, stores)
+	return new KTableImpl(table.ctx, processor, format, node)
+}
+
+/** A derived table's codecs: Materialized first, then the parent's (its value codec only if values are unchanged). */
+export function derivedFormat<K, V>(
+	format: StreamFormat,
+	materialized: Materialized<K, V> | undefined,
+	sameValues: boolean
+): StreamFormat {
+	return {
+		keyCodec: materialized?.key ?? format.keyCodec,
+		valueCodec: materialized?.value ?? (sameValues ? format.valueCodec : undefined),
+		windowed: materialized?.key === undefined ? format.windowed : undefined,
+	}
+}
+
+/** Registers the timestamped store a Materialized with a store name asks for; returns its name. */
+export function materializedStore<K, V>(
+	ctx: DslContext,
+	materialized: Materialized<K, V> | undefined,
+	format: StreamFormat,
+	operator: string
+): string | undefined {
+	const name = materialized?.storeName
+	if (name === undefined) {
+		return undefined
+	}
+	const keyCodec = requireCodec<K>(undefined, format.keyCodec, 'key', operator)
+	const valueCodec = requireCodec<V>(undefined, format.valueCodec, 'value', operator)
+	const logging = materialized?.changelog
+	ctx.builder.addStateStore(timestampedKeyValueStoreBuilder(ctx.changelog, { name, keyCodec, valueCodec, logging }))
+	return name
 }
