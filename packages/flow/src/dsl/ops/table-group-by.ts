@@ -5,7 +5,6 @@
  * Materialized.storeName | repartition-<n>>-repartition`: every aggregation of a named grouping shares one (KF6), every
  * aggregation of an unnamed one has its own (Kafka Streams).
  */
-import { TopologyError } from '@/api/errors.js'
 import type { KGroupedTable } from '@/api/grouped.js'
 import type { KeyValue } from '@/api/kstream.js'
 import type { KTable } from '@/api/ktable.js'
@@ -17,6 +16,7 @@ import { KGroupedTableImpl } from '@/dsl/kgrouped-table.js'
 import { KStreamImpl } from '@/dsl/kstream.js'
 import { KTableImpl } from '@/dsl/ktable.js'
 import { NodePrefix, storeName, StorePrefix } from '@/dsl/naming.js'
+import { COUNT_CODEC, requireAggregateCodec, type AggregationKind } from '@/dsl/ops/aggregate.js'
 import { repartitionIfRequired } from '@/dsl/ops/repartition.js'
 import {
 	KTableAggregate,
@@ -27,16 +27,6 @@ import {
 } from '@/operators/ktable-aggregate.js'
 import { groupedRowCodec, repartitionMapProcessor } from '@/operators/ktable-repartition-map.js'
 import { keyValueStoreBuilder, timestampedKeyValueStoreBuilder } from '@/state/store-builders.js'
-
-/** Default codec of counts and row counts: an 8-byte little-endian double (today's format; WP3.10 switches to int64). */
-const COUNT_CODEC: Codec<number> = {
-	encode: count => {
-		const encoded = Buffer.alloc(8)
-		encoded.writeDoubleLE(count, 0)
-		return encoded
-	},
-	decode: encoded => encoded.readDoubleLE(0),
-}
 
 /** The grouped key codec must be given (the selector changes keys); the value codec defaults to the table's. */
 export function groupBy<K, V, KR, VR>(
@@ -86,14 +76,10 @@ export function aggregate<K, V, A>(
 	subtractor: (key: K, value: V, aggregate: A) => A,
 	options: AggregateOptions<K, A> = {}
 ): KTable<K, A> {
-	if (options.value === undefined) {
-		throw new TopologyError('aggregate() needs a codec for its aggregates: pass one as the value option')
-	}
+	const valueCodec = requireAggregateCodec(options.value, 'aggregate()')
 	const aggregator = tableAggregate(initializer, adder, subtractor)
-	return aggregateGroups(grouped, 'aggregate', options, options.value, aggregator)
+	return aggregateGroups(grouped, 'aggregate', options, valueCodec, aggregator)
 }
-
-type AggregationKind = 'count' | 'reduce' | 'aggregate'
 
 /** Store-name and node-name prefixes of each kind. */
 const PREFIXES: Readonly<Record<AggregationKind, readonly [store: string, node: string]>> = {

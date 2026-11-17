@@ -14,7 +14,10 @@ import { aggregationInput } from '@/dsl/ops/grouping.js'
 import { aggregateWith, KStreamAggregate, reduceWith, type Aggregation } from '@/operators/kstream-aggregate.js'
 import { timestampedKeyValueStoreBuilder } from '@/state/store-builders.js'
 
-/** Default codec of counts: an 8-byte little-endian double (today's format; WP3.10 switches to KS's int64). */
+/**
+ * Default codec of counts, also of the row counts of a KGroupedTable aggregate(): an 8-byte little-endian double
+ * (today's format; WP3.10 switches to KS's int64).
+ */
 export const COUNT_CODEC: Codec<number> = {
 	encode: count => {
 		const encoded = Buffer.alloc(8)

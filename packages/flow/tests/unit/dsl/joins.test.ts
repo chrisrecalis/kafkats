@@ -343,6 +343,66 @@ describe('joins (copied from operator-semantics*.test.ts)', () => {
 			expect(values(ctx)).toEqual(['a+v'])
 		})
 	})
+
+	it('stream can be joined with an aggregated table (groupByKey().count())', async () => {
+		const driver = new TestDriver()
+		const counts = driver.input('a', S).groupByKey().count()
+		driver
+			.input('b', S)
+			.join(counts, (v, c) => `${v}:${c}`)
+			.to('out', S)
+		await driver.run(async ctx => {
+			await send(ctx, 'a', 'k', 'x', 1)
+			await send(ctx, 'b', 'k', 'y', 2)
+			expect(values(ctx)).toEqual(['y:1'])
+		})
+	})
+})
+
+describe('join wiring (copied from flow.test.ts)', () => {
+	it('repartitions a re-keyed stream after a global-table join before aggregating it', () => {
+		const app = flow({ applicationId: 'app', client })
+		const regions = app.globalTable('regions', { key: codec.string(), value: codec.string() })
+
+		// The join needs no repartitioning (every instance holds the whole table), but the
+		// records still sit in the partition of their old key.
+		app.stream('events', { key: codec.string(), value: codec.json<{ region: string }>() })
+			.selectKey((_key, value) => value!.region)
+			.join(regions, (event, name) => ({ ...event, name }))
+			.groupByKey({ key: codec.string(), value: codec.json() })
+			.count({ storeName: 'per-region' })
+
+		const topology = internals(app).build()
+		const perRegion = topology.subtopologies.find(s => s.stores.some(store => store.name === 'per-region'))
+		expect([...perRegion!.sourceTopics]).toEqual(['app-repartition-0-repartition'])
+	})
+
+	it('joins the results of a windowed aggregation with a table in the partition of the windowed key', () => {
+		const app = flow({ applicationId: 'app', client })
+		type Window = { key: string; window: { start: number; end: number } }
+		const labels = app.table('labels', { key: codec.json<Window>(), value: codec.string() })
+
+		app.stream('events', { key: codec.string(), value: codec.json<{ type: string }>() })
+			.groupByKey()
+			.windowedBy(TimeWindows.of('10s'))
+			.count({ storeName: 'windows' })
+			.mapValues(count => count ?? 0)
+			.filter(() => true)
+			.toStream()
+			.join(labels, (count, label) => `${label}: ${count}`, {
+				key: codec.json<Window>(),
+				value: codec.json<number>(),
+			})
+
+		const topology = internals(app).build()
+		expect([...topology.internalTopics.keys()].filter(topic => topic.endsWith('-repartition'))).toEqual([
+			'app-repartition-0-repartition',
+		])
+		expect(topology.copartitionGroups.map(group => [...group].sort())).toContainEqual([
+			'app-repartition-0-repartition',
+			'labels',
+		])
+	})
 })
 
 describe('stream-stream joins', () => {
