@@ -58,7 +58,11 @@ export interface KStream<K, V> {
 	to(topic: string | TopicNameExtractor<K | null, V | null>, options?: Produced<K, V>): void
 	/** @deprecated Use repartition(), or to() and stream(). Writes to a user topic and reads it back. */
 	through(topic: string, options?: Produced<K, V>): KStream<K, V>
-	/** Writes to and reads back the internal topic `<applicationId>-<name | repartition-N>-repartition`. */
+	/**
+	 * Writes to and reads back the internal topic `<applicationId>-<name | repartition-N>-repartition`, even if the keys
+	 * did not change; key-based operations downstream do not repartition again. Records with a null key are dropped
+	 * unless a left or outer join is downstream.
+	 */
 	repartition(options?: Repartitioned<K, V>): KStream<K, V>
 	toTable(options?: Materialized<K, V> & NamedOptions): KTable<K, V>
 	/** Always repartitions. */

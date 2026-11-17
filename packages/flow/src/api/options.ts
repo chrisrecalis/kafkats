@@ -110,12 +110,20 @@ export interface Joined<K, V, VO> extends NamedOptions {
 	changelog?: boolean | ChangelogConfig
 }
 
-/** How `repartition()` writes and reads back its internal topic. */
+/**
+ * How `repartition()` writes and reads back its internal topic `<applicationId>-<name>-repartition` (generated
+ * `<applicationId>-repartition-<n>-repartition` without a name).
+ */
 export interface Repartitioned<K, V> extends NamedOptions {
-	/** Default: the partition count of the upstream topics. */
+	/**
+	 * Default: the largest partition count of the topics the stream comes from, or the count of the topics it is
+	 * co-partitioned with downstream (joins, aggregations), which must equal an explicit count.
+	 */
 	numberOfPartitions?: number
+	/** Default: the stream's codecs. */
 	key?: Codec<K>
 	value?: Codec<V>
+	/** Default: the producer's partitioning of the encoded key; the base key's partition for a windowed key codec. */
 	partitioner?: RecordPartitioner<K, V>
 }
 
