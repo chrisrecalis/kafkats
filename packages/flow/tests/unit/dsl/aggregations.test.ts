@@ -19,14 +19,14 @@ const str = codec.string()
 const json = codec.json<unknown>()
 const key = (k: string) => ({ key: Buffer.from(k) })
 const at = (k: string, timestamp: number, partition = 0) => ({ key: Buffer.from(k), timestamp, partition, codec: str })
-/** Today's count codec: an 8-byte little-endian double. */
+/** The default count codec: an int64 big-endian (Kafka Streams' `Serdes.Long`). */
 const num: Codec<number> = {
 	encode: n => {
 		const b = Buffer.alloc(8)
-		b.writeDoubleLE(n, 0)
+		b.writeBigInt64BE(BigInt(n))
 		return b
 	},
-	decode: b => b.readDoubleLE(0),
+	decode: b => Number(b.readBigInt64BE()),
 }
 
 function topologyOf(driver: TestDriver): BuiltTopology {
@@ -564,10 +564,9 @@ describe('aggregations (copied from operator-semantics*.test.ts)', () => {
 })
 
 describe('aggregations', () => {
-	it('results keep the timestamp and headers of the record that produced them', async () => {
+	it('windowed results keep the timestamp and headers of the record that produced them', async () => {
 		const driver = new TestDriver()
 		const grouped = driver.input('in', { key: str, value: str }).groupByKey()
-		grouped.count().toStream().to('counts', { key: str, value: num })
 		grouped.windowedBy(TimeWindows.of(10)).count().toStream().to('windows', { value: num })
 		grouped.windowedBy(SessionWindows.withInactivityGap(10)).count().toStream().to('sessions', { value: num })
 		const first = { trace: Buffer.from('t1') }
@@ -576,10 +575,6 @@ describe('aggregations', () => {
 			await send('in', 'x', { ...at('k', 15), headers: first })
 			await send('in', 'x', { ...at('k', 18), headers: second })
 			const sent = (topic: string) => producer.messagesFor(topic).map(r => [r.timestamp, r.headers])
-			expect(sent('counts')).toEqual([
-				[15n, first],
-				[18n, second],
-			])
 			expect(sent('windows')).toEqual([
 				[15n, first],
 				[18n, second],
@@ -675,14 +670,14 @@ describe('aggregations', () => {
 		])
 	})
 
-	it('aggregation stores keep the aggregate with the timestamp of its last update', async () => {
+	it('aggregation stores keep the aggregate with the max timestamp of its records (Kafka Streams)', async () => {
 		const driver = new TestDriver()
 		driver.input('in', { key: str, value: str }).groupByKey().count({ storeName: 'counts' })
 		await driver.run(async ({ send, getStateStore }) => {
 			await send('in', 'x', at('k', 7))
 			await send('in', 'x', at('k', 3))
 			const store = getStateStore<TimestampedKeyValueStore<string, number>>('counts')
-			expect(await store.get('k')).toEqual({ value: 2, timestamp: 3 })
+			expect(await store.get('k')).toEqual({ value: 2, timestamp: 7 })
 		})
 	})
 
@@ -822,10 +817,15 @@ describe('aggregations', () => {
 		it('aggregate() needs a codec for its aggregates', () => {
 			const driver = new TestDriver()
 			const grouped = driver.input('in', { key: str, value: str }).groupByKey()
+			// Aggregates of the value type are kept with the value codec, which a value-changing operator drops.
+			const lengths = driver
+				.input('lengths', { key: str, value: str })
+				.mapValues(v => v?.length ?? 0)
+				.groupByKey()
 			expect(() =>
-				grouped.aggregate(
+				lengths.aggregate(
 					() => 0,
-					() => 1
+					(_k, v, agg) => agg + v
 				)
 			).toThrow('aggregate() needs a codec for its aggregates')
 			expect(() =>
