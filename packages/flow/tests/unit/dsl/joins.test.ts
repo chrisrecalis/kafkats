@@ -377,14 +377,15 @@ describe('join wiring (copied from flow.test.ts)', () => {
 		expect([...perRegion!.sourceTopics]).toEqual(['app-repartition-0-repartition'])
 	})
 
-	it('joins the results of a windowed aggregation with a table in the partition of the windowed key', () => {
+	it('BC10: joins the results of a windowed aggregation with a table without repartitioning them', () => {
 		const app = flow({ applicationId: 'app', client })
 		type Window = { key: string; window: { start: number; end: number } }
+		// The table's topic must be partitioned by base key, as windowed sinks write (6.9).
 		const labels = app.table('labels', { key: codec.json<Window>(), value: codec.string() })
 
 		app.stream('events', { key: codec.string(), value: codec.json<{ type: string }>() })
 			.groupByKey()
-			.windowedBy(TimeWindows.of('10s'))
+			.windowedBy(TimeWindows.ofSizeWithNoGrace('10s'))
 			.count({ storeName: 'windows' })
 			.mapValues(count => count ?? 0)
 			.filter(() => true)
@@ -395,13 +396,8 @@ describe('join wiring (copied from flow.test.ts)', () => {
 			})
 
 		const topology = internals(app).build()
-		expect([...topology.internalTopics.keys()].filter(topic => topic.endsWith('-repartition'))).toEqual([
-			'app-repartition-0-repartition',
-		])
-		expect(topology.copartitionGroups.map(group => [...group].sort())).toContainEqual([
-			'app-repartition-0-repartition',
-			'labels',
-		])
+		expect([...topology.internalTopics.keys()].filter(topic => topic.endsWith('-repartition'))).toEqual([])
+		expect(topology.copartitionGroups.map(group => [...group].sort())).toContainEqual(['events', 'labels'])
 	})
 })
 
