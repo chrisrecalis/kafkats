@@ -6,7 +6,7 @@
  *   pnpm exec tsx tests/chaos/close-chaos.ts --scenario drain --guarantee eos --mode count   # SIGTERM -> close() under load, restart, verify
  *   pnpm exec tsx tests/chaos/close-chaos.ts --scenario start --delay-ms 300                 # close() while start() in progress
  *   pnpm exec tsx tests/chaos/close-chaos.ts --scenario broker-down --down pause              # close() while broker unreachable (pause|kill)
- * Flags: --guarantee alo|eos --mode stateless|count|regroup|table-join|global-join --cycles 4 --partitions 4
+ * Flags: --guarantee alo|eos --mode stateless|count|regroup|table-join|global-join|window|join --cycles 4 --partitions 4
  *        --keys 12 --per-key 100 --delay-ms 0 (start) --down pause|kill (broker-down)
  * Exit 0 PASS / 1 FAIL. For `start`/`broker-down` PASS means close() returned within 30s and no member leaked.
  * Every scenario also fails on an unhandled rejection or uncaught exception in a worker, or a worker left in ERROR.
@@ -19,6 +19,9 @@ import {
 	scenarioTopics,
 	genInput,
 	produceBatches,
+	produceRight,
+	tickStreamTime,
+	lastEventTime,
 	readAll,
 	sleep,
 	flags,
@@ -58,6 +61,7 @@ const topics = await scenarioTopics(client, mode, Number(opts.partitions))
 const { appId, input, output } = topics
 const env = workerEnv({ ...topics, mode, guarantee })
 const feed = topics.table ? await TableFeed.start(client, topics.table, keys) : null
+await produceRight(client, topics, keys, perKey)
 const workers: Worker[] = []
 const startWorker = (label: string, extra: Record<string, string> = {}) => {
 	const w = new Worker(label, { ...env, ...extra }).start()
@@ -87,7 +91,7 @@ async function membersOf(group: string): Promise<string> {
 }
 
 if (scenario === 'drain') {
-	const inputs = genInput(keys, perKey)
+	const inputs = genInput(keys, perKey, mode)
 	console.log(
 		`== close/drain ${guarantee}/${mode}: ${inputs.length} records, ${cycles} graceful close+restart cycles`
 	)
@@ -115,6 +119,7 @@ if (scenario === 'drain') {
 	let sum: Summary
 	const t0 = Date.now()
 	do {
+		await tickStreamTime(client, topics, mode, Number(opts.partitions), lastEventTime(inputs))
 		outs = await readAll(client, output, isolation, { quietMs: 3000, maxMs: 20000 })
 		sum = summarize(mode, inputs, outs, sizes)
 	} while (!drained(sum) && Date.now() - t0 < 90000)
@@ -165,7 +170,7 @@ if (scenario === 'drain') {
 } else if (scenario === 'broker-down') {
 	const down = opts.down
 	console.log(`== close while broker down (${down}) ${guarantee}/${mode}`)
-	const inputs = genInput(keys, perKey)
+	const inputs = genInput(keys, perKey, mode)
 	const producing = produceBatches(client, input, inputs, 12, 100).catch(() => {})
 	const w = startWorker('w')
 	for (let i = 0; i < 60 && (w.last('status')?.processed ?? 0) < 40; i++) await sleep(500)

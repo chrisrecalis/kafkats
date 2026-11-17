@@ -6,8 +6,10 @@
  *   CHAOS_BROKERS=127.0.0.1:29092 CHAOS_APP_ID=x CHAOS_IN=in CHAOS_OUT=out \
  *   CHAOS_MODE=count CHAOS_GUARANTEE=exactly_once pnpm exec tsx tests/chaos/worker.ts
  *
- * Env: CHAOS_BROKERS, CHAOS_APP_ID, CHAOS_IN, CHAOS_OUT, CHAOS_MODE=stateless|count|regroup|table-join|global-join,
- *      CHAOS_TABLE (the table topic of the join modes), CHAOS_GUARANTEE=at_least_once|exactly_once,
+ * Env: CHAOS_BROKERS, CHAOS_APP_ID, CHAOS_IN, CHAOS_OUT,
+ *      CHAOS_MODE=stateless|count|regroup|table-join|global-join|window|join,
+ *      CHAOS_TABLE (the table topic of the table join modes), CHAOS_RIGHT (the right stream of the join mode),
+ *      CHAOS_GUARANTEE=at_least_once|exactly_once,
  *      CHAOS_BUFFERED_RECORDS (bufferedRecordsPerPartition, default the library's),
  *      CHAOS_SESSION_MS (default 6000), CHAOS_TXN_TIMEOUT_MS (default 10000),
  *      CHAOS_RESTORE_IDLE_MS (changelog restoration idleTimeoutMs, default 300 as in the repo's integration tests),
@@ -18,7 +20,7 @@
  * Behaviour: logs one JSON line per event on stdout (type=...). SIGTERM => graceful close().
  * Logs every unhandledRejection / uncaughtException (scenario E) but does NOT exit on them.
  */
-import { codec, flow } from '../../src/index.js'
+import { codec, flow, JoinWindows, TimeWindows } from '../../src/index.js'
 
 const env = (k: string, d?: string): string => {
 	const v = process.env[k] ?? d
@@ -58,6 +60,9 @@ const app = flow({
 	},
 	processingGuarantee: guarantee,
 	commitIntervalMs: 100,
+	// KIP-695: a task of the join mode waits up to 2 s for an input partition that is caught up, so the right stream,
+	// written in full before the input (common.ts produceRight), is joined in event-time order with the live input.
+	...(mode === 'join' ? { maxTaskIdleMs: 2_000 } : {}),
 	...(process.env.CHAOS_BUFFERED_RECORDS
 		? { bufferedRecordsPerPartition: Number(process.env.CHAOS_BUFFERED_RECORDS) }
 		: {}),
@@ -116,6 +121,21 @@ if (mode === 'stateless') {
 			k => k,
 			(v, version) => `m:${v}|${version}`
 		)
+		.to(env('CHAOS_OUT'), { key: str, value: str })
+} else if (mode === 'window') {
+	// counts per key and 1 s window; no grace, but every partition is in event-time order (common.ts genInput)
+	input()
+		.groupByKey()
+		.windowedBy(TimeWindows.ofSizeWithNoGrace(1_000))
+		.count({ storeName: 'counts', value: num })
+		.toStream()
+		.selectKey(key => `${key!.key}@${key!.window.start}`)
+		.to(env('CHAOS_OUT'), { key: str, value: num })
+} else if (mode === 'join') {
+	// left join within 1 s, no grace: matched at once, unmatched joined with null once its window closed
+	const right = app.stream(env('CHAOS_RIGHT'), { key: str, value: str })
+	input()
+		.leftJoin(right, (v, r) => `m:${v}|${r ?? 'null'}`, JoinWindows.ofTimeDifferenceWithNoGrace(1_000))
 		.to(env('CHAOS_OUT'), { key: str, value: str })
 } else {
 	throw new Error(`unknown CHAOS_MODE ${mode}`)

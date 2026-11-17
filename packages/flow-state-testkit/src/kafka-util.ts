@@ -65,11 +65,20 @@ export async function createTopic(client: any, name: string, partitions: number)
 	}
 	throw new Error('topic not ready')
 }
-export async function readCommitted(
+/** A committed record of an output topic; values are JSON (numbers unless `V` says else). */
+export interface CommittedRow<V = number> {
+	key: string
+	value: V | null
+	partition: number
+	offset: bigint
+}
+
+/** Everything committed on `topic` until it was quiet for `quietMs`. */
+export async function readCommitted<V = number>(
 	client: any,
 	topic: string,
 	quietMs = 2_000
-): Promise<Array<{ key: string; value: number | null; partition: number; offset: bigint }>> {
+): Promise<CommittedRow<V>[]> {
 	const consumer = client.consumer({
 		groupId: uniq('r3-reader'),
 		autoOffsetReset: 'earliest',

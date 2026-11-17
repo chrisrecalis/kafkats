@@ -1,9 +1,10 @@
 /**
  * Child worker for the crash tests (spawned, never run directly by vitest).
- * Env: R3_BROKERS, R3_APP, R3_IN, R3_OUT, R3_STATE, R3_MODE=count|window, R3_GUARANTEE, R3_RESTORE_DELAY_MS (slow restore),
+ * Env: R3_BROKERS, R3_APP, R3_IN, R3_OUT, R3_STATE, R3_MODE=count|window|session|join, R3_RIGHT (the right stream of
+ *      the join mode), R3_GUARANTEE, R3_RESTORE_DELAY_MS (slow restore),
  *      R3_PROVIDER_MODULE + R3_PROVIDER_FACTORY (the provider under test, see EngineUnderTest.module)
  */
-import { codec, flow, SessionWindows, TimeWindows } from '@kafkats/flow'
+import { codec, flow, JoinWindows, SessionWindows, TimeWindows } from '@kafkats/flow'
 import type { StateStoreProvider } from '@kafkats/flow'
 import { KafkaClient } from '@kafkats/client'
 
@@ -70,6 +71,9 @@ const app = flow({
 	client,
 	processingGuarantee: env('R3_GUARANTEE') as 'at_least_once' | 'exactly_once',
 	commitIntervalMs: 100,
+	// KIP-695: a join task waits up to 2 s for an input partition that is caught up, so the right stream, written in
+	// full first, is joined in event-time order with the live input.
+	...(env('R3_MODE') === 'join' ? { maxTaskIdleMs: 2_000 } : {}),
 	consumer: { autoOffsetReset: 'earliest', maxWaitMs: 100, sessionTimeoutMs: 6000 },
 	producer: { lingerMs: 0, transactionTimeoutMs: 10000 },
 	stateStoreProvider: createProvider({ stateDir: env('R3_STATE') }),
@@ -77,18 +81,33 @@ const app = flow({
 		restoration: { idleTimeoutMs: 1000, initialIdleTimeoutMs: 5000, checkIntervalMs: 50, consumerMaxWaitMs: 50 },
 	},
 })
-const grouped = app.stream(env('R3_IN'), { key: str, value: str }).groupByKey()
-if (env('R3_MODE') === 'count') {
-	grouped.count({ storeName: 'counts', key: str, value: num }).toStream().to(env('R3_OUT'), { key: str, value: num })
+const input = app.stream(env('R3_IN'), { key: str, value: str })
+if (env('R3_MODE') === 'join') {
+	// Left join within 1 s, no grace: its join buffers and the outer-join store of unmatched records on the provider.
+	input
+		.leftJoin(
+			app.stream(env('R3_RIGHT'), { key: str, value: str }),
+			(left, right) => `${left}|${right ?? 'null'}`,
+			JoinWindows.ofTimeDifferenceWithNoGrace(1_000)
+		)
+		.to(env('R3_OUT'), { key: str, value: codec.json<string>() })
+} else if (env('R3_MODE') === 'count') {
+	input
+		.groupByKey()
+		.count({ storeName: 'counts', key: str, value: num })
+		.toStream()
+		.to(env('R3_OUT'), { key: str, value: num })
 } else if (env('R3_MODE') === 'session') {
-	grouped
+	input
+		.groupByKey()
 		.windowedBy(SessionWindows.withInactivityGap(1_000))
 		.count({ storeName: 'scounts', value: num })
 		.toStream()
 		.selectKey(k => `${k!.key}@${k!.window.start}-${k!.window.end}`)
 		.to(env('R3_OUT'), { key: str, value: num })
 } else {
-	grouped
+	input
+		.groupByKey()
 		.windowedBy(TimeWindows.of(1_000))
 		.count({ storeName: 'wcounts', value: num })
 		.toStream()

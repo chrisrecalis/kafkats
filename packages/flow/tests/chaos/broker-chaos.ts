@@ -5,7 +5,7 @@
  * Run (from packages/flow):
  *   pnpm exec tsx tests/chaos/broker-chaos.ts --guarantee eos --mode stateless --fault restart
  *   pnpm exec tsx tests/chaos/broker-chaos.ts --guarantee alo --mode count --fault pause --pause-s 25
- * Flags: --guarantee alo|eos --mode stateless|count|regroup|table-join|global-join
+ * Flags: --guarantee alo|eos --mode stateless|count|regroup|table-join|global-join|window|join
  *        --fault restart|pause|kill|rolling (multi-broker: CHAOS_RF=3 CHAOS_CONTAINER=<one> CHAOS_CONTAINERS=<all>)
  *        --pause-s 25 --partitions 4 --keys 12 --per-key 100
  *        --recover-ms 120000 (how long to wait for self-recovery before declaring HANG)
@@ -22,8 +22,12 @@ import {
 	makeClient,
 	scenarioTopics,
 	genInput,
+	produceRight,
 	readAll,
 	sleep,
+	tickStreamTime,
+	lastEventTime,
+	TICK_KEY,
 	flags,
 	guaranteeOf,
 	modeOf,
@@ -61,9 +65,10 @@ const ev = (m: string) => console.log(`  [+${((Date.now() - T0) / 1000).toFixed(
 let client = await makeClient()
 const topics = await scenarioTopics(client, mode, Number(opts.partitions))
 const { input, output } = topics
-const inputs = genInput(keys, perKey)
+const inputs = genInput(keys, perKey, mode)
 console.log(`== ${label}: ${inputs.length} records`)
 const feed = topics.table ? await TableFeed.start(client, topics.table, keys) : null
+await produceRight(client, topics, keys, perKey)
 
 // producer that survives broker outages: retries each batch on a fresh producer until it succeeds
 let sentCount = 0
@@ -79,7 +84,11 @@ const sendLoop = (async () => {
 			try {
 				await p.send(
 					input,
-					slice.map(r => ({ key: r.key, value: Buffer.from(r.value) }))
+					slice.map(r => ({
+						key: r.key,
+						value: Buffer.from(r.value),
+						...(r.timestamp === undefined ? {} : { timestamp: new Date(r.timestamp) }),
+					}))
 				)
 				break
 			} catch {
@@ -191,12 +200,13 @@ const stderr = w.lines
 await client.disconnect().catch(() => {})
 client = await makeClient()
 const actualInput = await readAll(client, input, 'read_uncommitted', { quietMs: 4000, maxMs: 30000 })
-const actualRecs: Rec[] = actualInput.map(o => ({ key: o.key, value: o.value }))
-const expectedByKey = new Map<string, number>()
-for (const r of actualRecs) expectedByKey.set(r.key, (expectedByKey.get(r.key) ?? 0) + 1)
+const actualRecs: Rec[] = actualInput
+	.filter(o => o.key !== TICK_KEY)
+	.map(o => ({ key: o.key, value: o.value, timestamp: o.timestamp }))
 const dedupInput = new Set(actualRecs.map(r => r.value)).size !== actualRecs.length
+await tickStreamTime(client, topics, mode, Number(opts.partitions), lastEventTime(actualRecs), 3)
 const outs = await readAll(client, output, isolation, { quietMs: 8000, maxMs: 60000 })
-const sum = summarize(mode, actualRecs, outs, { keys, perKey, expectedByKey })
+const sum = summarize(mode, actualRecs, outs, { keys, perKey })
 
 // Is the app actually dead? Produce a sentinel (on a key the join modes' tables hold) and see if it still processes.
 let stillAlive = 'n/a'
@@ -205,6 +215,8 @@ if (w.alive) {
 	const p = client.producer({ lingerMs: 0 })
 	await p.send(input, [{ key: 'k0', value: Buffer.from('sentinel#1') }])
 	await p.disconnect()
+	// The join mode emits the (unmatched) sentinel once stream time passed its window.
+	await tickStreamTime(client, topics, mode, Number(opts.partitions), Date.now(), 3)
 	await sleep(15000)
 	const after = await readAll(client, output, isolation, { quietMs: 5000, maxMs: 30000 })
 	stillAlive = after.length > before ? 'yes (processed sentinel)' : 'NO (sentinel not processed in 15s)'

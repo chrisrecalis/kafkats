@@ -7,7 +7,16 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { ChildWorker, workerEnv, createTopic, makeClient, readCommitted, sleep, uniq } from './kafka-util.js'
+import {
+	ChildWorker,
+	workerEnv,
+	createTopic,
+	makeClient,
+	readCommitted,
+	sleep,
+	uniq,
+	type CommittedRow,
+} from './kafka-util.js'
 import type { EngineUnderTest } from './engine.js'
 
 export function crashSuite(engine: EngineUnderTest): void {
@@ -16,6 +25,19 @@ export function crashSuite(engine: EngineUnderTest): void {
 	const PER_KEY = 60
 	// NOTE: timestamps must be near wall-clock: ancient record timestamps make the broker's time-based retention delete the output log
 	const BASE = Math.floor(Date.now() / 1000) * 1000
+	/** Key of the join mode's records that only move stream time. */
+	const TICK = 'tick'
+	/**
+	 * The join mode's right stream: for two thirds of the keys, a record every 2.5 s from 1.25 s on, up to the last input
+	 * record. The input records are 300 ms apart from BASE: each lies within 1 s of at most one of them, and none exactly
+	 * 1 s from one, so it joins that one or none.
+	 */
+	const RIGHT: Array<{ key: string; value: string; timestamp: number }> = []
+	for (let j = 0, t = 1_250; t <= (PER_KEY - 1) * 300; j++, t += 2_500) {
+		for (let k = 0; k < KEYS; k++) {
+			if (k % 3 !== 2) RIGHT.push({ key: `k${k}`, value: `r${j}`, timestamp: BASE + t })
+		}
+	}
 
 	describe.skipIf(!brokers)(`${engine.name}: hardening: SIGKILL +`, () => {
 		let client: any
@@ -29,13 +51,15 @@ export function crashSuite(engine: EngineUnderTest): void {
 			await client?.disconnect()
 		})
 
-		async function scenario(
+		/** Runs the mode's app through `kills` SIGKILLs; the output values are JSON of type `V`. */
+		async function scenario<V = number>(
 			guarantee: 'exactly_once' | 'at_least_once',
-			mode: 'count' | 'window' | 'session',
+			mode: 'count' | 'window' | 'session' | 'join',
 			kills: number
 		) {
 			const input = uniq('r3c-in')
 			const out = uniq('r3c-out')
+			const right = uniq('r3c-right')
 			const app = uniq('r3c-app')
 			const stateDir = mkdtempSync(join(tmpdir(), 'r3-crash-'))
 			await createTopic(client, input, 3)
@@ -48,9 +72,19 @@ export function crashSuite(engine: EngineUnderTest): void {
 				R3_STATE: stateDir,
 				R3_MODE: mode,
 				R3_GUARANTEE: guarantee,
+				...(mode === 'join' ? { R3_RIGHT: right } : {}),
 				...(process.env.R3_TRACE ? { R3_TRACE: '1' } : {}),
 			}
 			const producer = client.producer({ lingerMs: 0, idempotent: true })
+			if (mode === 'join') {
+				// All of the right side first: each task reads its two partitions in timestamp order and waits for the
+				// live input (KIP-695, the worker's maxTaskIdleMs).
+				await createTopic(client, right, 3)
+				await producer.send(
+					right,
+					RIGHT.map(r => ({ key: r.key, value: Buffer.from(r.value), timestamp: new Date(r.timestamp) }))
+				)
+			}
 			let produced = false
 			// per-key sequence, round-robin over keys; timestamps advance 300ms per record so windows of 1s hold 3-4 records
 			const producing = (async () => {
@@ -59,7 +93,7 @@ export function crashSuite(engine: EngineUnderTest): void {
 						input,
 						Array.from({ length: KEYS }, (_, k) => ({
 							key: `k${k}`,
-							value: Buffer.from('x'),
+							value: Buffer.from(`k${k}#${s}`),
 							timestamp: new Date(BASE + s * 300),
 						}))
 					)
@@ -86,18 +120,32 @@ export function crashSuite(engine: EngineUnderTest): void {
 				// final: let it drain
 				const total = KEYS * PER_KEY
 				const deadline = Date.now() + 60_000
-				let rows: Awaited<ReturnType<typeof readCommitted>> = []
-				while (Date.now() < deadline) {
+				let rows: CommittedRow<V>[] = []
+				for (let tick = 0; Date.now() < deadline; tick++) {
+					if (mode === 'join') {
+						// The last records of each partition are joined with null once stream time passed their window.
+						await producer.send(
+							input,
+							[0, 1, 2].map(partition => ({
+								key: TICK,
+								value: Buffer.from('t'),
+								partition,
+								timestamp: new Date(BASE + PER_KEY * 300 + 5_000 + tick),
+							}))
+						)
+					}
 					await sleep(2_000)
 					if (w.proc.exitCode !== null) w = spawn()
-					rows = await readCommitted(client, out, 1_500)
-					if (mode === 'count') {
+					rows = await readCommitted<V>(client, out, 1_500)
+					if (mode === 'join') {
+						if (rows.filter(r => r.key !== TICK).length >= total) break
+					} else if (mode === 'count') {
 						const finals = new Map<string, number>()
-						for (const r of rows) finals.set(r.key, Math.max(finals.get(r.key) ?? 0, r.value!))
+						for (const r of rows) finals.set(r.key, Math.max(finals.get(r.key) ?? 0, Number(r.value)))
 						if ([...finals.values()].filter(v => v >= PER_KEY).length === KEYS) break
 					} else if (mode === 'window') {
 						const sum = new Map<string, number>()
-						for (const r of rows) sum.set(r.key, Math.max(sum.get(r.key) ?? 0, r.value!))
+						for (const r of rows) sum.set(r.key, Math.max(sum.get(r.key) ?? 0, Number(r.value)))
 						if ([...sum.values()].reduce((a, b) => a + b, 0) >= total) break
 					} else if (rows.filter(r => r.value === PER_KEY).length === KEYS) {
 						break // session: every key's single session has absorbed all records
@@ -197,6 +245,21 @@ export function crashSuite(engine: EngineUnderTest): void {
 				truth[`k${k}@${start}-${end}`] = n
 			}
 			expect(live).toEqual(truth)
+		}, 180_000)
+
+		it('exactly_once stream-stream left join: every input record is joined exactly once after >=8 SIGKILLs', async () => {
+			const { rows } = await scenario<string>('exactly_once', 'join', 8)
+			const want: string[] = []
+			for (let s = 0; s < PER_KEY; s++) {
+				for (let k = 0; k < KEYS; k++) {
+					const timestamp = BASE + s * 300
+					const partner = RIGHT.find(r => r.key === `k${k}` && Math.abs(r.timestamp - timestamp) <= 1_000)
+					want.push(`k${k}=k${k}#${s}|${partner?.value ?? 'null'}`)
+				}
+			}
+			const got = rows.filter(r => r.key !== TICK).map(r => `${r.key}=${r.value}`)
+			expect(want.filter(row => !row.endsWith('|null')).length, 'matched records').toBeGreaterThan(KEYS * 20)
+			expect(got.sort()).toEqual(want.sort())
 		}, 180_000)
 
 		it('at_least_once count: no record lost (final >= N per key) and final is never below truth', async () => {

@@ -36,6 +36,8 @@ SCENARIOS=(
 	'kc 1b-eos-tablejoin-2i --guarantee eos --mode table-join --instances 2 --kills 8 --drain-ms 60000'
 	'bc 1b-eos-global-pause --guarantee eos --mode global-join --fault pause --pause-s 20'
 	'kc 1b-eos-count-bp-2i CHAOS_BUFFERED_RECORDS=8 --guarantee eos --mode count --instances 2 --kills 8 --drain-ms 60000'
+	'kc 1b-eos-window-2i --guarantee eos --mode window --instances 2 --kills 8 --drain-ms 60000'
+	'kc 1b-eos-join-2i --guarantee eos --mode join --instances 2 --kills 8 --drain-ms 60000'
 	'bc 3b-eos-count-kill --guarantee eos --mode count --fault kill'
 	'bc 3b-eos-count-rolling --guarantee eos --mode count --fault rolling'
 	'bc 3b-eos-stateless-rolling --guarantee eos --mode stateless --fault rolling'

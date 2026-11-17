@@ -20,12 +20,14 @@ export const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms))
 export const rnd = (a: number, b: number) => a + Math.random() * (b - a)
 
 /**
- * The pipelines of worker.ts. The join modes join the input with a table (`table-join`, co-partitioned) or a global
- * table (`global-join`) whose rows are versions written by a TableFeed; their outputs are `m:<value>|<version>`.
+ * The pipelines of worker.ts. The table join modes join the input with a table (`table-join`, co-partitioned) or a
+ * global table (`global-join`) whose rows are versions written by a TableFeed; their outputs are `m:<value>|<version>`.
+ * The event-time modes work on the input's timestamps (`genInput`): `window` counts per key and 1 s window (no grace),
+ * `join` left-joins the input with the records of `genRight` within 1 s (no grace).
  */
-export type Mode = 'stateless' | 'count' | 'regroup' | 'table-join' | 'global-join'
+export type Mode = 'stateless' | 'count' | 'regroup' | 'table-join' | 'global-join' | 'window' | 'join'
 export type Guarantee = 'at_least_once' | 'exactly_once'
-const MODES: readonly string[] = ['stateless', 'count', 'regroup', 'table-join', 'global-join']
+const MODES: readonly string[] = ['stateless', 'count', 'regroup', 'table-join', 'global-join', 'window', 'join']
 
 /** `--name value` flags with these defaults; an unknown flag (such as the removed `--threads`) fails fast. */
 export function flags<const T extends Record<string, string>>(defaults: T): { [K in keyof T]: string } {
@@ -83,24 +85,31 @@ export interface Topics {
 	output: string
 	/** The table (table-join) or global table (global-join) topic. */
 	table?: string
+	/** The right stream of the `join` mode. */
+	right?: string
 }
 
 export async function scenarioTopics(client: KafkaClient, mode: Mode, partitions: number): Promise<Topics> {
 	const topics: Topics = { appId: uid('chaos-app'), input: uid('chaos-in'), output: uid('chaos-out') }
 	if (hasTable(mode)) topics.table = uid('chaos-table')
-	await createTopics(client, [topics.input, topics.output, ...(topics.table ? [topics.table] : [])], partitions)
+	if (mode === 'join') topics.right = uid('chaos-right')
+	const extra = [topics.table, topics.right].filter(topic => topic !== undefined)
+	await createTopics(client, [topics.input, topics.output, ...extra], partitions)
 	return topics
 }
 
 export interface Rec {
 	key: string
 	value: string
+	/** Event time (ms); the producer's clock when absent. */
+	timestamp?: number | undefined
 }
 export interface Out {
 	partition: number
 	offset: bigint
 	key: string
 	value: string
+	timestamp: number
 }
 
 /** Read all of `topic` with a fresh group until `done(msgs)` is true, or `quietMs` passes with no new message, or maxMs. */
@@ -124,6 +133,7 @@ export async function readAll(
 			offset: m.offset,
 			key: m.key ? m.key.toString() : '',
 			value: m.value ? m.value.toString() : '',
+			timestamp: Number(m.timestamp),
 		})
 		last = Date.now()
 	})
@@ -210,16 +220,109 @@ export function workerEnv(p: Topics & { mode: Mode; guarantee: Guarantee }): Rec
 		CHAOS_IN: p.input,
 		CHAOS_OUT: p.output,
 		...(p.table ? { CHAOS_TABLE: p.table } : {}),
+		...(p.right ? { CHAOS_RIGHT: p.right } : {}),
 		CHAOS_MODE: p.mode,
 		CHAOS_GUARANTEE: p.guarantee,
 	}
 }
 
-/** Input generator: KEYS keys x PER_KEY records; value = `${key}#${seq}` (seq is per-key 1..PER_KEY). Interleaved round-robin. */
-export function genInput(keys: number, perKey: number): Rec[] {
+/** Event time of the generated records: a whole second near the start of the harness. */
+export const EVENT_TIME_BASE = Math.floor(Date.now() / 1000) * 1000
+/** Event time between two sequence numbers of a key: 10 per 1 s window. */
+export const EVENT_TIME_STEP_MS = 100
+
+/** The modes whose results depend on the input's timestamps. */
+export const usesEventTime = (mode: Mode) => mode === 'window' || mode === 'join'
+
+/**
+ * Input generator: KEYS keys x PER_KEY records; value = `${key}#${seq}` (seq is per-key 1..PER_KEY). Interleaved
+ * round-robin. For the event-time modes record `seq` is at `EVENT_TIME_BASE + seq * EVENT_TIME_STEP_MS`, so every
+ * partition is in event-time order; the others carry the producer's clock (tasks process their partitions in timestamp
+ * order, KIP-695: a table join's version 0, written before the input, must be older than every input record).
+ */
+export function genInput(keys: number, perKey: number, mode?: Mode): Rec[] {
 	const recs: Rec[] = []
-	for (let s = 1; s <= perKey; s++) for (let k = 0; k < keys; k++) recs.push({ key: `k${k}`, value: `k${k}#${s}` })
+	for (let s = 1; s <= perKey; s++) {
+		const timestamp = mode && usesEventTime(mode) ? EVENT_TIME_BASE + s * EVENT_TIME_STEP_MS : undefined
+		for (let k = 0; k < keys; k++) recs.push({ key: `k${k}`, value: `k${k}#${s}`, timestamp })
+	}
 	return recs
+}
+
+/** The latest event time of `recs` (0 without any). */
+export const lastEventTime = (recs: readonly Rec[]) => Math.max(0, ...recs.map(r => r.timestamp ?? 0))
+
+/** Time difference of the `join` mode's windows (no grace). */
+export const JOIN_WINDOW_MS = 1_000
+const RIGHT_EVERY_MS = 2_500
+
+/**
+ * The right stream of the `join` mode: for two thirds of the keys (k % 3 !== 2), a record `r:<key>@<j>` every 2.5 s of
+ * the input's event time, at 1.25 s + 2.5 s j. Each input record lies within 1 s of at most one of them (they are more
+ * than twice the time difference apart, and no input record is exactly 1 s from one), so it joins exactly one record or
+ * none (`joinPartner`).
+ */
+export function genRight(keys: number, perKey: number): Rec[] {
+	const recs: Rec[] = []
+	const end = EVENT_TIME_BASE + perKey * EVENT_TIME_STEP_MS
+	for (let j = 0, time = EVENT_TIME_BASE + RIGHT_EVERY_MS / 2; time <= end; j++, time += RIGHT_EVERY_MS) {
+		for (let k = 0; k < keys; k++) {
+			if (k % 3 !== 2) recs.push({ key: `k${k}`, value: `r:k${k}@${j}`, timestamp: time })
+		}
+	}
+	return recs
+}
+
+/** The right record an input record of the `join` mode joins, if any. */
+export function joinPartner(input: Rec, right: readonly Rec[]): Rec | undefined {
+	return right.find(r => r.key === input.key && Math.abs(r.timestamp! - input.timestamp!) <= JOIN_WINDOW_MS)
+}
+
+/**
+ * Before the workers start: the right stream of the `join` mode, all of it. Its tasks process their two partitions in
+ * timestamp order and wait for a caught-up input partition (KIP-695, the worker's `maxTaskIdleMs`), so each right record
+ * is joined when the input reaches its time; without the wait they would read the right stream ahead of the input.
+ */
+export async function produceRight(client: KafkaClient, topics: Topics, keys: number, perKey: number) {
+	if (topics.right) await produceBatches(client, topics.right, genRight(keys, perKey), 100, 0)
+}
+
+/** Key of the records that only move stream time; their results are not verified. */
+export const TICK_KEY = 'tick'
+let ticks = 0
+
+/**
+ * The `join` mode emits an unmatched record with null once stream time passed its window, so the last records of each
+ * partition wait for a later one: sends a tick record past `after` to every partition of the input, `rounds` times a
+ * second apart (each task scans the windows that closed at most once a second). A no-op for the other modes.
+ */
+export async function tickStreamTime(
+	client: KafkaClient,
+	topics: Topics,
+	mode: Mode,
+	partitions: number,
+	after: number,
+	rounds = 1
+) {
+	if (mode !== 'join') return
+	const producer = client.producer({ lingerMs: 0 })
+	try {
+		for (let round = 0; round < rounds; round++) {
+			if (round > 0) await sleep(1_100)
+			const timestamp = new Date(after + 2 * JOIN_WINDOW_MS + ticks++)
+			await producer.send(
+				topics.input,
+				Array.from({ length: partitions }, (_, partition) => ({
+					key: TICK_KEY,
+					value: Buffer.from('t'),
+					partition,
+					timestamp,
+				}))
+			)
+		}
+	} finally {
+		await producer.disconnect()
+	}
 }
 
 export async function produceBatches(
@@ -235,7 +338,11 @@ export async function produceBatches(
 		if (stop?.()) break
 		await producer.send(
 			topic,
-			recs.slice(i, i + batch).map(r => ({ key: r.key, value: Buffer.from(r.value) }))
+			recs.slice(i, i + batch).map(r => ({
+				key: r.key,
+				value: Buffer.from(r.value),
+				...(r.timestamp === undefined ? {} : { timestamp: new Date(r.timestamp) }),
+			}))
 		)
 		if (delayMs) await sleep(delayMs)
 	}

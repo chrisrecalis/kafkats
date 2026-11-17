@@ -4,7 +4,7 @@
  * Prereq: a broker at 127.0.0.1:29092 (override with CHAOS_BROKERS); `tests/chaos/brokers.sh single` starts one.
  * Run (from packages/flow):
  *   pnpm exec tsx tests/chaos/kill-chaos.ts --guarantee eos --mode count --instances 2 --kills 8
- * Flags: --guarantee alo|eos  --mode stateless|count|regroup|table-join|global-join  --instances N  --kills N
+ * Flags: --guarantee alo|eos  --mode stateless|count|regroup|table-join|global-join|window|join  --instances N  --kills N
  *        --partitions 4  --keys 12 --per-key 100  --batch 12 --delay-ms 250 (producer pacing)  --drain-ms 120000
  *        --max-dupes N (ALO stateless/join: fail above N duplicates)  --max-count N (ALO count: fail above a count of N)
  * One worker process runs one app (there is no --threads: every app has one scheduler; use --instances).
@@ -18,6 +18,9 @@ import {
 	scenarioTopics,
 	genInput,
 	produceBatches,
+	produceRight,
+	tickStreamTime,
+	lastEventTime,
 	readAll,
 	sleep,
 	rnd,
@@ -57,10 +60,11 @@ const isolation = guarantee === 'exactly_once' ? 'read_committed' : 'read_uncomm
 const label = `${guarantee}/${mode}/inst=${instances}/p=${partitions}`
 const client = await makeClient()
 const topics = await scenarioTopics(client, mode, partitions)
-const inputs = genInput(keys, perKey)
+const inputs = genInput(keys, perKey, mode)
 console.log(`== ${label}: ${inputs.length} records, ${kills} kills; in=${topics.input} out=${topics.output}`)
 
 const feed = topics.table ? await TableFeed.start(client, topics.table, keys) : null
+await produceRight(client, topics, keys, perKey)
 const producing = produceBatches(client, topics.input, inputs, Number(opts.batch), Number(opts['delay-ms']))
 
 const env = workerEnv({ ...topics, mode, guarantee })
@@ -99,6 +103,7 @@ const t0 = Date.now()
 let outs: Out[] = []
 let sum: Summary
 while (Date.now() - t0 < drainMs) {
+	await tickStreamTime(client, topics, mode, partitions, lastEventTime(inputs))
 	outs = await readAll(client, topics.output, isolation, { quietMs: 3000, maxMs: 20000 })
 	sum = summarize(mode, inputs, outs, sizes)
 	if (drained(sum)) break
