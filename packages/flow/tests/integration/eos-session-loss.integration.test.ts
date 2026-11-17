@@ -5,10 +5,11 @@
  * the broker fences its offsets by the generation): nothing of it becomes visible, and every input is output once.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { codec, type KafkaClient, type Producer } from '@kafkats/client'
+import { codec, type KafkaClient, type KafkaClientConfig, type Producer } from '@kafkats/client'
 import type { FlowApp } from '../../src/api/app.js'
 import { flow } from '../../src/app/flow.js'
 import {
+	clientConfig,
 	collectUnhandledRejections,
 	createTopics,
 	fetchCommitted,
@@ -127,7 +128,7 @@ describe('exactly-once session loss', () => {
 		const gate = new Gate()
 		const stalled = stalledClient(gate)
 		/** Outputs `<value>@<tag>`: which instance processed the input. */
-		const build = (client: KafkaClient, tag: string): FlowApp => {
+		const build = (client: KafkaClient | KafkaClientConfig, tag: string): FlowApp => {
 			const app = flow({
 				applicationId,
 				client,
@@ -143,7 +144,7 @@ describe('exactly-once session loss', () => {
 		}
 		const outputs = async () => (await readAllCommitted(admin, out, 800)).map(m => m.value!.toString())
 		const stuck = build(stalled.client, 'A')
-		const healthy = build(newClient('session-loss-b'), 'B')
+		const healthy = build(clientConfig('session-loss-b'), 'B')
 		try {
 			await stuck.start()
 			await healthy.start()

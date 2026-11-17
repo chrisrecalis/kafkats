@@ -9,6 +9,7 @@ import { codec, type KafkaClient, type Producer } from '@kafkats/client'
 import type { FlowApp } from '../../src/api/app.js'
 import { flow } from '../../src/app/flow.js'
 import {
+	clientConfig,
 	collectUnhandledRejections,
 	createTopics,
 	fetchCommitted,
@@ -79,7 +80,7 @@ describe('backpressure', () => {
 		const build = (): FlowApp => {
 			const app = flow({
 				applicationId,
-				client: newClient('backpressure-app'),
+				client: clientConfig('backpressure-app'),
 				processingGuarantee: 'exactly_once',
 				bufferedRecordsPerPartition: 5,
 				consumer: { maxWaitMs: 100 },

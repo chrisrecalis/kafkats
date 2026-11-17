@@ -14,7 +14,7 @@ import {
 const stringCodec = codec.string()
 const numberCodec = codec.json<number>()
 
-describe('global tables and worker lifecycle', () => {
+describe('global tables and app lifecycle', () => {
 	let admin: KafkaClient
 	let producer: Producer
 	beforeAll(async () => {
@@ -238,7 +238,7 @@ describe('global tables and worker lifecycle', () => {
 		}
 	}, 60_000)
 
-	it('close() while a worker is in restart backoff returns promptly and leaves no extra handles', async () => {
+	it('close() during the recovery backoff returns promptly and leaves no extra handles', async () => {
 		const input = uniqueTopicName('r2-lc-in')
 		const output = uniqueTopicName('r2-lc-out')
 		await createTopics(admin, [{ name: input }, { name: output }])
@@ -261,7 +261,7 @@ describe('global tables and worker lifecycle', () => {
 				.toStream()
 				.to(output, { key: stringCodec, value: numberCodec })
 			await app.start()
-			await sleep(2_500) // several failed commits -> worker is in backoff
+			await sleep(2_500) // several failed commits -> the app is in its recovery backoff
 			const t0 = Date.now()
 			await app.close()
 			expect(Date.now() - t0).toBeLessThan(5_000)

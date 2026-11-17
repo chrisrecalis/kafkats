@@ -745,7 +745,7 @@ describe('app lifecycle', () => {
 		}
 	}, 30_000)
 
-	it('start() failing while workers are starting (consumer cannot join) cleans up its sockets', async () => {
+	it('start() failing while joining the group (consumer cannot join) cleans up its sockets', async () => {
 		const input = uniqueTopicName('restore-joinfail-in')
 		await createTopics(client, [{ name: input }])
 		const app = flow({

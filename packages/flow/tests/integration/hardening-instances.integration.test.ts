@@ -59,8 +59,10 @@ describe('hardening: EOS topologies on several instances with commit failures', 
 				{ name: T.oTj },
 			])
 			let commits = 0
+			const clients: KafkaClient[] = []
 			const build = (): FlowApp => {
 				const client = newClient('r3-in-app')
+				clients.push(client)
 				injectCommitFailures(client, () => {
 					commits += 1
 					return commits % 9 === 0 && commits <= 90
@@ -195,6 +197,7 @@ describe('hardening: EOS topologies on several instances with commit failures', 
 				expect(new Set(tjs)).toEqual(wantTj)
 			} finally {
 				await Promise.all(apps.map(app => app.close().catch(() => {})))
+				await Promise.all(clients.map(client => client.disconnect()))
 			}
 		}, 88_000)
 	}

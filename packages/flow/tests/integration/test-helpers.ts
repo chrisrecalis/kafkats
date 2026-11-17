@@ -1,6 +1,13 @@
 /** Shared helpers for the integration tests (real broker, see kafka.global-setup.ts). */
 import { afterAll, beforeAll } from 'vitest'
-import { ErrorCode, KafkaClient, KafkaError, type Consumer, type Message } from '@kafkats/client'
+import {
+	ErrorCode,
+	KafkaClient,
+	KafkaError,
+	type Consumer,
+	type KafkaClientConfig,
+	type Message,
+} from '@kafkats/client'
 import type {
 	ChangelogCheckpointStore,
 	Codec,
@@ -36,9 +43,14 @@ export function uniqueTopicName(prefix: string): string {
 	return `${prefix.replace(/[^a-zA-Z0-9._-]/g, '-')}-${RUN_ID}-${randomSuffix()}`
 }
 
-/** A new (not yet connected) client for the test broker. */
+/** The config of a client for the test broker; a flow app given it creates, connects and disconnects the client. */
+export function clientConfig(prefix: string): KafkaClientConfig {
+	return { clientId: `${prefix}-${Date.now()}-${randomSuffix()}`, brokers: requireKafkaBrokers() }
+}
+
+/** A new (not yet connected) client for the test broker; whoever creates it disconnects it. */
 export function newClient(prefix: string): KafkaClient {
-	return new KafkaClient({ clientId: `${prefix}-${Date.now()}-${randomSuffix()}`, brokers: requireKafkaBrokers() })
+	return new KafkaClient(clientConfig(prefix))
 }
 
 /** Rejects with `Timed out after <ms>ms: <label>` when `promise` does not settle in time. */

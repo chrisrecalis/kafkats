@@ -10,6 +10,7 @@ import { flow } from '../../src/app/flow.js'
 import type { KeyValueStore, KeyValueStoreOptions } from '../../src/state.js'
 import { InMemoryStateStoreProvider } from '../../src/state/memory.js'
 import {
+	clientConfig,
 	collectUnhandledRejections,
 	createTopics,
 	delayPuts,
@@ -74,7 +75,7 @@ class BlockingProvider extends InMemoryStateStoreProvider {
 function counting(applicationId: string, input: string, out: string, config: Partial<FlowConfig>): FlowApp {
 	const app = flow({
 		applicationId,
-		client: newClient('resume-app'),
+		client: clientConfig('resume-app'),
 		consumer: { maxWaitMs: 100 },
 		producer: { lingerMs: 0 },
 		changelog: { restoration: { idleTimeoutMs: 5_000, consumerMaxWaitMs: 100 } },
