@@ -1,4 +1,4 @@
-import type { ConsumerConfig, KafkaClient, KafkaClientConfig, ProducerConfig } from '@kafkats/client'
+import type { AutoOffsetReset, ConsumerConfig, KafkaClient, KafkaClientConfig, ProducerConfig } from '@kafkats/client'
 import type {
 	DeserializationExceptionHandler,
 	HandlerResponse,
@@ -32,12 +32,18 @@ export interface FlowConfig {
 	stateStoreProvider?: StateStoreProvider
 	/**
 	 * The group id is the application id. `partitionAssignmentStrategy` must be 'range' if given; `maxWaitMs`
-	 * defaults to 500; `autoOffsetReset` is the default reset policy of the sources (default 'earliest').
+	 * defaults to 500; `autoOffsetReset` is the default reset policy of the sources (default 'earliest'), one
+	 * policy for the app (per-source policies are `Consumed.offsetReset`).
 	 */
 	consumer?: Omit<
 		ConsumerConfig,
-		'groupId' | 'onBeforeRebalance' | 'onPartitionsAssigned' | 'onPartitionsRevoked' | 'onPartitionsLost'
-	>
+		| 'groupId'
+		| 'autoOffsetReset'
+		| 'onBeforeRebalance'
+		| 'onPartitionsAssigned'
+		| 'onPartitionsRevoked'
+		| 'onPartitionsLost'
+	> & { autoOffsetReset?: AutoOffsetReset }
 	/**
 	 * exactly_once: `transactionalId` defaults to `<applicationId>-<processId>`, `retries` to 10 and
 	 * `transactionTimeoutMs` to 10000 (it must not be below commitIntervalMs).
