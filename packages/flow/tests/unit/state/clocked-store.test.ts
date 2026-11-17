@@ -1,9 +1,10 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { IllegalStateError } from '@/api/errors.js'
 import { windowedKeyCodec } from '@/changelog/writer.js'
 import type { ProcessorContext, ProcessorMetadata, ProcessorSupplier } from '@/processor/api.js'
 import { decodeCommitMetadata } from '@/processor/metadata.js'
 import type { SessionStore, WindowedKey, WindowStore } from '@/state.js'
+import { storeHandle } from '@/state/handles.js'
 import { TaskStateManager } from '@/state/state-manager.js'
 import { sessionStoreBuilder, windowStoreBuilder } from '@/state/store-builders.js'
 import { ClockedSessionStore, ClockedWindowStore, TaskStoreClock } from '@/state/time-clipping.js'
@@ -297,6 +298,25 @@ describe('stacks without a clock', () => {
 			expect(registered.clock).toBeUndefined()
 			expect(registered.top).not.toBeInstanceOf(ClockedWindowStore)
 			expect(registered.top).not.toBeInstanceOf(ClockedSessionStore)
+		}
+	})
+})
+
+describe('the handle processors get of a store with a clock', () => {
+	it('keeps expire() and the unclipped reads; expire() rejects once the handle closed', async () => {
+		for (const builder of [windows(), sessions(10)]) {
+			const { state } = await stack(builder)
+			const top = state.store(builder.name) as
+				| ClockedWindowStore<string, string>
+				| ClockedSessionStore<string, string>
+			const expire = vi.spyOn(top, 'expire')
+			let closed = false
+			const handle = storeHandle(top, builder.kind, () => closed, 'processors of task 0_0') as typeof top
+			expect(handle.unclipped).toBe(top.unclipped)
+			await handle.expire()
+			closed = true
+			await expect(handle.expire()).rejects.toBeInstanceOf(IllegalStateError)
+			expect(expire).toHaveBeenCalledTimes(1)
 		}
 	})
 })

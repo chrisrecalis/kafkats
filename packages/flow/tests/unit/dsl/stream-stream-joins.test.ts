@@ -10,6 +10,7 @@ import { decodeCommitMetadata } from '@/processor/metadata.js'
 import type { SessionStore } from '@/state.js'
 import type { TaskStateManager } from '@/state/state-manager.js'
 import { TestDriver, type TestContextApi, type TestDriverConfig } from '@/testing/driver.js'
+import { GUARANTEES } from '../support/guarantees.js'
 import { APP, TaskHarness } from '../support/task-harness.js'
 
 const str = codec.string()
@@ -56,13 +57,6 @@ function windowJoin(kind: JoinKind, windows: JoinWindows, config?: TestDriverCon
 	joined.to('out', S)
 	return driver
 }
-
-/** The guarantees and commit cadences under which the results must be the same (DL13). */
-const GUARANTEES: readonly [string, TestDriverConfig][] = [
-	['at-least-once', {}],
-	['exactly-once, committed per record', { processingGuarantee: 'exactly_once' }],
-	['exactly-once, committed on stop', { processingGuarantee: 'exactly_once', commitEvery: 'stop' }],
-]
 
 describe.each(GUARANTEES)('stream-stream join results (%s)', (_guarantee, config) => {
 	it('a match is at the later timestamp of both records, with the headers of the record that produced it', async () => {
@@ -228,6 +222,27 @@ describe.each(GUARANTEES)('stream-stream join results (%s)', (_guarantee, config
 			await send(ctx, 'r', 'k', 'R', 1050)
 			await send(ctx, 'l', 'm', 'M', 1200)
 			expect(timed(ctx)).toEqual(['J+null@850', 'K+R@1050'])
+		})
+	})
+
+	it('asymmetric windows: a left record waits after + grace, a right one before + grace (KS lookBack)', async () => {
+		// A left record at t joins right records in [t - 10, t + 100], a right record left ones in [t - 100, t + 10].
+		const driver = windowJoin('outerJoin', JoinWindows.ofTimeDifferenceWithNoGrace(100).before(10), config)
+		await driver.run(async ctx => {
+			await send(ctx, 'l', 'a', 'A', 1000)
+			await send(ctx, 'r', 'b', 'B', 1000)
+			// B closed after 1010, but a left record scans only once the oldest pending record could have closed by its
+			// own side's after, 1000 + 100 (KS checks the triggering side's after).
+			await send(ctx, 'l', 'c', 'C', 1020)
+			expect(timed(ctx)).toEqual([])
+			await send(ctx, 'r', 'd', 'D', 1030)
+			expect(timed(ctx)).toEqual(['null+B@1000'])
+			// Out of order on the right: X's window [800, 910] ended before the stream time 1030.
+			await send(ctx, 'r', 'x', 'X', 900)
+			expect(timed(ctx)).toEqual(['null+B@1000', 'null+X@900'])
+			// A closes after 1100, D after 1040; C stays pending until after 1120.
+			await send(ctx, 'l', 'e', 'E', 1101)
+			expect(timed(ctx)).toEqual(['null+B@1000', 'null+X@900', 'A+null@1000', 'null+D@1030'])
 		})
 	})
 

@@ -119,7 +119,7 @@ abstract class ClockedStore<K, V, S extends KeyValueStore<WindowedKey<K>, V>> im
 		protected readonly inner: S,
 		protected readonly clock: StoreClock,
 		/** The retention the layers below expire by (the builder's): they delete the windows ending before `t - retention`. */
-		protected readonly retentionMs: number
+		private readonly retentionMs: number
 	) {}
 
 	get name(): string {
@@ -170,12 +170,6 @@ abstract class ClockedStore<K, V, S extends KeyValueStore<WindowedKey<K>, V>> im
 	 */
 	abstract expire(): Promise<void>
 
-	/**
-	 * This layer with the same clock over `wrap(inner)`: a handle on a clocked store (state/handles.ts) wraps the stack
-	 * below and keeps the clipping layer, and its expiry, on top.
-	 */
-	abstract over(wrap: (inner: S) => S): ClockedStore<K, V, S>
-
 	/** The time the layers below expire at, so that exactly the entries below the expiry cutoff go. */
 	protected get expiryTime(): number {
 		return this.clock.expiryCutoff + this.retentionMs
@@ -213,10 +207,6 @@ export class ClockedWindowStore<K, V>
 	async expire(): Promise<void> {
 		await this.inner.expireOldWindows(this.expiryTime)
 	}
-
-	over(wrap: (inner: WindowStore<K, V>) => WindowStore<K, V>): ClockedWindowStore<K, V> {
-		return new ClockedWindowStore(wrap(this.inner), this.clock, this.retentionMs)
-	}
 }
 
 export class ClockedSessionStore<K, V>
@@ -239,9 +229,5 @@ export class ClockedSessionStore<K, V>
 
 	async expire(): Promise<void> {
 		await this.inner.expireOldSessions(this.expiryTime)
-	}
-
-	over(wrap: (inner: SessionStore<K, V>) => SessionStore<K, V>): ClockedSessionStore<K, V> {
-		return new ClockedSessionStore(wrap(this.inner), this.clock, this.retentionMs)
 	}
 }
