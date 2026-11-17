@@ -108,12 +108,15 @@ describe('windowed/session reduce + session aggregate retention', () => {
 	it('B14: a session clock (record timestamps, under the store name) is seeded from the commit metadata, without a store scan', async () => {
 		const store = sessionStore()
 		const scan = vi.spyOn(store, 'all')
+		const expire = vi.spyOn(store, 'expireOldSessions')
 		const node = new SessionWindowAggregate('s', GAP_MS, sessionReduceWith(add))
 		const { process, metadata } = await run(node, store, { s: BASE })
 
 		await process(BASE - 30_000) // joins no session and is older than the seeded clock minus 24 gaps: dropped
 		await process(BASE - 10_000) // within retention: a new session
 		expect(metadata.get('s')).toBe(BASE)
+		// The first expiry after the seeding runs at the clock, not at the (older) record.
+		expect(expire.mock.calls).toEqual([[BASE]])
 		await process(BASE + 500)
 		expect(metadata.get('s')).toBe(BASE + 500)
 

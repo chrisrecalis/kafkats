@@ -763,15 +763,59 @@ describe('aggregations', () => {
 				encode: s => Buffer.from(s.toUpperCase()),
 				decode: b => b.toString().toLowerCase(),
 			}
-			driver
+			const grouped = driver
 				.input('in', { key: str, value: str })
 				.groupBy((_k, v) => v, { key: str, value: str, name: 'by-value' })
-				.count({ key: upper, storeName: 'counts' })
+			grouped.count({ key: upper, storeName: 'counts' })
+			grouped.windowedBy(TimeWindows.of(10)).count({ key: upper, storeName: 'windows' })
+			grouped.windowedBy(SessionWindows.withInactivityGap(10)).count({ key: upper, storeName: 'sessions' })
 			await driver.run(async ({ send, producer }) => {
 				await send('in', 'x', at('k', 1))
 				const keys = (topic: string) => producer.messagesFor(topic).map(m => m.key?.toString())
 				expect(keys('test-app-by-value-repartition')).toEqual(['x'])
 				expect(keys('test-app-counts-changelog')).toEqual(['X'])
+				// Window and session changelog keys: [key][start int64BE][end int64BE].
+				const baseKeys = (topic: string) =>
+					producer.messagesFor(topic).map(m => m.key?.subarray(0, -16).toString())
+				expect(baseKeys('test-app-windows-changelog')).toEqual(['X'])
+				expect(baseKeys('test-app-sessions-changelog')).toEqual(['X'])
+			})
+		})
+
+		it('groupByKey() repartitions with its Grouped value codec, which the aggregation keeps', async () => {
+			const driver = new TestDriver()
+			const sums: unknown[] = []
+			driver
+				.input('in', { key: str, value: str })
+				.selectKey((_k, v) => v)
+				.mapValues(v => ({ n: v!.length }))
+				.groupByKey({ key: str, value: codec.json<{ n: number }>(), name: 'by-value' })
+				.reduce((a, b) => ({ n: a.n + b.n }))
+				.toStream()
+				.peek((k, v) => sums.push([k, v]))
+			await driver.run(async ({ send, producer }) => {
+				await send('in', 'xy', at('k', 1))
+				await send('in', 'xy', at('k', 2))
+				const values = producer.messagesFor('test-app-by-value-repartition').map(m => m.value?.toString())
+				expect(values).toEqual(['{"n":2}', '{"n":2}'])
+			})
+			expect(sums).toEqual([
+				['xy', { n: 2 }],
+				['xy', { n: 4 }],
+			])
+		})
+
+		it('count() keeps its counts with Materialized.value when given', async () => {
+			const driver = new TestDriver()
+			const grouped = driver.input('in', { key: str, value: str }).groupByKey()
+			const value = codec.json<number>()
+			grouped.count({ value }).toStream().to('counts')
+			grouped.windowedBy(TimeWindows.of(10)).count({ value }).toStream().to('windows')
+			grouped.windowedBy(SessionWindows.withInactivityGap(10)).count({ value }).toStream().to('sessions')
+			await driver.run(async ({ send, producer }) => {
+				await send('in', 'x', at('k', 15))
+				const values = (topic: string) => producer.messagesFor(topic).map(m => m.value?.toString())
+				expect([values('counts'), values('windows'), values('sessions')]).toEqual([['1'], ['1'], ['1']])
 			})
 		})
 
@@ -819,6 +863,70 @@ describe('aggregations', () => {
 				expect(windowKey.readBigInt64BE(9)).toBe(20n)
 				expect(windowRecord!.value).toBe(1)
 			})
+		})
+	})
+
+	describe('stores', () => {
+		it("unnamed aggregations keep today's store names, which name their changelogs", () => {
+			const driver = new TestDriver()
+			const grouped = driver.input('in', { key: str, value: str }).groupByKey()
+			const concat = (a: string, b: string) => a + b
+			const append = (_k: string, v: string, agg: string) => agg + v
+			grouped.count()
+			grouped.reduce(concat)
+			grouped.aggregate(() => '', append, { value: str })
+			const hopping = grouped.windowedBy(TimeWindows.of(10).advanceBy(5))
+			hopping.count()
+			hopping.reduce(concat)
+			hopping.aggregate(() => '', append, { value: str })
+			const sessions = grouped.windowedBy(SessionWindows.withInactivityGap(10))
+			sessions.count()
+			sessions.reduce(concat)
+			sessions.aggregate(
+				() => '',
+				append,
+				(_k, a, b) => a + b,
+				{ value: str }
+			)
+
+			// Store names are persisted state: they name the changelog topics and the local stores.
+			const stores = topologyOf(driver).subtopologies.flatMap(s => s.stores)
+			expect(stores.map(s => [s.name, s.logging.enabled && s.logging.topic])).toEqual(
+				[
+					'count-store-0',
+					'reduce-store-1',
+					'aggregate-store-2',
+					'window-count-store-3',
+					'window-reduce-store-4',
+					'window-aggregate-store-5',
+					'window-count-store-6',
+					'window-reduce-store-7',
+					'window-aggregate-store-8',
+				].map(name => [name, `test-app-${name}-changelog`])
+			)
+			// A hopping window store is told the window size, not the advance.
+			expect(stores.filter(s => s.kind === 'window').map(s => s.windowSizeMs)).toEqual([10, 10, 10])
+		})
+
+		it('the changelog option turns off or configures the changelog of every aggregation store', () => {
+			const driver = new TestDriver()
+			const grouped = driver.input('in', { key: str, value: str }).groupByKey()
+			grouped.count({ storeName: 'counts', changelog: false })
+			grouped.windowedBy(TimeWindows.of(10)).count({ storeName: 'windows', changelog: false })
+			grouped.windowedBy(SessionWindows.withInactivityGap(10)).count({ storeName: 'sessions', changelog: false })
+			const changelog = { topicName: 'custom-changelog', topicConfigs: { 'min.insync.replicas': '2' } }
+			grouped.count({ storeName: 'configured', changelog })
+
+			const topology = topologyOf(driver)
+			for (const name of ['counts', 'windows', 'sessions']) {
+				const { store, subtopology } = storeOf(topology, name)
+				expect(store.logging.enabled).toBe(false)
+				expect(subtopology.changelogTopics.has(name)).toBe(false)
+			}
+			const { store } = storeOf(topology, 'configured')
+			if (!store.logging.enabled) throw new Error('not logged')
+			expect(store.logging.topic).toBe('custom-changelog')
+			expect(store.logging.configs['min.insync.replicas']).toBe('2')
 		})
 	})
 
