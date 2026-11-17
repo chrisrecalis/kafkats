@@ -1,8 +1,9 @@
 /**
  * The app's lifecycle (3.15, 4.2, 4.3.5, 4.10.3, 4.11): its StreamState, the error getError() reports, and the
- * memoized start and close promises. What a start or a close does is the caller's (FlowRuntime, from Stage 2).
+ * memoized start and close promises. What a start or a close does is the caller's (FlowRuntime).
  *
- * States: CREATED (until a start succeeds) -> RUNNING <-> REBALANCING; ERROR after a fatal failure (sticky until
+ * States: CREATED (until a start succeeds) -> RUNNING <-> REBALANCING (BC17: RUNNING only while every assigned task
+ * is RUNNING; REBALANCING during a rebalance, a restore or a recovery); ERROR after a fatal failure (sticky until
  * close) or a failed start; STOPPED after close. getError(): the fatal error while there is one, else the most recent
  * recoverable error (a failed start, a recovery's cause), which never changes state(). A new start clears both.
  */
@@ -18,6 +19,8 @@ export class AppLifecycle {
 	private closePromise: Promise<void> | null = null
 	private isStarted = false
 	private isClosing = false
+	/** The runtime's last word: setRebalancing() more recent than setRunning(). Decides the state a start ends in. */
+	private rebalancing = false
 
 	get state(): StreamState {
 		return this.current
@@ -50,11 +53,13 @@ export class AppLifecycle {
 		this.recoverable = null
 		this.isClosing = false
 		this.closePromise = null
+		this.rebalancing = false
 		const promise = new Promise<void>(resolve => resolve(start())).then(
 			() => {
 				this.isStarted = true
 				if (this.current !== 'ERROR') {
-					this.current = 'RUNNING'
+					// A recovery may have begun between the start's end and this callback.
+					this.current = this.rebalancing ? 'REBALANCING' : 'RUNNING'
 				}
 			},
 			(error: unknown) => {
@@ -99,14 +104,16 @@ export class AppLifecycle {
 
 	/** Every assigned task is RUNNING: REBALANCING -> RUNNING, once started, unless failed or closing. */
 	setRunning(): void {
+		this.rebalancing = false
 		if (this.isStarted && !this.isClosing && this.current === 'REBALANCING') {
 			this.current = 'RUNNING'
 		}
 	}
 
-	/** A rebalance, a restore or a recovery began: RUNNING -> REBALANCING. */
+	/** A rebalance, a restore or a recovery began: RUNNING -> REBALANCING, unless closing (it ends STOPPED). */
 	setRebalancing(): void {
-		if (this.current === 'RUNNING') {
+		this.rebalancing = true
+		if (!this.isClosing && this.current === 'RUNNING') {
 			this.current = 'REBALANCING'
 		}
 	}

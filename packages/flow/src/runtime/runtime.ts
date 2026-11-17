@@ -1,33 +1,43 @@
 /**
- * The runtime of one start() (3.11, 4.2, 4.6.2, 4.11): what must outlive a group membership. It connects, prepares
- * the topics, loads the global tables, runs the Run of the app's group membership, reacts to failures and shuts
- * everything down within the close deadline.
+ * The runtime of one start() (3.11, 4.2, 4.6.2, 4.10, 4.11): what outlives a group membership. It connects, prepares
+ * the topics, loads the global tables and runs the app's group membership (a Run), reacts to failures like Kafka
+ * Streams, and shuts everything down within the close deadline.
  *
- * In this build any failure stops the app: a failure before start() resolved rejects start(); afterwards the app
- * halts (state ERROR, the run abandoned) until close(). Recovery by rejoining comes with a later build.
+ * Failures (4.6.2): corrupted tasks are revived in place; a migration abandons the run and joins again with a new one
+ * after a backoff (D10); a fatal failure goes to the uncaught exception handler, which halts the app (state ERROR)
+ * unless it answers 'restart'. Before start() resolved, every failure but a corruption rejects it instead.
  */
 import type { Logger } from '@kafkats/client'
-import { StreamsError } from '@/api/errors.js'
+import { StreamsError, type TaskCorruptedError } from '@/api/errors.js'
 import type { UncaughtExceptionResponse } from '@/api/handlers.js'
 import type { AppLifecycle } from '@/app/lifecycle.js'
 import type { ResolvedFlowConfig } from '@/runtime/config.js'
-import { classify, errorMessage, type FailureSite } from '@/runtime/errors.js'
+import {
+	classify,
+	errorMessage,
+	RESTART_INITIAL_BACKOFF_MS,
+	RESTART_MAX_BACKOFF_MS,
+	type FailureSite,
+} from '@/runtime/errors.js'
 import { GlobalStateManager } from '@/runtime/global-tables.js'
-import type { RuntimeIO } from '@/runtime/io.js'
+import type { Clock, RuntimeIO } from '@/runtime/io.js'
 import { Run } from '@/runtime/run.js'
-import { cap, raceSignal } from '@/runtime/signals.js'
+import { cap, delay, raceSignal } from '@/runtime/signals.js'
 import { StartPositions } from '@/runtime/start-positions.js'
 import type { Checkpoints } from '@/state/checkpoints.js'
 import type { StateDirectory } from '@/state/state-directory.js'
 import type { BuiltTopology } from '@/topology/built-topology.js'
 import { prepareTopics, type InternalTopicOptions } from '@/topology/internal-topics.js'
+import type { PartitionCounts } from '@/topology/nodes.js'
 
 /** The run's network awaits are cut this long before the close deadline, so that the local steps still fit. */
 const HARD_STOP_MARGIN_MS = 1000
-/** Bound of the abandon of a halted run (close cuts it shorter). */
+/** Bound of the abandon of a failed run (a close cuts it shorter). */
 const ABANDON_TIMEOUT_MS = 15_000
 const DISCONNECT_TIMEOUT_MS = 3000
 const GLOBAL_STOP_TIMEOUT_MS = 3000
+/** The backoff doubles with each recovery after which no run committed, up to 2^10 times the initial one. */
+const MAX_BACKOFF_DOUBLINGS = 10
 
 /** The app's client: connected at start, disconnected at the end of the start if the app created it. */
 export interface ClusterConnection {
@@ -52,18 +62,26 @@ export interface FlowRuntimeDeps {
 export class FlowRuntime {
 	/**
 	 * Background waits of this start (connect, topics, global bootstrap and follow, the start wait, restore
-	 * pipelines). Aborted at close start.
+	 * pipelines, the recovery backoff). Aborted at close start.
 	 */
 	readonly shutdown = new AbortController()
 	private readonly globals: GlobalStateManager | undefined
 	/** 'latest' pins of this start: every run of it settles start positions with them (4.7.4). */
 	private readonly startPositions: StartPositions
+	private counts: PartitionCounts | undefined
+	/** The current run: the live one, or the failed one until its recovery replaced it. */
 	private run: Run | undefined
 	/** Stream processing waits for a global table loaded again (4.12 step 3). */
 	private paused = false
 	private connecting: Promise<void> | undefined
-	/** The first failure: it stops the app; later ones are only logged. */
-	private failure: { readonly error: unknown } | undefined
+	/** The first fatal failure: the app halted. */
+	private fatal: { readonly error: unknown } | undefined
+	/** A migration in progress: the failed run is abandoned, then a new one joins after the backoff. */
+	private recovering = false
+	/** Aborted by a fatal failure: ends the backoff of a recovery, which then starts no run (CR5, runtime§6.49). */
+	private readonly recoveryAbort = new AbortController()
+	/** Recoveries since a run last committed: the backoff doubles with them (runtime§6.50). */
+	private attempt = 0
 	/** Aborted with the failure that fails a start in flight, or with the start timeout. */
 	private starting: AbortController | undefined
 	private stopping: Promise<void> | undefined
@@ -103,7 +121,7 @@ export class FlowRuntime {
 			this.connecting = this.deps.connection.connect()
 			await raceSignal(this.connecting, starting)
 			const admin = { admin: io.admin, clock: io.clock, logger }
-			const counts = await prepareTopics(topology, admin, this.deps.topics, starting)
+			this.counts = await prepareTopics(topology, admin, this.deps.topics, starting)
 			if (this.globals !== undefined) {
 				await this.globals.bootstrap(starting)
 				this.globals.follow(this.shutdown.signal)
@@ -111,16 +129,7 @@ export class FlowRuntime {
 			if (topology.groupTopics.size === 0) {
 				return
 			}
-			const run: Run = new Run({
-				...this.deps,
-				counts,
-				startPositions: this.startPositions,
-				globalStore: name => this.globals!.store(name),
-				paused: () => this.paused,
-				onFailure: (error, site) => this.fail(error, site, run),
-				shutdown: this.shutdown.signal,
-			})
-			this.run = run
+			const run = this.newRun()
 			cancelTimeout = io.clock.setTimer(io.clock.now() + config.startTimeoutMs, () => {
 				if (!run.assigned) {
 					failed.abort(
@@ -137,35 +146,54 @@ export class FlowRuntime {
 	}
 
 	/**
-	 * Reacts to a failure of the current run (4.6.2), synchronously: the first one wins and fails the run at once, so
-	 * that nothing of it is processed or committed afterwards (runtime§6.1). It rejects a start in flight, else halts
-	 * the app; during the stop the tasks just close dirty. Never throws.
+	 * Reacts to a failure of the current run, or outside any run (4.6.2), synchronously; never throws. A failed run
+	 * processes and commits nothing more from here on (runtime§6.1). The first failure wins (runtime§6.2), except
+	 * that a fatal one outranks a recovery in progress.
 	 */
 	fail(error: unknown, site: FailureSite, run?: Run): void {
 		const { logger, lifecycle } = this.deps
-		if ((run !== undefined && run !== this.run) || this.failure !== undefined) {
-			logger.debug('a later failure is ignored: the first one stops the app', {
-				site,
-				error: errorMessage(error),
-			})
+		if (run !== undefined && run !== this.run) {
+			logger.debug('a failure of an abandoned run is ignored', fields(site, error))
 			return
 		}
-		this.failure = { error }
-		this.run?.markFailed()
-		if (this.starting !== undefined) {
-			this.starting.abort(error)
-		} else if (this.stopping !== undefined) {
+		if (this.stopping !== undefined) {
+			// Also a corruption: the close must not commit what the corrupted tasks processed.
+			this.run?.markFailed()
 			lifecycle.recordError(error)
-			logger.warn('failed while closing: the tasks close dirty', { site, error: errorMessage(error) })
-		} else {
-			this.halt(error, site)
+			logger.warn('failed while closing: the tasks close dirty', fields(site, error))
+			return
 		}
+		const kind = classify(error, site)
+		if (kind === 'corrupted') {
+			this.run?.revive(error as TaskCorruptedError, { wipe: site === 'restore' })
+			return
+		}
+		if (this.starting !== undefined) {
+			// start() rejects with it (4.2 step 8); the start's stop closes the run dirty.
+			this.run?.markFailed()
+			this.starting.abort(error)
+			return
+		}
+		if (kind === 'fatal' && this.fatal === undefined && this.uncaughtResponse(error, site) === 'shutdown') {
+			this.fatal = { error }
+			this.run?.markFailed()
+			this.recoveryAbort.abort()
+			void this.halt(error, site)
+			return
+		}
+		if (this.fatal !== undefined || this.recovering || this.run === undefined) {
+			logger.debug('a later failure is ignored: the first one is being handled', fields(site, error))
+			return
+		}
+		this.recovering = true
+		this.run.markFailed()
+		void this.recover(this.run, error, site)
 	}
 
 	/**
 	 * Graceful if the run has not failed (close commit, clean close), else dirty (4.11 steps 2-6); then the stores and
-	 * the client. Bounded by `deadline` (clock time): the run's network awaits are cut at `deadline - 1 s`. Memoized:
-	 * a failed start and close() share it (CR14).
+	 * the client. Bounded by `deadline` (clock time): the run's network awaits are cut at `deadline - 1 s`, every
+	 * other await at `deadline`. Memoized: a failed start and close() share it (CR14).
 	 */
 	stop(deadline: number): Promise<void> {
 		this.stopping ??= this.release(deadline)
@@ -198,51 +226,117 @@ export class FlowRuntime {
 
 	// ---------------------------------------------------------------------------------------------------------
 
-	/** 4.10.3: the uncaught exception handler hears of a fatal failure; the app moves to ERROR and its run ends. */
-	private halt(error: unknown, site: FailureSite): void {
-		const { lifecycle, logger } = this.deps
-		if (classify(error, site) === 'fatal' && this.uncaughtResponse(error) === 'restart') {
-			logger.warn(
-				"the uncaught exception handler answered 'restart', which this build does not do: the app stops"
-			)
-		}
-		lifecycle.halt(error)
-		logger.error('the app stopped after a failure: close() releases it', { site, error: errorMessage(error) })
-		const { run } = this
-		void run?.abandon(AbortSignal.any([run.hardStop.signal, AbortSignal.timeout(ABANDON_TIMEOUT_MS)]))
-		void this.globals?.stop(AbortSignal.timeout(ABANDON_TIMEOUT_MS))
+	/** A run of this start: rebalance hooks, failures and the processing gate go through this runtime. */
+	private newRun(): Run {
+		const run: Run = new Run({
+			...this.deps,
+			counts: this.counts!,
+			startPositions: this.startPositions,
+			globalStore: name => this.globals!.store(name),
+			paused: () => this.paused,
+			onFailure: (error, site) => this.fail(error, site, run),
+			shutdown: this.shutdown.signal,
+		})
+		this.run = run
+		return run
 	}
 
-	private uncaughtResponse(error: unknown): UncaughtExceptionResponse {
+	/**
+	 * Task migration (4.10.2, KS `handleTaskMigrated`): the failed run is abandoned (its tasks close dirty, its
+	 * consumer leaves the group), then a new run joins after the backoff, from the committed offsets. A close or a
+	 * fatal failure during the backoff ends the recovery there.
+	 */
+	private async recover(failed: Run, error: unknown, site: FailureSite): Promise<void> {
+		const { lifecycle, io, logger } = this.deps
+		lifecycle.setRebalancing()
+		lifecycle.recordError(error)
+		this.attempt = failed.commits.committedOnce ? 1 : this.attempt + 1
+		const backoff = Math.min(
+			RESTART_MAX_BACKOFF_MS,
+			RESTART_INITIAL_BACKOFF_MS * 2 ** Math.min(this.attempt - 1, MAX_BACKOFF_DOUBLINGS)
+		)
+		logger.warn(`the app joins the group again in ${backoff} ms after a failure`, fields(site, error))
+		await failed.abandon(abandonSignal(failed))
 		try {
-			return this.deps.config.handlers.uncaught(error instanceof Error ? error : new Error(String(error)))
+			await delay(io.clock, backoff, AbortSignal.any([this.shutdown.signal, this.recoveryAbort.signal]))
+		} catch {
+			return
+		}
+		if (this.shutdown.signal.aborted || this.fatal !== undefined) {
+			return
+		}
+		const run = this.newRun()
+		this.recovering = false
+		run.start()
+	}
+
+	/**
+	 * 4.10.3: the app moves to ERROR, its run is abandoned and the global tables stop (W15). The stores stay with the
+	 * provider until close() releases them; start() keeps answering with its resolved promise until then.
+	 */
+	private async halt(error: unknown, site: FailureSite): Promise<void> {
+		const { lifecycle, logger } = this.deps
+		lifecycle.halt(error)
+		logger.error('the app stopped after a failure: close() releases it', fields(site, error))
+		const { run } = this
+		await run?.abandon(abandonSignal(run))
+		await this.globals?.stop(AbortSignal.timeout(ABANDON_TIMEOUT_MS))
+	}
+
+	/** KS cannot replace its global thread: 'restart' after a global table failure shuts down (KS REPLACE_THREAD). */
+	private uncaughtResponse(error: unknown, site: FailureSite): UncaughtExceptionResponse {
+		const { config, logger } = this.deps
+		let response: UncaughtExceptionResponse
+		try {
+			response = config.handlers.uncaught(error instanceof Error ? error : new Error(String(error)))
 		} catch (handlerError) {
-			this.deps.logger.warn('the uncaught exception handler threw', { error: errorMessage(handlerError) })
+			logger.warn('the uncaught exception handler threw: the app stops', { error: errorMessage(handlerError) })
 			return 'shutdown'
 		}
+		if (response === 'restart' && site === 'global') {
+			logger.warn("a global table cannot be restarted: the uncaught exception handler's 'restart' stops the app")
+			return 'shutdown'
+		}
+		return response === 'restart' ? 'restart' : 'shutdown'
 	}
 
 	private async release(deadline: number): Promise<void> {
 		const { io, stateDirectory, checkpoints, connection, logger } = this.deps
 		this.shutdown.abort(new StreamsError('the app is closing'))
-		const closeSignal = AbortSignal.timeout(Math.max(0, deadline - io.clock.now()))
-		const run = this.run
-		if (run !== undefined) {
-			const cancelHardStop = io.clock.setTimer(deadline - HARD_STOP_MARGIN_MS, () => run.hardStop.abort())
-			try {
-				await run.closeGracefully(closeSignal)
-			} finally {
-				cancelHardStop()
-			}
+		const close = deadlineSignal(io.clock, deadline)
+		const { run } = this
+		const cancelHardStop = run && io.clock.setTimer(deadline - HARD_STOP_MARGIN_MS, () => run.hardStop.abort())
+		try {
+			await run?.closeGracefully(close.signal)
+			await this.globals?.stop(cap(close.signal, GLOBAL_STOP_TIMEOUT_MS))
+			await stateDirectory.close()
+			checkpoints.clearInProcess()
+			// After a connect still in flight, so that the client does not stay connected.
+			const disconnected = (this.connecting ?? Promise.resolve())
+				.catch(() => {})
+				.then(() => connection.disconnect())
+			await raceSignal(disconnected, cap(close.signal, DISCONNECT_TIMEOUT_MS)).catch((error: unknown) => {
+				logger.warn('disconnecting the client did not finish in time', { error: errorMessage(error) })
+			})
+		} finally {
+			cancelHardStop?.()
+			close.cancel()
 		}
-		await this.globals?.stop(cap(closeSignal, GLOBAL_STOP_TIMEOUT_MS))
-		await stateDirectory.close()
-		checkpoints.clearInProcess()
-		// After a connect still in flight, so that the client does not stay connected.
-		const disconnected = (this.connecting ?? Promise.resolve()).catch(() => {}).then(() => connection.disconnect())
-		const remaining = Math.min(DISCONNECT_TIMEOUT_MS, Math.max(0, deadline - io.clock.now()))
-		await raceSignal(disconnected, AbortSignal.timeout(remaining)).catch((error: unknown) => {
-			logger.warn('disconnecting the client did not finish in time', { error: errorMessage(error) })
-		})
 	}
+}
+
+/** Bounds the abandon of a failed run; a close cuts it at its hard stop. */
+function abandonSignal(run: Run): AbortSignal {
+	return cap(run.hardStop.signal, ABANDON_TIMEOUT_MS)
+}
+
+/** A signal aborted at `at` on `clock` (the close deadline). */
+function deadlineSignal(clock: Clock, at: number): { signal: AbortSignal; cancel: () => void } {
+	const controller = new AbortController()
+	const cancel = clock.setTimer(at, () => controller.abort(new StreamsError('the close deadline passed')))
+	return { signal: controller.signal, cancel }
+}
+
+function fields(site: FailureSite, error: unknown): { site: FailureSite; error: string } {
+	return { site, error: errorMessage(error) }
 }

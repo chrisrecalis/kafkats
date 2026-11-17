@@ -129,6 +129,34 @@ describe('AppLifecycle', () => {
 		expect(lifecycle.state).toBe('STOPPED')
 	})
 
+	it('stays RUNNING while closing: the tasks closing do not make it REBALANCING', async () => {
+		const lifecycle = await started()
+		const close = deferred()
+		const closing = lifecycle.close(() => close.promise)
+		lifecycle.setRebalancing()
+		expect(lifecycle.state).toBe('RUNNING')
+		close.resolve()
+		await closing
+		expect(lifecycle.state).toBe('STOPPED')
+	})
+
+	it('a start ends REBALANCING when a rebalance or recovery began after its tasks ran, RUNNING otherwise', async () => {
+		const lifecycle = new AppLifecycle()
+		await lifecycle.start(async () => {
+			lifecycle.setRebalancing()
+			lifecycle.setRunning()
+		})
+		expect(lifecycle.state).toBe('RUNNING')
+		await lifecycle.close(async () => {})
+		await lifecycle.start(async () => {
+			lifecycle.setRunning()
+			lifecycle.setRebalancing()
+		})
+		expect(lifecycle.state).toBe('REBALANCING')
+		lifecycle.setRunning()
+		expect(lifecycle.state).toBe('RUNNING')
+	})
+
 	it('reports a recoverable error without changing the state', async () => {
 		const lifecycle = await started()
 		const error = new Error('migrated')

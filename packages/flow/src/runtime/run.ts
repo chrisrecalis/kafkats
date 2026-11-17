@@ -1,17 +1,18 @@
 /**
  * One group membership of the app (3.11, SI1): a group consumer, a producer and its RecordCollector, the
  * CommitCoordinator, the TaskManager and the Scheduler, wired to each other and to the consumer's rebalance hooks
- * (4.3). Created by FlowRuntime.start (and, from the recovery of a later build, by every recovery); never revived: a
- * Run ends once, gracefully (close) or abandoned (failure).
+ * (4.3). Created by FlowRuntime.start and by every recovery; never revived: a Run ends once, gracefully (close) or
+ * abandoned (failure). Corrupted tasks are revived in place within it (4.7.5).
  */
 import type { Logger } from '@kafkats/client'
-import { NoOffsetResetError, StreamsError } from '@/api/errors.js'
+import { NoOffsetResetError, StreamsError, type TaskCorruptedError } from '@/api/errors.js'
 import type { AppLifecycle } from '@/app/lifecycle.js'
 import { CommitCoordinator } from '@/runtime/commit.js'
 import type { ResolvedFlowConfig } from '@/runtime/config.js'
 import { errorMessage, type FailureSite } from '@/runtime/errors.js'
 import type { GroupConsumerHooks, GroupConsumerPort, ProducerPort, RuntimeIO } from '@/runtime/io.js'
 import { SinkPartitionCounts } from '@/runtime/partition-count-cache.js'
+import { PruneTimer } from '@/runtime/prune-timer.js'
 import { RepartitionPurger } from '@/runtime/purge.js'
 import { RecordCollector } from '@/runtime/record-collector.js'
 import { RestorationPool } from '@/runtime/restoration.js'
@@ -69,6 +70,7 @@ export class Run {
 	private producer: ProducerPort
 	private current: RecordCollector
 	private readonly partitionCounts: SinkPartitionCounts
+	private readonly pruneTimer: PruneTimer
 	private isClosed = false
 	private isFailed = false
 	private hasAssignment = false
@@ -135,7 +137,7 @@ export class Run {
 			resetOutput: () => this.resetOutput(),
 			onWork: task => this.scheduler.markWork(task),
 			requestCommit: () => this.scheduler.requestCommit(),
-			onAllRunningChanged: running => (running ? deps.lifecycle.setRunning() : deps.lifecycle.setRebalancing()),
+			onAllRunningChanged: running => (running ? this.allRunning() : this.rebalancing()),
 			failed: () => this.isFailed,
 			onFailure: (error, site) => this.fail(error, site),
 			hardStop: this.hardStop.signal,
@@ -154,6 +156,13 @@ export class Run {
 			failed: () => this.isFailed,
 			hardStop: this.hardStop.signal,
 			onFailure: (error, site) => this.fail(error, site),
+			logger,
+		})
+		this.pruneTimer = new PruneTimer({
+			stateDirectory: deps.stateDirectory,
+			exclusive: fn => this.scheduler.exclusive(fn),
+			clock: io.clock,
+			signal: this.hardStop.signal,
 			logger,
 		})
 	}
@@ -184,6 +193,27 @@ export class Run {
 	}
 
 	/**
+	 * Closes the corrupted tasks dirty and re-creates them from their last commit, without a rebalance (4.7.5, KS
+	 * `closeDirtyAndRevive`); `wipe` clears their state first (a restore that found its records gone). The other
+	 * tasks go on.
+	 */
+	revive(error: TaskCorruptedError, options: { wipe: boolean }): void {
+		const ids = new Set(error.tasks)
+		const tasks = this.tasks.tasks().filter(task => ids.has(task.id))
+		if (tasks.length === 0) {
+			return
+		}
+		this.deps.logger.warn('tasks are revived from their last commit', {
+			tasks: tasks.map(task => task.id.key),
+			wipe: options.wipe,
+			...errorFields(error),
+		})
+		this.scheduler
+			.exclusive(() => this.tasks.revive(tasks, options))
+			.catch((failure: unknown) => this.fail(failure, 'assignment'))
+	}
+
+	/**
 	 * The gate of a global table loaded again (4.12 step 3): inside exclusive, a commit of the RUNNING tasks (skipped
 	 * while a rebalance is pending; a failure fails the run), then `pause()`, so that no slice starts in between.
 	 */
@@ -201,7 +231,7 @@ export class Run {
 	/** Joins the group: the consumer's handler enqueues, its hooks run the TaskManager inside exclusive (4.3). */
 	start(): void {
 		const { consumer, deps } = this
-		consumer.on('rebalancePending', () => deps.lifecycle.setRebalancing())
+		consumer.on('rebalancePending', () => this.rebalancing())
 		consumer.on('error', error => deps.logger.warn('the group consumer reported an error', errorFields(error)))
 		consumer.on('offsetReset', ({ reason, topic, partition, from, to }) => {
 			// Offsets as strings: the client's logger writes JSON, which has no bigint.
@@ -292,6 +322,18 @@ export class Run {
 		return !this.isClosed && !this.isFailed
 	}
 
+	/** Every assigned task is RUNNING (4.3.5): the app state follows, and the unowned state is pruned later. */
+	private allRunning(): void {
+		this.deps.lifecycle.setRunning()
+		this.pruneTimer.arm()
+	}
+
+	/** A rebalance is pending or a task left RUNNING (assignment, revocation, revival). */
+	private rebalancing(): void {
+		this.deps.lifecycle.setRebalancing()
+		this.pruneTimer.disarm()
+	}
+
 	private fail(error: unknown, site: FailureSite): void {
 		this.deps.onFailure(error, site)
 	}
@@ -323,14 +365,18 @@ export class Run {
 	 */
 	private async end(mode: 'clean' | 'dirty', signal: AbortSignal): Promise<void> {
 		this.stopping = true
+		this.pruneTimer.disarm()
 		const settle = cap(signal, SETTLE_TIMEOUT_MS)
 		await this.scheduler.stop(settle)
-		const closeTasks = once(() => this.closeTasks(mode, signal))
-		if (settle.aborted) {
-			this.isFailed = true
-		} else {
+		let closing: Promise<void> | undefined
+		const closeTasks = () => (closing ??= this.closeTasks(mode, signal))
+		if (!settle.aborted) {
 			// Bounds the wait for its turn: an op that hangs must not hold the close up (it runs once, either way).
 			await raceSignal(this.scheduler.exclusive(closeTasks), cap(signal, EXCLUSIVE_WAIT_MS)).catch(() => {})
+		}
+		if (closing === undefined) {
+			// A slice or an op did not finish in time: nothing is committed beside it, the tasks close dirty (4.11 a).
+			this.isFailed = true
 		}
 		await closeTasks()
 		await this.consumer.stop({ signal: cap(signal, CONSUMER_STOP_TIMEOUT_MS) }).catch((error: unknown) => {
@@ -383,11 +429,6 @@ export class Run {
 			logger,
 		})
 	}
-}
-
-function once<T>(fn: () => Promise<T>): () => Promise<T> {
-	let result: Promise<T> | undefined
-	return () => (result ??= fn())
 }
 
 function errorFields(error: unknown): { error: string } {
