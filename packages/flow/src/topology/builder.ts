@@ -152,6 +152,11 @@ export class InternalTopologyBuilder {
 		this.throughTopics.add(topic)
 	}
 
+	/** The nodes registered so far, by name: the DSL walks its graph upstream through them (suppress's grace search). */
+	registeredNodes(): ReadonlyMap<NodeName, NodeDef> {
+		return this.nodes
+	}
+
 	/** `named`, or `<prefix>-<10-digit counter>` (KS `KSTREAM-FILTER-0000000003`). */
 	nodeName(prefix: string, named?: string): NodeName {
 		this.checkOpen()
