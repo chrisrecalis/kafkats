@@ -443,7 +443,7 @@ describe('incarnation boundary (CR9)', () => {
 			release()
 			await completing
 			expect(task.state).toBe('CLOSED')
-			expect(task.hasWork(h.clock.now(), h.consumer.lag)).toBe(false)
+			expect(task.hasWork(h.clock.now(), h.lag)).toBe(false)
 			expect(closes).toBe(1)
 			return h
 		}
@@ -480,8 +480,8 @@ describe('incarnation boundary (CR9)', () => {
 		task.markLost()
 		expect(task.lost).toBe(true)
 		const now = h.clock.now()
-		expect(task.isProcessable(now, h.consumer.lag)).toBe(false)
-		expect(task.hasWork(now, h.consumer.lag)).toBe(false)
+		expect(task.isProcessable(now, h.lag)).toBe(false)
+		expect(task.hasWork(now, h.lag)).toBe(false)
 		expect(await task.processOne(now)).toBe(false)
 		expect(await task.maybePunctuateStreamTime()).toBe(false)
 		h.collector.forTask(task).send('sink', { topic: 'output', key: null, value: null })
@@ -718,14 +718,14 @@ describe('processing', () => {
 				}),
 		})
 		const task = h.task()
-		expect(task.hasWork(0, h.consumer.lag)).toBe(false)
+		expect(task.hasWork(0, h.lag)).toBe(false)
 		await h.start(task)
 		const now = h.clock.now()
-		expect(task.hasWork(now, h.consumer.lag)).toBe(false)
+		expect(task.hasWork(now, h.lag)).toBe(false)
 		expect(task.nextWallClockDue()).toBe(now + 100)
-		expect(task.hasWork(now + 100, h.consumer.lag)).toBe(true)
+		expect(task.hasWork(now + 100, h.lag)).toBe(true)
 		h.enqueue(task, 'input', records(1))
-		expect(task.hasWork(now, h.consumer.lag)).toBe(true)
+		expect(task.hasWork(now, h.lag)).toBe(true)
 	})
 })
 
@@ -785,7 +785,7 @@ describe('punctuation (4.9)', () => {
 		await task.initialize()
 		task.setStarts(new Map([['input:0', committed({}, 70)]]))
 		await task.completeRestoration(new Map())
-		expect(task.hasWork(h.clock.now(), h.consumer.lag)).toBe(true)
+		expect(task.hasWork(h.clock.now(), h.lag)).toBe(true)
 		expect(await task.maybePunctuateStreamTime()).toBe(true)
 		expect(calls).toEqual([70])
 	})
@@ -832,7 +832,7 @@ describe('commit bookkeeping (4.8.3)', () => {
 		await task.processOne(h.clock.now())
 		expect(task.committableOffsets(next)).toMatchObject([{ topic: 'input', partition: 0, offset: 1n }])
 		await h.process(task)
-		h.consumer.positions.set('input:0', 5n)
+		h.consumer.partition('input:0').position = 5n
 		const [offset] = task.committableOffsets(next)
 		expect(offset!.offset).toBe(5n)
 		expect(decodeCommitMetadata(offset!.metadata)).toEqual({ partitionTime: 3, metadata: new Map() })
@@ -875,9 +875,9 @@ describe('commit bookkeeping (4.8.3)', () => {
 		task.setStarts(new Map([['input:0', { committed: { offset: 5n, metadata: null }, resolved: 5n }]]))
 		await task.completeRestoration(new Map())
 		const next = h.consumer.nextOffset.bind(h.consumer)
-		h.consumer.positions.set('input:0', 5n)
+		h.consumer.partition('input:0').position = 5n
 		expect(task.needsCommit(next)).toBe(false)
-		h.consumer.positions.set('input:0', 7n)
+		h.consumer.partition('input:0').position = 7n
 		expect(task.needsCommit(next)).toBe(true)
 		expect(task.committableOffsets(next)).toMatchObject([{ offset: 7n }])
 		await task.postCommit(new Map(), task.committableOffsets(next))
@@ -952,7 +952,7 @@ describe('commit bookkeeping (4.8.3)', () => {
 				['b:0', { committed: null, resolved: 3n }],
 			])
 		)
-		h.consumer.positions.set('b:0', 3n)
+		h.consumer.partition('b:0').position = 3n
 		for (const timestamp of [10, 20]) {
 			h.enqueue(task, 'a', records(timestamp))
 			await h.process(task)

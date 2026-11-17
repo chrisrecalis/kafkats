@@ -6,7 +6,7 @@ import { TimestampExtractors } from '@/processor/timestamps.js'
 import { PartitionGroup } from '@/runtime/partition-group.js'
 import { isSkipMarker, RecordQueue } from '@/runtime/record-queue.js'
 import { TaskIdRegistry, tpKey } from '@/runtime/task-id.js'
-import { message } from '../support/task-harness.js'
+import { message } from '../support/fake-io.js'
 
 const TASK = new TaskIdRegistry().get(0, 0)
 const A = { topic: 'a', partition: 0 }

@@ -7,7 +7,6 @@ import {
 	RecordTooLargeError,
 	TimeoutError,
 	TransactionAbortedError,
-	type SendResult,
 } from '@kafkats/client'
 import { FailedProcessingError, IllegalStateError, StreamsError, TaskMigratedError } from '@/api/errors.js'
 import type { ErrorHandlerContext, HandlerResponse, ProductionExceptionHandler } from '@/api/handlers.js'
@@ -32,33 +31,15 @@ function changelog(partition = 0): CollectedRecord {
 	return { topic: 'app-s-changelog', partition, key: Buffer.from('k'), value: Buffer.from('v') }
 }
 
-interface Deferred {
-	resolve(result: SendResult): void
-	reject(error: unknown): void
-}
-
-/** A harness whose producer answers sends only when the test says so. */
+/** A harness whose producer answers sends only when the test says so (`pending`, in send order). */
 function manual(options: { eos?: boolean; production?: ProductionExceptionHandler } = {}) {
 	const h = new TaskHarness({
 		build: b => pipe(b, { processor: passThrough }),
 		eos: options.eos,
 		handlers: options.production ? { production: options.production } : {},
 	})
-	const pending: Deferred[] = []
-	h.producer.answer = (topic, message) =>
-		new Promise<SendResult>((resolve, reject) => {
-			pending.push({
-				resolve: result => resolve(result),
-				reject,
-			})
-			void topic
-			void message
-		})
-	const ackAll = () => {
-		for (const deferred of pending.splice(0))
-			deferred.resolve({ topic: 'x', partition: 0, offset: 0n, timestamp: new Date(0) })
-	}
-	return { h, pending, ackAll }
+	const sends = h.producer.steps.send.always('hang')
+	return { h, pending: sends.hung, ackAll: () => sends.answerAll() }
 }
 
 async function running(h: TaskHarness, partition = 0): Promise<StreamTask> {
@@ -113,8 +94,7 @@ describe('RecordCollector at-least-once', () => {
 		const b = await running(h, 0)
 		send(h, a, 'sink')
 		send(h, b, 'sink')
-		pending[0]!.reject(new ConnectionError('broker', 9092))
-		pending.splice(0, 1)
+		pending[0]!.answer(new ConnectionError('broker', 9092))
 		ackAll()
 		expect((await h.collector.flush(signal())).corrupted).toEqual(new Set([a]))
 		expect((await h.collector.flush(signal())).corrupted).toEqual(new Set())
@@ -123,7 +103,7 @@ describe('RecordCollector at-least-once', () => {
 	for (const error of [new TimeoutError('produce', 30_000), new KafkaProtocolError(ErrorCode.NotLeaderOrFollower)]) {
 		it(`${error.name} after the producer's retries is task-scoped`, async () => {
 			const h = new TaskHarness({ build: b => pipe(b, { processor: passThrough }) })
-			h.producer.answer = () => Promise.reject(error)
+			h.producer.steps.send.always(error)
 			const task = await running(h)
 			send(h, task, 'sink')
 			expect((await h.collector.flush(signal())).corrupted).toEqual(new Set([task]))
@@ -142,7 +122,7 @@ describe('RecordCollector at-least-once', () => {
 			},
 		})
 		const tooLarge = new RecordTooLargeError('output', 0, 3_000_000, 1_000_000)
-		h.producer.answer = () => Promise.reject(tooLarge)
+		h.producer.steps.send.always(tooLarge)
 		const task = await running(h)
 		send(h, task, 'sink')
 		expect(await h.collector.flush(signal())).toEqual({ corrupted: new Set() })
@@ -165,7 +145,7 @@ describe('RecordCollector at-least-once', () => {
 			build: b => pipe(b, { processor: passThrough }),
 			handlers: { production: ctx => (seen.push(ctx), 'continue') },
 		})
-		h.producer.answer = () => Promise.reject(new RecordTooLargeError('output', 0, 2, 1))
+		h.producer.steps.send.always(new RecordTooLargeError('output', 0, 2, 1))
 		const task = await running(h)
 		h.enqueue(task, 'input', [{ key: 'k', value: 'v', timestamp: 7 }], 0)
 		await h.process(task)
@@ -198,7 +178,7 @@ describe('RecordCollector at-least-once', () => {
 				build: b => pipe(b, { processor: passThrough }),
 				handlers: { production: production as () => HandlerResponse },
 			})
-			h.producer.answer = () => Promise.reject(new RecordTooLargeError('output', 0, 2, 1))
+			h.producer.steps.send.always(new RecordTooLargeError('output', 0, 2, 1))
 			const task = await running(h)
 			send(h, task, kind)
 			await expect(h.collector.flush(signal())).rejects.toThrow(FailedProcessingError)
@@ -226,7 +206,7 @@ describe('RecordCollector at-least-once', () => {
 				handlers: { production: () => (handled++, 'continue') },
 			})
 			const error = new KafkaProtocolError(code)
-			h.producer.answer = () => Promise.reject(error)
+			h.producer.steps.send.always(error)
 			const task = await running(h)
 			send(h, task, 'sink')
 			const failure = await h.collector.flush(signal()).catch((e: unknown) => e)
@@ -239,7 +219,7 @@ describe('RecordCollector at-least-once', () => {
 
 	it('a fenced producer migrates the run', async () => {
 		const h = new TaskHarness({ build: b => pipe(b, { processor: passThrough }) })
-		h.producer.answer = () => Promise.reject(new ProducerFencedError(1n, 2))
+		h.producer.steps.send.always(new ProducerFencedError(1n, 2))
 		const task = await running(h)
 		send(h, task, 'sink')
 		await expect(h.collector.flush(signal())).rejects.toThrow(TaskMigratedError)
@@ -251,8 +231,9 @@ describe('RecordCollector at-least-once', () => {
 		send(h, task, 'changelog', changelog())
 		send(h, task, 'sink')
 		h.collector.discard()
-		pending[0]!.resolve({ topic: 'app-s-changelog', partition: 0, offset: 3n, timestamp: new Date(0) })
-		pending[1]!.reject(new RecordTooLargeError('output', 0, 2, 1))
+		const [ack, failure] = pending
+		ack!.answer()
+		failure!.answer(new RecordTooLargeError('output', 0, 2, 1))
 		await expect(h.collector.flush(signal())).resolves.toEqual({ corrupted: new Set() })
 		expect(h.collector.takeChangelogOffsets(task)).toEqual(new Map())
 	})
@@ -265,7 +246,7 @@ describe('RecordCollector at-least-once', () => {
 		const flush = h.collector.flush(signal()).then(() => (flushed = true))
 		await Promise.resolve()
 		send(h, task, 'sink')
-		pending.shift()!.resolve({ topic: 'x', partition: 0, offset: 0n, timestamp: new Date(0) })
+		pending[0]!.answer()
 		await new Promise(resolve => setTimeout(resolve, 5))
 		expect(flushed).toBe(false)
 		ackAll()
@@ -330,7 +311,7 @@ describe('RecordCollector at-least-once', () => {
 		expect(loadSignal!.aborted).toBe(true)
 		output.send('sink', RECORD)
 		expect(h.producer.sent).toHaveLength(1)
-		pending[0]!.resolve({ topic: 'app-s-changelog', partition: 0, offset: 8n, timestamp: new Date(0) })
+		pending[0]!.answer()
 		await Promise.resolve()
 		expect(collector.takeChangelogOffsets(task)).toEqual(new Map())
 	})
@@ -426,8 +407,9 @@ describe('RecordCollector exactly-once', () => {
 		const aborted = h.collector.abortTransaction(signal())
 		await new Promise(resolve => setTimeout(resolve, 5))
 		expect(transaction!.calls).toEqual(['send', 'send'])
-		pending[0]!.resolve({ topic: 'app-s-changelog', partition: 0, offset: 1n, timestamp: new Date(0) })
-		pending[1]!.reject(new TransactionAbortedError('tx'))
+		const [ack, failure] = pending
+		ack!.answer()
+		failure!.answer(new TransactionAbortedError('tx'))
 		await aborted
 		expect(transaction!.calls).toEqual(['send', 'send', 'abort'])
 		expect(h.collector.transactionOpen).toBe(false)
@@ -460,7 +442,7 @@ describe('RecordCollector exactly-once', () => {
 		h.producer.beginTransaction = async () => {
 			calls.push('begin')
 			if (calls.length === 1) await new Promise<void>(resolve => (open = resolve))
-			const transaction = await begin()
+			const transaction = await begin({ signal: signal() })
 			const abort = transaction.abort.bind(transaction)
 			transaction.abort = options => (calls.push('abort'), abort(options))
 			return transaction
@@ -491,7 +473,7 @@ describe('RecordCollector exactly-once', () => {
 			calls.push('aborted')
 		}
 		const begin = h.producer.beginTransaction.bind(h.producer)
-		h.producer.beginTransaction = () => (calls.push('begin'), begin())
+		h.producer.beginTransaction = options => (calls.push('begin'), begin(options))
 		const aborting = h.collector.abortTransaction(signal())
 		// A later abort finds no transaction: it is done at once, while the first one still runs.
 		await h.collector.abortTransaction(signal())
@@ -540,7 +522,7 @@ describe('RecordCollector exactly-once', () => {
 				eos: true,
 				handlers: { production: () => (handled++, 'continue') },
 			})
-			h.producer.answer = () => Promise.reject(error)
+			h.producer.steps.send.always(error)
 			const task = await running(h)
 			send(h, task, 'sink')
 			await expect(h.collector.flush(signal())).rejects.toThrow(expected)

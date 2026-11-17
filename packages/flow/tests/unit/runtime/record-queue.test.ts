@@ -13,7 +13,7 @@ import {
 import { isSkipMarker, RecordQueue, type StampedRecord } from '@/runtime/record-queue.js'
 import { TaskIdRegistry } from '@/runtime/task-id.js'
 import type { SourceDef } from '@/topology/nodes.js'
-import { message } from '../support/task-harness.js'
+import { message } from '../support/fake-io.js'
 
 const TP = { topic: 't', partition: 0 }
 const TASK = new TaskIdRegistry().get(0, 0)

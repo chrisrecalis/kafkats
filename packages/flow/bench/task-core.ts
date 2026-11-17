@@ -12,7 +12,8 @@ import type { ProcessorContext, ProcessorSupplier } from '@/processor/api.js'
 import type { KeyValueStore } from '@/state.js'
 import type { InternalTopologyBuilder } from '@/topology/builder.js'
 import { isThenable } from '@/processor/node.js'
-import { kvStore, message, passThrough, pipe, TaskHarness } from '../tests/unit/support/task-harness.js'
+import { message } from '../tests/unit/support/fake-io.js'
+import { kvStore, passThrough, pipe, TaskHarness } from '../tests/unit/support/task-harness.js'
 
 const RECORDS = 1_000_000
 const WARMUP = 200_000

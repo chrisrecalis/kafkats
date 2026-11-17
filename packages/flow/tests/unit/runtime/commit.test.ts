@@ -23,11 +23,7 @@ async function setup(options: Partial<TaskHarnessOptions> & { tasks?: number } =
 		h.events.push('flush')
 		return flush(signal)
 	}
-	const commit = h.consumer.answerCommit
-	h.consumer.answerCommit = (offsets, signal) => {
-		h.events.push('commit')
-		return commit(offsets, signal)
-	}
+	h.consumer.steps.commit.always(() => (h.events.push('commit'), 'ok'))
 	for (const task of tasks) {
 		h.enqueue(task, 'input', [{ key: 'k', value: `v${task.partition}`, timestamp: 1 }])
 		await h.process(task)
@@ -86,7 +82,7 @@ describe('CommitCoordinator at-least-once (4.8.1)', () => {
 
 	it("interval and user commits are 'skipped' while a rebalance is pending; revocation and close commits are not", async () => {
 		const { h } = await setup()
-		h.consumer.rebalancePending = true
+		h.consumer.requestRebalance()
 		h.events.length = 0
 		expect(await h.commit('interval')).toBe('skipped')
 		expect(await h.commit('user')).toBe('skipped')
@@ -100,7 +96,7 @@ describe('CommitCoordinator at-least-once (4.8.1)', () => {
 	] as const) {
 		it(`${name} defers an interval commit to the next interval; failing for taskTimeoutMs migrates (KF5)`, async () => {
 			const { h, tasks } = await setup({ taskTimeoutMs: 1000 })
-			h.consumer.answerCommit = () => Promise.reject(error)
+			h.consumer.steps.commit.always(error)
 			const start = h.commits.lastSuccessAt
 			h.clock.advance(400)
 			expect(await h.commit()).toBe('deferred')
@@ -117,29 +113,26 @@ describe('CommitCoordinator at-least-once (4.8.1)', () => {
 
 	it('the commit deadline passing counts as a timeout', async () => {
 		const { h } = await setup()
-		h.consumer.answerCommit = (_offsets, signal) =>
-			new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason)))
+		h.consumer.steps.commit.always('hang')
 		expect(await h.commits.commit('interval', AbortSignal.timeout(5))).toBe('deferred')
 	})
 
 	it('the commit deadline passing during the flush defers an interval commit; the sends stay pending', async () => {
 		const { h, tasks } = await setup()
-		let ack!: () => void
-		h.producer.answer = (topic, message) =>
-			new Promise(resolve => (ack = () => resolve(h.producer.ack(topic, message))))
+		h.producer.steps.send.next('hang')
 		h.enqueue(tasks[0]!, 'input', [{ key: 'k', value: 'slow', timestamp: 2 }])
 		await h.process(tasks[0]!)
 		expect(await h.commits.commit('interval', AbortSignal.timeout(5))).toBe('deferred')
 		expect(h.consumer.commits).toEqual([])
 		await expect(h.commits.commit('revocation', AbortSignal.timeout(5))).rejects.toThrow()
-		ack()
+		h.producer.steps.send.answerAll()
 		expect(await h.commit()).toBe('committed')
 		expect(h.consumer.commits).toEqual([[expect.objectContaining({ offset: 2n })]])
 	})
 
 	it('a rebalance at a revocation commit leaves the offsets uncommitted but writes the checkpoints', async () => {
 		const { h, tasks } = await setup()
-		h.consumer.answerCommit = () => Promise.reject(new RebalanceInProgressError('app'))
+		h.consumer.steps.commit.always(new RebalanceInProgressError('app'))
 		expect(await h.commit('revocation')).toBe('committed')
 		expect(h.state(tasks[0]!).checkpoints).toHaveLength(1)
 		expect(tasks[0]!.lastCommitted({ topic: 'input', partition: 0 })).toBeUndefined()
@@ -150,7 +143,7 @@ describe('CommitCoordinator at-least-once (4.8.1)', () => {
 	it('a timeout at a revocation or close commit is a failure', async () => {
 		const { h } = await setup()
 		const timeout = new TimeoutError('commit', 10_000)
-		h.consumer.answerCommit = () => Promise.reject(timeout)
+		h.consumer.steps.commit.always(timeout)
 		await expect(h.commit('revocation')).rejects.toBe(timeout)
 		await expect(h.commit('close')).rejects.toBe(timeout)
 	})
@@ -158,14 +151,11 @@ describe('CommitCoordinator at-least-once (4.8.1)', () => {
 	it("a failed commit with a task lost meanwhile is 'lost'; otherwise the error is rethrown as is", async () => {
 		const { h, tasks } = await setup()
 		const failed = new CommitFailedError('app', new KafkaProtocolError(ErrorCode.IllegalGeneration))
-		h.consumer.answerCommit = async () => {
-			tasks[0]!.markLost()
-			throw failed
-		}
+		h.consumer.steps.commit.next(() => (tasks[0]!.markLost(), failed))
 		expect(await h.commit()).toBe('lost')
 
 		const other = await setup()
-		other.h.consumer.answerCommit = () => Promise.reject(failed)
+		other.h.consumer.steps.commit.always(failed)
 		await expect(other.h.commit()).rejects.toBe(failed)
 	})
 
@@ -200,7 +190,7 @@ describe('CommitCoordinator at-least-once (4.8.1)', () => {
 			await flush(signal)
 			return { corrupted: new Set([a]) }
 		}
-		h.consumer.answerCommit = () => Promise.reject(new TimeoutError('commit', 10_000))
+		h.consumer.steps.commit.always(new TimeoutError('commit', 10_000))
 		const start = h.commits.lastSuccessAt
 		h.clock.advance(10)
 		const failure = await h.commit().catch((e: unknown) => e)
@@ -232,7 +222,7 @@ describe('CommitCoordinator at-least-once (4.8.1)', () => {
 			h.task(),
 			new Map([['input:0', { committed: { offset: 4n, metadata: null }, resolved: 4n }]])
 		)
-		h.consumer.positions.set('input:0', 6n)
+		h.consumer.partition('input:0').position = 6n
 		expect(await h.commit('revocation')).toBe('committed')
 		expect(h.consumer.commits).toEqual([[expect.objectContaining({ offset: 6n })]])
 		expect(task.lastCommitted({ topic: 'input', partition: 0 })).toBe(6n)
@@ -334,8 +324,8 @@ describe('CommitCoordinator exactly-once (4.8.2)', () => {
 	})
 
 	for (const [name, fail] of [
-		['sendOffsets', (h: TaskHarness, error: Error) => void (h.producer.transactions[0]!.failSendOffsets = error)],
-		['commit', (h: TaskHarness, error: Error) => void (h.producer.transactions[0]!.failCommit = error)],
+		['sendOffsets', (h: TaskHarness, error: Error) => void h.producer.steps.sendOffsets.next(error)],
+		['commit', (h: TaskHarness, error: Error) => void h.producer.steps.commit.next(error)],
 		['flush', (h: TaskHarness, error: Error) => void (h.collector.flush = () => Promise.reject(error))],
 	] as const) {
 		it(`a failing ${name} aborts, drops every buffer and rethrows the original error`, async () => {

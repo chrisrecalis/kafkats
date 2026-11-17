@@ -17,18 +17,18 @@ import { Checkpoints } from '@/state/checkpoints.js'
 import { inMemory } from '@/state/memory.js'
 import { StateDirectory } from '@/state/state-directory.js'
 import { InternalTopologyBuilder } from '@/topology/builder.js'
-import { deferred, FakeGroupConsumer, FakeRestorer, FakeStartPositions, SerialExclusive } from '../support/fake-io.js'
 import {
-	APP,
+	deferred,
+	FakeGroupConsumer,
 	FakeProducer,
-	kvStore,
-	ManualClock,
+	FakeRestorer,
+	FakeStartPositions,
 	message,
-	passThrough,
-	pipe,
-	RecordingLogger,
+	SerialExclusive,
 	type TestRecord,
-} from '../support/task-harness.js'
+} from '../support/fake-io.js'
+import { ManualClock } from '../support/manual-clock.js'
+import { APP, kvStore, passThrough, pipe, RecordingLogger } from '../support/task-harness.js'
 
 /** Puts every record into store `s`, forwards it, then fails if its value is 'boom'. */
 const writer: ProcessorSupplier<string, string, string, string> = () => {
@@ -68,7 +68,7 @@ function assigned(key: string, committed: CommittedOffset | null = null): Assign
 class Harness {
 	readonly clock = new ManualClock(1_000)
 	readonly logger = new RecordingLogger()
-	readonly consumer = new FakeGroupConsumer()
+	readonly consumer = new FakeGroupConsumer({ groupId: APP })
 	readonly producer = new FakeProducer()
 	readonly restorer = new FakeRestorer()
 	readonly startPositions = new FakeStartPositions()
@@ -104,6 +104,7 @@ class Harness {
 		build(builder)
 		const topology = builder.build()
 		const eos = options.eos ?? false
+		this.consumer.group = { groupId: APP, generationId: 1, memberId: 'member' }
 		this.config = {
 			applicationId: APP,
 			processId: 'process',
@@ -245,16 +246,15 @@ class Harness {
 	/** Delivers records (dense offsets) through the consumer's handler and moves its position. */
 	enqueue(key: string, ...records: TestRecord[]): void {
 		const { topic, partition } = tp(key)
-		let next = this.consumer.positions.get(key) ?? 0n
-		const messages = records.map(record => message(topic, partition, next++, record))
-		this.consumer.positions.set(key, next)
+		const position = this.consumer.partition(key)
+		const messages = records.map(record => message(topic, partition, position.position++, record))
 		this.manager.enqueue({ topic, partition }, messages)
 	}
 
 	/** Processes what the task can process now (in a transaction under exactly-once, as the scheduler does). */
 	async process(task: StreamTask): Promise<void> {
 		if (this.config.eos) await this.collector.ensureTransaction(this.hardStop.signal)
-		while (task.isProcessable(this.clock.now(), this.consumer.lag)) {
+		while (task.isProcessable(this.clock.now(), tp => this.consumer.currentLag(tp) ?? 0n)) {
 			if (!(await task.processOne(this.clock.now()))) break
 		}
 	}
@@ -416,7 +416,7 @@ describe('TaskManager: eager rebalances (4.3)', () => {
 			const tasks = h.tasks()
 			h.enqueue('input:0', { key: 'k', value: 'v' })
 			await h.process(tasks[0]!)
-			h.consumer.answerCommit = () => Promise.reject(error)
+			h.consumer.steps.commit.always(error)
 			await h.revoke('input:0', 'input:1')
 			expect(h.events.filter(e => e === 'resetOutput')).toHaveLength(1)
 			expect(tasks.map(task => task.state)).toEqual(['CLOSED', 'CLOSED'])
