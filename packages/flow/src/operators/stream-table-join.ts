@@ -19,7 +19,7 @@ import type { StreamRecord } from '@/processor/record.js'
 
 export interface StreamTableJoin<K, V, KT, VT, VR> {
 	readonly valueGetter: KTableValueGetterSupplier<KT, VT>
-	/** The table key a record looks up. */
+	/** The table key a record looks up; null, or undefined (a selector reading a missing field), when it has none. */
 	readonly lookupKey: (key: K | null, value: V) => KT | null
 	readonly joiner: (key: K | null, value: V, tableValue: VT | null) => VR
 	readonly left: boolean

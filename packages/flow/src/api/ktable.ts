@@ -52,11 +52,13 @@ export interface KTable<K, V> {
 }
 
 /**
- * A table every instance reads in full, outside the consumer group. Only usable as the lookup side of a
- * stream join; it cannot be streamed.
+ * A table every instance reads in full, outside the consumer group, and keeps up to date while it runs: the
+ * latest value per key of its topic (a null value deletes the key, a record without a key is skipped). Only
+ * usable as the lookup side of a stream join (`KStream.join/leftJoin(globalTable, keySelector, joiner)`); it
+ * cannot be streamed.
  */
 export interface GlobalKTable<K, V> {
-	/** Name of the table's store. */
+	/** Name of the table's store: `materialized.storeName`, else `global-table-<topic>-<n>`. */
 	readonly storeName: string
 	/** Phantom: carries the key and value types. */
 	readonly __global?: { readonly key: K; readonly value: V }

@@ -26,6 +26,8 @@ export type KeyValue<K, V> = readonly [K, V]
 export type ValueMapper<K, V, VR> = ((value: V) => VR) | ((key: K, value: V) => VR)
 /** A value joiner with or without the key (same arity rule as ValueMapper). */
 export type ValueJoiner<K, V, VO, VR> = ((value: V, otherValue: VO) => VR) | ((key: K, value: V, otherValue: VO) => VR)
+/** Computes something, such as the key a stream-global table join looks up, from a record's key and value. */
+export type KeyValueMapper<K, V, R> = (key: K, value: V) => R
 
 /**
  * An unbounded stream of key-value records. Keys and values may be null (a null value is a tombstone in a
@@ -94,20 +96,28 @@ export interface KStream<K, V> {
 		joiner: (key: K, value: V, tableValue: VT) => VR,
 		options?: Joined<K, V, VT>
 	): KStream<K, VR>
-	/** Stream-global table inner join on the key `keySelector` picks; no repartitioning. */
+	/**
+	 * Stream-global table inner join: each record looks up the global table's current value for the key
+	 * `keySelector` picks and is joined with it. No repartitioning: every instance holds the whole table, so the
+	 * topics need not be co-partitioned, and a key change upstream is still pending downstream. Records with a null
+	 * value, records whose selector returns null and records the table has no value for are dropped. Only stream
+	 * records produce results, with their key, timestamp and headers; the table is read as it is when the record is
+	 * processed (it is not synchronized with the stream's time).
+	 */
 	join<GK, GV, VR>(
 		globalTable: GlobalKTable<GK, GV>,
-		keySelector: (key: K | null, value: V) => GK | null,
+		keySelector: KeyValueMapper<K | null, V, GK | null>,
 		joiner: (value: V, globalValue: GV) => VR,
 		options?: NamedOptions
 	): KStream<K, VR>
+	/** Stream-global table inner join whose joiner also receives the record's key (not the selected one). */
 	join<GK, GV, VR>(
 		globalTable: GlobalKTable<GK, GV>,
-		keySelector: (key: K | null, value: V) => GK | null,
+		keySelector: KeyValueMapper<K | null, V, GK | null>,
 		joiner: (key: K | null, value: V, globalValue: GV) => VR,
 		options?: NamedOptions
 	): KStream<K, VR>
-	/** @deprecated Pass a key selector: `join(globalTable, (key) => key, joiner)`. */
+	/** @deprecated Pass a key selector: `join(globalTable, (key) => key, joiner)` (the record key is looked up). */
 	join<GV, VR>(globalTable: GlobalKTable<K, GV>, joiner: (value: V, globalValue: GV) => VR): KStream<K, VR>
 
 	/** Windowed stream-stream left join. */
@@ -133,19 +143,24 @@ export interface KStream<K, V> {
 		joiner: (key: K | null, value: V, tableValue: VT | null) => VR,
 		options?: Joined<K, V, VT>
 	): KStream<K, VR>
+	/**
+	 * Stream-global table left join: like the inner join, but records the table has no value for, and records whose
+	 * selector returns null (KIP-962), are joined with null. Records with a null value are dropped.
+	 */
 	leftJoin<GK, GV, VR>(
 		globalTable: GlobalKTable<GK, GV>,
-		keySelector: (key: K | null, value: V) => GK | null,
+		keySelector: KeyValueMapper<K | null, V, GK | null>,
 		joiner: (value: V, globalValue: GV | null) => VR,
 		options?: NamedOptions
 	): KStream<K, VR>
+	/** Stream-global table left join whose joiner also receives the record's key (not the selected one). */
 	leftJoin<GK, GV, VR>(
 		globalTable: GlobalKTable<GK, GV>,
-		keySelector: (key: K | null, value: V) => GK | null,
+		keySelector: KeyValueMapper<K | null, V, GK | null>,
 		joiner: (key: K | null, value: V, globalValue: GV | null) => VR,
 		options?: NamedOptions
 	): KStream<K, VR>
-	/** @deprecated Pass a key selector: `leftJoin(globalTable, (key) => key, joiner)`. */
+	/** @deprecated Pass a key selector: `leftJoin(globalTable, (key) => key, joiner)` (the record key is looked up). */
 	leftJoin<GV, VR>(globalTable: GlobalKTable<K, GV>, joiner: (value: V, globalValue: GV | null) => VR): KStream<K, VR>
 
 	/** Windowed stream-stream outer join. */

@@ -65,7 +65,7 @@ export function globalTable<K, V>(ctx: DslContext, topic: string, options: Table
 		valueCodec: format.valueCodec,
 		timestampExtractor: options.timestampExtractor,
 	})
-	return new GlobalKTableImpl<K, V>(ctx, store, { keyCodec: codecs.keyCodec, valueCodec: codecs.valueCodec })
+	return new GlobalKTableImpl<K, V>(ctx, store)
 }
 
 /** Registers the table's store and its KTableSource under `parent`. */
