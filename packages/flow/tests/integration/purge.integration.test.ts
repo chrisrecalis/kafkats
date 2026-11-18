@@ -7,7 +7,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { string, type KafkaClient, type Producer } from '@kafkats/client'
 import type { FlowApp, FlowConfig } from '../../src/api/app.js'
-import { SourceTopicNotFoundError } from '../../src/changelog/errors.js'
+import { InternalTopicNotFoundError } from '../../src/changelog/errors.js'
 import { flow } from '../../src/app/flow.js'
 import { internals } from '../../src/app/internal.js'
 import { COUNT_CODEC } from '../../src/dsl/ops/aggregate.js'
@@ -172,12 +172,12 @@ describe('internal topics', () => {
 		}, 60_000)
 	})
 
-	it('a missing changelog with changelog.autoCreate false fails the start with SourceTopicNotFoundError', async () => {
+	it('a missing changelog with changelog.autoCreate false fails the start with InternalTopicNotFoundError', async () => {
 		const input = uniqueTopicName('autocreate-in')
 		await createTopics(client, [{ name: input }])
 		const app = flow({ applicationId: uniqueTopicName('autocreate'), client, changelog: { autoCreate: false } })
 		app.stream(input, strings).groupByKey().count()
-		await expect(app.start()).rejects.toThrow(SourceTopicNotFoundError)
+		await expect(app.start()).rejects.toThrow(InternalTopicNotFoundError)
 		expect(app.state()).toBe('ERROR')
 		await app.close()
 	}, 30_000)

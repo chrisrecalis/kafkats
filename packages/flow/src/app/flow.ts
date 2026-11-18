@@ -129,16 +129,20 @@ class FlowAppImpl implements FlowApp {
 			lifecycle.recordError(error)
 			logger.warn('writing a changelog checkpoint failed: restoration replays more', { error: error.message })
 		})
+		const io = createKafkaIO({ client, config: this.config, settings: config, topology })
 		return new FlowRuntime({
 			topology,
 			config,
-			io: createKafkaIO({ client, config: this.config, settings: config, topology }),
+			io,
 			connection: {
 				connect: () => client.connect(),
 				disconnect: () => (ownsClient ? client.disconnect() : Promise.resolve()),
 			},
 			lifecycle,
-			stateDirectory: new StateDirectory(config.applicationId, stateStoreProvider, checkpoints, logger),
+			stateDirectory: new StateDirectory(config.applicationId, stateStoreProvider, checkpoints, logger, {
+				delayMs: config.stateCleanupDelayMs,
+				now: () => io.clock.now(),
+			}),
 			checkpoints,
 			topics: this.config.changelog ?? {},
 			logger,

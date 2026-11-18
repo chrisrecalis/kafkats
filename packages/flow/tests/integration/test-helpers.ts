@@ -39,6 +39,15 @@ export function requireKafkaBrokers(): string[] {
 }
 
 /** A name that is unique per test run and call; also used for group and application ids. */
+/**
+ * An event-time base near the wall clock, a multiple of `alignMs` (so of every window size dividing it). Records
+ * stamped far in the past are deleted by the broker's time-based retention (7 days by default, checked every 5 minutes,
+ * the active segment included) while a test still reads them back.
+ */
+export function eventTimeBase(alignMs = 3_600_000): number {
+	return Math.floor(Date.now() / alignMs) * alignMs
+}
+
 export function uniqueTopicName(prefix: string): string {
 	return `${prefix.replace(/[^a-zA-Z0-9._-]/g, '-')}-${RUN_ID}-${randomSuffix()}`
 }

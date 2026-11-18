@@ -62,8 +62,9 @@ test`, `pnpm -C packages/flow-state-rocksdb test`).
 - **State**: every task has its own instance of each store of its subtopology (provider name
   `<applicationId>.<storeName>.p<partition>`), stacked provider store -> exactly-once write buffer -> changelog
   logging -> clock/clipping; DSL stores are timestamped (`[int64BE timestamp][value]`). `StateDirectory` keeps
-  instances open across task lifetimes (a re-assigned task catches up from its checkpoint); unowned in-memory
-  instances are pruned 30 s after the run is RUNNING.
+  instances open across task lifetimes (a re-assigned task catches up from its checkpoint); unowned instances are
+  pruned while the run is RUNNING (`PruneTimer`): in-memory ones after 30 s, durable ones once unowned for
+  `stateCleanupDelayMs` (KS `state.cleanup.delay.ms`; partitions an earlier start left on disk count from the start).
 - **Restoration**: a restore job per task that is not RUNNING (at most `changelog.restoration.maxConcurrentTasks`),
   its partitions paused meanwhile: replay to the end offsets captured at the start, checkpoint trust rules (within the
   log and the store not empty, else wipe and rebuild), progress checkpoints, stall detection, open transactions
@@ -171,7 +172,8 @@ src/
 ├── changelog/
 │   ├── config.ts          # ChangelogConfig, restoration options, changelog and repartition topic configs
 │   ├── restorer.ts, replay.ts, writer.ts   # ChangelogRestorer (trust rules, replay), changelog writes
-│   └── errors.ts          # ChangelogPartitionMismatchError, SourceTopicNotFoundError, CoPartitioningError, ChangelogDecodeError
+│   └── errors.ts          # ChangelogPartitionMismatchError, SourceTopicNotFoundError, InternalTopicNotFoundError,
+│                          # CoPartitioningError, ChangelogDecodeError
 └── testing/
     ├── driver.ts, loop.ts, test-io.ts   # TestDriver over the production TaskManager with deterministic ports
     ├── mocks.ts, helpers.ts, globals.ts, partitioner.ts, store-writes.ts

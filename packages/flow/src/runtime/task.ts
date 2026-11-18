@@ -485,15 +485,23 @@ export class StreamTask {
 		}
 	}
 
-	/** Replaces the processor metadata by the max-merge of the committed one; seeds partition times and store clocks. */
+	/**
+	 * Replaces the processor metadata by the max-merge of the committed one; seeds partition times and store clocks.
+	 * A store clock starts from its committed `<store>.observed` (-1 for a store not written before the commit), as
+	 * the records replayed after that commit found it the first time: under at-least-once the restore also applied the
+	 * writes they made then, whose key times would put the read floor ahead of them. Only without any commit metadata
+	 * (no commit yet, or none that decodes) it starts from the max key time the restore applied.
+	 */
 	private seed(restoredStoreTimes: ReadonlyMap<string, number>): void {
 		const committed: ReadonlyMap<string, number>[] = []
+		let decodedAny = false
 		for (const queue of this.queues) {
 			const metadata = this.offsets.starts.get(tpKey(queue.tp))?.committed?.metadata
 			if (metadata === undefined || metadata === null) {
 				continue
 			}
 			const decoded = decodeCommitMetadata(metadata)
+			decodedAny ||= metadata !== '' && decoded.invalid === undefined
 			if (decoded.invalid !== undefined && !this.metadataWarned) {
 				this.metadataWarned = true
 				this.logger.warn('ignoring commit metadata that cannot be decoded', {
@@ -510,8 +518,11 @@ export class StreamTask {
 		this.metadata.replaceAll(committed, this.subtopology.metadataKeys)
 		for (const { builder, clock } of this.stateManager.stores) {
 			if (clock) {
-				const observed = this.metadata.get(observedKey(builder.name)) ?? -1
-				clock.seed(Math.max(observed, restoredStoreTimes.get(builder.name) ?? -1))
+				clock.seed(
+					decodedAny
+						? (this.metadata.get(observedKey(builder.name)) ?? -1)
+						: (restoredStoreTimes.get(builder.name) ?? -1)
+				)
 			}
 		}
 	}
@@ -597,6 +608,7 @@ export class StreamTask {
 	private closed<M extends 'clean' | 'dirty'>(mode: M): M {
 		this.taskState = 'CLOSED'
 		this.closedAs = mode
+		this.output.close()
 		return mode
 	}
 }

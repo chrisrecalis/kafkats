@@ -1,5 +1,5 @@
 import type { KGroupedStream } from '@/api/grouped.js'
-import type { BranchedKStream, KStream, KeyValue, ValueMapper } from '@/api/kstream.js'
+import type { BranchedKStream, KStream, KeyValue, ValueMapper, ValueMapperWithKey } from '@/api/kstream.js'
 import type { GlobalKTable, KTable } from '@/api/ktable.js'
 import type {
 	Grouped,
@@ -53,7 +53,11 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 		return stateless.map(this, mapper, options)
 	}
 
-	mapValues<VR>(mapper: ValueMapper<K | null, V | null, VR>, options?: NamedOptions): KStream<K, VR> {
+	mapValues<VR>(mapper: ValueMapper<V | null, VR>, options?: NamedOptions): KStream<K, VR> {
+		return stateless.mapValues(this, (_key, value) => mapper(value), options)
+	}
+
+	mapValuesWithKey<VR>(mapper: ValueMapperWithKey<K | null, V | null, VR>, options?: NamedOptions): KStream<K, VR> {
 		return stateless.mapValues(this, mapper, options)
 	}
 
@@ -64,7 +68,14 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 		return stateless.flatMap(this, mapper, options)
 	}
 
-	flatMapValues<VR>(mapper: ValueMapper<K | null, V | null, Iterable<VR>>, options?: NamedOptions): KStream<K, VR> {
+	flatMapValues<VR>(mapper: ValueMapper<V | null, Iterable<VR>>, options?: NamedOptions): KStream<K, VR> {
+		return stateless.flatMapValues(this, (_key, value) => mapper(value), options)
+	}
+
+	flatMapValuesWithKey<VR>(
+		mapper: ValueMapperWithKey<K | null, V | null, Iterable<VR>>,
+		options?: NamedOptions
+	): KStream<K, VR> {
 		return stateless.flatMapValues(this, mapper, options)
 	}
 

@@ -121,6 +121,7 @@ export class ProcessorHarness {
 			send: (kind, record) => void this.sent.push({ kind, record }),
 			partitionCount: () => 1,
 			loadPartitionCount: () => Promise.resolve(1),
+			close: () => {},
 			...options.output,
 		}
 		this.task = new TaskContext({

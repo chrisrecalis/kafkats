@@ -11,6 +11,7 @@ import { flow } from '../../src/app/flow.js'
 import {
 	collectUnhandledRejections,
 	createTopics,
+	eventTimeBase,
 	MultiTopicCollector,
 	newClient,
 	sleep,
@@ -19,7 +20,7 @@ import {
 } from './test-helpers.js'
 
 const strings = { key: string(), value: string() }
-const BASE = 1_700_000_000_000
+const BASE = eventTimeBase() // near the wall clock: the broker's retention deletes older records
 
 let client: KafkaClient
 let producer: Producer

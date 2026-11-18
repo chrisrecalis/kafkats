@@ -18,9 +18,33 @@ interface Instance extends Opened {
 	readonly id: string
 	readonly builder: StoreBuilder
 	readonly partition: number
-	/** Set while the instance is pruned: a lease waits for it and then gets a new instance. */
-	pruning?: Promise<void>
+	/** When its last lease ended (its creation before that): how long no task of this start owned it. */
+	idleSince: number
 }
+
+/** A store partition of the topology whose durable state an earlier start may have left behind. */
+interface Unopened {
+	readonly builder: StoreBuilder
+	readonly partition: number
+}
+
+/** An instance no task holds, and when it may be dropped. */
+export interface UnleasedInstance {
+	readonly store: string
+	readonly partition: number
+	/** In-memory state: when its last lease ended; durable state: that time plus the cleanup delay. */
+	readonly prunableAt: number
+}
+
+/** How long durable state no task owns is kept, and the clock that measures it (the runtime's). */
+export interface StateCleanup {
+	/** FlowConfig.stateCleanupDelayMs (Kafka Streams' `state.cleanup.delay.ms`). */
+	readonly delayMs: number
+	readonly now: () => number
+}
+
+/** Kafka Streams' default `state.cleanup.delay.ms`. */
+export const DEFAULT_STATE_CLEANUP_DELAY_MS = 600_000
 
 const instanceId = (store: string, partition: number): string => `${store}\u0000${partition}`
 
@@ -30,11 +54,21 @@ const instanceId = (store: string, partition: number): string => `${store}\u0000
  * A store instance is lent to one task at a time; it stays open when the task closes, so that a task coming back
  * (every eager rebalance revokes before it assigns) finds its state and catches up from its checkpoint instead of
  * rebuilding it. The provider owns the stores: none is closed before the provider at close().
+ *
+ * State no task owns is dropped after a while (prune(), timed by the run's PruneTimer): in-memory state soon, durable
+ * state once no task held it for the cleanup delay, like Kafka Streams' state directory cleaner deletes the task
+ * directories nobody locked for `state.cleanup.delay.ms`. A checkpoint of state kept longer than that could be
+ * trusted although the changelog was compacted meanwhile: a replay from it misses the tombstones compaction removed.
  */
 export class StateDirectory {
 	private readonly instances = new Map<string, Instance>()
 	private readonly leases = new Map<string, TaskId>()
 	private readonly globals = new Map<string, Opened>()
+	/** Durable store partitions of the topology that no lease of this start opened yet (register()). */
+	private readonly unopened = new Map<string, Unopened>()
+	private registeredAt = 0
+	/** Prunes in progress: a lease waits for the instance's and then gets a new one. */
+	private readonly pruning = new Map<string, Promise<void>>()
 	/** Callers of released() waiting for the last lease to end. */
 	private waiters: (() => void)[] = []
 
@@ -42,7 +76,8 @@ export class StateDirectory {
 		private readonly applicationId: string,
 		private readonly provider: StateStoreProvider,
 		private readonly checkpoints: Checkpoints,
-		private readonly logger: Logger
+		private readonly logger: Logger,
+		private readonly cleanup: StateCleanup = { delayMs: DEFAULT_STATE_CLEANUP_DELAY_MS, now: Date.now }
 	) {}
 
 	/**
@@ -67,7 +102,8 @@ export class StateDirectory {
 		}
 		this.leases.set(id, owner)
 		try {
-			await this.instances.get(id)?.pruning
+			await this.pruning.get(id)
+			this.unopened.delete(id)
 			const instance = this.instances.get(id) ?? this.create(id, builder, partition)
 			await this.init(instance)
 			return instance.store
@@ -106,35 +142,78 @@ export class StateDirectory {
 	}
 
 	/**
-	 * The instances no task holds, if checkpoints are kept in process. Durable state is kept, like Kafka Streams' task
-	 * directories.
+	 * The store partitions of the topology (each logged store with its partition count), once the counts are known: with
+	 * durable checkpoints, the state an earlier start left of those no task of this start leases is dropped like that of
+	 * an instance released at this call (unleased()). State without a changelog has no checkpoint to invalidate.
 	 */
-	unleased(): readonly { store: string; partition: number }[] {
-		if (this.checkpoints.durable) return []
-		return [...this.instances.values()]
-			.filter(instance => !this.leases.has(instance.id))
-			.map(({ builder, partition }) => ({ store: builder.name, partition }))
+	register(stores: Iterable<{ readonly builder: StoreBuilder; readonly partitions: number }>): void {
+		if (!this.checkpoints.durable) return
+		this.registeredAt = this.cleanup.now()
+		for (const { builder, partitions } of stores) {
+			if (!builder.logging.enabled) continue
+			for (let partition = 0; partition < partitions; partition++) {
+				const id = instanceId(builder.name, partition)
+				if (!this.instances.has(id)) this.unopened.set(id, { builder, partition })
+			}
+		}
 	}
 
 	/**
-	 * Drops an unleased in-memory instance (another instance of the application owns its state by now): invalidates its
-	 * checkpoint, clears it and forgets it. Does nothing if a task leased it meanwhile; a lease made while it runs waits
-	 * for it and gets a new, empty instance.
+	 * The instances no task holds, with the time from which they may be dropped: in-memory state from its release,
+	 * durable state once no task held it for the cleanup delay (registered partitions no lease opened count from their
+	 * registration).
+	 */
+	unleased(): readonly UnleasedInstance[] {
+		const delay = this.checkpoints.durable ? this.cleanup.delayMs : 0
+		const unleased: UnleasedInstance[] = []
+		for (const instance of this.instances.values()) {
+			if (this.leases.has(instance.id)) continue
+			unleased.push({
+				store: instance.builder.name,
+				partition: instance.partition,
+				prunableAt: instance.idleSince + delay,
+			})
+		}
+		for (const [id, { builder, partition }] of this.unopened) {
+			if (this.leases.has(id)) continue
+			unleased.push({ store: builder.name, partition, prunableAt: this.registeredAt + delay })
+		}
+		return unleased
+	}
+
+	/**
+	 * Drops the state of an unleased instance (another instance of the application owns it by now): invalidates its
+	 * checkpoint, clears the store and forgets it; of a registered partition no lease opened, only invalidates its
+	 * checkpoint (opening the store just to clear it would cost a provider database), so that the next lease rebuilds
+	 * it. Does nothing if a task leased it meanwhile; a lease made while it runs waits for it and gets a new instance.
 	 */
 	async prune(store: string, partition: number, signal: AbortSignal): Promise<void> {
 		signal.throwIfAborted()
 		const id = instanceId(store, partition)
+		if (this.leases.has(id) || this.pruning.has(id)) return
 		const instance = this.instances.get(id)
-		if (instance === undefined || instance.pruning !== undefined || this.leases.has(id)) return
-		const pruned = this.wipe(instance).then(() => {
-			this.instances.delete(id)
-		})
-		// A failed prune leaves the instance with an invalidated checkpoint: its next owner rebuilds it.
-		instance.pruning = pruned.catch(() => {})
+		const unopened = this.unopened.get(id)
+		let pruned: Promise<void>
+		if (instance !== undefined) {
+			pruned = this.wipe(instance).then(() => {
+				this.instances.delete(id)
+			})
+		} else if (unopened !== undefined) {
+			pruned = this.invalidateUnopened(unopened).then(() => {
+				this.unopened.delete(id)
+			})
+		} else {
+			return
+		}
+		// A failed prune leaves the instance with an invalidated checkpoint, or untouched: either way consistent.
+		this.pruning.set(
+			id,
+			pruned.catch(() => {})
+		)
 		try {
 			await pruned
 		} finally {
-			instance.pruning = undefined
+			this.pruning.delete(id)
 		}
 	}
 
@@ -157,6 +236,8 @@ export class StateDirectory {
 		this.instances.clear()
 		this.leases.clear()
 		this.globals.clear()
+		this.unopened.clear()
+		this.pruning.clear()
 		this.notifyReleased()
 		try {
 			await this.provider.close()
@@ -173,6 +254,7 @@ export class StateDirectory {
 			builder,
 			partition,
 			store: builder.create(this.provider, this.providerName(builder.name, partition)),
+			idleSince: this.cleanup.now(),
 		}
 		this.instances.set(id, instance)
 		return instance
@@ -180,6 +262,8 @@ export class StateDirectory {
 
 	private endLease(id: string): void {
 		this.leases.delete(id)
+		const instance = this.instances.get(id)
+		if (instance !== undefined) instance.idleSince = this.cleanup.now()
 		this.notifyReleased()
 	}
 
@@ -206,5 +290,13 @@ export class StateDirectory {
 	private async wipe(instance: Instance): Promise<void> {
 		await this.invalidate(instance)
 		await clearStore(instance.store as KeyValueStore<unknown, unknown>)
+	}
+
+	/** Invalidates the checkpoint an earlier start left, if it would be trusted (a write and a flush otherwise saved). */
+	private async invalidateUnopened({ builder, partition }: Unopened): Promise<void> {
+		const { logging } = builder
+		if (!logging.enabled) return
+		const checkpoint = await this.checkpoints.get(logging.topic, partition)
+		if (checkpoint !== undefined && checkpoint >= 0n) await this.checkpoints.invalidate(logging.topic, partition)
 	}
 }

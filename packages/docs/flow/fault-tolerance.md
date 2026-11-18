@@ -89,7 +89,7 @@ Partitions without a committed offset start where their source's reset policy sa
 
 ## Repartition Topics
 
-Repartition topics are created with `cleanup.policy=delete` and `retention.ms=-1`, so records are never lost to retention while an application is down. After commits, at most every `repartitionPurgeIntervalMs` (default 30000), flow deletes their records below the committed offsets (`DeleteRecords`). Purging is best effort: a failure is logged and retried with the next purge. With `repartitionPurgeIntervalMs: 0`, or without permission to delete records, set a retention through `changelog.topicConfigs` to bound them.
+Repartition topics are created with `cleanup.policy=delete` and `retention.ms=-1`, so records are never lost to retention while an application is down. After commits, at most every `repartitionPurgeIntervalMs` (default 30000), flow deletes their records below the committed offsets (`DeleteRecords`). Purging is best effort: a failure is logged and retried with the next purge. With `repartitionPurgeIntervalMs: 0`, or without permission to delete records, set a retention through `changelog.topicConfigs` to bound them. It applies to every changelog too, except the `retention.ms` of window and session changelogs, which keep their store's retention plus a day (see [State Stores](/flow/state-stores#topic-configs)).
 
 ## Global Tables
 

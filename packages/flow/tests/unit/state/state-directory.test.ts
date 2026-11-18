@@ -4,7 +4,7 @@ import { IllegalStateError } from '@/api/errors.js'
 import type { KeyValueStore } from '@/state.js'
 import { Checkpoints } from '@/state/checkpoints.js'
 import { InMemoryStateStoreProvider } from '@/state/memory.js'
-import { StateDirectory } from '@/state/state-directory.js'
+import { StateDirectory, type StateCleanup } from '@/state/state-directory.js'
 import { keyValueStoreBuilder, timestampedKeyValueStoreBuilder } from '@/state/store-builders.js'
 import { APP, DEFAULTS, checkpointStore, directory, str, taskId } from './support.js'
 
@@ -136,17 +136,17 @@ describe('StateDirectory', () => {
 	})
 
 	describe('unowned in-memory state', () => {
-		it('unleased() lists the instances no task holds, only for in-process checkpoints', async () => {
-			const { directory: dir } = directory()
+		it('unleased() lists the instances no task holds, prunable from their release', async () => {
+			let now = 100
+			const { directory: dir } = directory({ cleanup: { delayMs: 600_000, now: () => now } })
 			await dir.lease(T0, counts, 0)
 			await dir.lease(T1, counts, 1)
+			now = 250
 			await dir.release(T1, 'counts', 1)
-			expect(dir.unleased()).toEqual([{ store: 'counts', partition: 1 }])
-
-			const durable = directory({ checkpoints: new Checkpoints(checkpointStore(), () => {}) }).directory
-			await durable.lease(T0, counts, 0)
-			await durable.release(T0, 'counts', 0)
-			expect(durable.unleased()).toEqual([])
+			expect(dir.unleased()).toEqual([{ store: 'counts', partition: 1, prunableAt: 250 }])
+			// Nothing of an earlier start is in memory.
+			dir.register([{ builder: counts, partitions: 4 }])
+			expect(dir.unleased()).toHaveLength(1)
 		})
 
 		it('prune() invalidates the checkpoint first, clears and forgets the instance', async () => {
@@ -220,6 +220,100 @@ describe('StateDirectory', () => {
 			await expect(dir.prune('counts', 0, controller.signal)).rejects.toThrow()
 			expect(await store.get('k')).toBe('v')
 			expect(await checkpoints.get('app-counts-changelog', 0)).toBeUndefined()
+		})
+	})
+
+	describe('unowned durable state (Kafka Streams: state.cleanup.delay.ms)', () => {
+		function durable() {
+			const clock = { now: 1000 }
+			const cleanup: StateCleanup = { delayMs: 600_000, now: () => clock.now }
+			const store = checkpointStore()
+			const checkpoints = new Checkpoints(store, () => {})
+			return { clock, store, ...directory({ checkpoints, cleanup }) }
+		}
+
+		it('an instance released at t is prunable at t + the cleanup delay; prune() invalidates, clears and forgets it', async () => {
+			const d = durable()
+			const store = (await d.directory.lease(T0, counts, 0)) as KeyValueStore<string, string>
+			await store.put('k', 'v')
+			await d.checkpoints.set('app-counts-changelog', 0, 10n)
+			d.clock.now = 5000
+			await d.directory.release(T0, 'counts', 0)
+			expect(d.directory.unleased()).toEqual([{ store: 'counts', partition: 0, prunableAt: 605_000 }])
+
+			await d.directory.prune('counts', 0, new AbortController().signal)
+
+			expect(d.store.values.get('app-counts-changelog:0')).toBe(-1n)
+			expect(await store.approximateNumEntries()).toBe(0)
+			expect(d.directory.unleased()).toEqual([])
+			// The next owner rebuilds it from the changelog: an old checkpoint is no longer trusted over a compacted log.
+			const next = (await d.directory.lease(T0, counts, 0)) as KeyValueStore<string, string>
+			expect(await next.get('k')).toBeUndefined()
+		})
+
+		it('register(): the partitions an earlier start left on disk count from now; their prune only invalidates a trusted checkpoint', async () => {
+			const d = durable()
+			d.store.values.set('app-counts-changelog:1', 42n)
+			d.store.values.set('app-counts-changelog:2', -1n)
+			const create = vi.spyOn(d.provider, 'createKeyValueStore')
+			await d.directory.lease(T0, counts, 0)
+			d.clock.now = 2000
+			d.directory.register([
+				{ builder: counts, partitions: 3 },
+				{ builder: unlogged, partitions: 3 },
+			])
+			// Partition 0 is leased: it counts from its release, like any other instance.
+			expect(d.directory.unleased()).toEqual([
+				{ store: 'counts', partition: 1, prunableAt: 602_000 },
+				{ store: 'counts', partition: 2, prunableAt: 602_000 },
+			])
+
+			const flushes = d.store.flushes
+			for (const partition of [1, 2]) await d.directory.prune('counts', partition, new AbortController().signal)
+
+			expect(d.store.values.get('app-counts-changelog:1')).toBe(-1n)
+			// Already invalid: nothing written or flushed for it, and no store was opened to prune.
+			expect(d.store.flushes).toBe(flushes + 1)
+			expect(create).toHaveBeenCalledTimes(1)
+			expect(d.directory.unleased()).toEqual([])
+		})
+
+		it('a partition of an earlier start that a task leases is no longer pruned as such', async () => {
+			const d = durable()
+			d.store.values.set('app-counts-changelog:1', 42n)
+			d.directory.register([{ builder: counts, partitions: 2 }])
+			await d.directory.lease(T1, counts, 1)
+			await d.directory.prune('counts', 1, new AbortController().signal)
+			expect(d.store.values.get('app-counts-changelog:1')).toBe(42n)
+			d.clock.now = 7000
+			await d.directory.release(T1, 'counts', 1)
+			expect(d.directory.unleased()).toEqual([
+				{ store: 'counts', partition: 1, prunableAt: 607_000 },
+				{ store: 'counts', partition: 0, prunableAt: 601_000 },
+			])
+		})
+
+		it('a lease during the prune of a partition of an earlier start waits for its invalidated checkpoint', async () => {
+			const d = durable()
+			d.store.values.set('app-counts-changelog:0', 42n)
+			d.directory.register([{ builder: counts, partitions: 1 }])
+			let unblock!: () => void
+			const blocked = new Promise<void>(resolve => (unblock = resolve))
+			const set = d.store.set
+			d.store.set = async (topic, partition, offset) => {
+				await blocked
+				await set(topic, partition, offset)
+			}
+			const pruned = d.directory.prune('counts', 0, new AbortController().signal)
+			let leased = false
+			const lease = d.directory.lease(T0, counts, 0).then(() => (leased = true))
+			await new Promise(resolve => setImmediate(resolve))
+			expect(leased).toBe(false)
+
+			unblock()
+			await pruned
+			await lease
+			expect(d.store.values.get('app-counts-changelog:0')).toBe(-1n)
 		})
 	})
 

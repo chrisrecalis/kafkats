@@ -4,6 +4,7 @@
  * once with callbacks returning undefined and once with them returning null, and must write the same records.
  */
 import { describe, expect, it } from 'vitest'
+import type { KTable } from '@/api/ktable.js'
 import { codec } from '@/codec.js'
 import { JoinWindows } from '@/dsl/windows.js'
 import { TestDriver, type TestContextApi } from '@/testing/driver.js'
@@ -123,6 +124,67 @@ describe('undefined is no value, as null is', () => {
 			}
 		)
 		expect(written).toEqual(['g=1', 'g=0'])
+	})
+
+	it('a stream-table join looks up a table-table join or transformValues() whose callback returned undefined: no value', async () => {
+		for (const op of ['join', 'transformValues'] as const) {
+			const [written] = await outputs(
+				(driver, absent) => {
+					const left = driver.table('l', S)
+					const lookUp = <V>(table: KTable<string, V>) =>
+						driver
+							.input('in', S)
+							.join(table, (s, t) => `${s}:${t}`)
+							.to('out', S)
+					// Not materialized: the stream-table join reads them through their value getters.
+					if (op === 'join') {
+						lookUp(left.leftJoin(driver.table('r', S), (a, b) => (b === 'none' ? absent : `${a}+${b}`)))
+					} else {
+						lookUp(
+							left.transformValues(() => ({
+								transform: (_key, value) => (value === 'y' ? absent : value),
+							}))
+						)
+					}
+				},
+				async ctx => {
+					await sendString(ctx, 'l', 'k', 'y')
+					await sendString(ctx, 'r', 'k', 'none')
+					await sendString(ctx, 'l', 'j', 'z')
+					await sendString(ctx, 'r', 'j', 'w')
+					await sendString(ctx, 'in', 'k', 's')
+					await sendString(ctx, 'in', 'j', 's')
+				}
+			)
+			expect(written, op).toEqual([op === 'join' ? 'j=s:z+w' : 'j=s:z'])
+		}
+	})
+
+	it('transformValues() and a table-table join feeding groupBy(): a row that was or became undefined is no row', async () => {
+		for (const op of ['transformValues', 'join'] as const) {
+			const [written] = await outputs(
+				(driver, absent) => {
+					const table = driver.table('t', S)
+					const derived =
+						op === 'transformValues'
+							? table.transformValues(() => ({
+									transform: (_key, value) => (value === 'x' ? absent : value),
+								}))
+							: table.leftJoin(driver.table('r', S), (a, b) => (a === 'x' ? absent : `${a}${b ?? ''}`))
+					// groupBy() asks for old values: the old row is transformed (joined) again, to undefined here.
+					derived
+						.groupBy((key, value) => [(value as string).toUpperCase(), key], S)
+						.count()
+						.toStream()
+						.to('out', { key: str, value: num })
+				},
+				async ctx => {
+					await sendString(ctx, 't', 'k', 'x')
+					await sendString(ctx, 't', 'k', 'g')
+				}
+			)
+			expect(written, op).toEqual(['G=1'])
+		}
 	})
 
 	it('stream-table and stream-stream joins drop a stream record mapped to undefined', async () => {

@@ -145,7 +145,9 @@ async function plan(
 /**
  * The trust rule (runtime§6.35): within the log, and the store can hold what it claims. A checkpoint past the log
  * start on an empty store claims progress the store cannot contain (its state was replaced). The invalidation
- * sentinel -1n and a checkpoint of a longer, recreated changelog fall outside the log.
+ * sentinel -1n and a checkpoint of a longer, recreated changelog fall outside the log. Its age is the state directory's
+ * concern: state left unowned for the cleanup delay is invalidated before a compacted changelog, whose replay misses
+ * the deletes compaction removed, could outdate it (StateDirectory.prune).
  */
 async function isTrusted(
 	checkpoint: bigint | undefined,

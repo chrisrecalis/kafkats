@@ -14,6 +14,7 @@ import { decodeCommitMetadata } from '../../src/processor/metadata.js'
 import {
 	collectUnhandledRejections,
 	createTopics,
+	eventTimeBase,
 	fetchCommitted,
 	MultiTopicCollector,
 	newClient,
@@ -26,7 +27,7 @@ import {
 const str = codec.string()
 const num = codec.json<number>()
 const GUARANTEES = ['at_least_once', 'exactly_once'] as const
-const BASE = 1_700_000_000_000 // a multiple of the window size
+const BASE = eventTimeBase() // near the wall clock (retention), a multiple of the window size
 
 let client: KafkaClient
 let producer: Producer

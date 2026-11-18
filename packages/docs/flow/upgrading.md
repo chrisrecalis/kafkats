@@ -6,7 +6,7 @@
 
 **Stop every instance and reset the application's state.** State stores, changelogs and windowed keys use new formats (timestamped stores, Kafka Streams' windowed key formats, partitioned state), and the consumer group now uses the `range` assignor; old and new instances cannot run side by side, and old state cannot be read. Either:
 
-- delete the application's internal topics (`<applicationId>-*-changelog`, `<applicationId>-*-repartition`) and its local state directory, then start the new version; or
+- delete the application's internal topics (`<applicationId>-*-changelog`, `<applicationId>-*-repartition`), its local state directory **and the committed offsets of its consumer group** (the group id is the `applicationId`; 0.13 committed its input offsets there), then start the new version. Without the offset reset the new version resumes near the end of its inputs with empty stores: tables miss every row not updated since, and aggregations restart from zero, without any error. Delete the group with `kafka-consumer-groups --bootstrap-server <brokers> --delete --group <applicationId>`, or reset it with `--reset-offsets --to-earliest --all-topics --execute` (Kafka's `kafka-streams-application-reset` tool resets the input offsets too); or
 - start the new version with a new `applicationId` (it reads its inputs from the start, see [Offset reset](/flow/fault-tolerance#offset-reset)).
 
 ## Configuration
@@ -60,8 +60,8 @@ See [Configuration](/flow/configuration) for every option.
 
 ## Tables and Aggregations
 
-- **Every callback takes `(key, value)`.** `selectKey((key, value) => ...)` was `(value, key)`: swap the arguments.
-- **Table callbacks never see deletes.** `KTable.filter()`, `filterNot()`, `mapValues()`, `groupBy()` and the table joins pass deletes on without calling your function, so their parameters are typed without `null`. `transformValues()` and `toStream(mapper)` do see them.
+- **Every callback takes `(key, value)`.** `selectKey((key, value) => ...)` was `(value, key)`: swap the arguments. `mapValues()` and `flatMapValues()` still pass the value alone, to any function; the key-aware forms are the new `mapValuesWithKey()` and `flatMapValuesWithKey()`.
+- **Table callbacks never receive `null`.** `KTable.filter()`, `filterNot()`, `mapValues()`, `groupBy()` and the table joins pass deletes on as deletes, so their parameters are typed without `null`. Where a delete retracts a row, they are called with the row's previous value: `groupBy()`'s selector always, the others when old values are computed downstream. `transformValues()` and `toStream(mapper)` see deletes as a `null` value.
 - **Grouped tables keep their aggregate when a group empties** (a count goes to 0) and send no tombstone, as Kafka Streams does. Filter zeros downstream if needed. `KTable.groupBy()`'s mapper may change the value type (give `Grouped.value`).
 - **`count()` results are int64 big-endian** (Kafka Streams' `Serdes.Long`; they were 8-byte little-endian doubles). Pass `value` in the options of `count()` or of `to()` to keep another encoding.
 - **Result timestamps** follow Kafka Streams: aggregations `max(record, previous result)`, time and sliding windows the largest record timestamp of the window, sessions their end, table-table joins the larger timestamp of both sides.
@@ -78,6 +78,8 @@ See [Configuration](/flow/configuration) for every option.
 
 - `send()` resolves once the record and everything it led to were processed; offsets are committed after every record by default (`commitEvery`).
 - `driver.consumers` and `driver.producers` have exactly one element: drop assertions on consumers per thread.
+- `MockConsumer` is no longer an `EventEmitter` and has no `runEach()` or `stop()`: it has `sendMessage()` and `committed` (the group's committed offsets). Wait for `send()` instead of the `'running'` and `'stopped'` events.
+- `MockProducer` has no `transaction(fn)` and no `disconnect()`: it is the runtime's producer, with `send(topic, message)` (the message needs a `key`, and the call resolves to `{ topic, partition, offset }`), `initTransactions()`, `beginTransaction()`, `partitionCount()`, `close()`, `messages`, `messagesFor(topic)`, `transactions` and `clear()`. The offsets of a committed transaction (`CommittedTransaction.offsets`) carry the commit `metadata` too. Both mocks are created by the driver, not by you.
 - New: `advanceWallClockTime(ms)`, `getStateStore(name, partition?)`, `driver.globalTable()`, `initialWallClockTimeMs`, `partitions`, `emitIntervalMs`.
 - `vi` is no longer re-exported: import it from `vitest`.
 
@@ -90,4 +92,4 @@ See [Configuration](/flow/configuration) for every option.
 
 ## New
 
-The [Processor API](/flow/processor-api), [`suppress()`](/flow/suppress), `emit: 'on-window-close'`, `split()`, `repartition()`, `Stores` and `addStateStore()`, `{ name }` on every operator, [`describe()`](/flow/topology#describe), the exception handlers, timestamp extractors, `getError()`, `taskTimeoutMs`, `maxTaskIdleMs`, `bufferedRecordsPerPartition`, `repartitionPurgeIntervalMs`, and the `kafkats:flow:process` tracing channel. See [Differences from Kafka Streams](/flow/kafka-streams) for where flow deliberately differs.
+The [Processor API](/flow/processor-api), [`suppress()`](/flow/suppress), `emit: 'on-window-close'`, `split()`, `repartition()`, `Stores` and `addStateStore()`, `{ name }` on every operator, [`describe()`](/flow/topology#describe), the exception handlers, timestamp extractors, `getError()`, `taskTimeoutMs`, `maxTaskIdleMs`, `bufferedRecordsPerPartition`, `repartitionPurgeIntervalMs`, `stateCleanupDelayMs`, `mapValuesWithKey()` and `flatMapValuesWithKey()`, `InternalTopicNotFoundError`, and the `kafkats:flow:process` tracing channel. See [Differences from Kafka Streams](/flow/kafka-streams) for where flow deliberately differs.

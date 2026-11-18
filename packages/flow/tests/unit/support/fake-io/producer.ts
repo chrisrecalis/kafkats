@@ -23,6 +23,7 @@ export interface SentRecord {
 export class FakeProducer implements ProducerPort {
 	readonly steps = {
 		send: new Steps(),
+		initTransactions: new Steps(),
 		beginTransaction: new Steps(),
 		sendOffsets: new Steps(),
 		commit: new Steps(),
@@ -33,6 +34,8 @@ export class FakeProducer implements ProducerPort {
 	/** Every send, in call order (a transaction's too). */
 	readonly sent: SentRecord[] = []
 	readonly transactions: FakeTransaction[] = []
+	/** Initializations answered (initTransactions). */
+	initialized = 0
 	closed = false
 	private readonly counters = new Map<string, bigint>()
 
@@ -40,6 +43,13 @@ export class FakeProducer implements ProducerPort {
 
 	send(topic: string, message: ProducedMessage): Promise<SendResult> {
 		return this.produce(topic, message)
+	}
+
+	/** Counted in `initialized`. */
+	initTransactions(options: { signal: AbortSignal }): Promise<void> {
+		return this.steps.initTransactions.perform(() => {
+			this.initialized++
+		}, options.signal)
 	}
 
 	/** One transaction at a time: beginning another while one is open is InvalidTxnStateError. */

@@ -69,6 +69,11 @@ export class MockProducer implements ProducerPort {
 		return Promise.resolve({ topic, partition, offset, timestamp: message.timestamp ?? new Date(0) })
 	}
 
+	/** Nothing to fence: the driver has one producer at a time. */
+	initTransactions(): Promise<void> {
+		return Promise.resolve()
+	}
+
 	/** One transaction at a time, like a transactional producer: its sends are recorded with it once it commits. */
 	beginTransaction(): Promise<TransactionPort> {
 		const open = { messages: [] as TestRecord<Buffer, Buffer>[], offsets: [] as OffsetAndMetadata[] }

@@ -1,5 +1,5 @@
 import type { KGroupedTable } from '@/api/grouped.js'
-import type { KStream, KeyValue, ValueMapper } from '@/api/kstream.js'
+import type { KStream, KeyValue, ValueMapper, ValueMapperWithKey } from '@/api/kstream.js'
 import type { KTable } from '@/api/ktable.js'
 import type {
 	Grouped,
@@ -39,7 +39,11 @@ export class KTableImpl<K, V> implements KTable<K, V> {
 		return tableOps.filterNot(this, predicate, options)
 	}
 
-	mapValues<VR>(mapper: ValueMapper<K, V, VR | null>, options?: TableOptions<K, VR>): KTable<K, VR> {
+	mapValues<VR>(mapper: ValueMapper<V, VR | null>, options?: TableOptions<K, VR>): KTable<K, VR> {
+		return tableOps.mapValues(this, (_key, value) => mapper(value), options)
+	}
+
+	mapValuesWithKey<VR>(mapper: ValueMapperWithKey<K, V, VR | null>, options?: TableOptions<K, VR>): KTable<K, VR> {
 		return tableOps.mapValues(this, mapper, options)
 	}
 

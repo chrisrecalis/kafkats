@@ -189,16 +189,17 @@ describe('stateless operators', () => {
 		})
 	})
 
-	it('mapValues and flatMapValues get the key when the mapper declares two parameters', async () => {
+	it('mapValues and flatMapValues get the value only, mapValuesWithKey and flatMapValuesWithKey the key too', async () => {
 		const driver = new TestDriver()
 		const stream = driver.input('in', { key: str, value: str })
 		stream.mapValues(v => `${v}!`).to('value-only', { key: str, value: str })
-		stream.mapValues((k: string | null, v: string | null) => `${k}=${v}`).to('with-key', { key: str, value: str })
-		stream
-			.flatMapValues((k: string | null, v: string | null) => [k ?? '', v ?? ''])
-			.to('flat', { key: str, value: str })
+		stream.mapValuesWithKey((k, v) => `${k}=${v}`).to('with-key', { key: str, value: str })
+		stream.flatMapValuesWithKey((k, v) => [k ?? '', v ?? '']).to('flat', { key: str, value: str })
 		stream.flatMapValues(v => [v, v]).to('flat-values', { key: str, value: str })
-		// The documented caveat: a parameter with a default does not count in fn.length, so this mapper gets the value only.
+		// Functions declaring more parameters get the value alone, whatever their arity (0.13 called mapValues so too).
+		stream.mapValues(JSON.stringify).to('stringified', { key: str, value: str })
+		const withSuffix = (v: string | null, suffix?: string) => `${v}${suffix ?? '?'}`
+		stream.mapValues(withSuffix).to('optional', { key: str, value: str })
 		stream.mapValues((v: string | null, suffix = '?') => `${v}${suffix}`).to('default', { key: str, value: str })
 		await driver.run(async ({ send, output }) => {
 			await send('in', 'v', { ...key('k'), codec: str })
@@ -207,6 +208,8 @@ describe('stateless operators', () => {
 			expect(values('with-key')).toEqual(['k=v'])
 			expect(values('flat')).toEqual(['k', 'v'])
 			expect(values('flat-values')).toEqual(['v', 'v'])
+			expect(values('stringified')).toEqual(['"v"'])
+			expect(values('optional')).toEqual(['v?'])
 			expect(values('default')).toEqual(['v?'])
 		})
 	})

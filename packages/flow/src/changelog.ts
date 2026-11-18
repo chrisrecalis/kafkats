@@ -12,6 +12,7 @@ export {
 	ChangelogDecodeError,
 	ChangelogPartitionMismatchError,
 	CoPartitioningError,
+	InternalTopicNotFoundError,
 	SourceTopicNotFoundError,
 } from '@/changelog/errors.js'
 export { windowedKeyCodec } from '@/changelog/writer.js'

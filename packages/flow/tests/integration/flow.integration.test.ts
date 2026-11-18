@@ -15,6 +15,7 @@ import {
 } from '../../src/index.js'
 import {
 	createTopics,
+	eventTimeBase,
 	float64Codec as numberCodec,
 	MultiTopicCollector,
 	newClient,
@@ -678,6 +679,8 @@ describe('stream-stream joins (deprecated Joined.within: eager left and outer re
 	const outInner = uniqueTopicName('flow-it-ss-out-inner')
 	const outLeft = uniqueTopicName('flow-it-ss-out-left')
 	const outOuter = uniqueTopicName('flow-it-ss-out-outer')
+	// Event times near the wall clock: the broker's retention would delete records stamped in 1970.
+	const T = eventTimeBase()
 
 	const appId = `flow-it-join-ss-${Date.now()}`
 	let app: ReturnType<typeof flow>
@@ -722,7 +725,11 @@ describe('stream-stream joins (deprecated Joined.within: eager left and outer re
 		await output.start()
 		await app.start()
 
-		await producer.send(leftTopic, { key: '__warmup__', value: numberCodec.encode(1), timestamp: new Date(1_000) })
+		await producer.send(leftTopic, {
+			key: '__warmup__',
+			value: numberCodec.encode(1),
+			timestamp: new Date(T + 1_000),
+		})
 		await output.waitFor(outLeft, m => m.key === '__warmup__', 15_000)
 	})
 
@@ -732,47 +739,47 @@ describe('stream-stream joins (deprecated Joined.within: eager left and outer re
 	})
 
 	it('inner join emits when right arrives within the window after left', async () => {
-		await producer.send(leftTopic, { key: 'k1', value: numberCodec.encode(1), timestamp: new Date(10_000) })
-		await producer.send(rightTopic, { key: 'k1', value: numberCodec.encode(2), timestamp: new Date(10_500) })
+		await producer.send(leftTopic, { key: 'k1', value: numberCodec.encode(1), timestamp: new Date(T + 10_000) })
+		await producer.send(rightTopic, { key: 'k1', value: numberCodec.encode(2), timestamp: new Date(T + 10_500) })
 		const msg = await output.waitFor(outInner, m => m.key === 'k1' && m.value === 3)
 		expect(msg.value).toBe(3)
 	})
 
 	it('inner join emits when left arrives within the window after right', async () => {
-		await producer.send(rightTopic, { key: 'k2', value: numberCodec.encode(2), timestamp: new Date(20_000) })
-		await producer.send(leftTopic, { key: 'k2', value: numberCodec.encode(1), timestamp: new Date(20_200) })
+		await producer.send(rightTopic, { key: 'k2', value: numberCodec.encode(2), timestamp: new Date(T + 20_000) })
+		await producer.send(leftTopic, { key: 'k2', value: numberCodec.encode(1), timestamp: new Date(T + 20_200) })
 		await output.waitFor(outInner, m => m.key === 'k2' && m.value === 3)
 	})
 
 	it('inner join does not emit when records are outside the window', async () => {
-		await producer.send(leftTopic, { key: 'k3', value: numberCodec.encode(1), timestamp: new Date(30_000) })
-		await producer.send(rightTopic, { key: 'k3', value: numberCodec.encode(2), timestamp: new Date(40_000) })
+		await producer.send(leftTopic, { key: 'k3', value: numberCodec.encode(1), timestamp: new Date(T + 30_000) })
+		await producer.send(rightTopic, { key: 'k3', value: numberCodec.encode(2), timestamp: new Date(T + 40_000) })
 		await expect(output.waitFor(outInner, m => m.key === 'k3', 400)).rejects.toThrow('Timed out')
 	})
 
 	it('leftJoin emits with null when no match exists', async () => {
-		await producer.send(leftTopic, { key: 'k4', value: numberCodec.encode(9), timestamp: new Date(50_000) })
+		await producer.send(leftTopic, { key: 'k4', value: numberCodec.encode(9), timestamp: new Date(T + 50_000) })
 		await output.waitFor(outLeft, m => m.key === 'k4' && m.value === 9)
 	})
 
 	it('leftJoin emits joined results when a match exists', async () => {
-		await producer.send(rightTopic, { key: 'k5', value: numberCodec.encode(2), timestamp: new Date(60_000) })
-		await producer.send(leftTopic, { key: 'k5', value: numberCodec.encode(1), timestamp: new Date(60_100) })
+		await producer.send(rightTopic, { key: 'k5', value: numberCodec.encode(2), timestamp: new Date(T + 60_000) })
+		await producer.send(leftTopic, { key: 'k5', value: numberCodec.encode(1), timestamp: new Date(T + 60_100) })
 		await output.waitFor(outLeft, m => m.key === 'k5' && m.value === 3)
 	})
 
 	it('outerJoin emits when left record has no match', async () => {
-		await producer.send(leftTopic, { key: 'k6', value: numberCodec.encode(7), timestamp: new Date(70_000) })
+		await producer.send(leftTopic, { key: 'k6', value: numberCodec.encode(7), timestamp: new Date(T + 70_000) })
 		await output.waitFor(outOuter, m => m.key === 'k6' && m.value === 7)
 	})
 
 	it('outerJoin emits when right record has no match', async () => {
-		await producer.send(rightTopic, { key: 'k7', value: numberCodec.encode(8), timestamp: new Date(80_000) })
+		await producer.send(rightTopic, { key: 'k7', value: numberCodec.encode(8), timestamp: new Date(T + 80_000) })
 		await output.waitFor(outOuter, m => m.key === 'k7' && m.value === 8)
 	})
 
 	it('null-key records are dropped by the inner join and joined with null by left and outer joins (KIP-962)', async () => {
-		await producer.send(leftTopic, { key: null, value: numberCodec.encode(1), timestamp: new Date(90_000) })
+		await producer.send(leftTopic, { key: null, value: numberCodec.encode(1), timestamp: new Date(T + 90_000) })
 		await output.waitFor(outLeft, m => m.key === null && m.value === 1)
 		await output.waitFor(outOuter, m => m.key === null && m.value === 1)
 		await expect(output.waitFor(outInner, m => m.key === null, 400)).rejects.toThrow('Timed out')
@@ -791,6 +798,8 @@ describe('stream-stream joins (JoinWindows: left and outer results when the wind
 	const outLeft = uniqueTopicName('flow-it-ssw-out-left')
 	const outOuter = uniqueTopicName('flow-it-ssw-out-outer')
 	const TICK = '__tick__'
+	// Event times near the wall clock (offsets from T): the broker's retention would delete records stamped in 1970.
+	const T = eventTimeBase()
 
 	const appId = `flow-it-join-ssw-${Date.now()}`
 	let app: ReturnType<typeof flow>
@@ -833,8 +842,16 @@ describe('stream-stream joins (JoinWindows: left and outer results when the wind
 		await output.start()
 		await app.start()
 
-		await producer.send(leftTopic, { key: '__warmup__', value: numberCodec.encode(1), timestamp: new Date(1_000) })
-		await producer.send(rightTopic, { key: '__warmup__', value: numberCodec.encode(1), timestamp: new Date(1_000) })
+		await producer.send(leftTopic, {
+			key: '__warmup__',
+			value: numberCodec.encode(1),
+			timestamp: new Date(T + 1_000),
+		})
+		await producer.send(rightTopic, {
+			key: '__warmup__',
+			value: numberCodec.encode(1),
+			timestamp: new Date(T + 1_000),
+		})
 		await output.waitFor(outInner, m => m.key === '__warmup__', 15_000)
 	})
 
@@ -850,7 +867,7 @@ describe('stream-stream joins (JoinWindows: left and outer results when the wind
 	async function advancePast(after: number, done: () => boolean): Promise<void> {
 		for (let attempt = 0; attempt < 8 && !done(); attempt++) {
 			tick = Math.max(tick, after) + 1
-			await producer.send(leftTopic, { key: TICK, value: numberCodec.encode(0), timestamp: new Date(tick) })
+			await producer.send(leftTopic, { key: TICK, value: numberCodec.encode(0), timestamp: new Date(T + tick) })
 			await waitUntil('a closed window was scanned', done, 1_200).catch(() => {})
 		}
 		expect(done()).toBe(true)
@@ -868,12 +885,12 @@ describe('stream-stream joins (JoinWindows: left and outer results when the wind
 			.map(m => m.value)
 
 	it('matches records within the window in either order, without a null result after the window closed', async () => {
-		await producer.send(leftTopic, { key: 'k1', value: numberCodec.encode(1), timestamp: new Date(10_000) })
-		await producer.send(rightTopic, { key: 'k1', value: numberCodec.encode(2), timestamp: new Date(10_500) })
-		await producer.send(rightTopic, { key: 'k2', value: numberCodec.encode(2), timestamp: new Date(10_500) })
-		await producer.send(leftTopic, { key: 'k2', value: numberCodec.encode(1), timestamp: new Date(11_200) })
+		await producer.send(leftTopic, { key: 'k1', value: numberCodec.encode(1), timestamp: new Date(T + 10_000) })
+		await producer.send(rightTopic, { key: 'k1', value: numberCodec.encode(2), timestamp: new Date(T + 10_500) })
+		await producer.send(rightTopic, { key: 'k2', value: numberCodec.encode(2), timestamp: new Date(T + 10_500) })
+		await producer.send(leftTopic, { key: 'k2', value: numberCodec.encode(1), timestamp: new Date(T + 11_200) })
 		// An unmatched left record as late as the others: once it is joined with null, their windows closed too.
-		await producer.send(leftTopic, { key: 'w1', value: numberCodec.encode(5), timestamp: new Date(11_200) })
+		await producer.send(leftTopic, { key: 'w1', value: numberCodec.encode(5), timestamp: new Date(T + 11_200) })
 		for (const topic of [outInner, outLeft, outOuter]) {
 			await output.waitFor(topic, m => m.key === 'k1' && m.value === 3)
 			await output.waitFor(topic, m => m.key === 'k2' && m.value === 3)
@@ -886,12 +903,12 @@ describe('stream-stream joins (JoinWindows: left and outer results when the wind
 	})
 
 	it('left and outer joins hold an unmatched left record until its window and grace closed', async () => {
-		await producer.send(leftTopic, { key: 'k3', value: numberCodec.encode(9), timestamp: new Date(20_000) })
+		await producer.send(leftTopic, { key: 'k3', value: numberCodec.encode(9), timestamp: new Date(T + 20_000) })
 		// Stream time reaches the end of the grace period: still open. The scans run at most once a second (wall clock):
 		// wait for one to be due, so that the boundary record does scan.
 		await sleep(1_100)
 		tick = 21_500
-		await producer.send(leftTopic, { key: TICK, value: numberCodec.encode(0), timestamp: new Date(tick) })
+		await producer.send(leftTopic, { key: TICK, value: numberCodec.encode(0), timestamp: new Date(T + tick) })
 		await sleep(1_500)
 		expect(results(outLeft, 'k3')).toEqual([])
 		expect(results(outOuter, 'k3')).toEqual([])
@@ -899,8 +916,8 @@ describe('stream-stream joins (JoinWindows: left and outer results when the wind
 	})
 
 	it('the outer join holds an unmatched right record until its window and grace closed; the left join drops it', async () => {
-		await producer.send(rightTopic, { key: 'k4', value: numberCodec.encode(8), timestamp: new Date(30_000) })
-		await producer.send(leftTopic, { key: 'w4', value: numberCodec.encode(5), timestamp: new Date(30_000) })
+		await producer.send(rightTopic, { key: 'k4', value: numberCodec.encode(8), timestamp: new Date(T + 30_000) })
+		await producer.send(leftTopic, { key: 'w4', value: numberCodec.encode(5), timestamp: new Date(T + 30_000) })
 		await sleep(500)
 		expect(results(outOuter, 'k4')).toEqual([])
 		await advancePast(31_500, () => results(outOuter, 'k4').length > 0 && joinedWithNull('w4', 5)())
@@ -909,7 +926,7 @@ describe('stream-stream joins (JoinWindows: left and outer results when the wind
 	})
 
 	it('null-key records are dropped by the inner join and joined with null at once by left and outer joins (KIP-962)', async () => {
-		await producer.send(leftTopic, { key: null, value: numberCodec.encode(7), timestamp: new Date(40_000) })
+		await producer.send(leftTopic, { key: null, value: numberCodec.encode(7), timestamp: new Date(T + 40_000) })
 		await output.waitFor(outLeft, m => m.key === null && m.value === 7)
 		await output.waitFor(outOuter, m => m.key === null && m.value === 7)
 		await expect(output.waitFor(outInner, m => m.key === null, 400)).rejects.toThrow('Timed out')

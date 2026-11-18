@@ -46,8 +46,15 @@ export interface TaskManagerDeps {
 	/** The read-only view of a global store, which every processor may read (TaskDeps.globalStore). */
 	readonly globalStore: (name: string) => StateStore
 	readonly consumer: Pick<GroupConsumerPort, 'pause' | 'resume' | 'seek' | 'groupMetadata' | 'nextOffset'>
-	/** The Run's current collector: per-task outputs, and (EOS) an open transaction before a task's init() (4.4). */
-	readonly outputs: { forTask(task: StreamTask): TaskOutput; ensureTransaction(signal: AbortSignal): Promise<void> }
+	/**
+	 * The Run's current collector: per-task outputs, (EOS) the producer initialized before a restore and an open
+	 * transaction before a task's init() (4.4).
+	 */
+	readonly outputs: {
+		forTask(task: StreamTask): TaskOutput
+		initialize(signal: AbortSignal): Promise<void>
+		ensureTransaction(signal: AbortSignal): Promise<void>
+	}
 	readonly restorer: TaskRestorer
 	readonly startPositions: StartPositionSettler
 	readonly exclusive: <T>(fn: () => Promise<T>) => Promise<T>
@@ -70,7 +77,7 @@ export interface TaskManagerDeps {
 	readonly logger: Logger
 }
 
-/** Bound of the transaction a task's init() may write into (EOS). */
+/** Bound of the transaction a task's init() may write into, and of the producer's initialization before a restore (EOS). */
 const TRANSACTION_TIMEOUT_MS = 10_000
 const REVOCATION_COMMIT_MAX_MS = 30_000
 /** A task corrupted again within this window escalates to a migration (4.7.5). */
@@ -101,6 +108,7 @@ export class TaskManager {
 	constructor(private readonly deps: TaskManagerDeps) {
 		this.taskConfig = taskConfig(deps.config, deps.topology)
 		this.pipelines = new RestorePipelines({
+			initializeOutput: signal => deps.outputs.initialize(cap(signal, TRANSACTION_TIMEOUT_MS)),
 			restorer: deps.restorer,
 			startPositions: deps.startPositions,
 			exclusive: deps.exclusive,

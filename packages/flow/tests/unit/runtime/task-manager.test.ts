@@ -116,6 +116,7 @@ class Harness {
 			bufferedRecordsPerPartition: options.bufferedRecordsPerPartition ?? 1000,
 			emitIntervalMs: 0,
 			repartitionPurgeIntervalMs: 0,
+			stateCleanupDelayMs: 600_000,
 			transactionTimeoutMs: 10_000,
 			rebalanceTimeoutMs: 60_000,
 			defaultTimestampExtractor: TimestampExtractors.failOnInvalid,
@@ -161,6 +162,7 @@ class Harness {
 			consumer: this.consumer,
 			outputs: {
 				forTask: task => this.collector.forTask(task),
+				initialize: signal => this.collector.initialize(signal),
 				ensureTransaction: signal => this.collector.ensureTransaction(signal),
 			},
 			restorer: this.restorer,
@@ -521,6 +523,8 @@ describe('TaskManager: restore pipelines (4.7.1)', () => {
 		const h = new Harness({ eos: true, build: stateful(['input'], counting) })
 		h.restorer.manual = true
 		await h.assign('input:0')
+		// The restore starts once the producer is initialized.
+		await h.settle()
 		const [task] = h.tasks()
 		const gate = deferred()
 		const ensureTransaction = h.collector.ensureTransaction.bind(h.collector)
@@ -551,6 +555,7 @@ describe('TaskManager: restore pipelines (4.7.1)', () => {
 			const h = new Harness({ eos, build: stateful(['input'], counting), counts: { input: 2 } })
 			h.restorer.manual = true
 			await h.assign('input:0', 'input:1')
+			await h.settle()
 			const [restoring, other] = h.tasks()
 			h.restorer.job(other!).finish()
 			await h.settle()

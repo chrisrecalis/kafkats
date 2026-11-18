@@ -3,7 +3,7 @@
  * KTable toStream). Each is a plain function of the record that returns its forward's result, so a synchronous chain
  * allocates no promise. Callbacks see null keys and values (ksdsl§1.4); results keep the input timestamp and headers.
  */
-import type { KeyValue, ValueMapper } from '@/api/kstream.js'
+import type { KeyValue, ValueMapperWithKey } from '@/api/kstream.js'
 import type { Change } from '@/operators/change.js'
 import type { ForwardResult, ProcessorContext, ProcessorSupplier } from '@/processor/api.js'
 import { StreamRecord } from '@/processor/record.js'
@@ -26,13 +26,6 @@ function stateless<KIn, VIn, KOut, VOut>(
 			process: record => process(context, record),
 		}
 	}
-}
-
-/** A ValueMapper as a function of key and value: mappers declaring two or more parameters get the key (6.20). */
-export function withKey<K, V, VR>(mapper: ValueMapper<K, V, VR>): (key: K, value: V) => VR {
-	return mapper.length >= 2
-		? (mapper as (key: K, value: V) => VR)
-		: (_key, value) => (mapper as (value: V) => VR)(value)
 }
 
 /** Forwards the records one after the other, each once the previous one's subtree settled. */
@@ -82,9 +75,8 @@ export function mapProcessor<K, V, KR, VR>(
 	})
 }
 
-export function mapValuesProcessor<K, V, VR>(mapper: ValueMapper<K, V, VR>): ProcessorSupplier<K, V, K, VR> {
-	const map = withKey(mapper)
-	return stateless((context, record) => context.forward(record.withValue(map(record.key, record.value))))
+export function mapValuesProcessor<K, V, VR>(mapper: ValueMapperWithKey<K, V, VR>): ProcessorSupplier<K, V, K, VR> {
+	return stateless((context, record) => context.forward(record.withValue(mapper(record.key, record.value))))
 }
 
 export function flatMapProcessor<K, V, KR, VR>(
@@ -94,10 +86,9 @@ export function flatMapProcessor<K, V, KR, VR>(
 }
 
 export function flatMapValuesProcessor<K, V, VR>(
-	mapper: ValueMapper<K, V, Iterable<VR>>
+	mapper: ValueMapperWithKey<K, V, Iterable<VR>>
 ): ProcessorSupplier<K, V, K, VR> {
-	const map = withKey(mapper)
-	return stateless((context, record) => forwardEach(context, withValues(record, map(record.key, record.value))))
+	return stateless((context, record) => forwardEach(context, withValues(record, mapper(record.key, record.value))))
 }
 
 export function selectKeyProcessor<K, V, KR>(mapper: (key: K, value: V) => KR): ProcessorSupplier<K, V, KR, V> {

@@ -20,8 +20,11 @@ function overloads(
 	windows: { join: JoinWindows; time: TimeWindows; session: SessionWindows; sliding: SlidingWindows }
 ) {
 	expectTypeOf(stream.mapValues(value => String(value))).toEqualTypeOf<KStream<string, string>>()
-	expectTypeOf(stream.mapValues((key: string | null, value: number | null) => [key, value])).toEqualTypeOf<
+	expectTypeOf(stream.mapValuesWithKey((key, value) => [key, value])).toEqualTypeOf<
 		KStream<string, (string | number | null)[]>
+	>()
+	expectTypeOf(table.mapValuesWithKey((key, value) => `${key}${value.getTime()}`)).toEqualTypeOf<
+		KTable<string, string>
 	>()
 	expectTypeOf(stream.selectKey((key, value) => `${key}:${value}`)).toEqualTypeOf<KStream<string, number>>()
 
@@ -132,8 +135,8 @@ function overloads(
 	expectTypeOf(app.globalTable<number, Date>('dates')).toEqualTypeOf<GlobalKTable<number, Date>>()
 	// @ts-expect-error a global table cannot be streamed
 	app.globalTable('dates').toStream()
-	// @ts-expect-error a key-value lambda needs explicit parameter types to pick the keyed overload
-	stream.mapValues((key, value) => [key, value])
+	// @ts-expect-error mapValues() passes the value alone: a mapper requiring the key is mapValuesWithKey()'s
+	stream.mapValues((key: string | null, value: number | null) => [key, value])
 
 	// Processor API: typed stores and processors.
 	const counts = Stores.keyValueStore({ name: 'counts', key: codec.string(), value: codec.json<number>() })

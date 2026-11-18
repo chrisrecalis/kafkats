@@ -19,7 +19,15 @@ export type {
 	GlobalStoreDescription,
 	TopologyNodeDescription,
 } from '@/api/app.js'
-export type { KStream, BranchedKStream, KeyValue, KeyValueMapper, ValueMapper, ValueJoiner } from '@/api/kstream.js'
+export type {
+	KStream,
+	BranchedKStream,
+	KeyValue,
+	KeyValueMapper,
+	ValueMapper,
+	ValueMapperWithKey,
+	ValueJoiner,
+} from '@/api/kstream.js'
 export type { KTable, GlobalKTable } from '@/api/ktable.js'
 export type {
 	KGroupedStream,
@@ -152,6 +160,7 @@ export {
 	ChangelogDecodeError,
 	ChangelogPartitionMismatchError,
 	CoPartitioningError,
+	InternalTopicNotFoundError,
 	SourceTopicNotFoundError,
 } from '@/changelog.js'
 export type { ChangelogConfig, ChangelogRestorationOptions } from '@/changelog.js'

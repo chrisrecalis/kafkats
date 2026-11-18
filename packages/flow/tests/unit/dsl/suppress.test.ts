@@ -128,6 +128,41 @@ describe.each(GUARANTEES)('suppress until windows close (6.16; %s)', (_, config)
 		expect(results[1]).toEqual(results[0])
 	})
 
+	it('a session forwarded as final takes no more records, whatever the retention of its store', async () => {
+		// Kafka Streams merges a record into any session its store still holds: with a retention above gap + grace, a
+		// record within the gap of a session forwarded as final would merge into it and forward it a second time.
+		for (const closer of [6, 10]) {
+			const results: Final[][] = []
+			for (const retention of [undefined, 100]) {
+				for (const emitFinal of [false, true]) {
+					const driver = new TestDriver(config)
+					const sessions = driver
+						.input('in', S)
+						.groupByKey()
+						.windowedBy(SessionWindows.ofInactivityGapWithNoGrace(5))
+					const table = emitFinal
+						? sessions.count({ emit: 'on-window-close', retention })
+						: sessions.count({ retention }).suppress(FINAL)
+					table.toStream().to('out', { value: num })
+					await driver.run(async ctx => {
+						await send(ctx, 'in', 'k', 'v', 0)
+						await send(ctx, 'in', 'j', 'v', closer) // [0,0] is final: 0 < closer - 5
+						expect(finals(ctx, WindowedCodecs.sessionWindowed(str))).toEqual([['k', 0, 0, 1, 0]])
+						await send(ctx, 'in', 'k', 'v', 5) // not late (its session ends at 5), but [0,0] closed
+						await send(ctx, 'in', 'x', 'v', 30)
+						results.push(finals(ctx, WindowedCodecs.sessionWindowed(str)).sort())
+					})
+				}
+			}
+			expect(results[3], `closed at ${closer}`).toEqual([
+				['j', closer, closer, 1, closer],
+				['k', 0, 0, 1, 0],
+				['k', 5, 5, 1, 5],
+			])
+			for (const result of results) expect(result, `closed at ${closer}`).toEqual(results[3])
+		}
+	})
+
 	it('waits the grace alone after the end of a sliding window', async () => {
 		const driver = new TestDriver(config)
 		const keys = WindowedCodecs.timeWindowed(str, 10)

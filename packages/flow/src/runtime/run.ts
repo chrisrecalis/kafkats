@@ -121,6 +121,7 @@ export class Run {
 			consumer: this.consumer,
 			outputs: {
 				forTask: task => this.current.forTask(task),
+				initialize: signal => this.current.initialize(signal),
 				ensureTransaction: signal => this.current.ensureTransaction(signal),
 			},
 			restorer: new RestorationPool({

@@ -56,7 +56,7 @@ export interface StoreClock {
 	readonly time: number
 	/** Processor writes through the clipping layer only (restore writes go to the provider store). */
 	advance(keyTime: number): void
-	/** `time = max(time, seed)`, when the task starts running. */
+	/** `time = max(time, seed)`, when the task starts running (StreamTask.seed: the committed clock). */
 	seed(time: number): void
 	/** Lowest key time a read may return: `time - retention + 1`. */
 	readonly readFloor: number

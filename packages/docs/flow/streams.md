@@ -35,24 +35,23 @@ Changes the key and the value. A key-based operation downstream [repartitions](#
 stream.map((key, order) => [order!.customerId, order!.amount] as const)
 ```
 
-### mapValues
+### mapValues, mapValuesWithKey
 
-Changes the value and keeps the key, so no repartitioning is needed.
+Changes the value and keeps the key, so no repartitioning is needed. `mapValues()` calls its mapper with the value alone (Kafka Streams' `ValueMapper`), whatever parameters the function declares, so `stream.mapValues(JSON.stringify)` stringifies the value; `mapValuesWithKey()` calls it with the key and the value (`ValueMapperWithKey`).
 
 ```typescript
 stream.mapValues(order => order!.amount)
-stream.mapValues((key: string | null, order: Order | null) => `${key}:${order?.amount}`)
+stream.mapValuesWithKey((key, order) => `${key}:${order?.amount}`)
 ```
 
-A mapper that declares two parameters receives `(key, value)`; one with one parameter receives `(value)`. Parameters with defaults do not count. TypeScript infers the parameter of a one-parameter lambda, but needs explicit parameter types on a two-parameter one to pick the right overload.
+### flatMap, flatMapValues, flatMapValuesWithKey
 
-### flatMap, flatMapValues
-
-Zero or more records per record. `flatMap` may change keys (and so requires repartitioning downstream); `flatMapValues` keeps the record's key. Any iterable works.
+Zero or more records per record. `flatMap` may change keys (and so requires repartitioning downstream); `flatMapValues` and `flatMapValuesWithKey` keep the record's key. Any iterable works.
 
 ```typescript
 stream.flatMap((key, order) => order!.items.map(item => [item.sku, item] as const))
 stream.flatMapValues(order => order!.items)
+stream.flatMapValuesWithKey((key, order) => order!.items.map(item => `${key}:${item.sku}`))
 ```
 
 ### selectKey

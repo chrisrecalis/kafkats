@@ -9,7 +9,7 @@ import { flow } from '@/app/flow.js'
 import { internals } from '@/app/internal.js'
 import { AppLifecycle } from '@/app/lifecycle.js'
 import { FlowRuntime } from '@/runtime/runtime.js'
-import type { StateStoreProvider } from '@/state.js'
+import type { ChangelogCheckpointStore, StateStoreProvider } from '@/state.js'
 import { Checkpoints } from '@/state/checkpoints.js'
 import { inMemory } from '@/state/memory.js'
 import { StateDirectory } from '@/state/state-directory.js'
@@ -23,13 +23,15 @@ export interface RuntimeHarnessOptions {
 	/** Partition counts of the topics created before the start (default: `in` and `out` with one each). */
 	readonly partitions?: Record<string, number>
 	readonly provider?: StateStoreProvider
+	/** Durable checkpoints (a provider's checkpoint store); in process by default. */
+	readonly checkpointStore?: ChangelogCheckpointStore
 }
 
 export class RuntimeHarness {
 	readonly io = new FakeIO({ groupId: APP })
 	readonly lifecycle = new AppLifecycle()
 	readonly logger = new RecordingLogger()
-	readonly checkpoints = new Checkpoints(undefined, () => {})
+	readonly checkpoints: Checkpoints
 	readonly stateDirectory: StateDirectory
 	readonly topology: BuiltTopology
 	readonly runtime: FlowRuntime
@@ -43,10 +45,15 @@ export class RuntimeHarness {
 			this.io.cluster.createTopic(topic, count)
 		}
 		const { connection } = this
-		this.stateDirectory = new StateDirectory(APP, options.provider ?? inMemory(), this.checkpoints, this.logger)
+		const { settings } = internals(app)
+		this.checkpoints = new Checkpoints(options.checkpointStore, () => {})
+		this.stateDirectory = new StateDirectory(APP, options.provider ?? inMemory(), this.checkpoints, this.logger, {
+			delayMs: settings.stateCleanupDelayMs,
+			now: () => this.io.clock.now(),
+		})
 		this.runtime = new FlowRuntime({
 			topology: this.topology,
-			config: { ...internals(app).settings, processId: 'process' },
+			config: { ...settings, processId: 'process' },
 			io: this.io,
 			connection: {
 				connect: async () => void connection.connected++,

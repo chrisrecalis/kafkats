@@ -5,7 +5,7 @@ Real-world examples demonstrating streaming topologies with `@kafkats/flow`.
 ## Prerequisites
 
 - Docker & Docker Compose
-- Node.js 18+
+- Node.js 22 or later
 - pnpm
 
 ## Quick Start

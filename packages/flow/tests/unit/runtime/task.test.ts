@@ -536,7 +536,8 @@ describe('seeding from the commits (D5, KF7)', () => {
 		expect(metadata.get('w.observed')).toBe(80)
 		expect(metadata.get('removed')).toBeUndefined()
 		expect(task.streamTime).toBe(130)
-		expect(clock.time).toBe(95)
+		// The committed clock, not the restored one: the replay of the records after the commit advances it again.
+		expect(clock.time).toBe(80)
 		// Seeding is not a change to commit.
 		expect(task.needsCommit(h.consumer.nextOffset.bind(h.consumer))).toBe(false)
 	})
@@ -556,19 +557,31 @@ describe('seeding from the commits (D5, KF7)', () => {
 		}
 		task.setStarts(new Map([['a:0', committed({ w: 100, 'w.observed': 80 }, 90)]]))
 		await task.completeRestoration(new Map([['w', 95]]))
-		expect(clock.time).toBe(95)
+		expect(clock.time).toBe(80)
 		expect(task.streamTime).toBe(90)
 		expect(reads).toEqual([])
 	})
 
-	it('a store clock is seeded with the larger of its committed and restored times', async () => {
-		const h = new TaskHarness({ build: twoTopics(passThrough) })
-		const task = h.task()
-		await task.initialize()
-		const clock = giveClock(task)
-		task.setStarts(new Map([['a:0', committed({ 'w.observed': 300 }, 10)]]))
-		await task.completeRestoration(new Map([['w', 200]]))
-		expect(clock.time).toBe(300)
+	it('a store clock is seeded with its committed time; with no commit metadata, with the time the restore applied', async () => {
+		const cases: [PartitionStart | undefined, number][] = [
+			[committed({ 'w.observed': 300 }, 10), 300],
+			// At-least-once: the restore applied the writes made after the commit, at later key times.
+			[committed({ 'w.observed': 100 }, 10), 100],
+			// The store was not written before the commit.
+			[committed({ other: 5 }, 10), -1],
+			[{ committed: { offset: 1n, metadata: '' }, resolved: 1n }, 200],
+			[{ committed: { offset: 1n, metadata: 'garbage!' }, resolved: 1n }, 200],
+			[undefined, 200],
+		]
+		for (const [start, seeded] of cases) {
+			const h = new TaskHarness({ build: twoTopics(passThrough) })
+			const task = h.task()
+			await task.initialize()
+			const clock = giveClock(task)
+			task.setStarts(new Map(start === undefined ? [] : [['a:0', start]]))
+			await task.completeRestoration(new Map([['w', 200]]))
+			expect(clock.time, start?.committed?.metadata ?? 'no commit').toBe(seeded)
+		}
 	})
 
 	it('metadata that cannot be decoded seeds nothing and warns once', async () => {

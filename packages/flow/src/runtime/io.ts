@@ -93,6 +93,11 @@ export interface TransactionPort {
 export interface ProducerPort {
 	/** At-least-once sends. */
 	send(topic: string, message: ProducedMessage): Promise<SendResult>
+	/**
+	 * Exactly-once: initializes the transactional producer now (KS `initTransactions`), which fences the producers with
+	 * its transactional id and aborts the transaction the last of them left open.
+	 */
+	initTransactions(options: { signal: AbortSignal }): Promise<void>
 	/** Exactly-once. */
 	beginTransaction(options: { signal: AbortSignal }): Promise<TransactionPort>
 	partitionCount(topic: string, options: { signal: AbortSignal }): Promise<number>

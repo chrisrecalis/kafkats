@@ -61,6 +61,8 @@ export class RecordCollector {
 	private readonly lifetime = new AbortController()
 	private transaction: TransactionPort | undefined
 	private opening: Promise<TransactionPort> | undefined
+	/** Exactly-once: the producer's initialization, once per collector (a failed one is retried). */
+	private initializing: Promise<void> | undefined
 	/** Every abort so far (none rejects): the producer runs one transaction at a time, the next begins after them. */
 	private aborting: Promise<unknown> | undefined
 	/** Exactly-once: the last transaction was aborted and none was opened since, so the work done meanwhile is void. */
@@ -80,7 +82,27 @@ export class RecordCollector {
 			send: (kind, record) => this.send(task, kind, record),
 			partitionCount: topic => counts.get(topic),
 			loadPartitionCount: topic => this.loadPartitionCount(topic),
+			close: () => this.changelogOffsets.delete(task),
 		}
+	}
+
+	/**
+	 * Exactly-once: initializes the producer once (KS `RecordCollector.initialize` at task initialization), awaited by
+	 * every restore before it reads a changelog. A new producer with the transactional id of an earlier one fences it
+	 * when it initializes, which aborts the transaction it left open: until then that transaction's records hold back
+	 * the last stable offset of every changelog it wrote, and with it every restore that reads one.
+	 */
+	async initialize(signal: AbortSignal): Promise<void> {
+		if (!this.options.eos || this.isClosed) {
+			return
+		}
+		this.initializing ??= this.producer
+			.initTransactions({ signal: this.lifetime.signal })
+			.catch((error: unknown) => {
+				this.initializing = undefined
+				throw error
+			})
+		await raceSignal(this.initializing, signal)
 	}
 
 	/** Exactly-once: begins a transaction unless one is open; awaited before any slice that may send. */
@@ -260,8 +282,13 @@ export class RecordCollector {
 		generation.sent()
 		sent.then(
 			result => {
-				// A corrupted task is never checkpointed again: its next incarnation restores from the last commit.
-				if (kind === 'changelog' && generation === this.generation && !task.corrupted) {
+				// A corrupted or closed task is never checkpointed again: its next incarnation restores from the last commit.
+				if (
+					kind === 'changelog' &&
+					generation === this.generation &&
+					!task.corrupted &&
+					task.state !== 'CLOSED'
+				) {
 					this.changelogAcked(task, result)
 				}
 				generation.answered()

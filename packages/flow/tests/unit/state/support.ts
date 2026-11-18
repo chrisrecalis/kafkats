@@ -8,7 +8,7 @@ import type { CollectedRecord, SendKind, TaskOutput } from '@/processor/output.j
 import type { ChangelogCheckpointStore, StateStoreProvider } from '@/state.js'
 import { Checkpoints } from '@/state/checkpoints.js'
 import { InMemoryStateStoreProvider } from '@/state/memory.js'
-import { StateDirectory } from '@/state/state-directory.js'
+import { StateDirectory, type StateCleanup } from '@/state/state-directory.js'
 
 export const APP = 'app'
 export const DEFAULTS: ChangelogDefaults = { applicationId: APP }
@@ -33,6 +33,8 @@ export class RecordingOutput implements TaskOutput {
 	loadPartitionCount(): Promise<number> {
 		return Promise.reject(new Error('not used by state tests'))
 	}
+
+	close(): void {}
 
 	/** The changelog records sent, decoded with string codecs (`null` for a tombstone). */
 	changelog(): { topic: string; partition?: number; key: string; value: string | null }[] {
@@ -70,14 +72,20 @@ export function checkpointStore(): ChangelogCheckpointStore & { values: Map<stri
 	return store
 }
 
-export function directory(options: { provider?: StateStoreProvider; checkpoints?: Checkpoints } = {}): {
+export function directory(
+	options: { provider?: StateStoreProvider; checkpoints?: Checkpoints; cleanup?: StateCleanup } = {}
+): {
 	directory: StateDirectory
 	provider: StateStoreProvider
 	checkpoints: Checkpoints
 } {
 	const provider = options.provider ?? new InMemoryStateStoreProvider()
 	const checkpoints = options.checkpoints ?? new Checkpoints(undefined, () => {})
-	return { directory: new StateDirectory(APP, provider, checkpoints, noopLogger), provider, checkpoints }
+	return {
+		directory: new StateDirectory(APP, provider, checkpoints, noopLogger, options.cleanup),
+		provider,
+		checkpoints,
+	}
 }
 
 export async function collect<T>(iterable: AsyncIterable<T>): Promise<T[]> {

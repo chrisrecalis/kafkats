@@ -28,6 +28,7 @@ const app = flow({
 | `commitIntervalMs`                | `5000` (at-least-once), `100` (exactly-once) | How often offsets (and under exactly-once the transaction) are committed.                                                                                                                 |
 | `taskTimeoutMs`                   | `300000`                                     | At-least-once: how long interval commits may keep timing out (or meeting rebalances) before the instance leaves and rejoins the group.                                                    |
 | `stateStoreProvider`              | `inMemory()`                                 | Where state stores live: `inMemory()`, `lmdb()` or `rocksdb()`. See [State Stores](/flow/state-stores).                                                                                   |
+| `stateCleanupDelayMs`             | `600000`                                     | How long a persistent provider keeps the state of a partition this instance no longer owns (Kafka Streams' `state.cleanup.delay.ms`). See [State Stores](/flow/state-stores).             |
 | `consumer`                        | -                                            | Settings of the group consumer. See [Consumer settings](#consumer-settings).                                                                                                              |
 | `producer`                        | -                                            | Settings of the producer. See [Producer settings](#producer-settings).                                                                                                                    |
 | `startTimeoutMs`                  | `120000`                                     | How long `start()` waits for the first assignment. Restoration and the loading of global tables are not bounded by it.                                                                    |
@@ -41,7 +42,7 @@ const app = flow({
 | `uncaughtExceptionHandler`        | `'shutdown'`                                 | What a fatal error does: `'shutdown'` (state `ERROR`), `'restart'`, or a function choosing one.                                                                                           |
 | `changelog`                       | -                                            | Internal topics and restoration. See [Changelog settings](#changelog-settings).                                                                                                           |
 
-All durations are milliseconds. Numbers must be integers (`maxTaskIdleMs` may be `-1`; `taskTimeoutMs` and `repartitionPurgeIntervalMs` may be `0`).
+All durations are milliseconds. Numbers must be integers (`maxTaskIdleMs` may be `-1`; `taskTimeoutMs`, `repartitionPurgeIntervalMs` and `stateCleanupDelayMs` may be `0`).
 
 ## Consumer Settings
 
@@ -65,16 +66,16 @@ All durations are milliseconds. Numbers must be integers (`maxTaskIdleMs` may be
 
 ## Changelog Settings
 
-| Option                                       | Default                          | Description                                                                                                |
-| -------------------------------------------- | -------------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `changelog.replicationFactor`                | broker default                   | Replication factor of changelog and repartition topics whose store sets none.                              |
-| `changelog.topicConfigs`                     | -                                | Topic configs of every changelog and repartition topic, applied over the defaults and below a store's own. |
-| `changelog.autoCreate`                       | `true`                           | Whether missing internal topics are created. `false` only validates them: a missing one fails `start()`.   |
-| `changelog.restoration.idleTimeoutMs`        | `30000`                          | A restore that makes no progress for this long fails.                                                      |
-| `changelog.restoration.initialIdleTimeoutMs` | `idleTimeoutMs`                  | The same bound before the first record of a restore arrived.                                               |
-| `changelog.restoration.checkIntervalMs`      | `1000`                           | How often restore progress is checked.                                                                     |
-| `changelog.restoration.consumerMaxWaitMs`    | `consumer.maxWaitMs`, else `500` | `maxWaitMs` of restore consumers.                                                                          |
-| `changelog.restoration.maxConcurrentTasks`   | `4`                              | How many tasks restore at once (one restore consumer each).                                                |
+| Option                                       | Default                          | Description                                                                                                                                                             |
+| -------------------------------------------- | -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `changelog.replicationFactor`                | broker default                   | Replication factor of changelog and repartition topics whose store sets none.                                                                                           |
+| `changelog.topicConfigs`                     | -                                | Topic configs of every changelog and repartition topic, applied over the defaults and below a store's own (a window or session changelog keeps its own `retention.ms`). |
+| `changelog.autoCreate`                       | `true`                           | Whether missing internal topics are created. `false` only validates them: a missing one fails `start()`.                                                                |
+| `changelog.restoration.idleTimeoutMs`        | `30000`                          | A restore that makes no progress for this long fails.                                                                                                                   |
+| `changelog.restoration.initialIdleTimeoutMs` | `idleTimeoutMs`                  | The same bound before the first record of a restore arrived.                                                                                                            |
+| `changelog.restoration.checkIntervalMs`      | `1000`                           | How often restore progress is checked.                                                                                                                                  |
+| `changelog.restoration.consumerMaxWaitMs`    | `consumer.maxWaitMs`, else `500` | `maxWaitMs` of restore consumers.                                                                                                                                       |
+| `changelog.restoration.maxConcurrentTasks`   | `4`                              | How many tasks restore at once (one restore consumer each).                                                                                                             |
 
 Per-store changelog settings (topic name, configs, replication factor, disabling the changelog, skipping restoration) go in `Materialized.changelog` or a store definition's `logging`. See [Changelog topics](/flow/state-stores#changelog-topics).
 

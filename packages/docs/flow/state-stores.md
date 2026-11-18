@@ -24,7 +24,7 @@ const app = flow({
 
 With `inMemory()`, a restarted process restores all its state from the changelogs. A persistent provider also stores **checkpoints** (how far each store reflects its changelog), so a restarted instance only reads the changelog records written since. Do not let two running instances share one state directory.
 
-Provider-level store names are `<applicationId>.<storeName>.p<partition>`: one store per store of the topology and task partition (so an LMDB environment needs `maxDbs` above the number of stores times partitions; the default is 4096).
+Provider-level store names are `<applicationId>.<storeName>.p<partition>`: one store per store of the topology and task partition (so an LMDB environment needs `maxDbs` above the number of stores times the partitions an instance holds or held, plus one for checkpoints and one per global table; the default is 4096).
 
 ## Store Types
 
@@ -81,7 +81,7 @@ Each store is backed by a changelog topic: every write of a task's store instanc
 | Key-value stores          | `compact`        | `-1`                    |
 | Window and session stores | `delete,compact` | store retention + 1 day |
 
-Both get `segment.bytes=52428800`. Window stores expire old windows locally without writing tombstones, as Kafka Streams does; the changelog's time retention drops them on the broker. The configs are, in order of precedence: the store's own `topicConfigs`, then `FlowConfig.changelog.topicConfigs`, then these defaults.
+Both get `segment.bytes=52428800`. Window stores expire old windows locally without writing tombstones, as Kafka Streams does; the changelog's time retention drops them on the broker. The configs are, in order of precedence: the store's own `topicConfigs`, then `FlowConfig.changelog.topicConfigs`, then these defaults, except the `retention.ms` of a window or session store, which only its own `topicConfigs` replace (as in Kafka Streams): an application-wide `retention.ms`, set to bound repartition topics, never cuts a window's changelog below the store's retention.
 
 ### Partition counts
 
@@ -112,7 +112,7 @@ A store without a changelog is not restored: wherever its task runs next, the st
 
 ### Creation and validation
 
-`start()` creates missing changelog and repartition topics, with `FlowConfig.changelog.replicationFactor` and the configs above. In production, where topics are created ahead, set `changelog.autoCreate: false`: `start()` then only checks that every internal topic exists with its partition count, and fails with `SourceTopicNotFoundError` naming the missing one.
+`start()` creates missing changelog and repartition topics, with `FlowConfig.changelog.replicationFactor` and the configs above. In production, where topics are created ahead, set `changelog.autoCreate: false`: `start()` then only checks that every internal topic exists with its partition count, and fails with `InternalTopicNotFoundError` naming the missing one, its kind (`'changelog'` or `'repartition'`) and the partition count it needs.
 
 ```typescript
 flow({
@@ -126,12 +126,12 @@ flow({
 
 When a task with state is assigned, its partitions stay paused while its stores are restored from their changelogs, then it starts processing. `start()` resolves once the tasks of the first assignment are restored and running; the app is `REBALANCING` while any assigned task restores.
 
-- A restore reads each changelog partition up to the end it had when the restore began (the last stable offset), so exactly-once state is restored up to the last committed transaction. An open transaction left by a crashed instance is waited out.
+- A restore reads each changelog partition, with `read_committed`, up to the end (the high watermark) it had when the restore began, so exactly-once state is restored up to the last committed transaction. The records of a transaction left open are waited out until the broker aborts it; under exactly-once an instance's own producer aborts the one its previous incarnation (same transactional id) left open before it restores anything.
 - A checkpoint is trusted only when it is within the changelog's offsets and the local store is not empty. Otherwise the store is wiped and rebuilt from the beginning of the changelog. Restores write progress checkpoints as they go.
 - A restore that makes no progress for `changelog.restoration.idleTimeoutMs` (default 30 s) fails: during `start()`, `start()` rejects with it; later, the instance rejoins the group and tries again (see [Fault Tolerance](/flow/fault-tolerance#failure-handling)). A changelog whose records were deleted below the restore's position (out of range) makes the task wipe its stores and rebuild them.
 - At most `changelog.restoration.maxConcurrentTasks` tasks (default 4) restore at once; tasks that are running keep processing meanwhile.
 
-A task that comes back to an instance after a rebalance finds its store instance as it left it (stores stay open across rebalances in one process), and only catches up from its checkpoint. With `inMemory()`, the store instances of partitions another instance owns now are cleared 30 seconds after every assigned task is running; persistent providers keep them.
+A task that comes back to an instance after a rebalance finds its store instance as it left it (stores stay open across rebalances in one process), and only catches up from its checkpoint. With `inMemory()`, the store instances of partitions another instance owns now are cleared 30 seconds after every assigned task is running. Persistent providers keep them for `stateCleanupDelayMs` (default 10 minutes, Kafka Streams' `state.cleanup.delay.ms`) after their task left, then clear them and invalidate their checkpoints; the state an earlier start left of partitions no task of this start took is invalidated after the same delay. A task that comes back later rebuilds its stores from the changelog: an older checkpoint could be trusted over a compacted changelog, whose replay would miss the deletes compaction removed.
 
 ## Exactly-Once State
 

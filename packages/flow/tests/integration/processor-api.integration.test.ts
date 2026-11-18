@@ -19,6 +19,7 @@ import {
 } from '../../src/index.js'
 import {
 	createTopics,
+	eventTimeBase,
 	fetchCommitted,
 	injectCommitFailures,
 	newClient,
@@ -30,7 +31,7 @@ import {
 const str = codec.string()
 const num = codec.json<number>()
 const GUARANTEES = ['at_least_once', 'exactly_once'] as const
-const BASE = 1_700_000_000_000
+const BASE = eventTimeBase() // near the wall clock: the broker's retention deletes older records
 
 describe('Processor API', () => {
 	let admin: KafkaClient

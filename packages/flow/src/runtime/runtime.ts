@@ -29,7 +29,7 @@ import type { Checkpoints } from '@/state/checkpoints.js'
 import type { StateDirectory } from '@/state/state-directory.js'
 import type { BuiltTopology } from '@/topology/built-topology.js'
 import { prepareTopics, type InternalTopicOptions } from '@/topology/internal-topics.js'
-import type { PartitionCounts } from '@/topology/nodes.js'
+import type { PartitionCounts, StoreBuilder } from '@/topology/nodes.js'
 
 /** The run's network awaits are cut this long before the close deadline, so that the local steps still fit. */
 const HARD_STOP_MARGIN_MS = 1000
@@ -129,6 +129,7 @@ export class FlowRuntime {
 			await raceSignal(this.connecting, starting)
 			const admin = { admin: io.admin, clock: io.clock, logger }
 			this.counts = await prepareTopics(topology, admin, this.deps.topics, starting)
+			this.deps.stateDirectory.register(storePartitions(topology, this.counts))
 			if (this.globals !== undefined) {
 				await this.globals.bootstrap(starting)
 				this.globals.follow(this.shutdown.signal)
@@ -355,4 +356,17 @@ function deadlineSignal(clock: Clock, at: number): { signal: AbortSignal; cancel
 
 function fields(site: FailureSite, error: unknown): { site: FailureSite; error: string } {
 	return { site, error: errorMessage(error) }
+}
+
+/** Every store of the topology with the partition count of its changelog (none without one). */
+function storePartitions(
+	topology: BuiltTopology,
+	counts: PartitionCounts
+): { readonly builder: StoreBuilder; readonly partitions: number }[] {
+	return topology.subtopologies.flatMap(subtopology =>
+		subtopology.stores.map(builder => ({
+			builder,
+			partitions: builder.logging.enabled ? (counts.get(builder.logging.topic) ?? 0) : 0,
+		}))
+	)
 }

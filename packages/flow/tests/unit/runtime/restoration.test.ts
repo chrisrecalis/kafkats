@@ -375,6 +375,7 @@ function taskManager(h: PoolHarness) {
 		bufferedRecordsPerPartition: 1000,
 		emitIntervalMs: 0,
 		repartitionPurgeIntervalMs: 0,
+		stateCleanupDelayMs: 600_000,
 		transactionTimeoutMs: 10_000,
 		rebalanceTimeoutMs: 60_000,
 		defaultTimestampExtractor: TimestampExtractors.failOnInvalid,
@@ -411,6 +412,7 @@ function taskManager(h: PoolHarness) {
 		consumer,
 		outputs: {
 			forTask: t => collector.forTask(t),
+			initialize: signal => collector.initialize(signal),
 			ensureTransaction: signal => collector.ensureTransaction(signal),
 		},
 		restorer: h.pool,

@@ -109,16 +109,28 @@ describe('changelog', () => {
 
 		it("applies the application's topic configs over the defaults and the store's own over both", () => {
 			const resolved = resolveStoreChangelog(
-				{ applicationId: 'app', topicConfigs: { 'retention.ms': '1000', 'min.insync.replicas': '2' } },
+				{ applicationId: 'app', topicConfigs: { 'cleanup.policy': 'compact', 'min.insync.replicas': '2' } },
 				{ name: 'windows', retentionMs: 240_000 },
 				{ topicConfigs: { 'min.insync.replicas': '3' } }
 			)
 			expect(resolved.enabled && resolved.configs).toEqual({
-				'cleanup.policy': 'delete,compact',
-				'retention.ms': '1000',
+				'cleanup.policy': 'compact',
+				'retention.ms': String(240_000 + 86_400_000),
 				'segment.bytes': '52428800',
 				'min.insync.replicas': '3',
 			})
+		})
+
+		it("an application-wide retention.ms (for repartition topics) leaves a window store's retention: only its own config replaces it (KS)", () => {
+			const app = { applicationId: 'app', topicConfigs: { 'retention.ms': '86400000' } }
+			const windows = { name: 'windows', retentionMs: 7 * 86_400_000 }
+			const kept = resolveStoreChangelog(app, windows, true)
+			expect(kept.enabled && kept.configs['retention.ms']).toBe(String(8 * 86_400_000))
+			const own = resolveStoreChangelog(app, windows, { topicConfigs: { 'retention.ms': '5000' } })
+			expect(own.enabled && own.configs['retention.ms']).toBe('5000')
+			// A key-value changelog (compacted) takes the application's like any other config.
+			const counts = resolveStoreChangelog(app, { name: 'counts' }, true)
+			expect(counts.enabled && counts.configs['retention.ms']).toBe('86400000')
 		})
 
 		it('takes the topic name, replication factor and skipRestoration of the store config', () => {

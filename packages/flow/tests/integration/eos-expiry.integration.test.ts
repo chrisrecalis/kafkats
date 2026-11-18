@@ -4,6 +4,7 @@ import { codec, flow, JoinWindows, type FlowApp } from '../../src/index.js'
 import {
 	createTopics,
 	DurableMemoryProvider,
+	eventTimeBase,
 	injectCommitFailures,
 	newClient,
 	readAllCommitted,
@@ -43,7 +44,7 @@ describe('store expiry vs aborted transactions (durable local state)', () => {
 		const output = uniqueTopicName('r2-exp-out')
 		const applicationId = uniqueTopicName('r2-exp-app')
 		await createTopics(admin, [{ name: left }, { name: right }, { name: output }])
-		const base = 1_700_000_000_000
+		const base = eventTimeBase() // near the wall clock: the broker's retention deletes older records
 
 		const client = newClient('r2-exp-app')
 		let armed = false

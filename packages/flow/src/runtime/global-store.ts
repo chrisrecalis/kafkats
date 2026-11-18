@@ -31,6 +31,7 @@ const NO_OUTPUT: TaskOutput = {
 	},
 	partitionCount: () => undefined,
 	loadPartitionCount: () => Promise.reject(new IllegalStateError('a global store processor cannot send records')),
+	close: () => {},
 }
 
 export interface GlobalStoreDeps {

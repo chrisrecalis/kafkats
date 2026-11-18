@@ -4,7 +4,7 @@
  * the value codec.
  */
 import { TopologyError } from '@/api/errors.js'
-import type { BranchedKStream, KStream, KeyValue, ValueMapper } from '@/api/kstream.js'
+import type { BranchedKStream, KStream, KeyValue, ValueMapperWithKey } from '@/api/kstream.js'
 import type { BranchOptions, NamedOptions, SplitOptions } from '@/api/options.js'
 import { BranchedKStreamImpl } from '@/dsl/branched.js'
 import { mergedFormat, withNewKeys, withNewValues } from '@/dsl/format.js'
@@ -70,7 +70,7 @@ export function map<K, V, KR, VR>(
 
 export function mapValues<K, V, VR>(
 	stream: KStreamImpl<K, V>,
-	mapper: ValueMapper<K | null, V | null, VR>,
+	mapper: ValueMapperWithKey<K | null, V | null, VR>,
 	options?: NamedOptions
 ): KStream<K, VR> {
 	const node = add(stream, NodePrefix.MAP_VALUES, options, mapValuesProcessor(mapper))
@@ -88,7 +88,7 @@ export function flatMap<K, V, KR, VR>(
 
 export function flatMapValues<K, V, VR>(
 	stream: KStreamImpl<K, V>,
-	mapper: ValueMapper<K | null, V | null, Iterable<VR>>,
+	mapper: ValueMapperWithKey<K | null, V | null, Iterable<VR>>,
 	options?: NamedOptions
 ): KStream<K, VR> {
 	const node = add(stream, NodePrefix.FLAT_MAP_VALUES, options, flatMapValuesProcessor(mapper))

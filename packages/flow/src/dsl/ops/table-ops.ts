@@ -3,7 +3,7 @@
  * (Materialized first, then the parent's; the value codec only where values are unchanged) and its store, registered
  * only when Materialized names one (6.11).
  */
-import type { ValueMapper } from '@/api/kstream.js'
+import type { ValueMapperWithKey } from '@/api/kstream.js'
 import type { KTable } from '@/api/ktable.js'
 import type { Materialized, TableOptions } from '@/api/options.js'
 import type { DslContext } from '@/dsl/context.js'
@@ -13,7 +13,6 @@ import { NodePrefix } from '@/dsl/naming.js'
 import { ktableFilter } from '@/operators/ktable-filter.js'
 import { KTableMapValues } from '@/operators/ktable-map-values.js'
 import type { KTableNode } from '@/operators/ktable-node.js'
-import { withKey } from '@/operators/stateless.js'
 import { timestampedKeyValueStoreBuilder } from '@/state/store-builders.js'
 
 export function filter<K, V>(
@@ -32,15 +31,15 @@ export function filterNot<K, V>(
 	return filtered(table, predicate, true, options)
 }
 
-/** The mapper gets the key when it declares two parameters (6.20). */
+/** mapValues() and mapValuesWithKey(): the mapper as a function of the key and the value. */
 export function mapValues<K, V, VR>(
 	table: KTableImpl<K, V>,
-	mapper: ValueMapper<K, V, VR | null>,
+	mapper: ValueMapperWithKey<K, V, VR | null>,
 	options: TableOptions<K, VR> = {}
 ): KTable<K, VR> {
 	const format = derivedFormat(table.format, options.materialized, false)
 	const storeName = materializedStore(table.ctx, options.materialized, format, 'mapValues()')
-	const node = new KTableMapValues(table.table, withKey(mapper), { storeName })
+	const node = new KTableMapValues(table.table, mapper, { storeName })
 	return derived(table, NodePrefix.TABLE_MAP_VALUES, options.name, node, format, storeName)
 }
 

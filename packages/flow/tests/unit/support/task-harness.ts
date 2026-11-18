@@ -5,6 +5,7 @@
  * tasks' TaskStateManagers, probed for what the tasks ask of them). Free of vitest: the micro-benchmark uses it too.
  */
 import type { ConsumerGroupMetadata, Logger, TopicPartition } from '@kafkats/client'
+import { windowedKeyCodec } from '@/changelog/writer.js'
 import { string } from '@/codec.js'
 import type { HandlerResponse } from '@/api/handlers.js'
 import type { ProcessorContext, ProcessorSupplier } from '@/processor/api.js'
@@ -19,6 +20,7 @@ import type { ChangelogCheckpointStore, StateStore } from '@/state.js'
 import { Checkpoints } from '@/state/checkpoints.js'
 import { inMemory } from '@/state/memory.js'
 import { StateDirectory } from '@/state/state-directory.js'
+import { keyTime } from '@/state/time-clipping.js'
 import type { TaskStateManager } from '@/state/state-manager.js'
 import { keyValueStoreBuilder } from '@/state/store-builders.js'
 import { InternalTopologyBuilder } from '@/topology/builder.js'
@@ -280,13 +282,45 @@ export class TaskHarness {
 		return this.probes.get(task)!
 	}
 
-	/** CREATED -> RESTORING -> RUNNING with `starts` (under exactly-once a transaction is opened first). */
-	async start(task: StreamTask, starts: ReadonlyMap<string, PartitionStart> = new Map()): Promise<StreamTask> {
+	/**
+	 * CREATED -> RESTORING -> RUNNING with `starts` (under exactly-once a transaction is opened first), the restore
+	 * reporting `storeTimes`.
+	 */
+	async start(
+		task: StreamTask,
+		starts: ReadonlyMap<string, PartitionStart> = new Map(),
+		storeTimes: ReadonlyMap<string, number> = new Map()
+	): Promise<StreamTask> {
 		await task.initialize()
 		task.setStarts(starts)
 		await this.collector.ensureTransaction(this.hardStop.signal)
-		await task.completeRestoration(new Map())
+		await task.completeRestoration(storeTimes)
 		return task
+	}
+
+	/**
+	 * What the restore job of a task would report (4.7.2): per window and session store, the max key time of the
+	 * changelog records from its checkpoint on (those of aborted transactions skipped). The harness keeps the stores
+	 * as they are; this is what a restore of them from the changelog applies.
+	 */
+	async restoredStoreTimes(subtopology: number, partition: number): Promise<Map<string, number>> {
+		const times = new Map<string, number>()
+		for (const builder of this.topology.subtopologies[subtopology]!.stores) {
+			if (builder.kind === 'key-value' || !builder.logging.enabled) continue
+			const { topic } = builder.logging
+			const checkpoint = (await this.checkpoints.get(topic, partition)) ?? 0n
+			const keys = windowedKeyCodec(builder.keyCodec)
+			let offset = 0n
+			for (const sent of this.producer.sent) {
+				if (sent.topic !== topic || sent.message.partition !== partition) continue
+				const at = offset++
+				const aborted = sent.transaction !== undefined && sent.transaction.state !== 'committed'
+				if (at < checkpoint || aborted || sent.message.key === null) continue
+				const time = keyTime(keys.decode(sent.message.key))
+				times.set(builder.name, Math.max(times.get(builder.name) ?? -1, time))
+			}
+		}
+		return times
 	}
 
 	/** A new task started from the commits recorded so far (the assignment payload after a restart). */
@@ -299,7 +333,7 @@ export class TaskHarness {
 				resolved: offset.offset,
 			})
 		}
-		return this.start(task, starts)
+		return this.start(task, starts, await this.restoredStoreTimes(subtopology, partition))
 	}
 
 	/**
@@ -315,7 +349,12 @@ export class TaskHarness {
 				this.consumer.seek(tp, start.resolved)
 			}
 		}
-		return this.start(this.task(task.id.subtopology, task.partition), starts)
+		const { subtopology, partition } = task.id
+		return this.start(
+			this.task(subtopology, partition),
+			starts,
+			await this.restoredStoreTimes(subtopology, partition)
+		)
 	}
 
 	/** The last committed offset per tp, in commit order: consumer commits, or offsets of committed transactions. */

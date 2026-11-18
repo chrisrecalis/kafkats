@@ -24,6 +24,7 @@ describe('resolveConfig', () => {
 			bufferedRecordsPerPartition: 1000,
 			emitIntervalMs: 1000,
 			repartitionPurgeIntervalMs: 30_000,
+			stateCleanupDelayMs: 600_000,
 			transactionTimeoutMs: 10_000,
 			rebalanceTimeoutMs: 60_000,
 			defaultTimestampExtractor: TimestampExtractors.failOnInvalid,
@@ -107,6 +108,7 @@ describe('resolveConfig', () => {
 		[{ maxTaskIdleMs: -2 }, 'maxTaskIdleMs must be an integer >= -1'],
 		[{ bufferedRecordsPerPartition: 1.5 }, 'bufferedRecordsPerPartition must be an integer >= 1'],
 		[{ repartitionPurgeIntervalMs: -1 }, 'repartitionPurgeIntervalMs must be an integer >= 0'],
+		[{ stateCleanupDelayMs: -1 }, 'stateCleanupDelayMs must be an integer >= 0'],
 		[{ processingGuarantee: 'twice' }, "processingGuarantee must be 'at_least_once' or 'exactly_once'"],
 		[
 			{ consumer: { autoOffsetReset: 'middle' } },

@@ -48,6 +48,7 @@ export interface ResolvedFlowConfig {
 	readonly bufferedRecordsPerPartition: number
 	readonly emitIntervalMs: number
 	readonly repartitionPurgeIntervalMs: number
+	readonly stateCleanupDelayMs: number
 	readonly transactionTimeoutMs: number
 	readonly rebalanceTimeoutMs: number
 	readonly defaultTimestampExtractor: TimestampExtractor

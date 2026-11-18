@@ -1,5 +1,5 @@
 import type { KGroupedTable } from '@/api/grouped.js'
-import type { KStream, KeyValue } from '@/api/kstream.js'
+import type { KStream, KeyValue, ValueMapper, ValueMapperWithKey } from '@/api/kstream.js'
 import type {
 	Grouped,
 	Joined,
@@ -11,23 +11,22 @@ import type {
 import type { ValueTransformerWithKeySupplier } from '@/processor/api.js'
 
 /**
- * A changelog stream read as a table: the latest value per key; a null value deletes the key. Deletes are propagated
- * without calling the callbacks of `filter()`, `filterNot()`, `mapValues()`, `groupBy()` and the joins (a joiner gets
- * null only for a side that has no value, as its type says). `transformValues()` and `toStream(mapper)` get them, as a
- * null value (Kafka Streams). Undefined, as a value or as the result of a mapper, transformer or joiner, is no value,
- * as null is.
+ * A changelog stream read as a table: the latest value per key; a null value deletes the key. The callbacks of
+ * `filter()`, `filterNot()`, `mapValues()`, `mapValuesWithKey()`, `groupBy()` and the joins never receive null (a
+ * joiner gets null only for a side that has no value, as its type says): a delete goes on as a delete, and where it
+ * must retract the row's previous value they are called with that value (always `groupBy()`'s selector, the others
+ * when old values are computed downstream). `transformValues()` and `toStream(mapper)` get deletes as a null value
+ * (Kafka Streams). Undefined, as a value or as the result of a mapper, transformer or joiner, is no value, as null is.
  */
 export interface KTable<K, V> {
 	/** The entries the predicate accepts: an update it rejects deletes the key. */
 	filter(predicate: (key: K, value: V) => boolean, options?: TableOptions<K, V>): KTable<K, V>
 	/** The entries the predicate rejects: an update it accepts deletes the key. */
 	filterNot(predicate: (key: K, value: V) => boolean, options?: TableOptions<K, V>): KTable<K, V>
-	/**
-	 * A null (or undefined) result deletes the key. A mapper declaring two parameters gets the key too (give a
-	 * two-parameter lambda explicit parameter types).
-	 */
-	mapValues<VR>(mapper: (value: V) => VR | null, options?: TableOptions<K, VR>): KTable<K, VR>
-	mapValues<VR>(mapper: (key: K, value: V) => VR | null, options?: TableOptions<K, VR>): KTable<K, VR>
+	/** A new value per entry, computed from the value alone; a null (or undefined) result deletes the key. */
+	mapValues<VR>(mapper: ValueMapper<V, VR | null>, options?: TableOptions<K, VR>): KTable<K, VR>
+	/** A new value per entry, computed from the key and the value; a null (or undefined) result deletes the key. */
+	mapValuesWithKey<VR>(mapper: ValueMapperWithKey<K, V, VR | null>, options?: TableOptions<K, VR>): KTable<K, VR>
 	/**
 	 * Kafka Streams' `transformValues()`: every task creates a transformer with `supplier()` (which must return a new
 	 * one per call) and calls `transform(key, value)` once per update, tombstones included (`value` null); the result

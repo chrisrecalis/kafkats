@@ -10,6 +10,7 @@ import type { KafkaClient, Producer } from '@kafkats/client'
 import { codec, flow, JoinWindows, type FlowApp } from '../../src/index.js'
 import {
 	createTopics,
+	eventTimeBase,
 	fetchCommitted,
 	injectCommitFailures,
 	newClient,
@@ -19,7 +20,7 @@ import {
 } from './test-helpers.js'
 
 const str = codec.string()
-const BASE = 1_700_000_000_000
+const BASE = eventTimeBase() // near the wall clock: the broker's retention deletes older records
 /** Key of the records that only move stream time; their own results are ignored. */
 const TICK = 'tick'
 

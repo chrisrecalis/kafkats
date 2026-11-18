@@ -27,7 +27,7 @@ A table can also come from a stream (`stream.toTable()`), an aggregation (`count
 
 ## Transformations
 
-The callbacks of `filter()`, `filterNot()`, `mapValues()`, `groupBy()` and the table joins never see a deleted row: a delete is passed on as a delete without calling them, and their parameters are typed without `null`.
+The callbacks of `filter()`, `filterNot()`, `mapValues()`, `mapValuesWithKey()`, `groupBy()` and the table joins never receive `null`, so their parameters are typed without it. A delete is passed on as a delete; where a delete must retract the row's previous value, they are called with that value: `groupBy()`'s selector always (to find the group to subtract the row from), and a predicate, mapper or joiner whenever old values are computed downstream (for example below a `groupBy()`; a `filter()` of a source table always computes them).
 
 ### filter, filterNot
 
@@ -38,14 +38,14 @@ const inactive = table.filterNot((key, user) => user.active)
 
 A row the predicate stops accepting is deleted from the result table (a tombstone is sent downstream).
 
-### mapValues
+### mapValues, mapValuesWithKey
 
 ```typescript
 const emails = table.mapValues(user => user.email)
-const labels = table.mapValues((key: string, user: User) => `${key}: ${user.name}`)
+const labels = table.mapValuesWithKey((key, user) => `${key}: ${user.name}`)
 ```
 
-A `null` (or `undefined`) result deletes the key. As with streams, a mapper declaring two parameters receives the key.
+A `null` (or `undefined`) result deletes the key. As with streams, `mapValues()` passes the value alone and `mapValuesWithKey()` the key too.
 
 ### transformValues
 

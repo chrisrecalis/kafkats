@@ -31,6 +31,12 @@ export interface FlowConfig {
 	/** Default inMemory(). */
 	stateStoreProvider?: StateStoreProvider
 	/**
+	 * How long the durable state of a partition this instance no longer owns is kept (Kafka Streams'
+	 * `state.cleanup.delay.ms`): a task that comes back later rebuilds it from the changelog. Default 600000. In-memory
+	 * state is dropped 30 s after every task runs.
+	 */
+	stateCleanupDelayMs?: number
+	/**
 	 * The group id is the application id. `partitionAssignmentStrategy` must be 'range' if given; `maxWaitMs`
 	 * defaults to 500; `autoOffsetReset` is the default reset policy of the sources (default 'earliest'), one
 	 * policy for the app (per-source policies are `Consumed.offsetReset`).

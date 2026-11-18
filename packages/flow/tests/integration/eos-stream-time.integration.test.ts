@@ -3,6 +3,7 @@ import type { KafkaClient, Producer } from '@kafkats/client'
 import { codec, flow, TimeWindows, type FlowApp } from '../../src/index.js'
 import {
 	createTopics,
+	eventTimeBase,
 	injectCommitFailures,
 	newClient,
 	readAllCommitted,
@@ -35,7 +36,7 @@ describe('stream time across aborted transactions', () => {
 		const output = uniqueTopicName('r2-st-out')
 		const applicationId = uniqueTopicName('r2-st-app')
 		await createTopics(admin, [{ name: input }, { name: output }])
-		const base = 1_700_000_000_000 // multiple of 1s
+		const base = eventTimeBase() // near the wall clock (retention), a multiple of 1s
 		await producer.send(input, [
 			{ key: 'a', value: numberCodec.encode(1), timestamp: new Date(base) },
 			{ key: 'a', value: numberCodec.encode(1), timestamp: new Date(base + 100_000) },

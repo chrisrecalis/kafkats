@@ -105,7 +105,9 @@ export interface ChangelogDefaults {
  * The changelog of a store: its topic and the configs it is created with (the defaults, then the application's, then
  * the store's own). Window and session stores (those with a `retentionMs`) default to `delete,compact` with the store's
  * retention plus a day (5.4), so the broker drops the records of expired windows instead of keeping every window
- * forever; their expiry writes no tombstones (`state/logging.ts`).
+ * forever; their expiry writes no tombstones (`state/logging.ts`). That retention is the store's own, set over the
+ * application's configs (KS `WindowedChangelogTopicConfig`): an application-wide `retention.ms`, meant for repartition
+ * topics, must not cut the changelog of a window below the store's retention; only the store's own configs replace it.
  */
 export function resolveStoreChangelog(
 	defaults: ChangelogDefaults,
@@ -116,17 +118,16 @@ export function resolveStoreChangelog(
 	if (!config.enabled) {
 		return { enabled: false }
 	}
-	const windowed: Record<string, string> =
-		store.retentionMs === undefined
+	const { retentionMs } = store
+	const policy: Record<string, string> = retentionMs === undefined ? {} : { 'cleanup.policy': 'delete,compact' }
+	const retention: Record<string, string> =
+		retentionMs === undefined
 			? {}
-			: {
-					'cleanup.policy': 'delete,compact',
-					'retention.ms': String(store.retentionMs + WINDOWED_CHANGELOG_ADDITIONAL_RETENTION_MS),
-				}
+			: { 'retention.ms': String(retentionMs + WINDOWED_CHANGELOG_ADDITIONAL_RETENTION_MS) }
 	return {
 		enabled: true,
 		topic: config.topicName ?? buildChangelogTopicName(defaults.applicationId, store.name),
-		configs: getDefaultTopicConfigs({ ...windowed, ...defaults.topicConfigs, ...config.topicConfigs }),
+		configs: getDefaultTopicConfigs({ ...policy, ...defaults.topicConfigs, ...retention, ...config.topicConfigs }),
 		replicationFactor: config.replicationFactor,
 		skipRestoration: config.skipRestoration ?? false,
 	}

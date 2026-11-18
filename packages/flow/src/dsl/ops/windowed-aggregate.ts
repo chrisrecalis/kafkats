@@ -192,8 +192,8 @@ function sessionWindowed<K, V, A>(
 		node: new SessionWindowAggregate(name, windows, merge, emitFinal),
 		resultKeyCodec: WindowedCodecs.sessionWindowed(keyCodec),
 		// A record within the gap of a session's end still merges into it (KS SessionWindowedKStreamImpl), and its end
-		// is inclusive: a session still changes while end >= stream time - gap - grace, when its store's retention
-		// exceeds gap + grace (Kafka Streams' suppress() releases it one millisecond early).
+		// is inclusive: a session takes records while end >= stream time - gap - grace (the session aggregate merges
+		// into no session that ended before; Kafka Streams' suppress() releases it one millisecond early).
 		graceMs: windows.graceMs + windows.gapMs + 1,
 	}))
 }

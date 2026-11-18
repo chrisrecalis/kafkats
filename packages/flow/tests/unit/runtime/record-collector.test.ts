@@ -112,6 +112,26 @@ describe('RecordCollector at-least-once', () => {
 		expect(h.collector.takeChangelogOffsets(a)).toEqual(new Map())
 	})
 
+	it('a task that closes takes its changelog offsets with it; acknowledgements after its close are ignored', async () => {
+		// Kafka Streams closes a task's RecordCollector with the task: nothing of a closed incarnation stays referenced.
+		const { h, pending, ackAll } = manual()
+		const acked = await running(h, 0)
+		send(h, acked, 'changelog', changelog())
+		ackAll()
+		await h.collector.flush(signal())
+		await acked.close('dirty')
+		expect(h.collector.takeChangelogOffsets(acked)).toEqual(new Map())
+
+		// A held delete applied by the revocation commit's postCommit is acked once the task closed.
+		const late = await running(h, 0)
+		send(h, late, 'changelog', changelog())
+		await late.close('dirty')
+		expect(pending).toHaveLength(1)
+		ackAll()
+		await h.collector.flush(signal())
+		expect(h.collector.takeChangelogOffsets(late)).toEqual(new Map())
+	})
+
 	for (const error of [new TimeoutError('produce', 30_000), new KafkaProtocolError(ErrorCode.NotLeaderOrFollower)]) {
 		it(`${error.name} after the producer's retries is task-scoped`, async () => {
 			const h = new TaskHarness({ build: b => pipe(b, { processor: passThrough }) })

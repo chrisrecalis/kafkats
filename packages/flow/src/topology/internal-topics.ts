@@ -5,7 +5,11 @@
  */
 import { TimeoutError, type Logger } from '@kafkats/client'
 import { DEFAULT_REPARTITION_CONFIGS } from '@/changelog/config.js'
-import { ChangelogPartitionMismatchError, SourceTopicNotFoundError } from '@/changelog/errors.js'
+import {
+	ChangelogPartitionMismatchError,
+	InternalTopicNotFoundError,
+	SourceTopicNotFoundError,
+} from '@/changelog/errors.js'
 import type { AdminPort, Clock } from '@/runtime/io.js'
 import { delay } from '@/runtime/signals.js'
 import type { BuiltTopology } from '@/topology/built-topology.js'
@@ -37,7 +41,8 @@ export interface TopicDeps {
 
 /**
  * The partition count of every topic of the topology, once its internal topics exist with their counts.
- * @throws SourceTopicNotFoundError, CoPartitioningError, TopologyError, ChangelogPartitionMismatchError, TimeoutError
+ * @throws SourceTopicNotFoundError, InternalTopicNotFoundError, CoPartitioningError, TopologyError,
+ *   ChangelogPartitionMismatchError, TimeoutError
  */
 export async function prepareTopics(
 	topology: BuiltTopology,
@@ -52,7 +57,7 @@ export async function prepareTopics(
 		if (actual !== undefined) {
 			checkCount(topology, counts, spec.name, actual)
 		} else if (options.autoCreate === false || spec.validateOnly) {
-			throw new SourceTopicNotFoundError(spec.name, `${spec.kind} (changelog.autoCreate is false)`)
+			throw new InternalTopicNotFoundError(spec.name, spec.kind, counts.get(spec.name) ?? 0)
 		} else {
 			missing.push(withDefaults(spec, options))
 		}

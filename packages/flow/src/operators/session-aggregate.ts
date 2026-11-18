@@ -91,9 +91,13 @@ class SessionWindowAggregateProcessor<K, V, A> extends WindowedAggregateProcesso
 		const { gapMs, graceMs } = this.windows
 		// Advanced before the late check (6.0): the record is judged by a clock that includes it.
 		const closeTime = this.clock.advance(timestamp) - graceMs - gapMs
-		// In (start, end) order (store contract), the order the merge sees them in.
+		// In (start, end) order (store contract), the order the merge sees them in. A session that ended before the close
+		// time is closed (emitted as final, released by suppress) and takes no record, whatever the store's retention:
+		// Kafka Streams merges into any session its store still holds, so with a retention above gap + grace its final
+		// sessions could still change.
 		const sessions: [WindowedKey<K>, A][] = []
-		for await (const session of this.store.findSessions(key, timestamp - gapMs, timestamp + gapMs)) {
+		const earliestEnd = Math.max(timestamp - gapMs, closeTime)
+		for await (const session of this.store.findSessions(key, earliestEnd, timestamp + gapMs)) {
 			sessions.push(session)
 		}
 		const merged = sessions.reduce<Window>(

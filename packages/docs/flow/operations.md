@@ -68,7 +68,7 @@ grouped.windowedBy(TimeWindows.ofSizeWithNoGrace('1m')).count({ emit: 'on-window
 
 ### TableOptions
 
-For `KTable.filter()`, `filterNot()`, `mapValues()` and table joins: `{ name, materialized }`. With `materialized.storeName` the result table is materialized. `transformValues()` also takes `stores`.
+For `KTable.filter()`, `filterNot()`, `mapValues()`, `mapValuesWithKey()` and table joins: `{ name, materialized }`. With `materialized.storeName` the result table is materialized. `transformValues()` also takes `stores`.
 
 ### StreamJoined
 
@@ -141,8 +141,9 @@ A sink without a codec writes keys and values as they are: that works only for `
 | `filter`, `filterNot`                    | KStream                | KStream                        | no       | no                              |
 | `filter`, `filterNot`                    | KTable                 | KTable                         | optional | no                              |
 | `map`, `flatMap`, `selectKey`            | KStream                | KStream                        | no       | marks downstream                |
-| `mapValues`, `flatMapValues`             | KStream                | KStream                        | no       | no                              |
-| `mapValues`, `transformValues`           | KTable                 | KTable                         | optional | no                              |
+| `mapValues`, `flatMapValues` (`WithKey`) | KStream                | KStream                        | no       | no                              |
+| `mapValues`, `mapValuesWithKey`          | KTable                 | KTable                         | optional | no                              |
+| `transformValues`                        | KTable                 | KTable                         | optional | no                              |
 | `peek`, `foreach`                        | KStream                | KStream / none                 | no       | no                              |
 | `merge`, `split`, `branch`               | KStream                | KStream(s)                     | no       | no                              |
 | `process`, `processValues`               | KStream                | KStream                        | optional | `process` marks downstream      |

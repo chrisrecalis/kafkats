@@ -7,6 +7,7 @@ import type { FlowConfig } from '@/api/app.js'
 import type { HandlerResponse, UncaughtExceptionResponse } from '@/api/handlers.js'
 import { TimestampExtractors } from '@/processor/timestamps.js'
 import type { ResolvedFlowConfig, ResolvedHandlers } from '@/runtime/config.js'
+import { DEFAULT_STATE_CLEANUP_DELAY_MS } from '@/state/state-directory.js'
 import type { ResetPolicy } from '@/topology/nodes.js'
 
 /** The resolved config without the process id, which is new for every start. */
@@ -94,6 +95,11 @@ export function resolveConfig(config: FlowConfig): AppSettings {
 		repartitionPurgeIntervalMs: integer(
 			'repartitionPurgeIntervalMs',
 			config.repartitionPurgeIntervalMs ?? 30_000,
+			0
+		),
+		stateCleanupDelayMs: integer(
+			'stateCleanupDelayMs',
+			config.stateCleanupDelayMs ?? DEFAULT_STATE_CLEANUP_DELAY_MS,
 			0
 		),
 		transactionTimeoutMs,

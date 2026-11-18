@@ -1,6 +1,6 @@
 /**
- * Restore pipelines (4.7.1): per task that is not RUNNING, restore its stores and settle its start positions (the
- * network part, never inside exclusive), then complete it in an exclusive op of its own. Owned by the TaskManager
+ * Restore pipelines (4.7.1): per task that is not RUNNING, initialize the output (exactly-once), restore its stores and
+ * settle its start positions (the network part, never inside exclusive), then complete it in an exclusive op of its own. Owned by the TaskManager
  * (SI2): suspend, revive and close stop a task's pipeline and wait until it settled, so a store is never restored and
  * released at once (runtime§6.31), and no exclusive op ever waits for another one.
  */
@@ -23,6 +23,8 @@ export interface Restored {
 }
 
 export interface RestorePipelinesDeps {
+	/** Exactly-once: the producer is initialized before any changelog is read (RecordCollector.initialize). */
+	readonly initializeOutput: (signal: AbortSignal) => Promise<void>
 	readonly restorer: TaskRestorer
 	readonly startPositions: StartPositionSettler
 	readonly exclusive: <T>(fn: () => Promise<T>) => Promise<T>
@@ -80,6 +82,7 @@ export class RestorePipelines {
 	}
 
 	private async restoreAndSettle(task: StreamTask, signal: AbortSignal): Promise<Restored> {
+		await this.deps.initializeOutput(signal)
 		const { storeTimes } = await this.deps.restorer.restore(task, signal)
 		const positions = await this.deps.startPositions.settle(task, cap(signal, SETTLE_TIMEOUT_MS))
 		return { storeTimes, positions }

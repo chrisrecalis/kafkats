@@ -410,4 +410,20 @@ describe('at-least-once revive after an expiry pass (4.7.5)', () => {
 			['j', 70_000, 70_000, 2],
 		])
 	})
+
+	it('a time window updated after the last commit is updated again from its committed count, not restarted', async () => {
+		// The restore applied j's write at window end 110 after the commit: a store clock seeded from it would put the
+		// read floor at 101 and hide [0,10) from the replay of k@7, losing the committed k@5.
+		const task = counting(TimeWindows.ofSizeWithNoGrace(10), { value: num })
+		const [first, again] = await replay(task, [at('k', 5)], [at('k', 7), at('j', 100)])
+		expect(first).toEqual([
+			['k', 0, 10, 2],
+			['j', 100, 110, 1],
+		])
+		// At-least-once counts the replayed records twice (Kafka Streams too).
+		expect(again).toEqual([
+			['k', 0, 10, 3],
+			['j', 100, 110, 2],
+		])
+	})
 })

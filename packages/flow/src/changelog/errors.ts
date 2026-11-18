@@ -37,6 +37,26 @@ export class SourceTopicNotFoundError extends Error {
 }
 
 /**
+ * Error thrown by start() when a changelog or repartition topic of the topology does not exist and is not created
+ * (`changelog.autoCreate: false`).
+ */
+export class InternalTopicNotFoundError extends Error {
+	override readonly name = 'InternalTopicNotFoundError'
+
+	constructor(
+		public readonly topic: string,
+		public readonly kind: 'changelog' | 'repartition',
+		/** The partition count the topology needs it to have. */
+		public readonly partitions: number
+	) {
+		super(
+			`Internal ${kind} topic "${topic}" does not exist and changelog.autoCreate is false. ` +
+				`Create it with ${partitions} partitions, or let the application create it.`
+		)
+	}
+}
+
+/**
  * Error thrown when topics that must be co-partitioned have different partition counts.
  *
  * State is partitioned by source partition, so records with the same key from every topic feeding a

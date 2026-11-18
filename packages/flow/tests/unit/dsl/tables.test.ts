@@ -606,21 +606,24 @@ describe('tables (copied from operator-semantics*.test.ts)', () => {
 })
 
 describe('table filter, filterNot and mapValues', () => {
-	it('filterNot keeps the values the predicate rejects; a two-parameter mapper gets the key; null deletes', async () => {
+	it('filterNot keeps the values the predicate rejects; mapValuesWithKey gets the key; null deletes', async () => {
 		const driver = new TestDriver()
 		const t = driver.table('t', S)
 		t.filterNot((_k, v) => v.startsWith('x'))
 			.toStream()
 			.to('kept', S)
-		t.mapValues((k: string, v: string) => (v === 'gone' ? null : `${k}:${v}`))
+		t.mapValuesWithKey((k, v) => (v === 'gone' ? null : `${k}:${v}`))
 			.toStream()
 			.to('mapped', S)
+		// A function declaring more parameters gets the value alone (0.13 called mapValues so too).
+		t.mapValues(JSON.stringify).toStream().to('stringified', S)
 		await driver.run(async ctx => {
 			await send(ctx, 't', 'a', 'x1')
 			await send(ctx, 't', 'a', 'v')
 			await send(ctx, 't', 'a', 'gone')
 			expect(values(ctx, 'kept')).toEqual(['v', 'gone'])
 			expect(values(ctx, 'mapped')).toEqual(['a:x1', 'a:v', null])
+			expect(values(ctx, 'stringified')).toEqual(['"x1"', '"v"', '"gone"'])
 		})
 	})
 

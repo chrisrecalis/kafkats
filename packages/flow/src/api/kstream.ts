@@ -18,13 +18,14 @@ import type { TopicNameExtractor } from '@/topology/nodes.js'
 
 export type KeyValue<K, V> = readonly [K, V]
 
+/** Computes a new value from a value (Kafka Streams' `ValueMapper`): called with the value only, always. */
+export type ValueMapper<V, VR> = (value: V) => VR
+/** Computes a new value from a record's key and value (Kafka Streams' `ValueMapperWithKey`); the key is read-only. */
+export type ValueMapperWithKey<K, V, VR> = (key: K, value: V) => VR
 /**
- * A value mapper with or without the key. At runtime a mapper declaring two or more parameters receives
- * `(key, value)`, otherwise `(value)` (parameters with defaults do not count). TypeScript infers the
- * parameters of a one-parameter lambda; give a two-parameter lambda explicit parameter types.
+ * A value joiner with or without the key. At runtime a joiner declaring three or more parameters receives
+ * `(key, value, otherValue)`, otherwise `(value, otherValue)` (parameters with defaults do not count).
  */
-export type ValueMapper<K, V, VR> = ((value: V) => VR) | ((key: K, value: V) => VR)
-/** A value joiner with or without the key (same arity rule as ValueMapper). */
 export type ValueJoiner<K, V, VO, VR> = ((value: V, otherValue: VO) => VR) | ((key: K, value: V, otherValue: VO) => VR)
 /** Computes something, such as the key a stream-global table join looks up, from a record's key and value. */
 export type KeyValueMapper<K, V, R> = (key: K, value: V) => R
@@ -40,20 +41,22 @@ export interface KStream<K, V> {
 	filterNot(predicate: (key: K | null, value: V | null) => boolean, options?: NamedOptions): KStream<K, V>
 	/** Changes keys: a key-based operation downstream repartitions first. */
 	map<KR, VR>(mapper: (key: K | null, value: V | null) => KeyValue<KR, VR>, options?: NamedOptions): KStream<KR, VR>
-	/**
-	 * One new value per record; the key is kept. A mapper declaring two parameters gets the key too (ValueMapper:
-	 * give a two-parameter lambda explicit parameter types).
-	 */
-	mapValues<VR>(mapper: (value: V | null) => VR, options?: NamedOptions): KStream<K, VR>
-	mapValues<VR>(mapper: (key: K | null, value: V | null) => VR, options?: NamedOptions): KStream<K, VR>
+	/** One new value per record, computed from the value alone; the key is kept. */
+	mapValues<VR>(mapper: ValueMapper<V | null, VR>, options?: NamedOptions): KStream<K, VR>
+	/** One new value per record, computed from the key and the value; the key is kept. */
+	mapValuesWithKey<VR>(mapper: ValueMapperWithKey<K | null, V | null, VR>, options?: NamedOptions): KStream<K, VR>
 	/** Zero or more records per record. Changes keys: a key-based operation downstream repartitions first. */
 	flatMap<KR, VR>(
 		mapper: (key: K | null, value: V | null) => Iterable<KeyValue<KR, VR>>,
 		options?: NamedOptions
 	): KStream<KR, VR>
-	/** Zero or more values per record, each with the record's key; the mapper's arity as for mapValues(). */
-	flatMapValues<VR>(mapper: (value: V | null) => Iterable<VR>, options?: NamedOptions): KStream<K, VR>
-	flatMapValues<VR>(mapper: (key: K | null, value: V | null) => Iterable<VR>, options?: NamedOptions): KStream<K, VR>
+	/** Zero or more values per record, computed from the value alone, each with the record's key. */
+	flatMapValues<VR>(mapper: ValueMapper<V | null, Iterable<VR>>, options?: NamedOptions): KStream<K, VR>
+	/** Zero or more values per record, computed from the key and the value, each with the record's key. */
+	flatMapValuesWithKey<VR>(
+		mapper: ValueMapperWithKey<K | null, V | null, Iterable<VR>>,
+		options?: NamedOptions
+	): KStream<K, VR>
 	/** Calls the action for every record, then passes the record on. */
 	peek(action: (key: K | null, value: V | null) => void, options?: NamedOptions): KStream<K, V>
 	/** Calls the action for every record. Terminal. */

@@ -527,7 +527,9 @@ describe('prune of unowned in-memory state (4.10.4)', () => {
 		await vi.waitFor(() => expect(h.output(COUNT_CODEC.decode)).toEqual([1]))
 		await h.consumer.rebalance('in:0')
 		await vi.waitFor(() => expect(h.lifecycle.state).toBe('RUNNING'))
-		expect(h.stateDirectory.unleased()).toEqual([{ store: expect.any(String), partition: 1 }])
+		expect(h.stateDirectory.unleased()).toEqual([
+			{ store: expect.any(String), partition: 1, prunableAt: expect.any(Number) },
+		])
 		expect(await h.checkpoints.get(changelog, 1)).toBe(1n)
 
 		h.io.clock.advance(29_000)
@@ -544,6 +546,87 @@ describe('prune of unowned in-memory state (4.10.4)', () => {
 		h.io.clock.advance(1)
 		await vi.waitFor(() => expect(h.stateDirectory.unleased()).toEqual([]))
 		expect(await h.checkpoints.get(changelog, 1)).toBe(-1n)
+		await h.stop()
+	})
+})
+
+describe('cleanup of unowned durable state (Kafka Streams: state.cleanup.delay.ms)', () => {
+	/** A durable checkpoint store (as LMDB's and RocksDB's): StateDirectory decides on durable checkpoints alone. */
+	function durableCheckpoints() {
+		const values = new Map<string, bigint>()
+		return {
+			values,
+			get: (topic: string, partition: number) => Promise.resolve(values.get(`${topic}:${partition}`)),
+			set: (topic: string, partition: number, offset: bigint) => {
+				values.set(`${topic}:${partition}`, offset)
+				return Promise.resolve()
+			},
+		}
+	}
+
+	it('drops durable state no task owned for stateCleanupDelayMs: a task coming back later rebuilds it', async () => {
+		const store = durableCheckpoints()
+		const h = new Harness(
+			counting,
+			{ stateCleanupDelayMs: 120_000 },
+			{ partitions: { in: 2, out: 1 }, checkpointStore: store }
+		)
+		const changelog = changelogOf(h)
+		await h.started('in:0', 'in:1')
+		h.consumer.deliver('in:1', [{ key: 'k', value: 'a' }])
+		await vi.waitFor(() => expect(h.output(COUNT_CODEC.decode)).toEqual([1]))
+		await h.consumer.rebalance('in:0')
+		await vi.waitFor(() => expect(h.lifecycle.state).toBe('RUNNING'))
+		await vi.waitFor(() => expect(store.values.get(`${changelog}:1`)).toBe(1n))
+
+		// Kept past the 30 s of in-memory state: a task that comes back soon catches up from its checkpoint.
+		h.io.clock.advance(119_000)
+		await settle()
+		expect(h.stateDirectory.unleased()).toHaveLength(1)
+		expect(store.values.get(`${changelog}:1`)).toBe(1n)
+		h.io.clock.advance(1000)
+		await vi.waitFor(() => expect(h.stateDirectory.unleased()).toEqual([]))
+		expect(store.values.get(`${changelog}:1`)).toBe(-1n)
+		await h.stop()
+	})
+
+	it('invalidates the checkpoints an earlier start left of partitions no task of this start took', async () => {
+		const store = durableCheckpoints()
+		const h = new Harness(
+			counting,
+			{ stateCleanupDelayMs: 120_000 },
+			{ partitions: { in: 2, out: 1 }, checkpointStore: store }
+		)
+		const changelog = changelogOf(h)
+		store.values.set(`${changelog}:1`, 7n)
+		await h.started('in:0')
+		h.io.clock.advance(119_000)
+		await settle()
+		expect(store.values.get(`${changelog}:1`)).toBe(7n)
+		h.io.clock.advance(1000)
+		await vi.waitFor(() => expect(store.values.get(`${changelog}:1`)).toBe(-1n))
+		await h.stop()
+	})
+})
+
+describe('exactly-once: the producer is initialized before any restore (KS RecordCollector.initialize)', () => {
+	it('a restore waits for the InitProducerId that fences the transaction an earlier producer left open', async () => {
+		const h = new Harness(counting, { processingGuarantee: 'exactly_once' })
+		const starting = h.start()
+		await h.joined()
+		const init = h.producer.steps.initTransactions.next('hang')
+		await h.consumer.rebalance('in:0')
+		const restoreReads = () => h.io.admin.calls.filter(call => call.startsWith('listOffsets'))
+		await vi.waitFor(() => expect(init.hung).toHaveLength(1))
+		await settle()
+		// The restore plans nothing (no end offsets listed) and no transaction begins until the producer is initialized.
+		expect(restoreReads()).toEqual([])
+		expect(h.producer.transactions).toHaveLength(0)
+
+		init.hung[0]!.answer()
+		await starting
+		expect(h.producer.initialized).toBe(1)
+		expect(restoreReads()).not.toEqual([])
 		await h.stop()
 	})
 })

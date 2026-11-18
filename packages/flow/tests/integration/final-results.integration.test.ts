@@ -10,6 +10,7 @@ import type { KafkaClient, Producer } from '@kafkats/client'
 import { codec, flow, TimeWindows, type FlowApp } from '../../src/index.js'
 import {
 	createTopics,
+	eventTimeBase,
 	fetchCommitted,
 	injectCommitFailures,
 	newClient,
@@ -20,7 +21,7 @@ import {
 
 const str = codec.string()
 const num = codec.json<number>()
-const BASE = 1_700_000_000_000 // a multiple of the window size
+const BASE = eventTimeBase() // near the wall clock (retention), a multiple of the window size
 const SIZE = 10_000
 const GRACE = 2_000
 /** Key of the records that only move stream time. */

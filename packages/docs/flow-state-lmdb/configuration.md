@@ -73,22 +73,23 @@ Start with a generous mapSize. It's virtual memory, not actual disk usage. Incre
 
 ### maxDbs
 
-Maximum number of named databases (stores):
+Maximum number of named databases:
 
 ```typescript
-// 100 databases (default)
-lmdb({ stateDir: './state', maxDbs: 100 })
+// 4096 databases (default)
+lmdb({ stateDir: './state' })
 
-// More for complex topologies
-lmdb({ stateDir: './state', maxDbs: 500 })
+// More for many stores or partitions
+lmdb({ stateDir: './state', maxDbs: 16384 })
 ```
 
-Each materialized store uses one database. Count your:
+Every state store has one database per task partition (`<applicationId>.<storeName>.p<partition>`), so count:
 
-- KTable materializations
-- Aggregation results
-- Window stores
-- Session stores
+- every store of the topology (KTable materializations, aggregations, window, session, suppression and join stores, `Stores` definitions) times the input partitions an instance may hold. A partition that moved to another instance keeps its database open (cleared after `stateCleanupDelayMs`), so size for every partition an instance held since it started, up to all of them;
+- one database for the changelog checkpoints;
+- one per global table.
+
+Six stores over 32 input partitions need up to 6 × 32 + 1 = 193 databases on the instance that ends up holding every partition. When the limit is reached, opening the next store fails with `MDB_DBS_FULL` during an assignment.
 
 ## Environment-Based Configuration
 

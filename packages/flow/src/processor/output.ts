@@ -28,4 +28,9 @@ export interface TaskOutput {
 	partitionCount(topic: string): number | undefined
 	/** Loads the partition count of a topic named by a TopicNameExtractor on a cache miss. */
 	loadPartitionCount(topic: string): Promise<number>
+	/**
+	 * The task closed (Kafka Streams closes a task's RecordCollector with it): what the output kept for it, such as the
+	 * changelog offsets acknowledged since its last commit, is dropped, and acknowledgements arriving later are ignored.
+	 */
+	close(): void
 }

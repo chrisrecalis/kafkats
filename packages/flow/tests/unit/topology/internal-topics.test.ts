@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { noopLogger, TimeoutError } from '@kafkats/client'
-import { ChangelogPartitionMismatchError, CoPartitioningError, SourceTopicNotFoundError } from '@/changelog/errors.js'
+import { ChangelogPartitionMismatchError, CoPartitioningError, InternalTopicNotFoundError } from '@/changelog/errors.js'
 import type { BuiltTopology } from '@/topology/built-topology.js'
 import { prepareTopics, type InternalTopicOptions } from '@/topology/internal-topics.js'
 import type { PartitionCounts } from '@/topology/nodes.js'
@@ -136,9 +136,16 @@ describe('prepareTopics', () => {
 	it('with changelog.autoCreate false, a missing internal topic is an error and nothing is created (W17)', async () => {
 		const setup = setUp({ a: 3, g: 1, [BY_KEY]: 3 })
 		const prepared = prepare(setup, { autoCreate: false })
-		await expect(prepared).rejects.toBeInstanceOf(SourceTopicNotFoundError)
-		await expect(prepared).rejects.toMatchObject({ topic: COUNT })
+		await expect(prepared).rejects.toBeInstanceOf(InternalTopicNotFoundError)
+		await expect(prepared).rejects.toMatchObject({ topic: COUNT, kind: 'changelog', partitions: 3 })
+		await expect(prepared).rejects.toThrow(
+			`Internal changelog topic "${COUNT}" does not exist and changelog.autoCreate is false. ` +
+				'Create it with 3 partitions, or let the application create it.'
+		)
 		expect(setup.created).not.toHaveBeenCalled()
+
+		const repartition = prepare(setUp({ a: 3, g: 1, [COUNT]: 3 }), { autoCreate: false })
+		await expect(repartition).rejects.toMatchObject({ topic: BY_KEY, kind: 'repartition', partitions: 3 })
 	})
 
 	it('looks for a missing source topic again every 500 ms for 5 s', async () => {

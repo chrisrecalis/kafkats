@@ -52,7 +52,10 @@ export class TaskCorruptedError extends StreamsError {
 	}
 }
 
-/** An exception handler answered 'fail', or threw. */
+/**
+ * An exception handler answered 'fail', or threw; or, under exactly-once, a send failed with an error that is not
+ * retriable, which no handler is asked about (the transaction cannot commit).
+ */
 export class FailedProcessingError extends StreamsError {
 	override name = 'FailedProcessingError'
 }

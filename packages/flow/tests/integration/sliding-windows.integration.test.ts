@@ -18,6 +18,7 @@ import {
 import { TestDriver } from '../../src/testing.js'
 import {
 	createTopics,
+	eventTimeBase,
 	fetchCommitted,
 	injectCommitFailures,
 	lcg,
@@ -29,7 +30,7 @@ import {
 
 const str = codec.string()
 const list = codec.json<string[]>()
-const BASE = 1_700_000_000_000
+const BASE = eventTimeBase() // near the wall clock: the broker's retention deletes older records
 const DIFFERENCE = 1_000
 const GRACE = 500
 const windowedKey = WindowedCodecs.timeWindowed(str, DIFFERENCE)

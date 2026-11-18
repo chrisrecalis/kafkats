@@ -74,7 +74,10 @@ export class TestLoop {
 		const checkpoints = new Checkpoints(stateStoreProvider.getChangelogCheckpointStore?.(), error =>
 			logger.error('writing a changelog checkpoint failed', { error: error.message })
 		)
-		this.stateDirectory = new StateDirectory(this.settings.applicationId, stateStoreProvider, checkpoints, logger)
+		this.stateDirectory = new StateDirectory(this.settings.applicationId, stateStoreProvider, checkpoints, logger, {
+			delayMs: this.settings.stateCleanupDelayMs,
+			now: () => this.clock.now(),
+		})
 		this.producer = new MockProducer(
 			topic => this.partitions.reported(topic),
 			(record, partition) => {
@@ -112,6 +115,7 @@ export class TestLoop {
 			consumer: this.ports,
 			outputs: {
 				forTask: task => this.collector.forTask(task),
+				initialize: signal => this.collector.initialize(signal),
 				ensureTransaction: signal => this.collector.ensureTransaction(signal),
 			},
 			restorer: { restore: () => Promise.resolve({ storeTimes: new Map() }) },

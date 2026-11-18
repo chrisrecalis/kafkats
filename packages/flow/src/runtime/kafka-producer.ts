@@ -17,6 +17,15 @@ export class KafkaProducer implements ProducerPort {
 	}
 
 	/**
+	 * The client initializes a transactional producer (InitProducerId) when it opens its first transaction; an empty
+	 * one, which the client aborts without a request, does just that.
+	 */
+	async initTransactions({ signal }: { signal: AbortSignal }): Promise<void> {
+		const transaction = await this.beginTransaction({ signal })
+		await transaction.abort({ signal })
+	}
+
+	/**
 	 * The signal bounds the wait for the transaction to open, not its life: the client's own signal option would
 	 * abort the open transaction later. A transaction that opens after the caller gave up is aborted, so it does not
 	 * hold the producer's turn.

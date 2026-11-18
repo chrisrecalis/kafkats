@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { KafkaClient } from '@kafkats/client'
-import { ChangelogRestorer, InMemoryKeyValueStore, codec } from '../../src/index.js'
-import { createTopics, newClient, uniqueTopicName } from './test-helpers.js'
+import { ChangelogRestorer, InMemoryKeyValueStore, codec, flow } from '../../src/index.js'
+import { clientConfig, createTopics, newClient, uniqueTopicName } from './test-helpers.js'
 
 const stringCodec = codec.string()
 
@@ -77,4 +77,39 @@ describe('changelog restore with a dangling transaction', () => {
 			await crashed.disconnect().catch(() => {})
 		}
 	}, 60_000)
+
+	// Kafka Streams initializes the transactional producer before a task restores (RecordCollector.initialize): its
+	// InitProducerId fences the previous incarnation with the same transactional id and aborts the transaction that one
+	// left open, whose records otherwise hold every restore of the changelogs it wrote until the broker times it out.
+	it('exactly-once: the producer fences the transaction its previous incarnation left open before it restores', async () => {
+		const input = uniqueTopicName('flow-it-fence-in')
+		const applicationId = uniqueTopicName('flow-it-fence')
+		const changelog = `${applicationId}-counts-changelog`
+		const transactionalId = `${applicationId}-tx`
+		await createTopics(client, [{ name: input }, { name: changelog }])
+
+		// The previous incarnation crashed inside a transaction that wrote the changelog: open for another minute.
+		const crashed = client.producer({ transactionalId, transactionTimeoutMs: 60_000, lingerMs: 0 })
+		const open = await crashed.beginTransaction()
+		await open.send(changelog, { key: 'k', value: stringCodec.encode('uncommitted'), partition: 0 })
+
+		const app = flow({
+			applicationId,
+			client: clientConfig('flow-it-fence'),
+			processingGuarantee: 'exactly_once',
+			producer: { transactionalId },
+			consumer: { maxWaitMs: 100 },
+			changelog: { restoration: { idleTimeoutMs: 1_000, checkIntervalMs: 200, consumerMaxWaitMs: 100 } },
+		})
+		app.stream(input, { key: stringCodec, value: stringCodec }).groupByKey().count({ storeName: 'counts' })
+		const startedAt = Date.now()
+		try {
+			await app.start()
+			// Without the fence the restore waits for the broker to abort the transaction, a minute from now.
+			expect(Date.now() - startedAt).toBeLessThan(20_000)
+		} finally {
+			await app.close()
+			await crashed.disconnect().catch(() => {})
+		}
+	}, 90_000)
 })

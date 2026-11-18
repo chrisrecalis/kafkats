@@ -3,6 +3,7 @@ import { murmur2, toPositive, type KafkaClient, type Producer } from '@kafkats/c
 import { codec, flow, SessionWindows, TimeWindows, WindowedCodecs, type FlowApp } from '../../src/index.js'
 import {
 	createTopics,
+	eventTimeBase,
 	injectCommitFailures,
 	newClient,
 	readAllCommitted,
@@ -121,7 +122,7 @@ describe('repartitioning keeps event time, totals and topic identity', () => {
 		const output = uniqueTopicName('r2-ss-out')
 		const applicationId = uniqueTopicName('r2-ss-app')
 		await createTopics(admin, [{ name: input }, { name: output }])
-		const B = 1_700_000_000_000
+		const B = eventTimeBase() // near the wall clock: the broker's retention deletes older records
 		// session 1 = {0, 500, 900}, session 2 = {5000, 5400}, session 3 = {20000}; arrival order scrambled
 		const order = [900, 0, 5400, 500, 5000, 20_000]
 		const client = newClient('r2-ss-app')
