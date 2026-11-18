@@ -112,4 +112,47 @@ describe('changelog restore with a dangling transaction', () => {
 			await crashed.disconnect().catch(() => {})
 		}
 	}, 90_000)
+
+	it('exactly-once: a transaction left open after it sent the group offsets is fenced while the consumer joins', async () => {
+		const input = uniqueTopicName('flow-it-fence-offsets-in')
+		const output = uniqueTopicName('flow-it-fence-offsets-out')
+		const applicationId = uniqueTopicName('flow-it-fence-offsets')
+		const transactionalId = `${applicationId}-tx`
+		await createTopics(client, [{ name: input }, { name: output }])
+
+		// The previous incarnation's commit sent its offsets (TxnOffsetCommit), then lost its transaction coordinator
+		// before EndTxn: the group's offsets stay pending (UNSTABLE_OFFSET_COMMIT) for 75 s, past the client's 60 s fetch.
+		const crashed = client.producer({ transactionalId, transactionTimeoutMs: 75_000, lingerMs: 0 })
+		let offsetsSent!: () => void
+		const sent = new Promise<void>(resolve => (offsetsSent = resolve))
+		Object.assign(crashed, {
+			endTransaction: () => {
+				offsetsSent()
+				return new Promise(() => {})
+			},
+		})
+		const open = await crashed.beginTransaction()
+		await open.send(output, { key: 'k', value: stringCodec.encode('uncommitted'), partition: 0 })
+		await open.sendOffsets({ groupId: applicationId, offsets: [{ topic: input, partition: 0, offset: 0n }] })
+		void open.commit().catch(() => {})
+		await sent
+
+		const app = flow({
+			applicationId,
+			client: clientConfig('flow-it-fence-offsets'),
+			processingGuarantee: 'exactly_once',
+			producer: { transactionalId },
+			consumer: { maxWaitMs: 100 },
+		})
+		app.stream(input, { key: stringCodec, value: stringCodec }).to(output, { key: stringCodec, value: stringCodec })
+		const startedAt = Date.now()
+		try {
+			await app.start()
+			// Without the fence the assignment's offset fetch waits for the broker and fails after 60 s.
+			expect(Date.now() - startedAt).toBeLessThan(20_000)
+		} finally {
+			await app.close()
+			await crashed.disconnect({ timeoutMs: 1000 }).catch(() => {})
+		}
+	}, 120_000)
 })

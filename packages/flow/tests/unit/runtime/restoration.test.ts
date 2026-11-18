@@ -247,7 +247,7 @@ describe('RestorationPool (4.7.1)', () => {
 		expect(classify(error, 'restore')).toBe('corrupted')
 	})
 
-	it('resolves the max key time applied to each window and session store, by store name: window ends (6.2)', async () => {
+	it('restores window and session stores with the windowed keys of their changelogs', async () => {
 		const h = new PoolHarness()
 		const windowed = windowedKeyCodec(str)
 		const key = (k: string, start: number, end: number) =>
@@ -273,14 +273,8 @@ describe('RestorationPool (4.7.1)', () => {
 			kvBuilder('kv')
 		)
 
-		const { storeTimes } = await h.pool.restore(t0, new AbortController().signal)
+		await h.pool.restore(t0, new AbortController().signal)
 
-		expect(storeTimes).toEqual(
-			new Map([
-				['w', 130],
-				['ses', 70],
-			])
-		)
 		expect(await entries(t0.stores[0]!.raw)).toEqual([
 			'{"key":"a","windowStart":100,"windowEnd":110}="x"',
 			'{"key":"b","windowStart":120,"windowEnd":130}="y"',
@@ -293,7 +287,7 @@ describe('RestorationPool (4.7.1)', () => {
 		const t0 = await task(0, kvBuilder('unlogged', false), kvBuilder('skipped', { skipRestoration: true }))
 		h.write(`${APP}-skipped-changelog`, 0, ['a', '1'])
 
-		expect(await h.pool.restore(t0, AbortSignal.abort())).toEqual({ storeTimes: new Map() })
+		await h.pool.restore(t0, AbortSignal.abort())
 		expect(h.admin.calls).toEqual([])
 		expect(h.consumers).toEqual([])
 	})

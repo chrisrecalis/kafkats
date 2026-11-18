@@ -55,10 +55,10 @@ Some send failures are never offered to the handler:
 
 | Failure                                                                 | What happens                                                                                                   |
 | ----------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| Authentication, authorization, invalid topic, oversized commit metadata | Fatal: no answer can make the send succeed                                                                     |
-| Fenced producer                                                         | The instance rejoins the group (task migration)                                                                |
+| Authentication, authorization, invalid topic, oversized commit metadata | Fatal (a `StreamsError`): no answer can make the send succeed                                                  |
+| Fenced producer                                                         | The instance rejoins the group (task migration, a `TaskMigratedError`)                                         |
 | Retriable error that outlived the producer's retries, at-least-once     | The affected tasks are revived in place and reprocess from their last commit                                   |
-| Any send failure under exactly-once                                     | Retriable: the instance rejoins; otherwise fatal, as a `FailedProcessingError` (the transaction cannot commit) |
+| Any other send failure under exactly-once                               | Retriable: the instance rejoins; otherwise fatal, as a `FailedProcessingError` (the transaction cannot commit) |
 | A changelog record                                                      | `'continue'` counts as `'fail'`: a dropped changelog record would make the store and its changelog diverge     |
 
 ## Uncaught Exceptions
@@ -83,7 +83,7 @@ All exported from `@kafkats/flow`:
 | `FlowConfigError`                 | `flow()` got an invalid or removed option                                                                                                                                    |
 | `TopologyError`                   | The topology is invalid: a missing codec, an illegal or duplicate name, an invalid window or option                                                                          |
 | `StreamsError`                    | Base of the errors raised while the app runs; `taskId` names the task when there is one                                                                                      |
-| `FailedProcessingError`           | A handler answered `'fail'` or threw, or under exactly-once a send failed with an error that is not retriable (no handler is asked); `cause` is the original error           |
+| `FailedProcessingError`           | A handler answered `'fail'` or threw, or under exactly-once a send failed with an error neither retriable, fatal nor fencing (table above); `cause` is the original error    |
 | `InvalidTimestampError`           | A timestamp extractor returned an invalid timestamp                                                                                                                          |
 | `NoOffsetResetError`              | A source with reset policy `'none'` has no committed offset, or its position is out of range                                                                                 |
 | `AssignmentError`                 | An assigned topic is not part of the topology: instances run different topologies                                                                                            |

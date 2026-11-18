@@ -204,9 +204,9 @@ export class StreamTask {
 	 * init() (a close past its deadline) wins: the new processors are closed, and their failure counts for nothing, like
 	 * that of a slice that outlived a close.
 	 */
-	async completeRestoration(restoredStoreTimes: ReadonlyMap<string, number>): Promise<void> {
+	async completeRestoration(): Promise<void> {
 		this.expectState('completeRestoration', 'RESTORING')
-		this.seed(restoredStoreTimes)
+		this.seed()
 		this.commitNeeded = false
 		const topology = TaskTopology.create(this, {
 			stores: this.stateManager,
@@ -487,21 +487,20 @@ export class StreamTask {
 
 	/**
 	 * Replaces the processor metadata by the max-merge of the committed one; seeds partition times and store clocks.
-	 * A store clock starts from its committed `<store>.observed` (-1 for a store not written before the commit), as
-	 * the records replayed after that commit found it the first time: under at-least-once the restore also applied the
-	 * writes they made then, whose key times would put the read floor ahead of them. Only without any commit metadata
-	 * (no commit yet, or none that decodes) it starts from the max key time the restore applied.
+	 * A store clock starts from its committed `<store>.observed`, -1 for a store not written before the commit and
+	 * without any commit (or none that decodes), like the processor clocks: as the records replayed after the commit
+	 * found it the first time. Under at-least-once the restore also applied the writes they made then, whose key times
+	 * would put the read floor ahead of them: a replayed window would then be read as absent and overwritten with a
+	 * partial aggregate.
 	 */
-	private seed(restoredStoreTimes: ReadonlyMap<string, number>): void {
+	private seed(): void {
 		const committed: ReadonlyMap<string, number>[] = []
-		let decodedAny = false
 		for (const queue of this.queues) {
 			const metadata = this.offsets.starts.get(tpKey(queue.tp))?.committed?.metadata
 			if (metadata === undefined || metadata === null) {
 				continue
 			}
 			const decoded = decodeCommitMetadata(metadata)
-			decodedAny ||= metadata !== '' && decoded.invalid === undefined
 			if (decoded.invalid !== undefined && !this.metadataWarned) {
 				this.metadataWarned = true
 				this.logger.warn('ignoring commit metadata that cannot be decoded', {
@@ -518,11 +517,7 @@ export class StreamTask {
 		this.metadata.replaceAll(committed, this.subtopology.metadataKeys)
 		for (const { builder, clock } of this.stateManager.stores) {
 			if (clock) {
-				clock.seed(
-					decodedAny
-						? (this.metadata.get(observedKey(builder.name)) ?? -1)
-						: (restoredStoreTimes.get(builder.name) ?? -1)
-				)
+				clock.seed(this.metadata.get(observedKey(builder.name)) ?? -1)
 			}
 		}
 	}

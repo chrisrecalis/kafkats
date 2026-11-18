@@ -6,7 +6,6 @@
  * in an inner join, while a left join joins them with null without a lookup (KIP-962). Only stream records produce
  * results, with their key, timestamp and headers; the table is read as it is when the record is processed.
  */
-import type { ValueJoiner } from '@/api/kstream.js'
 import type { KTableValueGetter, KTableValueGetterSupplier } from '@/operators/ktable-node.js'
 import type {
 	InternalProcessorContext,
@@ -23,15 +22,6 @@ export interface StreamTableJoin<K, V, KT, VT, VR> {
 	readonly lookupKey: (key: K | null, value: V) => KT | null
 	readonly joiner: (key: K | null, value: V, tableValue: VT | null) => VR
 	readonly left: boolean
-}
-
-/** A ValueJoiner as a function of the key too: joiners declaring three or more parameters get the key (6.20). */
-export function joinerWithKey<K, V, VO, VR>(
-	joiner: ValueJoiner<K, V, VO, VR>
-): (key: K, value: V, otherValue: VO) => VR {
-	return joiner.length >= 3
-		? (joiner as (key: K, value: V, otherValue: VO) => VR)
-		: (_key, value, otherValue) => (joiner as (value: V, otherValue: VO) => VR)(value, otherValue)
 }
 
 export function streamTableJoinProcessor<K, V, KT, VT, VR>(

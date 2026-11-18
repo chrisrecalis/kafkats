@@ -358,15 +358,13 @@ function fields(site: FailureSite, error: unknown): { site: FailureSite; error: 
 	return { site, error: errorMessage(error) }
 }
 
-/** Every store of the topology with the partition count of its changelog (none without one). */
+/** Every store of the topology with the partition count of its subtopology: one instance per task. */
 function storePartitions(
 	topology: BuiltTopology,
 	counts: PartitionCounts
 ): { readonly builder: StoreBuilder; readonly partitions: number }[] {
-	return topology.subtopologies.flatMap(subtopology =>
-		subtopology.stores.map(builder => ({
-			builder,
-			partitions: builder.logging.enabled ? (counts.get(builder.logging.topic) ?? 0) : 0,
-		}))
-	)
+	return topology.subtopologies.flatMap(subtopology => {
+		const partitions = Math.max(0, ...[...subtopology.sourceTopics].map(topic => counts.get(topic) ?? 0))
+		return subtopology.stores.map(builder => ({ builder, partitions }))
+	})
 }

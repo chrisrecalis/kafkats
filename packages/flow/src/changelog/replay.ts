@@ -14,8 +14,8 @@ import type { Checkpoints } from '@/state/checkpoints.js'
 export interface ReplayTarget {
 	readonly topic: string
 	readonly partition: number
-	/** Applies a batch to the raw store (latest change per key, decoded, written); resolves to the max key time, -1 none. */
-	readonly apply: (batch: readonly Message<Buffer, Buffer>[]) => Promise<number>
+	/** Applies a batch to the raw store (latest change per key, decoded, written). */
+	readonly apply: (batch: readonly Message<Buffer, Buffer>[]) => Promise<void>
 }
 
 export interface ReplayOptions {
@@ -31,8 +31,6 @@ export interface ReplayOptions {
 export interface ReplayResult {
 	/** Records applied that are not tombstones (overwritten ones included). */
 	readonly restored: number
-	/** Max key time applied per changelog partition (`topic:partition`). */
-	readonly maxKeyTime: ReadonlyMap<string, number>
 }
 
 /**
@@ -58,7 +56,6 @@ interface Partition {
 	position: bigint | undefined
 	/** A batch of this partition is being applied. */
 	applying: boolean
-	maxKeyTime: number
 	done: boolean
 	/** The last stable offset at which an open transaction held this partition at the last stall check. */
 	heldAt: bigint | undefined
@@ -104,7 +101,6 @@ export class Replay {
 				checkpointed: start,
 				position: start,
 				applying: false,
-				maxKeyTime: -1,
 				done: false,
 				heldAt: undefined,
 			})
@@ -145,11 +141,7 @@ export class Replay {
 			await this.checkpointProgress()
 			throw outcome.failure
 		}
-		const maxKeyTime = new Map<string, number>()
-		for (const [key, p] of this.partitions) {
-			if (p.maxKeyTime >= 0) maxKeyTime.set(key, p.maxKeyTime)
-		}
-		return { restored: this.restored, maxKeyTime }
+		return { restored: this.restored }
 	}
 
 	/** The consumer's handler: one batch of one partition, in offset order; the next is not delivered before it settled. */
@@ -169,7 +161,7 @@ export class Replay {
 			// Records past the captured end belong to a concurrent writer: its owner has them in its own state.
 			const records = messages.filter(message => message.offset < p.end)
 			if (records.length > 0) {
-				p.maxKeyTime = Math.max(p.maxKeyTime, await p.target.apply(records))
+				await p.target.apply(records)
 				this.restored += records.filter(record => record.key !== null && record.value !== null).length
 			}
 			p.applied = last.offset + 1n < p.end ? last.offset + 1n : p.end

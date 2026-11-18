@@ -6,7 +6,14 @@
  * not processed under either guarantee, a halt stops the whole runtime, also a recovery waiting out its backoff.
  */
 import { describe, expect, it, vi } from 'vitest'
-import { KafkaClient, NoOffsetForPartitionError, string, TimeoutError } from '@kafkats/client'
+import {
+	ErrorCode,
+	KafkaClient,
+	KafkaProtocolError,
+	NoOffsetForPartitionError,
+	string,
+	TimeoutError,
+} from '@kafkats/client'
 import type { FlowApp, FlowConfig } from '@/api/app.js'
 import { FailedProcessingError, NoOffsetResetError, TaskCorruptedError, TaskMigratedError } from '@/api/errors.js'
 import { flow } from '@/app/flow.js'
@@ -612,12 +619,15 @@ describe('cleanup of unowned durable state (Kafka Streams: state.cleanup.delay.m
 describe('exactly-once: the producer is initialized before any restore (KS RecordCollector.initialize)', () => {
 	it('a restore waits for the InitProducerId that fences the transaction an earlier producer left open', async () => {
 		const h = new Harness(counting, { processingGuarantee: 'exactly_once' })
+		h.io.scriptProducer = producer => producer.steps.initTransactions.next('hang')
 		const starting = h.start()
 		await h.joined()
-		const init = h.producer.steps.initTransactions.next('hang')
+		// It began as the run started, before the group assigned anything: while the consumer joins, its epoch bump
+		// aborts a transaction whose pending offsets would hold the assignment's offset fetch (requireStable).
+		const init = h.producer.steps.initTransactions
+		expect(init.hung).toHaveLength(1)
 		await h.consumer.rebalance('in:0')
 		const restoreReads = () => h.io.admin.calls.filter(call => call.startsWith('listOffsets'))
-		await vi.waitFor(() => expect(init.hung).toHaveLength(1))
 		await settle()
 		// The restore plans nothing (no end offsets listed) and no transaction begins until the producer is initialized.
 		expect(restoreReads()).toEqual([])
@@ -627,6 +637,33 @@ describe('exactly-once: the producer is initialized before any restore (KS Recor
 		await starting
 		expect(h.producer.initialized).toBe(1)
 		expect(restoreReads()).not.toEqual([])
+		await h.stop()
+	})
+})
+
+describe('exactly-once: a producer that cannot be initialized', () => {
+	it('a transactional id the principal may not use is fatal, not a migration (KS: a StreamsException)', async () => {
+		const seen: Error[] = []
+		const h = new Harness(stateless, {
+			processingGuarantee: 'exactly_once',
+			uncaughtExceptionHandler: error => {
+				seen.push(error)
+				return 'shutdown'
+			},
+		})
+		await h.started()
+		// The ACL is gone and a recovery needs a new producer.
+		const denied = new KafkaProtocolError(ErrorCode.TransactionalIdAuthorizationFailed, 'InitProducerId failed')
+		h.io.scriptProducer = producer => producer.steps.initTransactions.always(denied)
+		h.consumer.fail(connectionReset())
+		await vi.waitFor(() => expect(h.io.created.producers[0]!.closed).toBe(true))
+		await settle()
+		h.io.clock.advance(500)
+		await h.joined(2)
+		await h.consumer.rebalance('in:0')
+		await vi.waitFor(() => expect(h.lifecycle.state).toBe('ERROR'))
+		expect(seen).toEqual([denied])
+		expect(h.io.created.consumers).toHaveLength(2)
 		await h.stop()
 	})
 })

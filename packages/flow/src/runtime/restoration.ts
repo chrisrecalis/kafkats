@@ -11,12 +11,10 @@ import type { ResolvedRestorationOptions } from '@/runtime/config.js'
 import type { RuntimeIO } from '@/runtime/io.js'
 import type { TaskRestorer } from '@/runtime/restore-pipelines.js'
 import { abortError } from '@/runtime/signals.js'
-import { tpKey } from '@/runtime/task-id.js'
 import type { StreamTask } from '@/runtime/task.js'
 import type { KeyValueStore, WindowedKey } from '@/state.js'
 import type { Checkpoints } from '@/state/checkpoints.js'
 import type { RegisteredStore } from '@/state/state-manager.js'
-import { keyTime } from '@/state/time-clipping.js'
 
 export interface RestorationPoolDeps {
 	readonly io: Pick<RuntimeIO, 'restoreConsumers' | 'admin'>
@@ -42,23 +40,23 @@ export class RestorationPool implements TaskRestorer {
 	constructor(private readonly deps: RestorationPoolDeps) {}
 
 	/**
-	 * Restores the task's logged stores that restore (raw stores, runtime§6.36) and resolves to the max key time
-	 * applied to each window and session store. An aborted job rejects with an AbortError: a queued one at once, a
-	 * running one once its store write in flight is done and its progress is checkpointed. A changelog that lost
-	 * records the restore needed (C7) is a TaskCorruptedError: the task is revived and rebuilds its stores (4.7.5).
+	 * Restores the task's logged stores that restore (raw stores, runtime§6.36). An aborted job rejects with an
+	 * AbortError: a queued one at once, a running one once its store write in flight is done and its progress is
+	 * checkpointed. A changelog that lost records the restore needed (C7) is a TaskCorruptedError: the task is revived
+	 * and rebuilds its stores (4.7.5).
 	 */
-	async restore(task: RestoringTask, signal: AbortSignal): Promise<{ storeTimes: ReadonlyMap<string, number> }> {
+	async restore(task: RestoringTask, signal: AbortSignal): Promise<void> {
 		const restoring = task.stores.flatMap(store => {
 			const { changelog } = store
 			return changelog === undefined || changelog.skipRestoration ? [] : [{ store, changelog }]
 		})
 		if (restoring.length === 0) {
-			return { storeTimes: new Map() }
+			return
 		}
 		await this.slot(signal)
 		const { io, checkpoints, options, applicationId, commitIntervalMs, logger } = this.deps
 		try {
-			const { maxKeyTime } = await restoreChangelogs(
+			await restoreChangelogs(
 				{
 					consumer: () =>
 						io.restoreConsumers(`${applicationId}-restore-${task.id.key}-${++restoreConsumers}`),
@@ -68,12 +66,6 @@ export class RestorationPool implements TaskRestorer {
 				checkpoints,
 				{ ...options, commitIntervalMs, signal, logger: logger.child({ task: task.id.key }) }
 			)
-			const storeTimes = new Map<string, number>()
-			for (const { store, changelog } of restoring) {
-				const time = maxKeyTime.get(tpKey(changelog))
-				if (time !== undefined) storeTimes.set(store.builder.name, time)
-			}
-			return { storeTimes }
 		} catch (error) {
 			if (error instanceof OffsetOutOfRangeError) {
 				throw new TaskCorruptedError(
@@ -120,8 +112,7 @@ export class RestorationPool implements TaskRestorer {
 
 /**
  * The restore target of a logged store: its raw store, written with the codecs of its changelog writer (window and
- * session stores: windowed keys), which reports the max key time it applied: window ends for every kind of window
- * (the store clock's key time, 6.2).
+ * session stores: windowed keys).
  */
 function target(
 	{ builder, raw }: RegisteredStore,
@@ -132,5 +123,5 @@ function target(
 		return restoreTarget(changelog, raw as KeyValueStore<unknown, unknown>, codecs)
 	}
 	const store = raw as KeyValueStore<WindowedKey<unknown>, unknown>
-	return restoreTarget(changelog, store, { ...codecs, key: windowedKeyCodec(builder.keyCodec) }, keyTime)
+	return restoreTarget(changelog, store, { ...codecs, key: windowedKeyCodec(builder.keyCodec) })
 }

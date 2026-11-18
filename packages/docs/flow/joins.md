@@ -9,7 +9,7 @@
 
 Co-partitioned topics have the same partition count and the same partitioning of keys, so that a key is in the same partition on both sides. Joins that need it put both sides in one task per partition, and `start()` throws `CoPartitioningError` when the counts differ. A stream side whose key changed upstream is repartitioned first (by the join's key), so only the topics you read have to agree.
 
-Joiners take the two values. The joiners of stream-table and stream-global table joins may declare three parameters to receive the record's key too.
+Joiners take the two values (Kafka Streams' `ValueJoiner`), whatever parameters the function declares. For a joiner that also receives the record's key (`ValueJoinerWithKey`), stream-table and stream-global table joins have `joinWithKey()` and `leftJoinWithKey()`.
 
 ## Stream-Stream Joins
 
@@ -78,8 +78,8 @@ const withOptional = orders.leftJoin(customers, (order, customer) => ({
 	customerName: customer?.name ?? 'unknown',
 }))
 
-// three parameters: the joiner also receives the key
-orders.join(customers, (customerId: string, order: Order, customer: Customer) => ({ customerId, name: customer.name }))
+// the joiner also receives the key
+orders.joinWithKey(customers, (customerId, order, customer) => ({ customerId, name: customer.name }))
 ```
 
 - Only stream records produce results, with the stream record's key, timestamp and headers. An update of the table produces nothing; it changes what later stream records find.
@@ -109,7 +109,7 @@ const withOptionalProduct = orders.leftJoin(
 )
 ```
 
-- The key selector receives the record's key and value and returns the global table's key. The joiner may declare three parameters to receive the record's key (not the selected one).
+- The key selector receives the record's key and value and returns the global table's key. With `joinWithKey()` and `leftJoinWithKey()` the joiner also receives the record's key (not the selected one).
 - No co-partitioning and no repartitioning: the stream keeps its partitioning. A key change upstream stays pending, so a key-based operation after the join still repartitions.
 - Only stream records produce results, with their key, timestamp and headers. The global table is read as it is when the record is processed; it is not synchronized with the stream's time.
 - Inner join: records the table has no value for, and records whose selector returns `null` or `undefined`, are dropped. Left join: both are joined with `null`. Records with a null (or undefined) value are dropped.

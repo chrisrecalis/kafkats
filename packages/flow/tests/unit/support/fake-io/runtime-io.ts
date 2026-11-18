@@ -23,6 +23,8 @@ export class FakeIO implements RuntimeIO {
 
 	/** The group of the group consumers (the application id). */
 	readonly groupId: string
+	/** Scripts every producer handed out from now on, before the runtime uses it. */
+	scriptProducer: (producer: FakeProducer) => void = () => {}
 
 	constructor(options: { groupId?: string; time?: number } = {}) {
 		this.groupId = options.groupId ?? 'app'
@@ -32,7 +34,11 @@ export class FakeIO implements RuntimeIO {
 	readonly consumer = (): FakeGroupConsumer =>
 		keep(this.created.consumers, new FakeGroupConsumer({ cluster: this.cluster, groupId: this.groupId }))
 
-	readonly producer = (): FakeProducer => keep(this.created.producers, new FakeProducer(this.cluster))
+	readonly producer = (): FakeProducer => {
+		const producer = keep(this.created.producers, new FakeProducer(this.cluster))
+		this.scriptProducer(producer)
+		return producer
+	}
 
 	readonly restoreConsumers = (groupId: string): FakeRestoreConsumer =>
 		keep(this.created.restoreConsumers, new FakeRestoreConsumer(this.cluster, groupId))

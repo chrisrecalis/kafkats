@@ -118,7 +118,7 @@ export class TestLoop {
 				initialize: signal => this.collector.initialize(signal),
 				ensureTransaction: signal => this.collector.ensureTransaction(signal),
 			},
-			restorer: { restore: () => Promise.resolve({ storeTimes: new Map() }) },
+			restorer: { restore: () => Promise.resolve() },
 			startPositions: { settle: task => Promise.resolve(uncommittedPositions(task)) },
 			exclusive: fn => fn(),
 			commit: (reason, signal) => this.commits.commit(reason, signal),

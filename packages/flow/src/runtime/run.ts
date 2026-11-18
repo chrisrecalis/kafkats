@@ -442,14 +442,23 @@ export class Run {
 		})
 	}
 
+	/**
+	 * The collector of the current producer. Exactly-once, its initialization starts at once, in the background, while
+	 * the consumer joins (KS initializes the producer at task initialization, before it reads any committed offset):
+	 * its epoch bump aborts a transaction the previous incarnation left open, whose pending offsets would hold the
+	 * assignment's offset fetch (requireStable) until the broker timed it out. Restore pipelines await it.
+	 */
 	private newCollector(): RecordCollector {
 		const { config, logger } = this.deps
-		return new RecordCollector(this.producer, {
+		const collector = new RecordCollector(this.producer, {
 			eos: config.eos,
 			handlers: config.handlers,
 			counts: this.partitionCounts,
 			logger,
 		})
+		// A failure is the pipelines' to report: their initialize() tries again.
+		collector.initialize(this.hardStop.signal).catch(() => {})
+		return collector
 	}
 }
 

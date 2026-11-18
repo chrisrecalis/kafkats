@@ -354,9 +354,9 @@ describe('at-least-once revive after an expiry pass (4.7.5)', () => {
 	}
 
 	/**
-	 * Processes `committed` and commits, then `uncommitted`, whose expiry pass runs past the retention of the records
-	 * before; revives the task as a failed send would and processes `uncommitted` again. Returns what each run of
-	 * `uncommitted` sent.
+	 * Processes `committed` and commits (nothing: no commit at all), then `uncommitted`, whose expiry pass runs past the
+	 * retention of the records before; revives the task as a failed send would and processes `uncommitted` again.
+	 * Returns what each run of `uncommitted` sent.
 	 */
 	async function replay(
 		{ h, sent }: ReturnType<typeof counting>,
@@ -364,9 +364,11 @@ describe('at-least-once revive after an expiry pass (4.7.5)', () => {
 		uncommitted: readonly TestRecord[]
 	) {
 		const first = await h.start(h.task())
-		h.enqueue(first, 'in', committed)
-		await h.process(first)
-		expect(await h.commit()).toBe('committed')
+		if (committed.length > 0) {
+			h.enqueue(first, 'in', committed)
+			await h.process(first)
+			expect(await h.commit()).toBe('committed')
+		}
 		const before = h.producer.sent.length
 		h.enqueue(first, 'in', uncommitted)
 		await h.process(first)
@@ -408,6 +410,24 @@ describe('at-least-once revive after an expiry pass (4.7.5)', () => {
 			['k', 100, 105, null],
 			['k', 100, 105, 3],
 			['j', 70_000, 70_000, 2],
+		])
+	})
+
+	it('without any commit, a time window is updated again from what the restore applied, not restarted', async () => {
+		// The restore applied every write, j's at window end 110 too: a store clock seeded from it would put the read
+		// floor at 101, and the replayed k@5 would read [0,10) as absent and write a partial count of 1 over it.
+		const task = counting(TimeWindows.ofSizeWithNoGrace(10), { value: num })
+		const [first, again] = await replay(task, [], [at('k', 5), at('k', 7), at('j', 100)])
+		expect(first).toEqual([
+			['k', 0, 10, 1],
+			['k', 0, 10, 2],
+			['j', 100, 110, 1],
+		])
+		// At-least-once counts the replayed records twice (Kafka Streams too); it never loses one.
+		expect(again).toEqual([
+			['k', 0, 10, 3],
+			['k', 0, 10, 4],
+			['j', 100, 110, 2],
 		])
 	})
 

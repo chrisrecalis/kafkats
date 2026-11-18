@@ -605,6 +605,8 @@ describe('RecordCollector exactly-once', () => {
 			FailedProcessingError,
 		],
 		['an authorization failure', new KafkaProtocolError(ErrorCode.TopicAuthorizationFailed), StreamsError],
+		['an invalid topic', new KafkaProtocolError(ErrorCode.InvalidTopicException), StreamsError],
+		['oversized commit metadata', new KafkaProtocolError(ErrorCode.OffsetMetadataTooLarge), StreamsError],
 		['an aborted transaction', new TransactionAbortedError('tx'), TransactionAbortedError],
 	] as const) {
 		it(`${name} fails the run: ${expected.name}`, async () => {
@@ -617,7 +619,10 @@ describe('RecordCollector exactly-once', () => {
 			h.producer.steps.send.always(error)
 			const task = await running(h)
 			send(h, task, 'sink')
-			await expect(h.collector.flush(signal())).rejects.toThrow(expected)
+			const failure: unknown = await h.collector.flush(signal()).catch((e: unknown) => e)
+			expect(failure).toBeInstanceOf(expected)
+			// FailedProcessingError extends StreamsError: the classes the docs name are exact.
+			expect(failure instanceof FailedProcessingError).toBe(expected === FailedProcessingError)
 			expect(handled).toBe(0)
 		})
 	}

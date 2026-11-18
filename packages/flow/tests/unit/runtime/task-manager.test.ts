@@ -460,6 +460,46 @@ describe('TaskManager: restore pipelines (4.7.1)', () => {
 		}
 	)
 
+	it('an assignment during the prune of its store waits for no clear: the restore pipeline finishes it first', async () => {
+		const h = new Harness()
+		await h.assign('input:0')
+		await h.settle()
+		const raw = h.tasks()[0]!.stores[0]!.raw as KeyValueStore<string, string>
+		await Promise.all(Array.from({ length: 25_000 }, (_, i) => raw.put(`k${i}`, 'v')))
+		await h.revoke('input:0')
+		await h.assign()
+		const remove = raw.delete.bind(raw)
+		const round = deferred()
+		const go = deferred()
+		let first = true
+		vi.spyOn(raw, 'delete').mockImplementation(async key => {
+			if (first) {
+				first = false
+				round.resolve()
+				await go.promise
+			}
+			await remove(key)
+		})
+		h.restorer.manual = true
+		const pruned = h.stateDirectory.prune('s', 0, new AbortController().signal)
+		await round.promise
+
+		const assigned = h.assign('input:0')
+		await tick()
+		go.resolve()
+		await assigned
+		await pruned
+		// The hook returned with the store partly cleared: no clear of millions of entries inside it.
+		expect(await raw.approximateNumEntries()).toBe(15_000)
+		const [task] = h.tasks()
+		await h.settle()
+		expect(h.restorer.restored.at(-1)).toBe(task)
+		expect(await raw.approximateNumEntries()).toBe(0)
+		h.restorer.job(task!).finish()
+		await h.settle()
+		expect(task!.state).toBe('RUNNING')
+	})
+
 	it('runtime§6.30: a completion queued behind an op that suspended the task does nothing', async () => {
 		const h = new Harness()
 		h.restorer.manual = true

@@ -5,16 +5,20 @@
  * cleanup delay too (`StateDirectory.unleased`, KS `state.cleanup.delay.ms`). Outside the scheduler's exclusive
  * section, like the cleaner beside its stream threads: a prune clears a whole store, which must not hold up slices,
  * commits and rebalance hooks. That is safe because StateDirectory.prune re-checks the lease and invalidates the
- * checkpoint before it clears, and a lease made meanwhile waits for the prune and gets a new, empty instance. A
- * rebalance, a revival, a recovery and close disarm it, also while it runs: no further instance is pruned then.
+ * checkpoint before it clears, and a lease made meanwhile stops the clear, which the new owner's restore pipeline
+ * finishes. A rebalance, a revival, a recovery and close disarm it, also while it runs: no further instance is pruned
+ * then. A failed prune is logged and retried 30 s later, like KS's cleaner goes on with the other directories and runs
+ * again.
  */
 import type { Logger } from '@kafkats/client'
 import { errorMessage } from '@/runtime/errors.js'
 import type { Clock } from '@/runtime/io.js'
-import type { StateDirectory } from '@/state/state-directory.js'
+import type { StateDirectory, UnleasedInstance } from '@/state/state-directory.js'
 
-/** How long a run stays RUNNING before the state it does not own is dropped. */
+/** How long a run stays RUNNING before the state it does not own is dropped, and before a failed prune is tried again. */
 export const PRUNE_DELAY_MS = 30_000
+
+const key = (store: string, partition: number): string => `${store}\u0000${partition}`
 
 export interface PruneTimerDeps {
 	readonly stateDirectory: Pick<StateDirectory, 'unleased' | 'prune'>
@@ -30,6 +34,8 @@ export class PruneTimer {
 	private generation = 0
 	/** When the run last became RUNNING (the last arm). */
 	private runningSince = 0
+	/** Per instance whose prune failed, when it is tried again. */
+	private readonly retryAt = new Map<string, number>()
 
 	constructor(private readonly deps: PruneTimerDeps) {}
 
@@ -51,7 +57,7 @@ export class PruneTimer {
 	/** A timer for the first instance due; nothing to prune, no timer. */
 	private schedule(generation: number): void {
 		let first = Infinity
-		for (const { prunableAt } of this.deps.stateDirectory.unleased()) first = Math.min(first, prunableAt)
+		for (const instance of this.deps.stateDirectory.unleased()) first = Math.min(first, this.dueAt(instance))
 		if (first === Infinity) {
 			return
 		}
@@ -61,22 +67,34 @@ export class PruneTimer {
 		})
 	}
 
-	/** Prunes the instances due, then waits for the next one; a failure waits for the next arm. */
+	/** Prunes the instances due, one after the other (a failure is logged and retried later), then waits for the next. */
 	private async prune(generation: number): Promise<void> {
 		const { stateDirectory, clock, signal, logger } = this.deps
-		try {
-			for (const { store, partition, prunableAt } of stateDirectory.unleased()) {
-				if (generation !== this.generation) {
-					return
-				}
-				if (prunableAt <= clock.now()) await stateDirectory.prune(store, partition, signal)
+		for (const instance of stateDirectory.unleased()) {
+			if (generation !== this.generation || signal.aborted) {
+				return
 			}
-		} catch (error) {
-			logger.warn('dropping unowned state failed: its next owner rebuilds it', { error: errorMessage(error) })
-			return
+			if (this.dueAt(instance) > clock.now()) continue
+			const { store, partition } = instance
+			try {
+				await stateDirectory.prune(store, partition, signal)
+				this.retryAt.delete(key(store, partition))
+			} catch (error) {
+				if (signal.aborted) return
+				this.retryAt.set(key(store, partition), clock.now() + PRUNE_DELAY_MS)
+				logger.warn('dropping unowned state failed: it is tried again in 30 s', {
+					store,
+					partition,
+					error: errorMessage(error),
+				})
+			}
 		}
 		if (generation === this.generation) {
 			this.schedule(generation)
 		}
+	}
+
+	private dueAt({ store, partition, prunableAt }: UnleasedInstance): number {
+		return Math.max(prunableAt, this.retryAt.get(key(store, partition)) ?? -Infinity)
 	}
 }

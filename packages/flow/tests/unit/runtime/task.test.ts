@@ -8,7 +8,7 @@ import type {
 	ProcessorSupplier,
 	RecordMetadata,
 } from '@/processor/api.js'
-import { decodeCommitMetadata, encodeCommitMetadata, ProcessorMetadataImpl } from '@/processor/metadata.js'
+import { decodeCommitMetadata } from '@/processor/metadata.js'
 import type { StreamRecord } from '@/processor/record.js'
 import { ObservedStreamTime } from '@/processor/time-tracker.js'
 import type { PartitionStart, StreamTask, TaskState } from '@/runtime/task.js'
@@ -16,7 +16,7 @@ import type { KeyValueStore, StateStore } from '@/state.js'
 import type { RegisteredStore } from '@/state/state-manager.js'
 import type { StoreClock } from '@/state/time-clipping.js'
 import type { InternalTopologyBuilder } from '@/topology/builder.js'
-import { kvStore, passThrough, pipe, TaskHarness } from '../support/task-harness.js'
+import { committed, kvStore, passThrough, pipe, TaskHarness } from '../support/task-harness.js'
 
 type Ctx = ProcessorContext<string, string>
 
@@ -85,12 +85,6 @@ function twoTopics(
 	}
 }
 
-function committed(metadata: Record<string, number>, partitionTime: number, offset = 10n): PartitionStart {
-	const encoded = new ProcessorMetadataImpl()
-	encoded.replaceAll([new Map(Object.entries(metadata))], new Set(Object.keys(metadata)))
-	return { committed: { offset, metadata: encodeCommitMetadata(partitionTime, encoded) }, resolved: offset }
-}
-
 const records = (...timestamps: number[]) =>
 	timestamps.map(timestamp => ({ key: 'k', value: `v${timestamp}`, timestamp }))
 
@@ -100,7 +94,7 @@ async function inState(h: TaskHarness, state: TaskState): Promise<StreamTask> {
 	await task.initialize()
 	if (state === 'RESTORING') return task
 	task.setStarts(new Map())
-	await task.completeRestoration(new Map())
+	await task.completeRestoration()
 	if (state === 'RUNNING') return task
 	await task.suspend()
 	if (state === 'SUSPENDED') return task
@@ -147,7 +141,7 @@ describe('StreamTask lifecycle (4.4)', () => {
 		expect(state.instances).toBe(checked)
 
 		task.setStarts(new Map())
-		await task.completeRestoration(new Map())
+		await task.completeRestoration()
 		expect(task.state).toBe('RUNNING')
 		expect([state.instances - checked, state.inits]).toEqual([1, 1])
 
@@ -160,7 +154,7 @@ describe('StreamTask lifecycle (4.4)', () => {
 
 		task.resume()
 		expect(task.state).toBe('RESTORING')
-		await task.completeRestoration(new Map())
+		await task.completeRestoration()
 		expect([state.instances - checked, state.inits]).toEqual([2, 2])
 		// The record queued before the suspension was dropped: it is fetched again from the committed offset.
 		expect(await h.process(task)).toBe(0)
@@ -175,7 +169,7 @@ describe('StreamTask lifecycle (4.4)', () => {
 
 	const ops = {
 		initialize: (t: StreamTask) => t.initialize(),
-		completeRestoration: (t: StreamTask) => t.completeRestoration(new Map()),
+		completeRestoration: (t: StreamTask) => t.completeRestoration(),
 		suspend: (t: StreamTask) => t.suspend(),
 		resume: async (t: StreamTask) => t.resume(),
 		closeClean: (t: StreamTask) => t.close('clean'),
@@ -287,7 +281,7 @@ describe('StreamTask lifecycle (4.4)', () => {
 		})
 		const task = h.task()
 		await task.initialize()
-		await expect(task.completeRestoration(new Map())).rejects.toThrow('failed to initialize processor')
+		await expect(task.completeRestoration()).rejects.toThrow('failed to initialize processor')
 		expect(task.state).toBe('RESTORING')
 		expect(task.initializing).toBe(false)
 		expect(events).toEqual(['a.init', 'b.init', 'a.close'])
@@ -443,7 +437,7 @@ describe('incarnation boundary (CR9)', () => {
 			const task = h.task()
 			await task.initialize()
 			task.setStarts(new Map())
-			const completing = task.completeRestoration(new Map())
+			const completing = task.completeRestoration()
 			expect(task.initializing).toBe(true)
 			expect(await task.close('dirty')).toBe('dirty')
 			// The output no longer takes its sends.
@@ -531,12 +525,12 @@ describe('seeding from the commits (D5, KF7)', () => {
 			])
 		)
 		const clock = giveClock(task)
-		await task.completeRestoration(new Map([['w', 95]]))
+		await task.completeRestoration()
 		expect(metadata.get('w')).toBe(120)
 		expect(metadata.get('w.observed')).toBe(80)
 		expect(metadata.get('removed')).toBeUndefined()
 		expect(task.streamTime).toBe(130)
-		// The committed clock, not the restored one: the replay of the records after the commit advances it again.
+		// The replay of the records after the commit advances it again.
 		expect(clock.time).toBe(80)
 		// Seeding is not a change to commit.
 		expect(task.needsCommit(h.consumer.nextOffset.bind(h.consumer))).toBe(false)
@@ -556,22 +550,21 @@ describe('seeding from the commits (D5, KF7)', () => {
 			}
 		}
 		task.setStarts(new Map([['a:0', committed({ w: 100, 'w.observed': 80 }, 90)]]))
-		await task.completeRestoration(new Map([['w', 95]]))
+		await task.completeRestoration()
 		expect(clock.time).toBe(80)
 		expect(task.streamTime).toBe(90)
 		expect(reads).toEqual([])
 	})
 
-	it('a store clock is seeded with its committed time; with no commit metadata, with the time the restore applied', async () => {
+	it('a store clock is seeded with its committed time, -1 without one, like the processor clocks', async () => {
 		const cases: [PartitionStart | undefined, number][] = [
 			[committed({ 'w.observed': 300 }, 10), 300],
-			// At-least-once: the restore applied the writes made after the commit, at later key times.
-			[committed({ 'w.observed': 100 }, 10), 100],
 			// The store was not written before the commit.
 			[committed({ other: 5 }, 10), -1],
-			[{ committed: { offset: 1n, metadata: '' }, resolved: 1n }, 200],
-			[{ committed: { offset: 1n, metadata: 'garbage!' }, resolved: 1n }, 200],
-			[undefined, 200],
+			// No commit metadata: every record whose writes the restore applied is replayed, from clocks at -1.
+			[{ committed: { offset: 1n, metadata: '' }, resolved: 1n }, -1],
+			[{ committed: { offset: 1n, metadata: 'garbage!' }, resolved: 1n }, -1],
+			[undefined, -1],
 		]
 		for (const [start, seeded] of cases) {
 			const h = new TaskHarness({ build: twoTopics(passThrough) })
@@ -579,7 +572,7 @@ describe('seeding from the commits (D5, KF7)', () => {
 			await task.initialize()
 			const clock = giveClock(task)
 			task.setStarts(new Map(start === undefined ? [] : [['a:0', start]]))
-			await task.completeRestoration(new Map([['w', 200]]))
+			await task.completeRestoration()
 			expect(clock.time, start?.committed?.metadata ?? 'no commit').toBe(seeded)
 		}
 	})
@@ -594,7 +587,7 @@ describe('seeding from the commits (D5, KF7)', () => {
 				['b:0', { committed: { offset: 1n, metadata: Buffer.from([9]).toString('base64') }, resolved: 1n }],
 			])
 		)
-		await task.completeRestoration(new Map())
+		await task.completeRestoration()
 		expect(task.streamTime).toBe(-1)
 		expect(h.logger.warnings.filter(w => w.includes('commit metadata'))).toHaveLength(1)
 	})
@@ -806,7 +799,7 @@ describe('punctuation (4.9)', () => {
 		const task = h.task()
 		await task.initialize()
 		task.setStarts(new Map([['input:0', committed({}, 70)]]))
-		await task.completeRestoration(new Map())
+		await task.completeRestoration()
 		expect(task.hasWork(h.clock.now(), h.lag)).toBe(true)
 		expect(await task.maybePunctuateStreamTime()).toBe(true)
 		expect(calls).toEqual([70])
@@ -895,7 +888,7 @@ describe('commit bookkeeping (4.8.3)', () => {
 		const task = h.task()
 		await task.initialize()
 		task.setStarts(new Map([['input:0', { committed: { offset: 5n, metadata: null }, resolved: 5n }]]))
-		await task.completeRestoration(new Map())
+		await task.completeRestoration()
 		const next = h.consumer.nextOffset.bind(h.consumer)
 		h.consumer.partition('input:0').position = 5n
 		expect(task.needsCommit(next)).toBe(false)

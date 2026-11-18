@@ -51,12 +51,25 @@ function overloads(
 		)
 	).toEqualTypeOf<KStream<string, number>>()
 	expectTypeOf(
-		stream.leftJoin(
+		stream.leftJoinWithKey(
 			global,
 			(_key, value) => value,
-			(key: string | null, value: number, globalValue: Date | null) => [key, value, globalValue] as const
+			(key, value, globalValue) => [key, value, globalValue] as const
 		)
 	).toEqualTypeOf<KStream<string, readonly [string | null, number, Date | null]>>()
+	// Key-aware joiners need no parameter types; join() never passes a key, so it takes no key-aware joiner.
+	expectTypeOf(
+		stream.joinWithKey(table, (key, value, tableValue) => [key, value, tableValue] as const)
+	).toEqualTypeOf<KStream<string, readonly [string, number, Date]>>()
+	expectTypeOf(stream.leftJoinWithKey(table, (key, _value, tableValue) => [key, tableValue] as const)).toEqualTypeOf<
+		KStream<string, readonly [string | null, Date | null]>
+	>()
+	// @ts-expect-error a joiner of three parameters goes to joinWithKey()
+	stream.join(table, (key: string, value: number, tableValue: Date) => key + value + tableValue.getTime())
+	// An optional third parameter is just that: join() calls it with the values.
+	expectTypeOf(
+		stream.join(table, (value: number, tableValue: Date, scale?: number) => value * (scale ?? 1))
+	).toEqualTypeOf<KStream<string, number>>()
 	const recordKey = (key: string | null) => key
 	// @ts-expect-error the selector must pick a key of the global table
 	stream.join(global, recordKey, (value: number) => value)

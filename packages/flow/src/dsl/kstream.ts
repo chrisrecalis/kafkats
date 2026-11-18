@@ -1,8 +1,19 @@
 import type { KGroupedStream } from '@/api/grouped.js'
-import type { BranchedKStream, KStream, KeyValue, ValueMapper, ValueMapperWithKey } from '@/api/kstream.js'
+import { TopologyError } from '@/api/errors.js'
+import type {
+	BranchedKStream,
+	KeyValueMapper,
+	KStream,
+	KeyValue,
+	ValueJoiner,
+	ValueJoinerWithKey,
+	ValueMapper,
+	ValueMapperWithKey,
+} from '@/api/kstream.js'
 import type { GlobalKTable, KTable } from '@/api/ktable.js'
 import type {
 	Grouped,
+	Joined,
 	Materialized,
 	NamedOptions,
 	ProcessOptions,
@@ -14,22 +25,26 @@ import type { DslContext } from '@/dsl/context.js'
 import type { StreamFormat } from '@/dsl/format.js'
 import { GlobalKTableImpl } from '@/dsl/global-ktable.js'
 import { KTableImpl } from '@/dsl/ktable.js'
-import { globalJoin, type GlobalJoinArgs } from '@/dsl/ops/global-join.js'
+import { globalJoin } from '@/dsl/ops/global-join.js'
 import { groupBy, groupByKey } from '@/dsl/ops/grouping.js'
 import { process, processValues } from '@/dsl/ops/process.js'
 import { repartition, through } from '@/dsl/ops/repartition.js'
 import * as stateless from '@/dsl/ops/stateless.js'
 import { streamStreamJoin, type StreamStreamJoinArgs } from '@/dsl/ops/stream-stream-join.js'
-import { streamTableJoin, type StreamTableJoinArgs } from '@/dsl/ops/stream-table-join.js'
+import { streamTableJoin } from '@/dsl/ops/stream-table-join.js'
 import { toTable } from '@/dsl/ops/table-source.js'
 import { to } from '@/dsl/ops/to.js'
 import type { FixedKeyProcessorSupplier, ProcessorSupplier } from '@/processor/api.js'
 import type { NodeName, TopicNameExtractor } from '@/topology/nodes.js'
 
+/** `(joiner, options?)` of a table; `(keySelector, joiner, options?)`, or the deprecated `(joiner)`, of a global table. */
+type TableJoinArgs<K, V, VO, J> =
+	| [joiner: J, options?: Joined<K, V, VO>]
+	| [keySelector: KeyValueMapper<K | null, V, unknown>, joiner: J, options?: NamedOptions]
+
 type JoinArgs<K, V, VO, VR> =
 	| StreamStreamJoinArgs<K, V, VO, VR>
-	| StreamTableJoinArgs<K, V, VO, VR>
-	| GlobalJoinArgs<K, V, unknown, VO, VR>
+	| TableJoinArgs<K, V, VO, ValueJoiner<V, VO | null, VR>>
 
 export class KStreamImpl<K, V> implements KStream<K, V> {
 	constructor(
@@ -131,14 +146,28 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 		other: KStream<K, VO> | KTable<K, VO> | GlobalKTable<unknown, VO>,
 		...args: JoinArgs<K, V, VO, VR>
 	): KStream<K, VR> {
-		return this.joinWith('inner', other, args)
+		return this.joinWith('inner', other, args, false)
 	}
 
 	leftJoin<VO, VR>(
 		other: KStream<K, VO> | KTable<K, VO> | GlobalKTable<unknown, VO>,
 		...args: JoinArgs<K, V, VO, VR>
 	): KStream<K, VR> {
-		return this.joinWith('left', other, args)
+		return this.joinWith('left', other, args, false)
+	}
+
+	joinWithKey<VO, VR>(
+		other: KTable<K, VO> | GlobalKTable<unknown, VO>,
+		...args: TableJoinArgs<K, V, VO, ValueJoinerWithKey<K, V, VO, VR>>
+	): KStream<K, VR> {
+		return this.joinWith('inner', other, args, true)
+	}
+
+	leftJoinWithKey<VO, VR>(
+		other: KTable<K, VO> | GlobalKTable<unknown, VO>,
+		...args: TableJoinArgs<K, V, VO, ValueJoinerWithKey<K | null, V, VO | null, VR>>
+	): KStream<K, VR> {
+		return this.joinWith('left', other, args, true)
 	}
 
 	outerJoin<VO, VR>(other: KStream<K, VO>, ...args: StreamStreamJoinArgs<K, V, VO, VR>): KStream<K, VR> {
@@ -159,17 +188,41 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 		return processValues(this, supplier, options)
 	}
 
-	/** Dispatches a join on the kind of the other side. */
+	/**
+	 * Dispatches a join on the kind of the other side. `withKey`: the joiner of a table join takes the record's key
+	 * first (joinWithKey, leftJoinWithKey); otherwise it is called with the values only.
+	 */
 	private joinWith<VO, VR>(
 		kind: 'inner' | 'left',
 		other: KStream<K, VO> | KTable<K, VO> | GlobalKTable<unknown, VO>,
-		args: JoinArgs<K, V, VO, VR>
+		args: readonly unknown[],
+		withKey: boolean
 	): KStream<K, VR> {
+		type Joiner = ValueJoinerWithKey<K | null, V, VO | null, VR>
+		const keyed = (joiner: unknown): Joiner =>
+			withKey
+				? (joiner as Joiner)
+				: (_key, value, otherValue) => (joiner as ValueJoiner<V, VO | null, VR>)(value, otherValue)
 		if (other instanceof GlobalKTableImpl) {
-			return globalJoin(this, kind, other, ...(args as GlobalJoinArgs<K, V, unknown, VO, VR>))
+			// The deprecated `(globalTable, joiner)` looks up the record key.
+			const [keySelector, joiner, options] = args.length === 1 ? [(key: K | null) => key, args[0]] : args
+			return globalJoin(
+				this,
+				kind,
+				other,
+				keySelector as KeyValueMapper<K | null, V, unknown>,
+				keyed(joiner),
+				options as NamedOptions | undefined
+			)
 		}
 		if (other instanceof KTableImpl) {
-			return streamTableJoin(this, kind, other, ...(args as StreamTableJoinArgs<K, V, VO, VR>))
+			const [joiner, options] = args
+			return streamTableJoin(this, kind, other, keyed(joiner), options as Joined<K, V, VO> | undefined)
+		}
+		if (withKey) {
+			throw new TopologyError(
+				`${kind === 'inner' ? 'joinWithKey()' : 'leftJoinWithKey()'} joins a table or a global table`
+			)
 		}
 		return streamStreamJoin(this, kind, other as KStream<K, VO>, ...(args as StreamStreamJoinArgs<K, V, VO, VR>))
 	}

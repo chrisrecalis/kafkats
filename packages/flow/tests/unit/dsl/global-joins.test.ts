@@ -48,11 +48,11 @@ function eventsAndRegions(driver: TestDriver) {
 const values = (ctx: TestContextApi, topic: string) => ctx.output(topic, S).map(o => o.value)
 
 describe.each(GUARANTEES)('stream-global table join results (6.19; %s)', (_guarantee, config) => {
-	it('looks up the key the selector picks; a joiner with the key gets the record key', async () => {
+	it('looks up the key the selector picks; leftJoinWithKey gives the joiner the record key', async () => {
 		const driver = new TestDriver(config)
 		const { events, regions } = eventsAndRegions(driver)
 		events.join(regions, byRegion, (value, name) => `${value.region}=${name}`).to('inner', S)
-		events.leftJoin(regions, byRegion, keyJoiner).to('left', S)
+		events.leftJoinWithKey(regions, byRegion, keyJoiner).to('left', S)
 		await driver.run(async ctx => {
 			await region(ctx, 1, 'Europe')
 			await event(ctx, 'a', { region: 1 })
@@ -70,8 +70,8 @@ describe.each(GUARANTEES)('stream-global table join results (6.19; %s)', (_guara
 			selected.push(key)
 			return byRegion(key, value)
 		}
-		events.join(regions, selector, keyJoiner).to('inner', S)
-		events.leftJoin(regions, selector, keyJoiner).to('left', S)
+		events.joinWithKey(regions, selector, keyJoiner).to('inner', S)
+		events.leftJoinWithKey(regions, selector, keyJoiner).to('left', S)
 		await driver.run(async ctx => {
 			await region(ctx, 1, 'Europe')
 			await event(ctx, null, { region: 1 })
@@ -90,8 +90,8 @@ describe.each(GUARANTEES)('stream-global table join results (6.19; %s)', (_guara
 	it('results carry the record key, timestamp and headers; table updates produce none', async () => {
 		const driver = new TestDriver(config)
 		const { events, regions } = eventsAndRegions(driver)
-		events.join(regions, byRegion, keyJoiner).to('inner', S)
-		events.leftJoin(regions, byRegion, keyJoiner).to('left', S)
+		events.joinWithKey(regions, byRegion, keyJoiner).to('inner', S)
+		events.leftJoinWithKey(regions, byRegion, keyJoiner).to('left', S)
 		await driver.run(async ctx => {
 			await ctx.send(
 				'events',
@@ -181,10 +181,10 @@ describe('stream-global table join wiring (6.19)', () => {
 			.input('events', S)
 			.selectKey((_key, value) => (value === 'eu' ? null : value))
 			.repartition({ name: 'by-region', key: str })
-			.leftJoin(
+			.leftJoinWithKey(
 				regions,
 				(_key, value) => value,
-				(key: string | null, value: string, name: string | null) => `${key}:${value}=${name}`
+				(key, value, name) => `${key}:${value}=${name}`
 			)
 			.to('out', S)
 		await driver.run(async ctx => {

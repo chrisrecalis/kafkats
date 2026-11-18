@@ -87,10 +87,11 @@ export class RecordCollector {
 	}
 
 	/**
-	 * Exactly-once: initializes the producer once (KS `RecordCollector.initialize` at task initialization), awaited by
-	 * every restore before it reads a changelog. A new producer with the transactional id of an earlier one fences it
-	 * when it initializes, which aborts the transaction it left open: until then that transaction's records hold back
-	 * the last stable offset of every changelog it wrote, and with it every restore that reads one.
+	 * Exactly-once: initializes the producer once (KS `RecordCollector.initialize` at task initialization): started by
+	 * the Run with the collector, awaited by every restore before it reads a changelog. A new producer with the
+	 * transactional id of an earlier one fences it when it initializes, which aborts the transaction it left open:
+	 * until then that transaction's records hold back the last stable offset of every changelog it wrote, and with it
+	 * every restore that reads one, and its pending offsets hold back the group's offset fetch.
 	 */
 	async initialize(signal: AbortSignal): Promise<void> {
 		if (!this.options.eos || this.isClosed) {

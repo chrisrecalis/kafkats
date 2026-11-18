@@ -87,8 +87,8 @@ export class ChangelogBackedSessionStore<K, V>
 	extends ChangelogBackedStore<WindowedKey<K>, V, SessionStore<K, V>>
 	implements SessionStore<K, V>
 {
-	findSessions(key: K, earliestStart: number, latestEnd: number): AsyncIterable<[WindowedKey<K>, V]> {
-		return this.inner.findSessions(key, earliestStart, latestEnd)
+	findSessions(key: K, earliestSessionEnd: number, latestSessionStart: number): AsyncIterable<[WindowedKey<K>, V]> {
+		return this.inner.findSessions(key, earliestSessionEnd, latestSessionStart)
 	}
 
 	async remove(key: K): Promise<void> {

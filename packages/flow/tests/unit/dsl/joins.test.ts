@@ -395,17 +395,29 @@ describe('join wiring (copied from flow.test.ts)', () => {
 })
 
 describe('stream-table joins', () => {
-	it('passes the key to a joiner that declares three parameters', async () => {
+	it('joinWithKey() passes the key; join() never does, whatever the joiner declares', async () => {
 		const driver = new TestDriver()
 		const table = driver.table('t', S)
-		driver
-			.input('s', S)
-			.join(table, (k: string, v: string, tv: string) => `${k}:${v}+${tv}`)
-			.to('out', S)
+		const stream = driver.input('s', S)
+		stream.joinWithKey(table, (k, v, tv) => `${k}:${v}+${tv}`).to('keyed', S)
+		// An optional parameter counts in a function's length, a wrapper's length is 0: neither gets a key.
+		const enrich = (order: string, customer: string | null, separator?: string) =>
+			`${order}${separator ?? '+'}${customer}`
+		stream.leftJoin(table, enrich).to('optional', S)
+		const traced = <F extends (...args: never[]) => unknown>(fn: F): F =>
+			((...args: Parameters<F>) => fn(...args)) as F
+		stream
+			.leftJoinWithKey(
+				table,
+				traced((k: string | null, v: string, tv: string | null) => `${k}:${v}+${tv}`)
+			)
+			.to('wrapped', S)
 		await driver.run(async ctx => {
 			await send(ctx, 't', 'k', 'T', 1)
 			await send(ctx, 's', 'k', 'S', 2)
-			expect(values(ctx)).toEqual(['k:S+T'])
+			expect(values(ctx, 'keyed')).toEqual(['k:S+T'])
+			expect(values(ctx, 'optional')).toEqual(['S+T'])
+			expect(values(ctx, 'wrapped')).toEqual(['k:S+T'])
 		})
 	})
 

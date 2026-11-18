@@ -19,12 +19,7 @@ import type { CommitOutcome, CommitReason } from '@/runtime/commit.js'
 import type { ResolvedFlowConfig } from '@/runtime/config.js'
 import { classify, errorMessage, type FailureSite } from '@/runtime/errors.js'
 import type { AssignedPartition, Clock, GroupConsumerPort } from '@/runtime/io.js'
-import {
-	RestorePipelines,
-	type Restored,
-	type StartPositionSettler,
-	type TaskRestorer,
-} from '@/runtime/restore-pipelines.js'
+import { RestorePipelines, type StartPositionSettler, type TaskRestorer } from '@/runtime/restore-pipelines.js'
 import { cap, raceSignal } from '@/runtime/signals.js'
 import { TaskIdRegistry, tpKey } from '@/runtime/task-id.js'
 import { StreamTask, type TaskConfig, type TaskState } from '@/runtime/task.js'
@@ -109,11 +104,12 @@ export class TaskManager {
 		this.taskConfig = taskConfig(deps.config, deps.topology)
 		this.pipelines = new RestorePipelines({
 			initializeOutput: signal => deps.outputs.initialize(cap(signal, TRANSACTION_TIMEOUT_MS)),
+			finishClears: (task, signal) => deps.stateDirectory.finishClears(task.id, signal),
 			restorer: deps.restorer,
 			startPositions: deps.startPositions,
 			exclusive: deps.exclusive,
 			signal: deps.signal,
-			complete: (task, signal, restored) => this.complete(task, signal, restored),
+			complete: (task, signal, positions) => this.complete(task, signal, positions),
 			onFailure: error => this.fail(error, 'restore'),
 		})
 	}
@@ -466,11 +462,15 @@ export class TaskManager {
 	}
 
 	/** A pipeline's completion op: RESTORING -> RUNNING, then its partitions resume (4.7.1). */
-	private async complete(task: StreamTask, signal: AbortSignal, restored: Restored): Promise<void> {
+	private async complete(
+		task: StreamTask,
+		signal: AbortSignal,
+		positions: ReadonlyMap<string, bigint>
+	): Promise<void> {
 		if (!this.completes(task, signal, 'RESTORING')) {
 			return
 		}
-		task.setSettledPositions(restored.positions)
+		task.setSettledPositions(positions)
 		if (this.taskConfig.eos) {
 			// init() may write logged stores (4.4).
 			await this.deps.outputs.ensureTransaction(cap(signal, TRANSACTION_TIMEOUT_MS))
@@ -478,7 +478,7 @@ export class TaskManager {
 				return
 			}
 		}
-		await task.completeRestoration(restored.storeTimes)
+		await task.completeRestoration()
 		if (!this.completes(task, signal, 'RUNNING')) {
 			return
 		}

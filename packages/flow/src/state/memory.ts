@@ -314,9 +314,9 @@ export class InMemorySessionStore<K, V>
 	extends InMemoryWindowedStore<K, V, SessionStoreOptions<K, V>>
 	implements SessionStore<K, V>
 {
-	findSessions(key: K, earliestStart: number, latestEnd: number): AsyncIterable<[WindowedKey<K>, V]> {
-		// A session overlaps if it starts before latestEnd and ends after earliestStart.
-		return this.whereKey(key, s => s.windowStart <= latestEnd && s.windowEnd >= earliestStart)
+	findSessions(key: K, earliestSessionEnd: number, latestSessionStart: number): AsyncIterable<[WindowedKey<K>, V]> {
+		// The sessions that end at or after earliestSessionEnd and start at or before latestSessionStart.
+		return this.whereKey(key, s => s.windowStart <= latestSessionStart && s.windowEnd >= earliestSessionEnd)
 	}
 
 	remove(key: K): Promise<void> {

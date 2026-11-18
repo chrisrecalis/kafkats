@@ -307,11 +307,11 @@ export class TransactionalSessionStore<K, V>
 	extends TransactionalWindowedStore<K, V, SessionStore<K, V>>
 	implements SessionStore<K, V>
 {
-	findSessions(key: K, earliestStart: number, latestEnd: number): AsyncIterable<[WindowedKey<K>, V]> {
+	findSessions(key: K, earliestSessionEnd: number, latestSessionStart: number): AsyncIterable<[WindowedKey<K>, V]> {
 		return this.windowsOf(
-			this.inner.findSessions(key, earliestStart, latestEnd),
+			this.inner.findSessions(key, earliestSessionEnd, latestSessionStart),
 			key,
-			(start, end) => start <= latestEnd && end >= earliestStart
+			(start, end) => start <= latestSessionStart && end >= earliestSessionEnd
 		)
 	}
 

@@ -22,11 +22,13 @@ export type KeyValue<K, V> = readonly [K, V]
 export type ValueMapper<V, VR> = (value: V) => VR
 /** Computes a new value from a record's key and value (Kafka Streams' `ValueMapperWithKey`); the key is read-only. */
 export type ValueMapperWithKey<K, V, VR> = (key: K, value: V) => VR
+/** Joins a value with the value of the other side (Kafka Streams' `ValueJoiner`): called with the values only, always. */
+export type ValueJoiner<V, VO, VR> = (value: V, otherValue: VO) => VR
 /**
- * A value joiner with or without the key. At runtime a joiner declaring three or more parameters receives
- * `(key, value, otherValue)`, otherwise `(value, otherValue)` (parameters with defaults do not count).
+ * Joins a value with the value of the other side, knowing the record's key (Kafka Streams' `ValueJoinerWithKey`), for
+ * `joinWithKey()` and `leftJoinWithKey()`; the key is read-only.
  */
-export type ValueJoiner<K, V, VO, VR> = ((value: V, otherValue: VO) => VR) | ((key: K, value: V, otherValue: VO) => VR)
+export type ValueJoinerWithKey<K, V, VO, VR> = (key: K, value: V, otherValue: VO) => VR
 /** Computes something, such as the key a stream-global table join looks up, from a record's key and value. */
 export type KeyValueMapper<K, V, R> = (key: K, value: V) => R
 
@@ -110,16 +112,7 @@ export interface KStream<K, V> {
 		options: Joined<K, V, VO>
 	): KStream<K, VR>
 	/** Stream-table inner join: looks up the table's current value; only stream records produce results. */
-	join<VT, VR>(
-		table: KTable<K, VT>,
-		joiner: (value: V, tableValue: VT) => VR,
-		options?: Joined<K, V, VT>
-	): KStream<K, VR>
-	join<VT, VR>(
-		table: KTable<K, VT>,
-		joiner: (key: K, value: V, tableValue: VT) => VR,
-		options?: Joined<K, V, VT>
-	): KStream<K, VR>
+	join<VT, VR>(table: KTable<K, VT>, joiner: ValueJoiner<V, VT, VR>, options?: Joined<K, V, VT>): KStream<K, VR>
 	/**
 	 * Stream-global table inner join: each record looks up the global table's current value for the key
 	 * `keySelector` picks and is joined with it. No repartitioning: every instance holds the whole table, so the
@@ -131,14 +124,7 @@ export interface KStream<K, V> {
 	join<GK, GV, VR>(
 		globalTable: GlobalKTable<GK, GV>,
 		keySelector: KeyValueMapper<K | null, V, GK | null>,
-		joiner: (value: V, globalValue: GV) => VR,
-		options?: NamedOptions
-	): KStream<K, VR>
-	/** Stream-global table inner join whose joiner also receives the record's key (not the selected one). */
-	join<GK, GV, VR>(
-		globalTable: GlobalKTable<GK, GV>,
-		keySelector: KeyValueMapper<K | null, V, GK | null>,
-		joiner: (key: K | null, value: V, globalValue: GV) => VR,
+		joiner: ValueJoiner<V, GV, VR>,
 		options?: NamedOptions
 	): KStream<K, VR>
 	/** @deprecated Pass a key selector: `join(globalTable, (key) => key, joiner)` (the record key is looked up). */
@@ -157,14 +143,10 @@ export interface KStream<K, V> {
 		joiner: (value: V, otherValue: VO | null) => VR,
 		options: Joined<K, V, VO>
 	): KStream<K, VR>
+	/** Stream-table left join: records the table has no value for are joined with null. */
 	leftJoin<VT, VR>(
 		table: KTable<K, VT>,
-		joiner: (value: V, tableValue: VT | null) => VR,
-		options?: Joined<K, V, VT>
-	): KStream<K, VR>
-	leftJoin<VT, VR>(
-		table: KTable<K, VT>,
-		joiner: (key: K | null, value: V, tableValue: VT | null) => VR,
+		joiner: ValueJoiner<V, VT | null, VR>,
 		options?: Joined<K, V, VT>
 	): KStream<K, VR>
 	/**
@@ -174,18 +156,38 @@ export interface KStream<K, V> {
 	leftJoin<GK, GV, VR>(
 		globalTable: GlobalKTable<GK, GV>,
 		keySelector: KeyValueMapper<K | null, V, GK | null>,
-		joiner: (value: V, globalValue: GV | null) => VR,
-		options?: NamedOptions
-	): KStream<K, VR>
-	/** Stream-global table left join whose joiner also receives the record's key (not the selected one). */
-	leftJoin<GK, GV, VR>(
-		globalTable: GlobalKTable<GK, GV>,
-		keySelector: KeyValueMapper<K | null, V, GK | null>,
-		joiner: (key: K | null, value: V, globalValue: GV | null) => VR,
+		joiner: ValueJoiner<V, GV | null, VR>,
 		options?: NamedOptions
 	): KStream<K, VR>
 	/** @deprecated Pass a key selector: `leftJoin(globalTable, (key) => key, joiner)` (the record key is looked up). */
 	leftJoin<GV, VR>(globalTable: GlobalKTable<K, GV>, joiner: (value: V, globalValue: GV | null) => VR): KStream<K, VR>
+
+	/** Like the stream-table `join()`, with a joiner that also receives the record's key (Kafka Streams' `ValueJoinerWithKey`). */
+	joinWithKey<VT, VR>(
+		table: KTable<K, VT>,
+		joiner: ValueJoinerWithKey<K, V, VT, VR>,
+		options?: Joined<K, V, VT>
+	): KStream<K, VR>
+	/** Like the stream-global table `join()`, with a joiner that also receives the record's key (not the selected one). */
+	joinWithKey<GK, GV, VR>(
+		globalTable: GlobalKTable<GK, GV>,
+		keySelector: KeyValueMapper<K | null, V, GK | null>,
+		joiner: ValueJoinerWithKey<K | null, V, GV, VR>,
+		options?: NamedOptions
+	): KStream<K, VR>
+	/** Like the stream-table `leftJoin()`, with a joiner that also receives the record's key, null in a null-key join. */
+	leftJoinWithKey<VT, VR>(
+		table: KTable<K, VT>,
+		joiner: ValueJoinerWithKey<K | null, V, VT | null, VR>,
+		options?: Joined<K, V, VT>
+	): KStream<K, VR>
+	/** Like the stream-global table `leftJoin()`, with a joiner that also receives the record's key (not the selected one). */
+	leftJoinWithKey<GK, GV, VR>(
+		globalTable: GlobalKTable<GK, GV>,
+		keySelector: KeyValueMapper<K | null, V, GK | null>,
+		joiner: ValueJoinerWithKey<K | null, V, GV | null, VR>,
+		options?: NamedOptions
+	): KStream<K, VR>
 
 	/** Windowed stream-stream outer join. */
 	outerJoin<VO, VR>(

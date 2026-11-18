@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { KStream } from '@/api/kstream.js'
+import type { GlobalKTable } from '@/api/ktable.js'
 import { codec } from '@/codec.js'
 import type { DslContext } from '@/dsl/context.js'
 import type { KTableNode } from '@/operators/ktable-node.js'
@@ -117,15 +118,50 @@ describe('DSL shells delegate every method to its operator builder', () => {
 		api.outerJoin(other, outer, windows)
 		expect(streamStreamJoin.streamStreamJoin).toHaveBeenCalledWith(stream, 'outer', other, outer, windows)
 
+		// join() and leftJoin() call a table joiner with the values only; the WithKey forms pass it on as it is.
+		const joinerOf = (spy: unknown, at: number) =>
+			vi.mocked(spy as (...args: unknown[]) => unknown).mock.lastCall![at] as (...args: unknown[]) => unknown
 		api.join(table, inner, options)
-		expect(streamTableJoin.streamTableJoin).toHaveBeenCalledWith(stream, 'inner', table, inner, options)
+		expect(streamTableJoin.streamTableJoin).toHaveBeenCalledWith(
+			stream,
+			'inner',
+			table,
+			expect.any(Function),
+			options
+		)
+		expect(joinerOf(streamTableJoin.streamTableJoin, 3)('k', 1, 2)).toBe(3)
 		api.leftJoin(table, left)
-		expect(streamTableJoin.streamTableJoin).toHaveBeenCalledWith(stream, 'left', table, left)
+		expect(streamTableJoin.streamTableJoin).toHaveBeenCalledWith(
+			stream,
+			'left',
+			table,
+			expect.any(Function),
+			undefined
+		)
+		const keyed = (key: string | null, value: number, otherValue: number | null) => `${key}${value}${otherValue}`
+		api.joinWithKey(table, keyed, options)
+		expect(streamTableJoin.streamTableJoin).toHaveBeenCalledWith(stream, 'inner', table, keyed, options)
+		api.leftJoinWithKey(table, keyed)
+		expect(streamTableJoin.streamTableJoin).toHaveBeenCalledWith(stream, 'left', table, keyed, undefined)
 
 		api.join(global, selector, inner, options)
-		expect(globalJoin.globalJoin).toHaveBeenCalledWith(stream, 'inner', global, selector, inner, options)
-		api.leftJoin(global, left)
-		expect(globalJoin.globalJoin).toHaveBeenCalledWith(stream, 'left', global, left)
+		expect(globalJoin.globalJoin).toHaveBeenCalledWith(
+			stream,
+			'inner',
+			global,
+			selector,
+			expect.any(Function),
+			options
+		)
+		expect(joinerOf(globalJoin.globalJoin, 4)('k', 1, 2)).toBe(3)
+		api.joinWithKey(global, selector, keyed, options)
+		expect(globalJoin.globalJoin).toHaveBeenCalledWith(stream, 'inner', global, selector, keyed, options)
+		api.leftJoinWithKey(global, selector, keyed)
+		expect(globalJoin.globalJoin).toHaveBeenCalledWith(stream, 'left', global, selector, keyed, undefined)
+		// The deprecated form looks up the record key.
+		api.leftJoin(global as unknown as GlobalKTable<string, number>, left)
+		expect(joinerOf(globalJoin.globalJoin, 3)('k', 1)).toBe('k')
+		expect(joinerOf(globalJoin.globalJoin, 4)('k', 1, 2)).toBe(3)
 	})
 
 	it('KTable operators', () => {

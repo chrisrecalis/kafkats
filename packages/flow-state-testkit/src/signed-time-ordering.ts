@@ -178,6 +178,31 @@ export function signedTimeOrderingSuite(engine: EngineUnderTest): void {
 			await provider.close()
 		})
 
+		it('findSessions(key, earliestSessionEnd, latestSessionStart) returns every overlapping session, not only those inside', async () => {
+			const provider = engine.create(stateDir)
+			const store = provider.createSessionStore<string, number>('s', {
+				keyCodec: stringCodec,
+				valueCodec: numberCodec,
+				retentionMs: 60_000,
+			})
+			await store.init()
+
+			await store.put({ key: 'k', windowStart: 0, windowEnd: 150 }, 1) // starts before 100, ends inside
+			await store.put({ key: 'k', windowStart: 120, windowEnd: 180 }, 2) // inside
+			await store.put({ key: 'k', windowStart: 190, windowEnd: 300 }, 3) // starts inside, ends after 200
+			await store.put({ key: 'k', windowStart: 0, windowEnd: 99 }, 4) // ends before 100
+			await store.put({ key: 'k', windowStart: 201, windowEnd: 250 }, 5) // starts after 200
+
+			const found: number[] = []
+			for await (const [, value] of store.findSessions('k', 100, 200)) {
+				found.push(value)
+			}
+			expect(found.sort((a, b) => a - b)).toEqual([1, 2, 3])
+
+			await store.close()
+			await provider.close()
+		})
+
 		it('findSessions and remove do NOT bleed into longer keys sharing the prefix', async () => {
 			// Session keys are stored as [keyBytes][biasedStart][biasedEnd] with no delimiter.
 			// A naive "[keyBytes, lex-min, lex-min] to [keyBytes, lex-max, lex-max]" range scan

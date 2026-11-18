@@ -38,8 +38,6 @@ export interface RestoreResult {
 	readonly rebuilt: readonly string[]
 	/** Targets that had records to replay. */
 	readonly replayed: readonly string[]
-	/** Max key time applied per target. */
-	readonly maxKeyTime: ReadonlyMap<string, number>
 }
 
 export interface RestoreIO {
@@ -81,10 +79,8 @@ export async function restoreChangelogs(
 		throw abortError(signal)
 	}
 	const replayed = plans.filter(p => p.start < p.end)
-	const { restored, maxKeyTime } =
-		replayed.length > 0
-			? await new Replay(io, replayed, checkpoints, options).run()
-			: { restored: 0, maxKeyTime: new Map<string, number>() }
+	const { restored } =
+		replayed.length > 0 ? await new Replay(io, replayed, checkpoints, options).run() : { restored: 0 }
 	// Rebuilt targets with nothing to replay hold exactly "empty as of the end" now.
 	const caughtUp = plans.filter(p => p.rebuild || p.start < p.end)
 	if (caughtUp.length > 0) {
@@ -95,7 +91,6 @@ export async function restoreChangelogs(
 		restored,
 		rebuilt: rebuilt.map(p => p.key),
 		replayed: replayed.map(p => p.key),
-		maxKeyTime,
 	}
 }
 
@@ -163,14 +158,12 @@ async function isTrusted(
 
 /**
  * The target of one changelog partition and its store. A batch is applied as the latest change of each key
- * (runtime§6.37), decoded with the changelog's codecs, written together (state/bulk.ts); `keyTime` gives the key time
- * of a written key (the window end, `state/time-clipping.ts`) for the store's clock.
+ * (runtime§6.37), decoded with the changelog's codecs, written together (state/bulk.ts).
  */
 export function restoreTarget<K, V>(
 	changelog: { readonly topic: string; readonly partition: number },
 	store: KeyValueStore<K, V>,
-	codecs: { readonly key: Codec<K>; readonly value: Codec<V> },
-	keyTime?: (key: K) => number
+	codecs: { readonly key: Codec<K>; readonly value: Codec<V> }
 ): RestoreTarget {
 	const { topic, partition } = changelog
 	const decode = (batch: readonly Message<Buffer, Buffer>[]): { key: K; value: V | null }[] => {
@@ -188,14 +181,9 @@ export function restoreTarget<K, V>(
 		partition,
 		store,
 		apply: async batch => {
-			let maxKeyTime = -1
 			await Promise.all(
-				decode(batch).map(({ key, value }) => {
-					if (keyTime) maxKeyTime = Math.max(maxKeyTime, keyTime(key))
-					return value === null ? store.delete(key) : store.put(key, value)
-				})
+				decode(batch).map(({ key, value }) => (value === null ? store.delete(key) : store.put(key, value)))
 			)
-			return maxKeyTime
 		},
 	}
 }

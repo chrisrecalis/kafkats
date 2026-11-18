@@ -54,7 +54,9 @@ export class TaskCorruptedError extends StreamsError {
 
 /**
  * An exception handler answered 'fail', or threw; or, under exactly-once, a send failed with an error that is not
- * retriable, which no handler is asked about (the transaction cannot commit).
+ * retriable, which no handler is asked about (the transaction cannot commit). Not for the send failures that are
+ * fatal under either guarantee (authentication, authorization, invalid topic, oversized commit metadata: a plain
+ * StreamsError) or that fence the producer (TaskMigratedError).
  */
 export class FailedProcessingError extends StreamsError {
 	override name = 'FailedProcessingError'

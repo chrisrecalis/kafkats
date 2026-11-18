@@ -15,7 +15,7 @@ import {
 	type ClockMetadata,
 } from '@/state/time-clipping.js'
 import type { EmitFinalWindows, StoreBuilder, StoreClockSpec } from '@/topology/nodes.js'
-import { pipe, TaskHarness } from '../support/task-harness.js'
+import { committed, pipe, TaskHarness } from '../support/task-harness.js'
 import { DEFAULTS, RecordingOutput, collect, directory, metadata, str, taskId } from './support.js'
 
 const w = (key: string, windowStart: number, windowEnd: number): WindowedKey<string> => ({
@@ -428,26 +428,29 @@ describe('store clocks across task incarnations (6.2, 4.4)', () => {
 		})
 	}
 
-	it('a restore reports the max keyTime of its changelog keys, window ends: they clip as Kafka Streams clips by start', async () => {
+	it('a clock seeded with the max key time written, window ends: it clips as Kafka Streams clips by start', async () => {
 		const h = new TaskHarness({
 			build: b => pipe(b, { processor: windowWriter, stores: [windows({}, 10), sessions(20)] }),
 		})
 		const task = h.task()
 		await task.initialize()
 		// 'w': time windows of 10 kept 10 ms; 's': the layout of sliding windows of 10, kept 2d = 20 ms.
-		const restored: Record<string, WindowedKey<string>[]> = {
+		const written: Record<string, WindowedKey<string>[]> = {
 			w: [w('k', 10, 20), w('k', 20, 30)],
 			s: [w('k', 80, 90), w('k', 115, 125)],
 		}
-		const storeTimes = new Map<string, number>()
+		const observed: Record<string, number> = {}
 		for (const { builder, raw } of task.stores) {
-			for (const key of restored[builder.name]!) {
+			for (const key of written[builder.name]!) {
 				await (raw as WindowStore<string, string>).put(key, 'restored')
-				storeTimes.set(builder.name, Math.max(storeTimes.get(builder.name) ?? -1, keyTime(key)))
+				observed[`${builder.name}.observed`] = Math.max(
+					observed[`${builder.name}.observed`] ?? -1,
+					keyTime(key)
+				)
 			}
 		}
-		task.setStarts(new Map())
-		await task.completeRestoration(storeTimes)
+		task.setStarts(new Map([['input:0', committed(observed, 0)]]))
+		await task.completeRestoration()
 		const read = (store: string, key: WindowedKey<string>) =>
 			(task.store(store) as WindowStore<string, string>).get(key)
 		// Kafka Streams' clock is the window start 20, its floor 11: [10,20) is gone, as by ends (clock 30, floor 21).
@@ -458,12 +461,14 @@ describe('store clocks across task incarnations (6.2, 4.4)', () => {
 		expect(await read('s', w('k', 115, 125))).toBe('restored')
 	})
 
-	it('the max key time a restore applied seeds the clock when it is above the committed one', async () => {
+	it('without a commit, the clock starts at -1 whatever the store holds: every restored window is read', async () => {
 		const h = new TaskHarness({ build: b => pipe(b, { processor: windowWriter, stores: [windows()] }) })
 		const task = h.task()
 		await task.initialize()
+		await (task.stores[0]!.raw as WindowStore<string, string>).put(w('k', 890, 900), 'restored')
 		task.setStarts(new Map())
-		await task.completeRestoration(new Map([['w', 900]]))
-		expect(task.stores[0]!.clock!.time).toBe(900)
+		await task.completeRestoration()
+		expect(task.stores[0]!.clock!.time).toBe(-1)
+		expect(await (task.store('w') as WindowStore<string, string>).get(w('k', 890, 900))).toBe('restored')
 	})
 })

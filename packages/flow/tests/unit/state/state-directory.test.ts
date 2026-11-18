@@ -13,6 +13,41 @@ const unlogged = keyValueStoreBuilder(DEFAULTS, { name: 'scratch', keyCodec: str
 const T0 = taskId(0, 0)
 const T1 = taskId(0, 1)
 
+const tick = () => new Promise(resolve => setImmediate(resolve))
+
+async function filled(store: KeyValueStore<string, string>, entries: number): Promise<void> {
+	await Promise.all(Array.from({ length: entries }, (_, i) => store.put(`k${i}`, 'v')))
+}
+
+/** Holds the first delete (the first round of a clear) until `release()`; `onDelete` sees every delete. */
+function blockFirstDelete(store: KeyValueStore<string, string>, onDelete: () => void = () => {}) {
+	let started!: () => void
+	let release!: () => void
+	const startedP = new Promise<void>(resolve => (started = resolve))
+	const blocked = new Promise<void>(resolve => (release = resolve))
+	const remove = store.delete.bind(store)
+	let first = true
+	vi.spyOn(store, 'delete').mockImplementation(async key => {
+		onDelete()
+		if (first) {
+			first = false
+			started()
+			await blocked
+		}
+		await remove(key)
+	})
+	return { started: startedP, release }
+}
+
+/** A provider whose stores of the given names are the ones an earlier start left (a durable provider reopens them). */
+function reopening(provider: InMemoryStateStoreProvider, stores: readonly KeyValueStore<string, string>[]) {
+	const byName = new Map(stores.map(store => [store.name, store]))
+	const create = provider.createKeyValueStore.bind(provider)
+	provider.createKeyValueStore = ((name, options) =>
+		byName.get(name) ?? create(name, options)) as typeof provider.createKeyValueStore
+	return provider
+}
+
 describe('StateDirectory', () => {
 	it('names provider stores <applicationId>.<store>.p<partition>', async () => {
 		const provider = new InMemoryStateStoreProvider()
@@ -180,34 +215,92 @@ describe('StateDirectory', () => {
 			expect(await checkpoints.get('app-counts-changelog', 0)).toBe(10n)
 		})
 
-		it('CR6: a lease during a slow prune gets a cleared store with an invalidated checkpoint', async () => {
-			const provider = new InMemoryStateStoreProvider()
-			const { directory: dir, checkpoints } = directory({ provider })
+		it('CR6: a lease during a prune stops its clear at the next round; finishClears() completes it', async () => {
+			const { directory: dir, checkpoints } = directory()
 			const store = (await dir.lease(T0, counts, 0)) as KeyValueStore<string, string>
-			for (let i = 0; i < 10; i++) await store.put(`k${i}`, 'v')
+			await filled(store, 25_000)
 			await checkpoints.set('app-counts-changelog', 0, 10n)
 			await dir.release(T0, 'counts', 0)
-			let unblock!: () => void
-			const blocked = new Promise<void>(resolve => (unblock = resolve))
-			const remove = store.delete.bind(store)
-			vi.spyOn(store, 'delete').mockImplementation(async key => {
-				await blocked
-				await remove(key)
-			})
+			const round = blockFirstDelete(store)
 
 			const pruned = dir.prune('counts', 0, new AbortController().signal)
-			await new Promise(resolve => setImmediate(resolve))
+			await round.started
 			let leased: KeyValueStore<string, string> | undefined
-			const lease = dir.lease(T0, counts, 0).then(s => (leased = s as KeyValueStore<string, string>))
-			await new Promise(resolve => setImmediate(resolve))
+			const lease = dir.lease(T1, counts, 0).then(s => (leased = s as KeyValueStore<string, string>))
+			await tick()
+			// It waits for the round of deletes in flight only.
 			expect(leased).toBeUndefined()
-
-			unblock()
-			await pruned
+			round.release()
 			await lease
+			await pruned
+
+			// The same, partly cleared instance: the checkpoint is invalid, a lease made it its owner's to finish.
+			expect(leased).toBe(store)
 			expect(await checkpoints.get('app-counts-changelog', 0)).toBe(-1n)
-			expect(await leased!.approximateNumEntries()).toBe(0)
-			expect(leased).not.toBe(store)
+			expect(await store.approximateNumEntries()).toBe(15_000)
+			await dir.finishClears(T0, new AbortController().signal)
+			expect(await store.approximateNumEntries()).toBe(15_000)
+			await dir.finishClears(T1, new AbortController().signal)
+			expect(await store.approximateNumEntries()).toBe(0)
+			// Finished: nothing more to clear.
+			await store.put('k', 'v')
+			await dir.finishClears(T1, new AbortController().signal)
+			expect(await store.get('k')).toBe('v')
+		})
+
+		it('finishClears() rejects with an AbortError once its signal aborts; the store stays partly cleared', async () => {
+			const { directory: dir } = directory()
+			const store = (await dir.lease(T0, counts, 0)) as KeyValueStore<string, string>
+			await filled(store, 25_000)
+			await dir.release(T0, 'counts', 0)
+			const round = blockFirstDelete(store)
+			const pruned = dir.prune('counts', 0, new AbortController().signal)
+			await round.started
+			const lease = dir.lease(T1, counts, 0)
+			round.release()
+			await lease
+			await pruned
+			const signal = AbortSignal.abort()
+			await expect(dir.finishClears(T1, signal)).rejects.toThrow(expect.objectContaining({ name: 'AbortError' }))
+			await dir.release(T1, 'counts', 0)
+			await dir.lease(T0, counts, 0)
+			await dir.finishClears(T0, new AbortController().signal)
+			expect(await store.approximateNumEntries()).toBe(0)
+		})
+
+		it('unleased() leaves out an instance being pruned: no timer waits for it again', async () => {
+			const { directory: dir } = directory()
+			const store = (await dir.lease(T0, counts, 0)) as KeyValueStore<string, string>
+			await filled(store, 15_000)
+			await dir.release(T0, 'counts', 0)
+			const round = blockFirstDelete(store)
+			const pruned = dir.prune('counts', 0, new AbortController().signal)
+			await round.started
+			expect(dir.unleased()).toEqual([])
+			round.release()
+			await pruned
+			expect(dir.unleased()).toEqual([])
+		})
+
+		it('a failed prune leaves the instance partly cleared and unleased: pruned again, or cleared by its next owner', async () => {
+			const { directory: dir } = directory()
+			const store = (await dir.lease(T0, counts, 0)) as KeyValueStore<string, string>
+			await filled(store, 15_000)
+			await dir.release(T0, 'counts', 0)
+			const remove = store.delete.bind(store)
+			let failed = false
+			vi.spyOn(store, 'delete').mockImplementation(async key => {
+				if (!failed) {
+					failed = true
+					throw new Error('disk full')
+				}
+				await remove(key)
+			})
+			await expect(dir.prune('counts', 0, new AbortController().signal)).rejects.toThrow('disk full')
+			expect(dir.unleased().map(u => `${u.store}:${u.partition}`)).toEqual(['counts:0'])
+			await dir.lease(T1, counts, 0)
+			await dir.finishClears(T1, new AbortController().signal)
+			expect(await store.approximateNumEntries()).toBe(0)
 		})
 
 		it('prune() with an aborted signal touches nothing', async () => {
@@ -258,10 +351,7 @@ describe('StateDirectory', () => {
 			const create = vi.spyOn(d.provider, 'createKeyValueStore')
 			await d.directory.lease(T0, counts, 0)
 			d.clock.now = 2000
-			d.directory.register([
-				{ builder: counts, partitions: 3 },
-				{ builder: unlogged, partitions: 3 },
-			])
+			d.directory.register([{ builder: counts, partitions: 3 }])
 			// Partition 0 is leased: it counts from its release, like any other instance.
 			expect(d.directory.unleased()).toEqual([
 				{ store: 'counts', partition: 1, prunableAt: 602_000 },
@@ -276,6 +366,44 @@ describe('StateDirectory', () => {
 			expect(d.store.flushes).toBe(flushes + 1)
 			expect(create).toHaveBeenCalledTimes(1)
 			expect(d.directory.unleased()).toEqual([])
+		})
+
+		it('register(): the state an earlier start left of a store nothing restores (unlogged, skipRestoration) is opened and cleared', async () => {
+			const provider = new InMemoryStateStoreProvider()
+			// What an earlier start left in the provider (an in-memory provider forgets nothing until it is closed).
+			const left = async (name: string) => {
+				const store = provider.createKeyValueStore<string, string>(name, { keyCodec: str, valueCodec: str })
+				await store.put('old', 'v')
+				return store
+			}
+			const scratch = await left('app.scratch.p1')
+			const skipped = await left('app.skipped.p1')
+			const skipping = keyValueStoreBuilder(DEFAULTS, {
+				name: 'skipped',
+				keyCodec: str,
+				valueCodec: str,
+				logging: { skipRestoration: true },
+			})
+			const clock = { now: 1000 }
+			const store = checkpointStore()
+			store.values.set('app-skipped-changelog:1', 42n)
+			const { directory: dir } = directory({
+				provider: reopening(provider, [scratch, skipped]),
+				checkpoints: new Checkpoints(store, () => {}),
+				cleanup: { delayMs: 600_000, now: () => clock.now },
+			})
+			dir.register([
+				{ builder: unlogged, partitions: 2 },
+				{ builder: skipping, partitions: 2 },
+			])
+			expect(dir.unleased()).toHaveLength(4)
+
+			for (const name of ['scratch', 'skipped']) await dir.prune(name, 1, new AbortController().signal)
+
+			expect(await scratch.get('old')).toBeUndefined()
+			expect(await skipped.get('old')).toBeUndefined()
+			expect(store.values.get('app-skipped-changelog:1')).toBe(-1n)
+			expect(dir.unleased().map(u => `${u.store}:${u.partition}`)).toEqual(['scratch:0', 'skipped:0'])
 		})
 
 		it('a partition of an earlier start that a task leases is no longer pruned as such', async () => {
@@ -345,6 +473,35 @@ describe('StateDirectory', () => {
 		expect(close).toHaveBeenCalledTimes(1)
 		const next = await dir.lease(T1, counts, 0)
 		expect(next).not.toBe(store)
+	})
+
+	it('close() stops a prune in progress and waits for it before it closes the provider', async () => {
+		const provider = new InMemoryStateStoreProvider()
+		const { directory: dir, checkpoints } = directory({ provider })
+		const store = (await dir.lease(T0, counts, 0)) as KeyValueStore<string, string>
+		await filled(store, 25_000)
+		await checkpoints.set('app-counts-changelog', 0, 10n)
+		await dir.release(T0, 'counts', 0)
+		const events: string[] = []
+		const round = blockFirstDelete(store, () => events.push('delete'))
+		vi.spyOn(provider, 'close').mockImplementation(() => {
+			events.push('provider.close')
+			return Promise.resolve()
+		})
+		const pruned = dir.prune('counts', 0, new AbortController().signal)
+		await round.started
+
+		const closed = dir.close()
+		await tick()
+		expect(events).not.toContain('provider.close')
+		round.release()
+		await closed
+		await pruned
+
+		// One round of deletes, then nothing after the provider closed.
+		expect(events.filter(e => e === 'delete')).toHaveLength(10_000)
+		expect(events.at(-1)).toBe('provider.close')
+		expect(await checkpoints.get('app-counts-changelog', 0)).toBe(-1n)
 	})
 
 	it('close() logs a provider that fails to close instead of throwing', async () => {

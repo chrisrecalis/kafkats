@@ -6,7 +6,7 @@ import { windowedKeyCodec } from '@/changelog/writer.js'
 import { codec } from '@/codec.js'
 import { classify } from '@/runtime/errors.js'
 import type { RestoreConsumerPort } from '@/runtime/io.js'
-import type { ChangelogCheckpointStore, KeyValueStore, WindowedKey } from '@/state.js'
+import type { ChangelogCheckpointStore, KeyValueStore } from '@/state.js'
 import { Checkpoints } from '@/state/checkpoints.js'
 import { InMemoryKeyValueStore, inMemory } from '@/state/memory.js'
 import { deferred, FakeAdmin, FakeCluster, FakeProducer, FakeRestoreConsumer } from '../support/fake-io.js'
@@ -155,7 +155,6 @@ describe('restoreChangelogs: replay (4.7.2)', () => {
 			restored: 5,
 			rebuilt: ['a:0', 'b:1'],
 			replayed: ['a:0', 'b:1'],
-			maxKeyTime: new Map(),
 		})
 		expect(h.consumers).toHaveLength(1)
 		expect(h.consumers[0]!.calls.slice(0, 2)).toEqual(['assign a:0@0 b:1@0', 'run'])
@@ -167,7 +166,7 @@ describe('restoreChangelogs: replay (4.7.2)', () => {
 		)
 	})
 
-	it('reports the max key time of window (start) and session (end) targets', async () => {
+	it('restores window and session targets with their windowed keys', async () => {
 		const h = new Harness()
 		const provider = inMemory()
 		const window = provider.createWindowStore<string, string>('w', {
@@ -187,17 +186,11 @@ describe('restoreChangelogs: replay (4.7.2)', () => {
 		h.write('s', 0, [key('a', 5, 50), 'x'], [key('b', 7, 9), 'y'])
 		const codecs = { key: windowed, value: str }
 
-		const result = await h.restore([
-			restoreTarget({ topic: 'w', partition: 0 }, window, codecs, (k: WindowedKey<string>) => k.windowStart),
-			restoreTarget({ topic: 's', partition: 0 }, session, codecs, (k: WindowedKey<string>) => k.windowEnd),
+		await h.restore([
+			restoreTarget({ topic: 'w', partition: 0 }, window, codecs),
+			restoreTarget({ topic: 's', partition: 0 }, session, codecs),
 		])
 
-		expect(result.maxKeyTime).toEqual(
-			new Map([
-				['w:0', 30],
-				['s:0', 50],
-			])
-		)
 		expect(await entries(window)).toEqual([
 			'{"key":"a","windowStart":10,"windowEnd":20}="y"',
 			'{"key":"a","windowStart":20,"windowEnd":30}="x"',
@@ -228,7 +221,7 @@ describe('restoreChangelogs: replay (4.7.2)', () => {
 
 		const result = await h.restore([kv(store, 'missing')])
 
-		expect(result).toEqual({ restored: 0, rebuilt: [], replayed: [], maxKeyTime: new Map() })
+		expect(result).toEqual({ restored: 0, rebuilt: [], replayed: [] })
 		expect(await entries(store)).toEqual(['"local"="1"'])
 		expect(h.consumers).toEqual([])
 		expect(h.checkpointStore.events).toEqual([])
@@ -244,7 +237,7 @@ describe('restoreChangelogs: replay (4.7.2)', () => {
 
 		const result = await h.restore([kv(store)])
 
-		expect(result).toEqual({ restored: 0, rebuilt: [], replayed: [], maxKeyTime: new Map() })
+		expect(result).toEqual({ restored: 0, rebuilt: [], replayed: [] })
 		expect(h.consumers).toEqual([])
 		expect(h.checkpointStore.events).toEqual([])
 	})

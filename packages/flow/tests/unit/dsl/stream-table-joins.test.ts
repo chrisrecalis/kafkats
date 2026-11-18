@@ -40,8 +40,8 @@ describe.each(GUARANTEES)('stream-table join results (6.14; %s)', (_guarantee, c
 		const driver = new TestDriver(config)
 		const table = driver.table('t', S)
 		const stream = driver.input('s', S)
-		stream.join(table, keyJoiner).to('inner', S)
-		stream.leftJoin(table, keyJoiner).to('left', S)
+		stream.joinWithKey(table, keyJoiner).to('inner', S)
+		stream.leftJoinWithKey(table, keyJoiner).to('left', S)
 		await driver.run(async ctx => {
 			await send(ctx, 't', 'k', 'T')
 			await send(ctx, 's', 'k', 'V')

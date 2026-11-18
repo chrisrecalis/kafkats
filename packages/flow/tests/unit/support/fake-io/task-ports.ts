@@ -10,7 +10,7 @@ import { deferred } from './steps.js'
 export class RestoreJob {
 	/** A store write in flight: an abort waits for it. */
 	write: Promise<void> | undefined
-	private readonly result = deferred<{ storeTimes: ReadonlyMap<string, number> }>()
+	private readonly result = deferred<void>()
 
 	constructor(
 		readonly task: StreamTask,
@@ -25,12 +25,12 @@ export class RestoreJob {
 		else signal.addEventListener('abort', abort, { once: true })
 	}
 
-	get promise(): Promise<{ storeTimes: ReadonlyMap<string, number> }> {
+	get promise(): Promise<void> {
 		return this.result.promise
 	}
 
-	finish(storeTimes: ReadonlyMap<string, number> = new Map()): void {
-		this.result.resolve({ storeTimes })
+	finish(): void {
+		this.result.resolve()
 	}
 
 	fail(error: unknown): void {
@@ -45,10 +45,10 @@ export class FakeRestorer implements TaskRestorer {
 	readonly restored: StreamTask[] = []
 	readonly jobs: RestoreJob[] = []
 
-	restore(task: StreamTask, signal: AbortSignal): Promise<{ storeTimes: ReadonlyMap<string, number> }> {
+	restore(task: StreamTask, signal: AbortSignal): Promise<void> {
 		this.restored.push(task)
 		if (!this.manual) {
-			return Promise.resolve({ storeTimes: new Map() })
+			return Promise.resolve()
 		}
 		const job = new RestoreJob(task, signal)
 		this.jobs.push(job)

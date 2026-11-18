@@ -129,8 +129,8 @@ class SessionHandle<K, V, S extends SessionStore<K, V> = SessionStore<K, V>>
 	extends KeyValueHandle<WindowedKey<K>, V, S>
 	implements SessionStore<K, V>
 {
-	findSessions(key: K, earliestStart: number, latestEnd: number): AsyncIterable<[WindowedKey<K>, V]> {
-		return this.inner.findSessions(key, earliestStart, latestEnd)
+	findSessions(key: K, earliestSessionEnd: number, latestSessionStart: number): AsyncIterable<[WindowedKey<K>, V]> {
+		return this.inner.findSessions(key, earliestSessionEnd, latestSessionStart)
 	}
 
 	remove(key: K): Promise<void> {

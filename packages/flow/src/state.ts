@@ -148,12 +148,14 @@ export interface WindowStore<K, V> extends KeyValueStore<WindowedKey<K>, V> {
  */
 export interface SessionStore<K, V> extends KeyValueStore<WindowedKey<K>, V> {
 	/**
-	 * Find all sessions for a key that overlap with the given time range.
+	 * The sessions of a key that end at or after `earliestSessionEnd` and start at or before `latestSessionStart`
+	 * (Kafka Streams' `findSessions(key, earliestSessionEndTime, latestSessionStartTime)`): those that overlap the
+	 * range `[earliestSessionEnd, latestSessionStart]`, not only those inside it.
 	 * @param key The key to search
-	 * @param earliestStart Earliest session start time (inclusive)
-	 * @param latestEnd Latest session end time (inclusive)
+	 * @param earliestSessionEnd Earliest session end time (inclusive)
+	 * @param latestSessionStart Latest session start time (inclusive)
 	 */
-	findSessions(key: K, earliestStart: number, latestEnd: number): AsyncIterable<[WindowedKey<K>, V]>
+	findSessions(key: K, earliestSessionEnd: number, latestSessionStart: number): AsyncIterable<[WindowedKey<K>, V]>
 
 	/**
 	 * Remove all sessions for a key.

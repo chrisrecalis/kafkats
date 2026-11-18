@@ -65,6 +65,7 @@ test`, `pnpm -C packages/flow-state-rocksdb test`).
   instances open across task lifetimes (a re-assigned task catches up from its checkpoint); unowned instances are
   pruned while the run is RUNNING (`PruneTimer`): in-memory ones after 30 s, durable ones once unowned for
   `stateCleanupDelayMs` (KS `state.cleanup.delay.ms`; partitions an earlier start left on disk count from the start).
+  A lease stops a prune's clear (nothing waits for a store to be cleared); the task's restore pipeline finishes it.
 - **Restoration**: a restore job per task that is not RUNNING (at most `changelog.restoration.maxConcurrentTasks`),
   its partitions paused meanwhile: replay to the end offsets captured at the start, checkpoint trust rules (within the
   log and the store not empty, else wipe and rebuild), progress checkpoints, stall detection, open transactions

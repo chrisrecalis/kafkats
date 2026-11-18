@@ -36,7 +36,8 @@ describe('repartitioning keeps event time, totals and topic identity', () => {
 			const applicationId = uniqueTopicName('r2-rp-app')
 			await createTopics(admin, [{ name: input, partitions: P }, { name: outWin }, { name: outPar }])
 			const hour = 3_600_000
-			const T0 = Math.floor(1_650_000_000_000 / hour) * hour + 5_000 // far in the past
+			// A day back: apart from the wall clock (the producer's own timestamps), within the broker's retention.
+			const T0 = eventTimeBase() - 24 * hour + 5_000
 			const N = 60
 
 			const build = (): FlowApp => {
@@ -210,7 +211,7 @@ describe('repartitioning keeps event time, totals and topic identity', () => {
 		type Window = { key: string; window: { start: number; end: number } }
 		const windowCodec = codec.json<Window>()
 		const size = 10_000
-		const start = Math.floor(1_650_000_000_000 / size) * size
+		const start = eventTimeBase() // near the wall clock: the broker's retention deletes older records
 
 		// One label per window of each key, wherever the windowed key hashes to.
 		const keys = ['k0', 'k1', 'k2', 'k3', 'k4', 'k5']
@@ -290,7 +291,7 @@ describe('repartitioning keeps event time, totals and topic identity', () => {
 			.toStream()
 			.to(sessionOut)
 		const keys = Array.from({ length: 12 }, (_, i) => `key-${i}`)
-		const start = Math.floor(1_650_000_000_000 / size) * size
+		const start = eventTimeBase() // near the wall clock: the broker's retention deletes older records
 		try {
 			await app.start()
 			await producer.send(

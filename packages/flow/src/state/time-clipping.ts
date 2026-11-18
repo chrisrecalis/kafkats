@@ -11,18 +11,16 @@
  *
  * The key time of an entry is its window end. Kafka Streams keys time and sliding windows by their start, but every
  * window of such a store has the same size (end = start + size), so its clock, floor and decisions are the same shifted
- * by the size; with ends, one rule covers windows, sessions and join buffers (`[ts, ts]`), and a restore finds the key
- * time of a changelog record in its key.
+ * by the size; with ends, one rule covers windows, sessions and join buffers (`[ts, ts]`). A restore does not move the
+ * clock: it starts from the clock committed with the offsets (`<store>.observed`, -1 without one), so the records
+ * replayed after that commit read the store as they did the first time.
  */
 import type { ProcessorMetadata } from '@/processor/api.js'
 import { emitKey, observedKey } from '@/processor/metadata.js'
 import type { KeyValueStore, SessionStore, WindowedKey, WindowStore } from '@/state.js'
 import type { EmitFinalWindows } from '@/topology/nodes.js'
 
-/**
- * The key time of a store entry: its window end, for every kind of window. A restore reports the max key time it
- * applied to a store with this (4.7.2), which seeds the store's clock.
- */
+/** The key time of a store entry: its window end, for every kind of window. */
 export const keyTime = (key: WindowedKey<unknown>): number => key.windowEnd
 
 /**

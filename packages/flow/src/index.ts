@@ -27,6 +27,7 @@ export type {
 	ValueMapper,
 	ValueMapperWithKey,
 	ValueJoiner,
+	ValueJoinerWithKey,
 } from '@/api/kstream.js'
 export type { KTable, GlobalKTable } from '@/api/ktable.js'
 export type {

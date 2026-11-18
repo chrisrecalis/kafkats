@@ -6,40 +6,34 @@
  * (4.1.6). The deprecated two-argument form looks up the record key (DL21).
  */
 import { TopologyError } from '@/api/errors.js'
-import type { KeyValueMapper, KStream, ValueJoiner } from '@/api/kstream.js'
+import type { KeyValueMapper, KStream, ValueJoinerWithKey } from '@/api/kstream.js'
 import type { NamedOptions } from '@/api/options.js'
 import { withNewValues } from '@/dsl/format.js'
 import type { GlobalKTableImpl } from '@/dsl/global-ktable.js'
 import { KStreamImpl } from '@/dsl/kstream.js'
 import { NodePrefix } from '@/dsl/naming.js'
 import { storeValueGetter } from '@/operators/ktable-node.js'
-import { joinerWithKey, streamTableJoinProcessor } from '@/operators/stream-table-join.js'
+import { streamTableJoinProcessor } from '@/operators/stream-table-join.js'
 
-/** `(keySelector, joiner, options?)`, or the deprecated `(joiner)`. A left join's joiner receives null values. */
-export type GlobalJoinArgs<K, V, GK, GV, VR> =
-	| [
-			keySelector: KeyValueMapper<K | null, V, GK | null>,
-			joiner: ValueJoiner<K | null, V, GV | null, VR>,
-			options?: NamedOptions,
-	  ]
-	| [joiner: (value: V, globalValue: GV | null) => VR]
-
+/**
+ * `joiner` gets the record's key (`join()` and `leftJoin()` pass one that ignores it); a left join's joiner receives
+ * null values.
+ */
 export function globalJoin<K, V, GK, GV, VR>(
 	stream: KStreamImpl<K, V>,
 	kind: 'inner' | 'left',
 	table: GlobalKTableImpl<GK, GV>,
-	...args: GlobalJoinArgs<K, V, GK, GV, VR>
+	keySelector: KeyValueMapper<K | null, V, GK | null>,
+	joiner: ValueJoinerWithKey<K | null, V, GV | null, VR>,
+	options?: NamedOptions
 ): KStream<K, VR> {
 	if (table.ctx !== stream.ctx) {
 		throw new TopologyError(`${kind === 'inner' ? 'join()' : 'leftJoin()'} needs a global table of the same app`)
 	}
-	// The deprecated overload types the global table's keys as the stream's.
-	const [keySelector, joiner, options] =
-		args.length === 1 ? [(key: K | null) => key as GK | null, args[0], undefined] : args
 	const supplier = streamTableJoinProcessor<K, V, GK, GV, VR>({
 		valueGetter: storeValueGetter(table.storeName),
 		lookupKey: keySelector,
-		joiner: joinerWithKey(joiner),
+		joiner,
 		left: kind === 'left',
 	})
 	const prefix = kind === 'inner' ? NodePrefix.JOIN : NodePrefix.LEFT_JOIN
