@@ -255,6 +255,8 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	private reservedSequences = new Map<string, number>() // "topic:partition" -> reserved count
 	private idempotentState: IdempotentState = 'idle'
 	private initPromise: Promise<void> | null = null
+	/** Why the initialization put the idempotent producer in the error state. */
+	private initFailure: Error | undefined
 
 	// In-flight batch tracking for fencing recovery
 	private inflightBatches = new Map<
@@ -2434,9 +2436,9 @@ export class Producer extends EventEmitter<ProducerEvents> {
 			return
 		}
 
-		// If in error state, fail immediately
+		// If in error state, fail immediately (with the failure that put it there)
 		if (this.idempotentState === 'error') {
-			throw new Error('Idempotent producer is in error state')
+			throw this.initFailure ?? new Error('Idempotent producer is in error state')
 		}
 
 		// If initializing, wait for existing promise
@@ -2480,16 +2482,29 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	 */
 	private async doInitializeIdempotentProducer(): Promise<void> {
 		// Retry coordinator discovery + InitProducerId until maxBlockMs, riding through a loading or
-		// briefly-unreachable coordinator. Non-retriable protocol errors fail fast.
+		// briefly-unreachable coordinator. Non-retriable protocol errors fail fast (Java: a fatal
+		// TransactionManager error). A disconnect stops it at once: a producer given up must not bump
+		// the epoch of its transactional id after its successor with the same id initialized.
 		const deadlineAt = Date.now() + this.config.maxBlockMs
+		const stop = this.closing.signal
 		const backoff = new ReconnectionStrategy({
 			initialDelayMs: this.config.retryBackoffMs,
 			maxDelayMs: this.config.maxRetryBackoffMs,
 			maxAttempts: Number.MAX_SAFE_INTEGER,
 		})
 		let lastError: Error = new Error('InitProducerId timed out before the coordinator was ready')
+		const retryAfter = async (error: Error): Promise<void> => {
+			lastError = error
+			const delay = backoff.nextDelay()
+			backoff.recordFailure()
+			await sleepMs(delay, { signal: stop }).catch(() => {})
+		}
 
 		while (Date.now() < deadlineAt) {
+			if (stop.aborted) {
+				this.idempotentState = 'idle'
+				throw toError(stop.reason)
+			}
 			let response: Awaited<ReturnType<Broker['initProducerId']>>
 			try {
 				let broker: Broker
@@ -2509,14 +2524,15 @@ export class Producer extends EventEmitter<ProducerEvents> {
 					producerEpoch: this.producerEpoch !== -1 ? this.producerEpoch : undefined,
 				})
 			} catch (error) {
+				// A broker's non-retriable answer to FindCoordinator (an authorization failure): fatal.
+				if (error instanceof KafkaProtocolError && !error.retriable) {
+					this.failInitialization(error)
+				}
 				// Transport failure: re-discover the coordinator and retry until the deadline.
 				if (this.config.transactionalId) {
 					this.cluster.invalidateCoordinator('TRANSACTION', this.config.transactionalId)
 				}
-				lastError = error instanceof Error ? error : new Error(String(error))
-				const delay = backoff.nextDelay()
-				backoff.recordFailure()
-				await this.sleep(delay)
+				await retryAfter(toError(error))
 				continue
 			}
 
@@ -2533,16 +2549,12 @@ export class Producer extends EventEmitter<ProducerEvents> {
 					) {
 						this.cluster.invalidateCoordinator('TRANSACTION', this.config.transactionalId)
 					}
-					lastError = new Error(`InitProducerId failed: ${ErrorCode[errorCode] ?? errorCode}`)
-					const delay = backoff.nextDelay()
-					backoff.recordFailure()
-					await this.sleep(delay)
+					await retryAfter(new KafkaProtocolError(errorCode, 'InitProducerId failed'))
 					continue
 				}
 
-				// CLUSTER_AUTHORIZATION_FAILED or other non-retriable errors — fail fast.
-				this.idempotentState = 'error'
-				throw new Error(`InitProducerId failed: ${ErrorCode[errorCode] ?? errorCode}`)
+				// Authorization failures and the other non-retriable errors: fail fast.
+				this.failInitialization(new KafkaProtocolError(errorCode, 'InitProducerId failed'))
 			}
 
 			// Success - store producer identity
@@ -2570,7 +2582,15 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		}
 
 		this.idempotentState = 'error'
+		this.initFailure = lastError
 		throw lastError
+	}
+
+	/** A non-retriable initialization failure: the producer stays in the error state, which rethrows it. */
+	private failInitialization(error: KafkaProtocolError): never {
+		this.idempotentState = 'error'
+		this.initFailure = error
+		throw error
 	}
 
 	/**

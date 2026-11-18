@@ -303,6 +303,12 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 				// offsets of the partitions being revoked and make the next owner
 				// reprocess them.
 				if (this.commitOffsets && !this.sessionLost) {
+					// A deleted topic (the leader's metadata watch asks for this rebalance once metadata stops showing
+					// it): its offsets cannot be committed (UNKNOWN_TOPIC_OR_PARTITION) and nobody will read it again.
+					// Dropped, so that the rebalance goes on (Java: "Will continue to join group").
+					offsetManager.clearPartitions(
+						partitions.filter(tp => !this.cluster.getMetadata()?.topics.has(tp.topic))
+					)
 					try {
 						await offsetManager.commitPendingOffsets()
 					} catch (error) {

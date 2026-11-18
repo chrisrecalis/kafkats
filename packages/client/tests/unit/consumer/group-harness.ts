@@ -3,6 +3,7 @@ import { onTestFinished } from 'vitest'
 import type { Cluster } from '@/client/cluster.js'
 import { Consumer } from '@/consumer/consumer.js'
 import type { ConsumerConfig } from '@/consumer/types.js'
+import { encodeAssignment, encodeSubscriptionMetadata } from '@/consumer/assignors/consumer-protocol.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import type { FetchRequest } from '@/protocol/messages/requests/fetch.js'
 import type { JoinGroupRequest } from '@/protocol/messages/requests/join-group.js'
@@ -43,10 +44,30 @@ interface ReceivedCommit {
  * logs, so a real Consumer with its ConsumerGroup, OffsetManager and FetchManager runs against it. `calls`
  * records the group requests in order (and `Fetch <partitions>` for each fetch).
  */
-export function fakeBroker(options: { partitions?: number; topicVisible?: boolean } = {}) {
+export function fakeBroker(
+	options: {
+		partitions?: number
+		topicVisible?: boolean
+		/** Members of the group besides the one under test, with their subscriptions (they never fetch or commit). */
+		otherMembers?: readonly { memberId: string; topics: readonly string[] }[]
+		/** Topics other than {@link TOPIC} that metadata shows, with their partition counts. */
+		topics?: Record<string, number>
+		/**
+		 * The first JoinGroup answers as to a static leader returning to a stable group (KIP-814, v9): skip the
+		 * assignment, SyncGroup then answers with this assignment of {@link TOPIC}.
+		 */
+		returningLeader?: readonly number[]
+	} = {}
+) {
 	const partitionCount = options.partitions ?? 2
 	/** Whether metadata shows {@link TOPIC} yet (a topic created moments ago may not show). */
 	let topicVisible = options.topicVisible ?? true
+	/** The topic was deleted: commits and fetches of it answer UNKNOWN_TOPIC_OR_PARTITION. */
+	let deleted = false
+	const otherTopics = new Map(Object.entries(options.topics ?? {}))
+	let returningLeader = options.returningLeader
+	/** The assignments of every SyncGroup request, by member. */
+	const syncs: Map<string, Buffer>[] = []
 	let metadataRefreshes = 0
 	let heartbeats = 0
 	const calls: string[] = []
@@ -86,24 +107,47 @@ export function fakeBroker(options: { partitions?: number; topicVisible?: boolea
 					members: [],
 				}
 			}
-			generationId++
+			const skipAssignment = returningLeader !== undefined
+			if (!skipAssignment) generationId++
 			const protocol = request.protocols[0]!
+			const others = (options.otherMembers ?? []).map(other => ({
+				memberId: other.memberId,
+				groupInstanceId: null,
+				metadata: encodeSubscriptionMetadata({ version: 0, topics: [...other.topics], userData: null }),
+			}))
 			return {
 				throttleTimeMs: 0,
 				errorCode: ErrorCode.None,
-				generationId,
+				generationId: Math.max(generationId, 1),
 				protocolType: 'consumer',
 				protocolName: protocol.name,
 				leader: memberId,
-				skipAssignment: false,
+				skipAssignment,
 				memberId,
-				members: [{ memberId, groupInstanceId: null, metadata: protocol.metadata }],
+				members: [{ memberId, groupInstanceId: null, metadata: protocol.metadata }, ...others],
 			}
 		},
 
 		async syncGroup(request: SyncGroupRequest) {
 			calls.push('SyncGroup')
 			await gates.syncGroup
+			syncs.push(new Map(request.assignments.map(entry => [entry.memberId, entry.assignment])))
+			if (returningLeader !== undefined) {
+				const partitions = [...returningLeader]
+				returningLeader = undefined
+				generationId = Math.max(generationId, 1)
+				return {
+					throttleTimeMs: 0,
+					errorCode: ErrorCode.None,
+					protocolType: 'consumer',
+					protocolName: request.protocolName,
+					assignment: encodeAssignment({
+						version: 0,
+						partitions: [{ topic: TOPIC, partitions }],
+						userData: null,
+					}),
+				}
+			}
 			const own = request.assignments.find(entry => entry.memberId === request.memberId)!.assignment
 			return {
 				throttleTimeMs: 0,
@@ -150,8 +194,10 @@ export function fakeBroker(options: { partitions?: number; topicVisible?: boolea
 			await gates.offsetCommit
 			const injected = commitErrors.shift()
 			const stale = request.generationId !== -1 && request.generationId !== generationId
-			const errorCode = injected ?? (stale ? ErrorCode.IllegalGeneration : ErrorCode.None)
+			const answer = injected ?? (stale ? ErrorCode.IllegalGeneration : ErrorCode.None)
+			const codeOf = (topic: string) => (deleted && topic === TOPIC ? ErrorCode.UnknownTopicOrPartition : answer)
 			for (const topic of request.topics) {
+				const errorCode = codeOf(topic.name)
 				for (const partition of topic.partitions) {
 					commits.push({
 						generationId: request.generationId,
@@ -171,7 +217,10 @@ export function fakeBroker(options: { partitions?: number; topicVisible?: boolea
 				throttleTimeMs: 0,
 				topics: request.topics.map(topic => ({
 					name: topic.name,
-					partitions: topic.partitions.map(({ partitionIndex }) => ({ partitionIndex, errorCode })),
+					partitions: topic.partitions.map(({ partitionIndex }) => ({
+						partitionIndex,
+						errorCode: codeOf(topic.name),
+					})),
 				})),
 			}
 		},
@@ -201,6 +250,13 @@ export function fakeBroker(options: { partitions?: number; topicVisible?: boolea
 			const answer = (): PartitionResponse[] =>
 				partitions.map(({ partitionIndex, fetchOffset }) => {
 					const log = logs.get(partitionIndex)!
+					if (deleted) {
+						return {
+							partition: partitionIndex,
+							errorCode: ErrorCode.UnknownTopicOrPartition,
+							highWatermark: -1n,
+						}
+					}
 					if (fetchOffset < log.start || fetchOffset > log.end) {
 						return {
 							partition: partitionIndex,
@@ -239,12 +295,14 @@ export function fakeBroker(options: { partitions?: number; topicVisible?: boolea
 		metadata: null as unknown,
 		refreshMetadata: async () => {
 			metadataRefreshes++
+			const shown = (count: number) => ({
+				partitions: new Map(Array.from({ length: count }, (_, p) => [p, { leader: 1 }])),
+			})
 			cluster.metadata = {
-				topics: new Map(
-					topicVisible
-						? [[TOPIC, { partitions: new Map(Array.from(logs.keys(), p => [p, { leader: 1 }])) }]]
-						: []
-				),
+				topics: new Map([
+					...(topicVisible ? [[TOPIC, shown(logs.size)] as const] : []),
+					...[...otherTopics].map(([topic, count]) => [topic, shown(count)] as const),
+				]),
 			}
 			return cluster.metadata
 		},
@@ -268,6 +326,17 @@ export function fakeBroker(options: { partitions?: number; topicVisible?: boolea
 		},
 		get heartbeats() {
 			return heartbeats
+		},
+		/** The assignments of every SyncGroup request, by member. */
+		syncs,
+		/** Delete {@link TOPIC}: metadata stops showing it, and commits and fetches of it fail. */
+		deleteTopic(): void {
+			deleted = true
+			topicVisible = false
+		},
+		/** Add partitions to one of the other topics (the next metadata refresh shows them). */
+		growTopic(topic: string, count: number): void {
+			otherTopics.set(topic, count)
 		},
 		/** Metadata shows the topic from now on. */
 		showTopic(): void {

@@ -550,7 +550,7 @@ const consumer = client.consumer({
 | `'sticky'`             | Minimize movement, eager rebalance                     |
 | `'range'`              | Simple per-topic assignment                            |
 
-As in the Java client, the member that computed the assignment (the group leader) keeps the partition counts of the subscribed topics it assigned with, and starts a rebalance once metadata shows different ones: a topic that metadata did not show yet when the group formed (one created moments before) is looked up again at every heartbeat and assigned once it shows up; partitions added to a topic, or a deleted topic, are noticed at the next metadata refresh (`metadataRefreshIntervalMs`).
+As in the Java client, the member that computed the assignment (the group leader) keeps the partition counts of the topics the group subscribes to (those of every member, not only its own) it assigned with, and starts a rebalance once metadata shows different ones: a topic that metadata did not show yet when the group formed (one created moments before) is looked up again at every heartbeat and assigned once it shows up; partitions added to a topic, or a deleted topic, are noticed at the next metadata refresh (`metadataRefreshIntervalMs`). The offsets consumed from a deleted topic are dropped, not committed. A static member that rejoins as leader while the group is stable keeps the group's assignment and goes on watching (KIP-814, JoinGroup v9).
 
 ## Isolation Level
 

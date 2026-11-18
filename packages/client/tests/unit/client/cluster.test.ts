@@ -664,7 +664,6 @@ describe('Cluster', () => {
 			const group = new ConsumerGroup(cluster, { groupId: 'g', partitionAssignmentStrategy: 'range' })
 			const leader = group as unknown as {
 				computeAssignments(
-					topics: string[],
 					members: Array<{ memberId: string; groupInstanceId: string | null; metadata: Buffer }>,
 					protocolName: string | null
 				): Promise<void>
@@ -673,7 +672,6 @@ describe('Cluster', () => {
 			const subscription = encodeSubscriptionMetadata({ version: 0, topics: ['t'], userData: null })
 
 			await leader.computeAssignments(
-				['t'],
 				[
 					{ memberId: 'a', groupInstanceId: null, metadata: subscription },
 					{ memberId: 'b', groupInstanceId: null, metadata: subscription },

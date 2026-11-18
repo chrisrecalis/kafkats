@@ -27,8 +27,10 @@ export interface JoinGroupRequest {
  *
  * - v0-v5: non-flexible encoding
  * - v6+: flexible encoding with compact strings and tagged fields
+ * - v9: a static leader that rejoins a stable group is told to skip the assignment (KIP-814); below it the
+ *   broker names the replaced member as leader, and the returning leader would stop watching the metadata
  */
-export const JOIN_GROUP_VERSIONS = { min: 5, max: 5 }
+export const JOIN_GROUP_VERSIONS = { min: 5, max: 9 }
 
 export function encodeJoinGroupRequest(encoder: IEncoder, version: number, request: JoinGroupRequest): void {
 	if (version < JOIN_GROUP_VERSIONS.min || version > JOIN_GROUP_VERSIONS.max) {

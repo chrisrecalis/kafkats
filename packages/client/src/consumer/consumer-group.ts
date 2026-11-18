@@ -10,6 +10,8 @@
 
 import { EventEmitter } from 'node:events'
 import type { Cluster } from '@/client/cluster.js'
+import type { ClusterMetadata } from '@/client/types.js'
+import type { JoinGroupMember } from '@/protocol/messages/responses/join-group.js'
 import type { Broker } from '@/client/broker.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import { KafkaProtocolError, CoordinatorNotAvailableError, isConnectionFailure } from '@/client/errors.js'
@@ -600,16 +602,24 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 			this.rebalanceProtocol = 'eager'
 		}
 
-		// If we're the leader, we need to compute assignments
-		if (response.leader === this.memberId) {
+		if (response.leader !== this.memberId) {
+			// Only the leader watches the metadata of the subscribed topics.
+			this.assignedPartitionCounts = null
+		} else if (response.skipAssignment) {
+			// A static leader that rejoined a stable group (KIP-814, JoinGroup v9): the group keeps its assignment, and
+			// the leader goes on watching the metadata (Java's onLeaderElected with skipAssignment).
+			this.logger.debug('this member is leader of an unchanged group, skipping the assignment', {
+				memberCount: response.members.length,
+			})
+			const { subscribed } = subscriptionsOf(response.members)
+			this.leaderAssignments = null
+			this.assignedPartitionCounts = partitionCounts(subscribed, await this.cluster.refreshMetadata(subscribed))
+		} else {
 			this.logger.debug('this member is leader, computing assignments', {
 				memberCount: response.members.length,
 				protocolName: response.protocolName,
 			})
-			await this.computeAssignments(topics, response.members, response.protocolName)
-		} else {
-			// Only the leader watches the metadata of the subscribed topics.
-			this.assignedPartitionCounts = null
+			await this.computeAssignments(response.members, response.protocolName)
 		}
 
 		this.state = ConsumerGroupState.AWAITING_SYNC
@@ -680,31 +690,22 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 	}
 
 	/**
-	 * Compute partition assignments (leader only)
+	 * Compute partition assignments (leader only), over the topics any member subscribes to: like Java's
+	 * onLeaderElected, the leader fetches and watches the metadata of the whole group's subscription, so that a topic
+	 * only other members subscribe to is assigned too.
 	 */
-	private async computeAssignments(
-		topics: string[],
-		members: Array<{ memberId: string; groupInstanceId: string | null; metadata: Buffer }>,
-		protocolName: string | null
-	): Promise<void> {
-		// Fetch metadata for all subscribed topics
-		const metadata = await this.cluster.refreshMetadata(topics)
+	private async computeAssignments(members: JoinGroupMember[], protocolName: string | null): Promise<void> {
+		const { subscriptions, subscribed } = subscriptionsOf(members)
+		const metadata = await this.cluster.refreshMetadata(subscribed)
 
 		// Build topic -> partitions map
 		const topicPartitions = new Map<string, number[]>()
-		for (const topic of topics) {
+		for (const topic of subscribed) {
 			const topicMeta = metadata.topics.get(topic)
 			if (topicMeta) {
 				topicPartitions.set(topic, Array.from(topicMeta.partitions.keys()))
 			}
 		}
-
-		// Build member subscriptions
-		const memberSubscriptions: MemberSubscription[] = members.map(m => ({
-			memberId: m.memberId,
-			groupInstanceId: m.groupInstanceId ?? undefined,
-			metadata: decodeSubscriptionMetadata(m.metadata),
-		}))
 
 		// Use the assignor matching the broker-selected protocol
 		const assignor = this.getAssignorForProtocol(protocolName)
@@ -712,12 +713,12 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 			assignor: assignor.name,
 			protocolName,
 			memberCount: members.length,
-			topicCount: topics.length,
+			topicCount: subscribed.length,
 		})
 
 		// Compute assignments using the selected assignor
-		this.leaderAssignments = assignor.assign(memberSubscriptions, topicPartitions)
-		this.assignedPartitionCounts = new Map(topics.map(topic => [topic, topicPartitions.get(topic)?.length ?? 0]))
+		this.leaderAssignments = assignor.assign(subscriptions, topicPartitions)
+		this.assignedPartitionCounts = partitionCounts(subscribed, metadata)
 	}
 
 	/**
@@ -1071,4 +1072,23 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 		this.ownedPartitions = []
 		this.pendingRevocation = []
 	}
+}
+
+/** The members' decoded subscriptions, and every topic one of them subscribes to (the group's subscription). */
+function subscriptionsOf(members: readonly JoinGroupMember[]): {
+	subscriptions: MemberSubscription[]
+	subscribed: string[]
+} {
+	const subscriptions = members.map(member => ({
+		memberId: member.memberId,
+		groupInstanceId: member.groupInstanceId ?? undefined,
+		metadata: decodeSubscriptionMetadata(member.metadata),
+	}))
+	const subscribed = [...new Set(subscriptions.flatMap(subscription => subscription.metadata.topics))].sort()
+	return { subscriptions, subscribed }
+}
+
+/** The partition count metadata shows of each topic (0 for a topic it does not show): the leader's snapshot. */
+function partitionCounts(topics: readonly string[], metadata: ClusterMetadata): Map<string, number> {
+	return new Map(topics.map(topic => [topic, metadata.topics.get(topic)?.partitions.size ?? 0]))
 }

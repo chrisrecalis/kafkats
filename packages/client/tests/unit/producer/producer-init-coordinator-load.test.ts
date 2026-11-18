@@ -1,6 +1,7 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 
 import { Producer } from '@/producer/producer.js'
+import { KafkaProtocolError } from '@/client/errors.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import { createMockBroker, createMockCluster, type MockBroker } from './_helpers.js'
 
@@ -96,5 +97,61 @@ describe('Producer InitProducerId retries CoordinatorLoadInProgress', () => {
 		await expect(producer.transaction(async () => {})).rejects.toThrow(/InitProducerId failed/)
 		// Non-retriable code must escape the retry loop on the first attempt (no deadline blocking).
 		expect(txnCoordinator.initProducerId).toHaveBeenCalledTimes(1)
+	})
+
+	it('a non-retriable InitProducerId error is a KafkaProtocolError with its code, rethrown by every later begin', async () => {
+		txnCoordinator.initProducerId.mockResolvedValue({
+			throttleTimeMs: 0,
+			errorCode: ErrorCode.TransactionalIdAuthorizationFailed,
+			producerId: -1n,
+			producerEpoch: -1,
+		})
+		const producer = new Producer(mockCluster, { lingerMs: 0, retryBackoffMs: 1, transactionalId: 'tx-1' })
+
+		const first: unknown = await producer.beginTransaction().catch((error: unknown) => error)
+		expect(first).toBeInstanceOf(KafkaProtocolError)
+		expect((first as KafkaProtocolError).errorCode).toBe(ErrorCode.TransactionalIdAuthorizationFailed)
+		await expect(producer.beginTransaction()).rejects.toBe(first)
+		expect(txnCoordinator.initProducerId).toHaveBeenCalledTimes(1)
+	})
+
+	it('a non-retriable FindCoordinator answer (no Describe on the transactional id) fails fast too', async () => {
+		const denied = new KafkaProtocolError(ErrorCode.TransactionalIdAuthorizationFailed, 'FindCoordinator failed')
+		mockCluster.getCoordinator.mockRejectedValue(denied)
+		const producer = new Producer(mockCluster, {
+			lingerMs: 0,
+			retryBackoffMs: 1,
+			maxBlockMs: 60_000,
+			transactionalId: 'tx-1',
+		})
+
+		await expect(producer.beginTransaction()).rejects.toBe(denied)
+		expect(mockCluster.getCoordinator).toHaveBeenCalledTimes(1)
+		expect(txnCoordinator.initProducerId).not.toHaveBeenCalled()
+	})
+
+	it('a disconnect stops the retries: a producer given up never bumps the epoch after its successor', async () => {
+		txnCoordinator.initProducerId.mockResolvedValue({
+			throttleTimeMs: 0,
+			errorCode: ErrorCode.ConcurrentTransactions,
+			producerId: -1n,
+			producerEpoch: -1,
+		})
+		const producer = new Producer(mockCluster, {
+			lingerMs: 0,
+			retryBackoffMs: 5,
+			maxRetryBackoffMs: 5,
+			maxBlockMs: 60_000,
+			transactionalId: 'tx-1',
+		})
+		const begin = producer.beginTransaction()
+		begin.catch(() => {})
+		await vi.waitFor(() => expect(txnCoordinator.initProducerId.mock.calls.length).toBeGreaterThanOrEqual(2))
+
+		await producer.disconnect({ timeoutMs: 100 })
+		await expect(begin).rejects.toThrow('Producer disconnected')
+		const calls = txnCoordinator.initProducerId.mock.calls.length
+		await new Promise(resolve => setTimeout(resolve, 50))
+		expect(txnCoordinator.initProducerId).toHaveBeenCalledTimes(calls)
 	})
 })

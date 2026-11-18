@@ -5,7 +5,7 @@ import { Consumer } from '@/consumer/consumer.js'
 describe('Consumer', () => {
 	it('clears sessionLost after partitionsAssigned so commits resume after rejoin', async () => {
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		const cluster = { getLogger: () => null } as any
+		const cluster = { getLogger: () => null, getMetadata: () => ({ topics: new Map([['t', {}]]) }) } as any
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const consumer = new Consumer(cluster, { groupId: 'g' } as any)
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
