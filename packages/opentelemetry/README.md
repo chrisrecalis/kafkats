@@ -1,6 +1,6 @@
 # @kafkats/opentelemetry
 
-OpenTelemetry traces and metrics for `@kafkats/client`.
+OpenTelemetry traces and metrics for `@kafkats/client` and `@kafkats/flow`.
 
 ## Installation
 
@@ -23,6 +23,8 @@ Nothing in the client is patched: the client publishes what it does on `node:dia
 ## What You Get
 
 **Traces.** A `send <topic>` span for every `send()` call and a `process <topic>` span for every handler call. The trace context travels in the message headers (W3C `traceparent` unless you configured another propagator), so the handler's span continues the trace of the request that sent the message. A batch handler's span links to the sends of its messages. The handler runs with its span active, so spans it creates are children.
+
+**Flow applications.** A `@kafkats/flow` application (0.14 or later) gets a `process <topic>` span for every record one of its tasks processes, continuing the trace of the send that produced the record. The processors run with it active, so the records the topology sends (outputs, repartition and changelog records) stay in that trace, and so do spans your processors create. The span carries the task (`kafkats.flow.task.id`) and the application id as the consumer group. The application's consumer still reports a `process` span per fetched batch: that is the handler that hands the records to the tasks.
 
 **Metrics.** Only what a broker cannot see. Consumer group lag, topic offsets and broker request rates come from a broker exporter such as `kafka_exporter`.
 
@@ -58,6 +60,8 @@ Once it is on, every send and every handler call costs a few microseconds, measu
 | waits 1 ms (a fast database call) | about −1.5%  | about −6%          | about −5%                  |
 
 Throughput of `runEach`, relative to no instrumentation. What you pay depends on what your handler does: next to real I/O it is small, next to an empty handler it dominates. `pnpm bench:client` in this package measures it for your machine.
+
+A flow application pays per record, for the record's `process` span and for the send of each record it produces. A topology that does almost nothing (the `stateless` scenario of `pnpm bench:flow`, at-least-once) runs about 70% slower with every record traced, of which about 20 points are the `process` spans of the records, and about 55% slower with 1% of traces sampled and metrics on. A flow application nothing listens to pays nothing.
 
 A message that belongs to a trace that was not sampled gets no span: the decision of the sender is followed, as OpenTelemetry's default sampler does, and it is passed on to whatever the handler sends.
 

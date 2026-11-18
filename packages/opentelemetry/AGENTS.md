@@ -1,6 +1,6 @@
 # @kafkats/opentelemetry
 
-Turns the diagnostics `@kafkats/client` publishes into OpenTelemetry spans and metrics.
+Turns the diagnostics `@kafkats/client` and `@kafkats/flow` publish into OpenTelemetry spans and metrics.
 
 ## Commands
 
@@ -16,12 +16,13 @@ pnpm typecheck  # Type checking
 - **Only what a broker cannot see.** Group lag, topic offsets and broker request rates belong to broker exporters (`kafka_exporter`, JMX). A metric goes in here if it describes the inside of the client or the application's handlers.
 - `src/operations.ts`: follows one operation of a tracing channel from start to finish. Both tracing and metrics are built on it.
 - `src/tracing.ts`: `send` and `process` spans; writes and reads trace context in message headers through the configured propagator; runs the handler with its span active (`ProcessDiagnostics.runHandlerIn`). No span inside a trace that is not sampled; the context is still passed on.
+- `src/flow.ts`: a `process` span per record a flow task processes, from flow's `kafkats:flow:process` channel (`FlowProcessDiagnostics.runIn` puts the processing in the span's context). Subscribed by channel name: flow is a dev dependency only (its types), never imported at run time.
 - `src/metrics.ts`: counters and histograms from operations; gauges read from `metrics()` of every producer and consumer created after `instrumentKafka()` (held weakly; instances with the same attributes are summed into one series).
 - `src/attributes.ts`: names from OpenTelemetry's messaging semantic conventions. They are "in development" upstream and have been renamed before, so they are kept in one place and out of the client.
 
 ## Tests
 
-`tests/tracing.test.ts` and `tests/metrics.test.ts` drive the client's channels directly, with in-memory OpenTelemetry exporters. `tests/end-to-end.test.ts` uses a real producer and consumer; `pnpm test:integration` runs it with a broker from testcontainers, which is what CI does.
+`tests/tracing.test.ts` and `tests/metrics.test.ts` drive the client's channels directly, with in-memory OpenTelemetry exporters; `tests/flow.test.ts` runs flow topologies on the `TestDriver`. `tests/end-to-end.test.ts` uses a real producer and consumer, and a flow application between them; `pnpm test:integration` runs it with a broker from testcontainers, which is what CI does.
 
 ## What Instrumentation Costs
 

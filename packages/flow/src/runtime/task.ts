@@ -17,6 +17,7 @@ import { isSkipMarker, RecordQueue } from '@/runtime/record-queue.js'
 import { tpKey } from '@/runtime/task-id.js'
 import { TaskOffsets, type PartitionStart } from '@/runtime/task-offsets.js'
 import { TaskTopology } from '@/runtime/task-topology.js'
+import { traceProcess } from '@/runtime/tracing.js'
 import type { StateStore } from '@/state.js'
 import type { Checkpoints } from '@/state/checkpoints.js'
 import type { StateDirectory } from '@/state/state-directory.js'
@@ -337,9 +338,9 @@ export class StreamTask {
 	/**
 	 * Processes one record. false: none ready, or the task left RUNNING while the record's subtree ran (a slice that
 	 * outlived a close: its record is not counted, and neither is its failure). A promise only when the record's
-	 * subtree went async.
+	 * subtree went async. `traced`: the tracing channel has subscribers (the caller asks it once per slice).
 	 */
-	processOne(now: number): MaybePromise<boolean> {
+	processOne(now: number, traced = false): MaybePromise<boolean> {
 		this.drained = false
 		const { topology } = this
 		if (!this.active || topology === undefined) {
@@ -352,7 +353,9 @@ export class StreamTask {
 		if (isSkipMarker(record)) {
 			return this.processed(record.queue)
 		}
-		const result = topology.process(record, now)
+		const result = traced
+			? traceProcess(this.config.applicationId, this.id, record.message, () => topology.process(record, now))
+			: topology.process(record, now)
 		if (result === undefined) {
 			return this.processed(record.queue)
 		}

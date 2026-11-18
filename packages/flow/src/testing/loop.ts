@@ -17,6 +17,7 @@ import { RecordCollector } from '@/runtime/record-collector.js'
 import { TaskIdRegistry, tpKey } from '@/runtime/task-id.js'
 import { TaskManager } from '@/runtime/task-manager.js'
 import type { StreamTask } from '@/runtime/task.js'
+import { flowDiagnostics } from '@/runtime/tracing.js'
 import type { StateStore } from '@/state.js'
 import { Checkpoints } from '@/state/checkpoints.js'
 import { StateDirectory } from '@/state/state-directory.js'
@@ -231,7 +232,7 @@ export class TestLoop {
 				return
 			}
 			await this.ensureTransaction()
-			await this.guard('processing', () => task.processOne(now))
+			await this.guard('processing', () => task.processOne(now, flowDiagnostics.process.hasSubscribers))
 			for (const each of this.tasks.tasks()) {
 				if (each.streamTimePunctuationDue()) {
 					await this.guard('punctuation', () => each.maybePunctuateStreamTime())

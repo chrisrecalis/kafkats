@@ -10,6 +10,7 @@ import type { GroupConsumerHooks } from '@/runtime/io.js'
 import { Scheduler } from '@/runtime/scheduler.js'
 import { tpKey } from '@/runtime/task-id.js'
 import type { PartitionStart, StreamTask } from '@/runtime/task.js'
+import { flowDiagnostics, type FlowProcessDiagnostics } from '@/runtime/tracing.js'
 import type { KeyValueStore } from '@/state.js'
 import type { InternalTopologyBuilder } from '@/topology/builder.js'
 import { deferred, type Deferred, type TestRecord } from '../support/fake-io.js'
@@ -417,6 +418,30 @@ describe('Scheduler: slices (4.5.5, 4.13)', () => {
 		f.scheduler.wake()
 		await settle()
 		expect(processed).toBe(1)
+	})
+
+	it('traces the records of the slices that start while the tracing channel has subscribers (6.26)', async () => {
+		const processed: string[] = []
+		const f = new Fixture({ build: b => pipe(b, { processor: processor(r => void processed.push(r.value)) }) })
+		const [task] = await f.tasks(1)
+		const traced: bigint[] = []
+		const start = (message: unknown) => void traced.push((message as FlowProcessDiagnostics).offset)
+		await f.start()
+
+		f.deliver(task!, values('a'))
+		await settle()
+		flowDiagnostics.process.start.subscribe(start)
+		try {
+			f.deliver(task!, values('b', 'c'))
+			await settle()
+		} finally {
+			flowDiagnostics.process.start.unsubscribe(start)
+		}
+		f.deliver(task!, values('d'))
+		await settle()
+
+		expect(processed).toEqual(['a', 'b', 'c', 'd'])
+		expect(traced).toEqual([1n, 2n])
 	})
 })
 

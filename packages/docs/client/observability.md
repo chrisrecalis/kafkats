@@ -45,6 +45,8 @@ The two are connected through message headers. On send, the trace context is wri
 
 A send or a message inside a trace that was not sampled gets no span. The sampling decision of the sender is followed, as OpenTelemetry's default sampler does, and it is passed on to whatever the handler sends.
 
+A [flow](/flow/) application processes records in its tasks, one at a time, after its consumer handed them over in batches. Each record gets its own `process <topic>` span, which continues the trace of the send that produced the record. The processors run with it active, so the records the topology sends while processing it (outputs, repartition and changelog records) stay in that trace. Flow publishes these on its own tracing channel, `kafkats:flow:process` (exported as `flowDiagnostics` from `@kafkats/flow`); `instrumentKafka()` subscribes to it as well.
+
 ### Metrics
 
 | Metric                                  | Type      | What it tells you                                            |

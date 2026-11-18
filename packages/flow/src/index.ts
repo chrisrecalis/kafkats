@@ -156,3 +156,7 @@ export {
 	SourceTopicNotFoundError,
 } from '@/changelog.js'
 export type { ChangelogConfig, ChangelogRestorationOptions } from '@/changelog.js'
+
+// Diagnostics: the records tasks process, on node:diagnostics_channel (`kafkats:flow:process`)
+export { flowDiagnostics } from '@/runtime/tracing.js'
+export type { FlowProcessDiagnostics } from '@/runtime/tracing.js'

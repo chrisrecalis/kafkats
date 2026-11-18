@@ -1,8 +1,9 @@
 import { context, trace } from '@opentelemetry/api'
 import { KafkaClient } from '@kafkats/client'
+import { flow } from '@kafkats/flow'
 import { afterEach, beforeAll, describe, expect, it } from 'vitest'
 
-import { KAFKATS_METRIC, METRIC, instrumentKafka } from '../src/index.js'
+import { ATTR, KAFKATS_METRIC, METRIC, instrumentKafka } from '../src/index.js'
 import { metricRecorder, spanRecorder, useW3CContext } from './setup.js'
 
 const brokers = process.env.KAFKA_BROKERS?.split(',').map(broker => broker.trim())
@@ -68,5 +69,66 @@ describe.skipIf(!brokers)('a real producer and consumer', () => {
 			await producer.disconnect()
 			await client.disconnect()
 		}
+	})
+
+	it('one trace from the request through a flow application to the handler that consumes its output', async () => {
+		const spans = spanRecorder()
+		stop = instrumentKafka({ tracerProvider: spans.tracerProvider, metrics: false })
+
+		const client = new KafkaClient({ brokers: brokers!, clientId: 'otel-e2e-flow', logLevel: 'silent' })
+		await client.connect()
+		const input = unique('otel-e2e-flow-in')
+		const output = unique('otel-e2e-flow-out')
+		await client.createTopics([
+			{ name: input, numPartitions: 1, replicationFactor: 1 },
+			{ name: output, numPartitions: 1, replicationFactor: 1 },
+		])
+		const app = flow({
+			applicationId: unique('otel-e2e-flow-app'),
+			client,
+			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 100 },
+		})
+		app.stream(input)
+			.mapValues(value => Buffer.from(`${value?.toString()} and billed`))
+			.to(output)
+		const producer = client.producer({ lingerMs: 0 })
+		const consumer = client.consumer({ groupId: unique('otel-e2e-flow-group'), autoOffsetReset: 'earliest' })
+		const request = spans.tracerProvider.getTracer('app').startSpan('POST /orders')
+		let traceparent: string | undefined
+		try {
+			await app.start()
+			await context.with(trace.setSpan(context.active(), request), () =>
+				producer.send(input, { key: 'order-1', value: Buffer.from('created') })
+			)
+			request.end()
+			await consumer.runEach(output, async message => {
+				traceparent = message.headers.traceparent?.toString()
+				consumer.stop()
+			})
+		} finally {
+			// Every send of the application is acknowledged: their spans ended.
+			await app.close()
+			await producer.disconnect()
+			await client.disconnect()
+		}
+
+		const named = (name: string) => spans.spans().filter(span => span.name === name)
+		const [sendInput] = named(`send ${input}`)
+		// The flow task's span, not the one of the handler that hands the fetched batches to the tasks.
+		const [processing] = named(`process ${input}`).filter(span => span.attributes[ATTR.taskId] === '0_0')
+		const [sendOutput] = named(`send ${output}`)
+		const [handler] = named(`process ${output}`)
+		const traceId = request.spanContext().traceId
+		expect([sendInput, processing, sendOutput, handler].map(span => span!.spanContext().traceId)).toEqual([
+			traceId,
+			traceId,
+			traceId,
+			traceId,
+		])
+		expect(sendInput!.parentSpanContext?.spanId).toBe(request.spanContext().spanId)
+		expect(processing!.parentSpanContext?.spanId).toBe(sendInput!.spanContext().spanId)
+		expect(sendOutput!.parentSpanContext?.spanId).toBe(processing!.spanContext().spanId)
+		expect(handler!.parentSpanContext?.spanId).toBe(sendOutput!.spanContext().spanId)
+		expect(traceparent).toBe(`00-${traceId}-${sendOutput!.spanContext().spanId}-01`)
 	})
 })

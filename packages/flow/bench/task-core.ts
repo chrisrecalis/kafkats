@@ -1,8 +1,9 @@
 /**
  * Micro-benchmark of the task core (spec 9.6): records through `StreamTask.processOne` for a stateless topology and
  * a count topology (in-memory store), at-least-once commits every 10000 records, over the test ports of the task
- * harness. A measurement is the best of 7 runs, in ns per record. More than 10% slower than `bench/baseline.json` in
- * three measurements in a row fails. `--record` writes the baseline instead (the median of three measurements).
+ * harness, with nothing subscribed to the tracing channel. A measurement is the best of 7 runs, in ns per record. More
+ * than 10% slower than `bench/baseline.json` in three measurements in a row fails. `--record` writes the baseline
+ * instead (the median of three measurements).
  *
  *     pnpm -C packages/flow bench:task-core [--record]
  */
@@ -12,6 +13,7 @@ import type { ProcessorContext, ProcessorSupplier } from '@/processor/api.js'
 import type { KeyValueStore } from '@/state.js'
 import type { InternalTopologyBuilder } from '@/topology/builder.js'
 import { isThenable } from '@/processor/node.js'
+import { flowDiagnostics } from '@/runtime/tracing.js'
 import { message } from '../tests/unit/support/fake-io.js'
 import { kvStore, passThrough, pipe, TaskHarness } from '../tests/unit/support/task-harness.js'
 
@@ -58,8 +60,10 @@ async function run(build: (b: InternalTopologyBuilder) => void): Promise<number>
 		const now = h.clock.now()
 		for (let done = 0; done < records; done += BATCH) {
 			task.addRecords(tp, batch)
+			// Asked once per slice, as the scheduler does.
+			const traced = flowDiagnostics.process.hasSubscribers
 			for (;;) {
-				let processed = task.processOne(now)
+				let processed = task.processOne(now, traced)
 				if (isThenable(processed)) {
 					processed = await processed
 				}

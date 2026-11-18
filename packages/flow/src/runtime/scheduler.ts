@@ -17,6 +17,7 @@ import { cap, raceSignal, yieldIfDue } from '@/runtime/signals.js'
 import { TaskIdRegistry } from '@/runtime/task-id.js'
 import type { TaskManager } from '@/runtime/task-manager.js'
 import type { StreamTask } from '@/runtime/task.js'
+import { flowDiagnostics } from '@/runtime/tracing.js'
 
 /** A slice stops after the record that crosses this much time since the slice started. */
 export const ROUND_SLICE_MS = 10
@@ -239,9 +240,10 @@ export class Scheduler {
 		let site: FailureSite = 'processing'
 		try {
 			const now = clock.now()
+			const traced = flowDiagnostics.process.hasSubscribers
 			let ready = task.isProcessable(now, this.lag)
 			while (ready && this.continues(task)) {
-				let processed = task.processOne(now)
+				let processed = task.processOne(now, traced)
 				if (isThenable(processed)) {
 					processed = await processed
 				}

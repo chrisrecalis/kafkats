@@ -1,7 +1,7 @@
 import type { TracingChannel } from 'node:diagnostics_channel'
 
 /**
- * Follow the operations of one of the client's tracing channels from start to finish.
+ * Follow the operations of one of the client's (or flow's) tracing channels from start to finish.
  *
  * `started` may return a value (a span, a start time) that `finished` gets back when the
  * operation has settled, with the failure if there was one. Returns the function that stops it.
@@ -20,7 +20,7 @@ export function onOperation<C extends { error?: unknown }, S>(
 		context[state] = { value: hooks.started(context) }
 		inFlight++
 	}
-	// The client settles every operation asynchronously, so this is always the last event.
+	// The client and flow settle every operation asynchronously, so this is always the last event.
 	const asyncEnd = (message: unknown): void => {
 		const context = message as Running
 		const running = context[state]
