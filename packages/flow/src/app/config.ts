@@ -17,6 +17,7 @@ const REMOVED_KEYS: Readonly<Record<string, string>> = {
 	numStreamThreads: 'run more instances of the application: tasks of one instance already process concurrently',
 	restartOnError: "use uncaughtExceptionHandler ('shutdown' is the default; 'restart' rejoins after a fatal error)",
 	consumerRun: 'use commitIntervalMs; tasks of one instance process concurrently',
+	runEach: 'use commitIntervalMs; tasks of one instance process concurrently',
 	stateDir: 'pass the directory to the state store provider, e.g. lmdb({ stateDir })',
 }
 

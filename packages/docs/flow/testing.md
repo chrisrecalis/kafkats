@@ -1,10 +1,6 @@
 # Testing
 
-@kafkats/flow provides a testing module for writing tests without a real Kafka broker.
-
-## Installation
-
-The testing utilities are included in @kafkats/flow. They mock the Kafka client with Vitest, so use them from Vitest tests:
+`@kafkats/flow/testing` runs a topology without Kafka. Its `TestDriver` is flow's counterpart of Kafka Streams' `TopologyTestDriver`: it runs the production task runtime (tasks, state stores, commits, the exception handlers) over in-memory ports, deterministically, and with a mock wall clock. The utilities do not depend on a test framework.
 
 ```typescript
 import { TestDriver, ResultCollector } from '@kafkats/flow/testing'
@@ -12,73 +8,121 @@ import { TestDriver, ResultCollector } from '@kafkats/flow/testing'
 
 ## TestDriver
 
-The main testing utility that mocks Kafka:
-
 ```typescript
-import { TestDriver, ResultCollector } from '@kafkats/flow/testing'
-import { string, json } from '@kafkats/client'
+import { string, json } from '@kafkats/flow'
+import { TestDriver } from '@kafkats/flow/testing'
 
 const driver = new TestDriver()
 
-// Build topology
 driver
 	.input('orders', { key: string(), value: json<Order>() })
 	.filter((_, order) => order !== null && order.total > 100)
-	.mapValues(order => ({ ...order, processed: true }))
-	.to('large-orders', { value: json() })
+	.mapValues(order => ({ ...order!, processed: true }))
+	.to('large-orders', { key: string(), value: json() })
 
-// Run test
 await driver.run(async ({ send, output }) => {
-	await send('orders', { id: '1', total: 150 })
-	await send('orders', { id: '2', total: 50 })
+	await send('orders', { id: '1', total: 150 }, { keyValue: 'o1', keyCodec: string() })
+	await send('orders', { id: '2', total: 50 }, { keyValue: 'o2', keyCodec: string() })
 
-	const results = output('large-orders', { value: json<Order>() })
+	const results = output('large-orders', { key: string(), value: json<Order>() })
 	expect(results).toHaveLength(1)
 	expect(results[0]?.value?.id).toBe('1')
 })
 ```
 
-`send()` encodes values as JSON unless you pass a `codec` (a `Buffer` is sent as is). Keys are `Buffer`s (`{ key: Buffer.from('k1') }`), or a value plus its codec (`{ keyValue: 'k1', keyCodec: string() }`). Timestamps are `bigint` milliseconds and default to the current time.
+- `driver.input(topic, consumed)`, `driver.table(topic, options)` and `driver.globalTable(topic, options)` start a topology, as `app.stream()`, `app.table()` and `app.globalTable()` do; `driver.flow` is the underlying app (for `addStateStore()`, `describe()`, or several inputs).
+- `run(fn)` starts the driver, runs `fn` with the test context, then stops it. `start()` and `stop()` do the same in two steps.
+- **`send()` resolves once the record and everything it led to were processed**: records written to topics the topology reads (repartition topics, `through()` topics, a topic it writes with `to()` and reads with `stream()`) are fed back in, partitioned as a producer would partition them. There is nothing to wait for.
+- Offsets are committed after every record by default, as `TopologyTestDriver` does (`commitEvery`).
 
-### Topics the topology also reads
-
-When a topology writes to a topic that it also reads, `TestDriver` feeds the record back into the topology automatically, like a real consumer would. This covers `through()` and the internal repartition topics created by `groupBy()` or by `selectKey()` followed by `groupByKey()`, a join or `toTable()`. The record is delivered once the current record has been processed, with its key, partition, timestamp and headers.
+### Sending records
 
 ```typescript
-driver
-	.input('orders', { key: string(), value: json<Order>() })
-	.groupBy((_, order) => order?.userId ?? 'unknown', { key: string(), name: 'orders-by-user' })
-	.count()
-	.toStream()
-	.peek(results.collector())
+await send('orders', order, {
+	keyValue: 'o1', // a key, encoded with keyCodec
+	keyCodec: string(),
+	// or key: Buffer.from('o1')
+	codec: json<Order>(), // value codec; without one, non-Buffer values are sent as JSON
+	partition: 0, // default 0
+	timestamp: 1_700_000_000_000, // number or bigint; default: the mock wall clock
+	headers: { source: Buffer.from('test') },
+})
+await send('users', null, { keyValue: 'u1', keyCodec: string() }) // a tombstone
+await sendAll('orders', [order1, order2], { keyValue: 'o1', keyCodec: string() })
+```
 
-await driver.run(async ({ send }) => {
-	await send('orders', { userId: 'u1', total: 10 }, { key: Buffer.from('o1') })
+A topic the topology reads gets as many partitions as the records sent to it need, unless `partitions` in the driver config says otherwise.
 
-	// The record went through the repartition topic and was counted
-	expect(results.last?.value).toBe(1)
+### Reading output
+
+```typescript
+const records = output('large-orders', { key: string(), value: json<Order>() }) // [{ topic, key, value, partition }]
+producer.messagesFor('large-orders') // raw: Buffer key and value, partition, timestamp (bigint), headers
+clear() // forget what was produced so far
+```
+
+`producer` (a `MockProducer`) records every send, including repartition and changelog records, and under exactly-once the committed transactions (`producer.transactions`). `consumer.committed` holds the committed offsets by `topic:partition`, with their commit metadata.
+
+## Time
+
+Stream time moves with the records' timestamps; the wall clock is a mock that moves only when the test moves it.
+
+```typescript
+const driver = new TestDriver({ initialWallClockTimeMs: 0 })
+
+await driver.run(async ({ send, advanceWallClockTime }) => {
+	await send('events', 'x', { timestamp: 1_000 })
+	await advanceWallClockTime(60_000) // wall-clock punctuators due by then run, then whatever became processable
 })
 ```
 
-### Timestamps and headers
+Windows close, suppressed results are released and unmatched left/outer join results are emitted only when stream time passes them: send a later record (of any key in the same task) to move it. The driver's throttle for emit-on-window-close and outer-join results is 0 by default (`emitIntervalMs`), so they appear as soon as stream time allows.
 
-`MockProducer` records the `timestamp` and `headers` of every message it receives, next to `topic`, `key`, `value` and `partition`, so you can assert on them. Records written with `to()` or `through()` keep the input record's timestamp:
+## State Stores
 
 ```typescript
-driver.input('in').to('out')
+await driver.run(async ({ send, getStateStore }) => {
+	await send('clicks', 'x', { keyValue: 'u1', keyCodec: string() })
 
-await driver.run(async ({ send, producer }) => {
-	await send('in', Buffer.from('v'), { timestamp: 1000n, headers: { 'trace-id': Buffer.from('abc') } })
+	const counts = getStateStore<TimestampedKeyValueStore<string, number>>('clicks-per-user') // the task of partition 0
+	expect((await counts.get('u1'))?.value).toBe(1)
 
-	const [message] = producer.messagesFor('out')
-	expect(message?.timestamp).toBe(1000n)
-	expect(message?.headers).toEqual({ 'trace-id': Buffer.from('abc') })
+	const typed = getStateStore(lastSeen) // the Stores definition of a processor's store gives it its type
+	const other = getStateStore('clicks-per-user', 1) // the task of partition 1
+})
+```
+
+`getStateStore(name, partition?)` returns the store instance of the task of `partition` (default 0), or a global table's store. The stores of tables and aggregations are timestamped: their values are `{ value, timestamp }`.
+
+## Configuration
+
+`new TestDriver(config)` takes every `FlowConfig` option except `client` (`applicationId` defaults to `'test-app'`), so tests can set `processingGuarantee`, handlers, `maxTaskIdleMs` or a state store provider, plus:
+
+| Option                   | Default            | Description                                                                                                  |
+| ------------------------ | ------------------ | ------------------------------------------------------------------------------------------------------------ |
+| `initialWallClockTimeMs` | `Date.now()`       | Start of the mock wall clock                                                                                 |
+| `partitions`             | -                  | Partition counts by topic, as partitioners and co-partitioning see them                                      |
+| `commitEvery`            | `'record'`         | Commit after every record, only when the driver stops (`'stop'`), or every N ms of mock wall clock           |
+| `emitIntervalMs`         | `0`                | Throttle of emit-on-window-close and outer-join results, on the mock wall clock                              |
+
+## Failures
+
+A failure stops the driver: the `send()` that caused it rejects with the error, and so does every later call. A fatal error is also given to the uncaught exception handler, but the driver neither restarts nor revives tasks: there is no log to replay from. Exception handlers answering `'continue'` work as in production, which makes them easy to test:
+
+```typescript
+const driver = new TestDriver({ deserializationExceptionHandler: 'continue' })
+driver.input('in', { value: json<{ n: number }>() }).to('out', { value: json() })
+
+await driver.run(async ({ send, output }) => {
+	await send('in', Buffer.from('not json'))
+	await send('in', { n: 1 })
+	expect(output('out')).toHaveLength(1)
 })
 ```
 
 ## ResultCollector
 
-Capture stream output without writing to a topic:
+Captures records with `peek()` instead of reading a topic:
 
 ```typescript
 const results = new ResultCollector<string, Order>()
@@ -97,68 +141,40 @@ await driver.run(async ({ send }) => {
 })
 ```
 
-### ResultCollector API
-
 ```typescript
 class ResultCollector<K, V> {
-	// Get all collected records
 	readonly records: ReadonlyArray<{ key: K; value: V }>
-
-	// Get just values
 	readonly values: V[]
-
-	// Get just keys
 	readonly keys: K[]
-
-	// First/last record
 	readonly first: { key: K; value: V } | undefined
 	readonly last: { key: K; value: V } | undefined
-
-	// Record at an index (throws if there is none), count, emptiness
-	get(index: number): { key: K; value: V }
+	get(index: number): { key: K; value: V } // throws if there is none
 	readonly length: number
 	readonly isEmpty: boolean
-
-	// Query collected records
 	filter(predicate: (key: K, value: V) => boolean): Array<{ key: K; value: V }>
 	some(predicate: (key: K, value: V) => boolean): boolean
 	every(predicate: (key: K, value: V) => boolean): boolean
-
-	// Clear collected records
 	clear(): void
-
-	// Get collector function for peek() (throws on a null key or value)
-	collector(): (key: K | null, value: V | null) => void
+	collector(): (key: K | null, value: V | null) => void // throws on a null key or value
 }
 ```
 
-## Testing Tables
+## Testing Tables and Joins
 
 ```typescript
 const driver = new TestDriver()
-const results = new ResultCollector<string, EnrichedEvent>()
+const results = new ResultCollector<string, { action: string; userName: string }>()
 
-// Create a table
-const users = driver.table('users', {
-	key: string(),
-	value: json<User>(),
-})
+const users = driver.table('users', { key: string(), value: json<User>() })
 
-// Join stream with table
 driver
-	.input('events', { key: string(), value: json<Event>() })
-	.join(users, (event, user) => ({
-		...event,
-		userName: user.name,
-	}))
+	.input('events', { key: string(), value: json<{ action: string }>() })
+	.join(users, (event, user) => ({ ...event, userName: user.name }))
 	.peek(results.collector())
 
 await driver.run(async ({ send }) => {
-	// Populate table first
-	await send('users', { id: 'u1', name: 'Alice' }, { key: Buffer.from('u1') })
-
-	// Then send event
-	await send('events', { action: 'click' }, { key: Buffer.from('u1') })
+	await send('users', { name: 'Alice' }, { keyValue: 'u1', keyCodec: string() })
+	await send('events', { action: 'click' }, { keyValue: 'u1', keyCodec: string() })
 
 	expect(results.first?.value.userName).toBe('Alice')
 })
@@ -168,7 +184,7 @@ await driver.run(async ({ send }) => {
 
 ```typescript
 import { TimeWindows, type Windowed } from '@kafkats/flow'
-import { timestamps } from '@kafkats/flow/testing'
+import { TestDriver, ResultCollector, timestamps } from '@kafkats/flow/testing'
 
 const driver = new TestDriver()
 const results = new ResultCollector<Windowed<string>, number>()
@@ -176,67 +192,34 @@ const results = new ResultCollector<Windowed<string>, number>()
 driver
 	.input('clicks', { key: string(), value: json() })
 	.groupByKey()
-	.windowedBy(TimeWindows.of('1h'))
-	.count()
+	.windowedBy(TimeWindows.ofSizeWithNoGrace('1h'))
+	.count({ emit: 'on-window-close' })
 	.toStream()
 	.peek(results.collector())
 
 await driver.run(async ({ send }) => {
 	const ts = timestamps(BigInt(Date.parse('2024-01-01T10:00:00Z')))
+	const key = { keyValue: 'user1', keyCodec: string() }
 
-	await send('clicks', {}, { key: Buffer.from('user1'), timestamp: ts.at(0) })
-	await send('clicks', {}, { key: Buffer.from('user1'), timestamp: ts.at('1s') })
-	await send('clicks', {}, { key: Buffer.from('user1'), timestamp: ts.at('2s') })
+	await send('clicks', {}, { ...key, timestamp: ts.at(0) })
+	await send('clicks', {}, { ...key, timestamp: ts.at('1s') })
+	expect(results.isEmpty).toBe(true) // the window is still open
 
-	expect(results.last?.key.key).toBe('user1')
-	expect(results.last?.value).toBe(3)
+	await send('clicks', {}, { ...key, timestamp: ts.at('1h') }) // stream time reaches the window's end
+	expect(results.first?.key.window.start).toBe(Number(ts.base))
+	expect(results.first?.value).toBe(2)
 })
 ```
 
+## Checking a Topology
+
+`driver.flow.describe()` (or `app.describe()`) builds the topology without running it: an invalid topology (a missing codec, a duplicate name) throws its `TopologyError`, and the description shows the subtopologies, stores and topics. See [describe()](/flow/topology#describe).
+
 ## Test Utilities
-
-### testRecord
-
-Create a test record:
-
-```typescript
-import { testRecord } from '@kafkats/flow/testing'
-
-const record = testRecord(
-	'my-topic',
-	'key',
-	{ data: 'value' },
-	{
-		timestamp: 1000n,
-		headers: { 'trace-id': Buffer.from('abc123') },
-	}
-)
-```
-
-### testRecordSequence
-
-Create multiple records with consecutive offsets and incrementing timestamps:
-
-```typescript
-import { testRecordSequence } from '@kafkats/flow/testing'
-
-const records = testRecordSequence(
-	'my-topic',
-	[
-		{ key: 'k1', value: { n: 1 } },
-		{ key: 'k2', value: { n: 2 } },
-		{ key: 'k3', value: { n: 3 } },
-	],
-	{ startTimestamp: 1000n, timestampIncrement: 1000n } // defaults: 0n and 1n
-)
-
-records[2]?.timestamp // 3000n
-records[2]?.offset // 2n
-```
 
 ### timestamps
 
-Helper for time-based testing. All values are `bigint` milliseconds, ready for the `timestamp` option of `send()`. Durations are milliseconds or strings like `'500ms'`, `'5s'`, `'1m'`, `'2h'`, `'1d'`:
+All values are `bigint` milliseconds, ready for the `timestamp` option of `send()`. Durations are milliseconds or strings like `'500ms'`, `'5s'`, `'1m'`, `'2h'`, `'1d'`:
 
 ```typescript
 import { timestamps } from '@kafkats/flow/testing'
@@ -244,17 +227,45 @@ import { timestamps } from '@kafkats/flow/testing'
 const ts = timestamps(1_700_000_000_000n) // base time, default 0n
 
 ts.base // 1700000000000n
-ts.at(0) // the base time
 ts.at('5m') // 5 minutes after the base time
-ts.after('1h') // 1 hour after the base time (alias for at())
+ts.after('1h') // alias of at()
+ts.advance('10s').base // 1700000010000n
+```
 
-const later = ts.advance('10s') // new helper whose base is 10 seconds later
-later.base // 1700000010000n
+### testRecord, testRecordSequence
+
+Records shaped like consumed messages, for testing functions directly:
+
+```typescript
+import { testRecord, testRecordSequence } from '@kafkats/flow/testing'
+
+const record = testRecord('my-topic', 'key', { data: 'value' }, { timestamp: 1000n, headers: {} })
+
+const records = testRecordSequence(
+	'my-topic',
+	[
+		{ key: 'k1', value: { n: 1 } },
+		{ key: 'k2', value: { n: 2 } },
+	],
+	{ startTimestamp: 1000n, timestampIncrement: 1000n } // defaults 0n and 1n
+)
+records[1]?.offset // 1n
+```
+
+### createFactory
+
+```typescript
+import { createFactory } from '@kafkats/flow/testing'
+
+const orders = createFactory(i => ({ id: `o${i}`, total: 10 * i }))
+orders.create() // { id: 'o0', total: 0 }
+orders.createMany(2, { total: 5 }) // o1 and o2, total 5
+orders.reset()
 ```
 
 ### quickTest
 
-Minimal setup for simple tests. Build the topology first; the driver starts on the first `send()`, `sendAll()` or `waitForOutput()` and is stopped when the function returns:
+Builds and exercises a topology in one function. The driver starts on the first `send()`, `sendAll()` or `waitForOutput()` and stops when the function returns:
 
 ```typescript
 import { quickTest } from '@kafkats/flow/testing'
@@ -266,75 +277,5 @@ await quickTest(async ({ input, send, output }) => {
 
 	await send('numbers', 5)
 	expect(output('doubled', { value: json<number>() })[0]?.value).toBe(10)
-})
-```
-
-## Complete Example
-
-```typescript
-import { describe, it, expect } from 'vitest'
-import { TestDriver, ResultCollector, timestamps } from '@kafkats/flow/testing'
-import { TimeWindows, type Windowed } from '@kafkats/flow'
-import { string, json } from '@kafkats/client'
-
-interface ClickEvent {
-	userId: string
-	page: string
-}
-
-describe('Click Analytics', () => {
-	it('counts page views per user in 1-hour windows', async () => {
-		const driver = new TestDriver()
-		const results = new ResultCollector<Windowed<string>, number>()
-
-		// Build topology
-		driver
-			.input('clicks', {
-				key: string(),
-				value: json<ClickEvent>(),
-			})
-			.groupByKey()
-			.windowedBy(TimeWindows.of('1h'))
-			.count()
-			.toStream()
-			.peek(results.collector())
-
-		await driver.run(async ({ send }) => {
-			const ts = timestamps(BigInt(Date.parse('2024-01-01T10:00:00Z')))
-			const key = Buffer.from('u1')
-
-			// User clicks
-			await send('clicks', { userId: 'u1', page: '/home' }, { key, timestamp: ts.at(0) })
-			await send('clicks', { userId: 'u1', page: '/products' }, { key, timestamp: ts.at('1m') })
-			await send('clicks', { userId: 'u1', page: '/checkout' }, { key, timestamp: ts.at('2m') })
-
-			// Check results
-			expect(results.last?.value).toBe(3)
-			expect(results.last?.key.key).toBe('u1')
-			expect(results.last?.key.window.start).toBe(Number(ts.base))
-		})
-	})
-
-	it('handles multiple users', async () => {
-		const driver = new TestDriver()
-		const results = new ResultCollector<string, number>()
-
-		driver
-			.input('clicks', { key: string(), value: json() })
-			.groupByKey()
-			.count()
-			.toStream()
-			.peek(results.collector())
-
-		await driver.run(async ({ send }) => {
-			await send('clicks', {}, { key: Buffer.from('user1') })
-			await send('clicks', {}, { key: Buffer.from('user2') })
-			await send('clicks', {}, { key: Buffer.from('user1') })
-
-			// Last update should show user1 with 2 clicks
-			const user1Records = results.filter(key => key === 'user1')
-			expect(user1Records[user1Records.length - 1]?.value).toBe(2)
-		})
-	})
 })
 ```

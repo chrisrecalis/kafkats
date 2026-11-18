@@ -71,6 +71,7 @@ describe('resolveConfig', () => {
 		['numStreamThreads', 2, 'run more instances'],
 		['restartOnError', false, 'uncaughtExceptionHandler'],
 		['consumerRun', {}, 'commitIntervalMs'],
+		['runEach', {}, 'commitIntervalMs'],
 		['stateDir', '/tmp', 'lmdb({ stateDir })'],
 	])('rejects the removed key %s, naming its replacement', (key, value, replacement) => {
 		expect(() => resolve({ [key]: value })).toThrow(FlowConfigError)

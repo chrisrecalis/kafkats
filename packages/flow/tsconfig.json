@@ -5,5 +5,5 @@
 		"rootDir": ".",
 		"noEmit": true
 	},
-	"include": ["src", "tests", "bench"]
+	"include": ["src", "tests", "bench", "package.json"]
 }

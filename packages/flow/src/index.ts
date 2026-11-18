@@ -1,4 +1,7 @@
-export const flowVersion = '0.1.0'
+import packageJson from '../package.json' with { type: 'json' }
+
+/** The version of this package. */
+export const flowVersion: string = packageJson.version
 
 // Core flow API
 export { flow } from '@/app/flow.js'
