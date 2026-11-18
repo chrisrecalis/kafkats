@@ -841,6 +841,28 @@ describe('TaskManager: closeAll', () => {
 		expect(tasks.map(task => task.state)).toEqual(['CLOSED', 'CLOSED'])
 	})
 
+	it('forgets every task before closing one: a closeAll beside it (Run.end beside an op) closes none of them again', async () => {
+		const h = await running({ counts: { input: 2 } }, 'input:0', 'input:1')
+		const tasks = h.tasks()
+		const closes = tasks.map(task => vi.spyOn(task, 'close'))
+		const released = deferred()
+		const release = h.stateDirectory.release.bind(h.stateDirectory)
+		vi.spyOn(h.stateDirectory, 'release').mockImplementation(async (...args) => {
+			await released.promise
+			return release(...args)
+		})
+		// The op's closeAll waits in the close of 0_0 while the end's runs beside it.
+		const op = h.manager.closeAll('dirty', h.hardStop.signal)
+		await tick()
+		const end = h.manager.closeAll('dirty', h.hardStop.signal)
+		await tick()
+		released.resolve()
+		await Promise.all([op, end])
+		expect(closes.map(close => close.mock.calls.length)).toEqual([1, 1])
+		expect(tasks.map(task => task.state)).toEqual(['CLOSED', 'CLOSED'])
+		expect(h.tasks()).toEqual([])
+	})
+
 	it('waits for the closes until its signal aborts; the rest close in the background', async () => {
 		const h = new Harness()
 		h.restorer.manual = true

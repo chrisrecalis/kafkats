@@ -345,9 +345,9 @@ export class RecordCollector {
 			`sending to '${record.topic}' failed`,
 			task.id
 		)
-		this.options.logger.warn('dropped a record whose send failed', {
-			task: task.id.key,
+		task.recordDropped('production', 'producer', {
 			topic: record.topic,
+			origin: 'send',
 			error: errorMessage(error),
 		})
 	}

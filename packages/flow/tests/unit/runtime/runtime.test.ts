@@ -189,6 +189,68 @@ describe('recovery (task migration, 4.10.2)', () => {
 		expect(h.lifecycle.state).toBe('STOPPED')
 	}, 15_000)
 
+	it('a failed run reports nothing more: what its held records throw meanwhile neither halts nor replaces the cause', async () => {
+		const held = deferred()
+		const entered: string[] = []
+		const uncaught = vi.fn(() => 'shutdown' as const)
+		const h = new Harness(
+			app => {
+				app.stream('in', strings).process(() => ({
+					process: async record => {
+						entered.push(record.value!)
+						await held.promise
+						// A fatal and a corrupted failure, side effects of the run's end.
+						throw record.value === 'corrupt' ? new TaskCorruptedError('corrupted', []) : new Error('boom')
+					},
+				}))
+			},
+			{ uncaughtExceptionHandler: uncaught },
+			{ partitions: { in: 2, out: 1 } }
+		)
+		await h.started('in:0', 'in:1')
+		h.consumer.deliver('in:0', [{ key: 'k', value: 'fatal' }])
+		h.consumer.deliver('in:1', [{ key: 'k', value: 'corrupt' }])
+		await vi.waitFor(() => expect(entered).toHaveLength(2))
+		const cause = connectionReset()
+		h.consumer.fail(cause)
+		await vi.waitFor(() => expect(h.lifecycle.state).toBe('REBALANCING'))
+		held.resolve()
+		await vi.waitFor(() => expect(h.producer.closed).toBe(true))
+		await settle()
+		expect(uncaught).not.toHaveBeenCalled()
+		expect(h.lifecycle.state).toBe('REBALANCING')
+		expect(h.lifecycle.error).toBe(cause)
+		h.io.clock.advance(500)
+		await h.joined(2)
+		await h.stop()
+		expect(h.lifecycle.state).toBe('STOPPED')
+	})
+
+	it('exactly-once: a loss whose dirty close outlives the end of its failed run creates no producer afterwards', async () => {
+		const h = new Harness(counting, { processingGuarantee: 'exactly_once' })
+		await h.started()
+		const released = deferred()
+		const release = h.stateDirectory.release.bind(h.stateDirectory)
+		vi.spyOn(h.stateDirectory, 'release').mockImplementation(async (...args) => {
+			await released.promise
+			return release(...args)
+		})
+		// The loss hook closes the task dirty (its store release hangs), then would continue on a new producer.
+		const lost = h.consumer.lose()
+		await settle()
+		h.consumer.fail(connectionReset())
+		// The run's end stops waiting for the hook after 5 s and closes the producer.
+		await vi.waitFor(() => expect(h.producer.closed).toBe(true), { timeout: 8000 })
+		released.resolve()
+		await lost
+		await settle()
+		expect(h.io.created.producers.map(producer => producer.closed)).toEqual([true])
+		h.io.clock.advance(500)
+		await h.joined(2)
+		await h.stop()
+		expect(h.io.created.producers.map(producer => producer.closed)).toEqual([true, true])
+	}, 15_000)
+
 	it('a close during the backoff ends the recovery: no new run', async () => {
 		const h = new Harness(stateless)
 		await h.started()
@@ -710,13 +772,16 @@ describe('runtime blocks of the legacy flow.test.ts', () => {
 			for (const step of ['commit', 'abort', 'close'] as const) producer!.steps[step].always('hang')
 			consumer!.steps.stop.always('hang')
 			let closed = false
+			// close() reads its deadline from the wall clock (Date.now() + timeoutMs), the runtime waits for it on the IO
+			// clock: in production both are the same clock, here the wall clock is pinned to the fake one for the call.
+			const now = vi.spyOn(Date, 'now').mockReturnValue(io.clock.now())
 			const closing = app.close({ timeoutMs: 3000 }).then(() => (closed = true))
+			now.mockRestore()
 			await settle()
 			io.clock.advance(2500)
 			await settle()
 			expect(closed).toBe(false)
-			// The deadline is Date.now() + 3000 at close(): the fake clock started at Date.now() when the IO was created.
-			io.clock.advance(1000)
+			io.clock.advance(500)
 			await vi.waitFor(() => expect(closed).toBe(true), { timeout: 1000 })
 			await closing
 			expect(app.state()).toBe('STOPPED')

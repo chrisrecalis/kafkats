@@ -136,6 +136,9 @@ function persistent(): StateStoreProvider {
 	}
 }
 
+/** Lets the promise chains run that a timer or a failure started (a backoff's end, a new reader). */
+const settle = () => new Promise(resolve => setTimeout(resolve, 10))
+
 /** Resolves to whether `promise` settled by now (after pending callbacks ran). */
 async function settled(promise: Promise<unknown>): Promise<boolean> {
 	let done = false
@@ -291,7 +294,9 @@ describe('GlobalStateManager: follow', () => {
 
 		h.consumers[0]!.fail(new Error('connection reset'))
 		await vi.waitFor(() => expect(h.consumers[0]!.calls.at(-1)).toBe('stop'))
+		await settle()
 		h.io.clock.advance(999)
+		await settle()
 		expect(h.consumers).toHaveLength(1)
 		h.io.clock.advance(1)
 		await vi.waitFor(() => expect(h.consumers).toHaveLength(2))
@@ -301,7 +306,9 @@ describe('GlobalStateManager: follow', () => {
 
 		h.consumers[1]!.fail(new Error('connection reset'))
 		await vi.waitFor(() => expect(h.consumers[1]!.calls.at(-1)).toBe('stop'))
+		await settle()
 		h.io.clock.advance(1999)
+		await settle()
 		expect(h.consumers).toHaveLength(2)
 		h.io.clock.advance(1)
 		await vi.waitFor(() => expect(h.consumers).toHaveLength(3))
@@ -318,7 +325,9 @@ describe('GlobalStateManager: follow', () => {
 		h.append(0, { key: 'k2', value: '{not json' })
 		await vi.waitFor(() => expect(h.fatal).toHaveLength(1))
 		expect(h.fatal[0]).toBeInstanceOf(FailedProcessingError)
+		await settle()
 		h.io.clock.advance(60_000)
+		await settle()
 		expect(h.consumers).toHaveLength(1)
 		expect(h.logger.errors).toEqual(['a global table cannot be kept up to date: the app stops'])
 		await h.stop()

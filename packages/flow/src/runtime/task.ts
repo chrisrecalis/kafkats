@@ -565,7 +565,11 @@ export class StreamTask {
 		})
 	}
 
-	private recordDropped(reason: DroppedReason, source: string, detail: Readonly<Record<string, unknown>>): void {
+	/**
+	 * Counts a dropped record in the context of the task's processors, which logs drops at most once per second per
+	 * reason; a plain warning while the task has no processors (an acknowledgement that came after they closed).
+	 */
+	recordDropped(reason: DroppedReason, source: string, detail: Readonly<Record<string, unknown>>): void {
 		if (this.topology) {
 			this.topology.context.recordDropped(reason, source, detail)
 		} else {

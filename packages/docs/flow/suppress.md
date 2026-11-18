@@ -21,7 +21,7 @@ clicks
 - Like everything that depends on time in flow, windows close by stream time: a window's final result is forwarded only once a later record arrives. A key that receives no more records still has its windows closed by other keys' records in the same task.
 - The buffer never emits early: a record that overfills it fails with a `StreamsError`, which goes to the [processing exception handler](/flow/error-handling#processing-exceptions); with the default (`'fail'`) the app stops. Bound the buffer (`maxRecords`, `maxBytes`) only if you prefer stopping to growing.
 
-For time and session window aggregations, `emit: 'on-window-close'` gives the same final results without a buffer; see [Emit on window close](/flow/windowing#emit-on-window-close).
+For time, session and sliding window aggregations, `emit: 'on-window-close'` gives the same final results without a buffer; see [Emit on window close](/flow/windowing#emit-on-window-close).
 
 ## Rate Limiting Updates
 

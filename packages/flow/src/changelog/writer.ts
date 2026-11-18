@@ -8,7 +8,8 @@ import type { WindowedKey } from '@/state.js'
  * The partition is the task's partition: restoration rebuilds the state of task partition N from changelog partition
  * N, so the two must line up however the changelog key hashes (windowed keys, custom input partitioners, differing key
  * codecs, ...). Sends are not awaited here: the task's commit flushes them, and only acknowledged writes become
- * checkpoints. Records carry no timestamp (broker time), so the topic's time retention follows write time.
+ * checkpoints. Records carry no timestamp of their own: the producer stamps them with its wall-clock time (their create
+ * time), so the topic's time retention follows write time.
  */
 export class ChangelogWriter<K, V> {
 	constructor(

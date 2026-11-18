@@ -70,7 +70,9 @@ describe('undefined is no value, as null is', () => {
 						op === 'mapValues'
 							? table.mapValues(row => row.a ?? absent)
 							: op === 'materialized'
-								? table.mapValues(row => row.a ?? absent, { materialized: { storeName: 'm', value: str } })
+								? table.mapValues(row => row.a ?? absent, {
+										materialized: { storeName: 'm', value: str },
+									})
 								: table.transformValues(() => ({ transform: (_key, row) => row?.a ?? absent }))
 					mapped.toStream().to('out', S)
 				},
@@ -88,7 +90,9 @@ describe('undefined is no value, as null is', () => {
 			(driver, absent) => {
 				const left = driver.table('l', rows).mapValues(row => row.a ?? absent)
 				const right = driver.table('r', S)
-				left.join(right, (a, b) => `${a}+${b}`).toStream().to('out', S)
+				left.join(right, (a, b) => `${a}+${b}`)
+					.toStream()
+					.to('out', S)
 				left.leftJoin(right, (a, b) => (b === 'none' ? absent : `${a}+${b}`), { name: 'left' })
 					.toStream()
 					.to('out', S)

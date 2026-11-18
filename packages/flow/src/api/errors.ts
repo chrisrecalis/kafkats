@@ -29,7 +29,7 @@ export class StreamsError extends Error {
 	}
 }
 
-/** Use of a closed context or store, or an invalid task transition: a bug. */
+/** start() while close() is in flight; or use of a closed context or store, or an invalid task transition: a bug. */
 export class IllegalStateError extends StreamsError {
 	override name = 'IllegalStateError'
 }

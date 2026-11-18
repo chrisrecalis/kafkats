@@ -138,6 +138,25 @@ describe('AppLifecycle', () => {
 		}
 	})
 
+	it('start() rejects until the close ends, also once a start the close cut short failed (already STOPPED)', async () => {
+		const lifecycle = new AppLifecycle()
+		const start = deferred()
+		const starting = lifecycle.start(() => start.promise)
+		const close = deferred()
+		const closing = lifecycle.close(() => close.promise)
+		start.reject(new Error('closed during the start'))
+		await expect(starting).rejects.toThrow('closed during the start')
+		expect(lifecycle.state).toBe('STOPPED')
+		const second = vi.fn(async () => {})
+		await expect(lifecycle.start(second)).rejects.toBeInstanceOf(IllegalStateError)
+		close.resolve()
+		await closing
+		expect(second).not.toHaveBeenCalled()
+		expect(lifecycle.state).toBe('STOPPED')
+		await lifecycle.start(second)
+		expect(lifecycle.state).toBe('RUNNING')
+	})
+
 	it('can start again after a close', async () => {
 		const lifecycle = await started()
 		await lifecycle.close(async () => {})

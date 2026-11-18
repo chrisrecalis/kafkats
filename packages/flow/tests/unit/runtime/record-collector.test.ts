@@ -74,6 +74,13 @@ describe('RecordCollector at-least-once', () => {
 		await expect(h.collector.flush(signal())).resolves.toBeUndefined()
 	})
 
+	it("changelog records go out without a timestamp: the client stamps the producer's wall-clock time", async () => {
+		const h = new TaskHarness({ build: b => pipe(b, { processor: passThrough }) })
+		send(h, await running(h), 'changelog', changelog())
+		expect(h.producer.sent).toHaveLength(1)
+		expect(h.producer.sent[0]!.message.timestamp).toBeUndefined()
+	})
+
 	it('changelog records report their acked offsets per task until taken', async () => {
 		const h = new TaskHarness({ build: b => pipe(b, { processor: passThrough }), partitions: 2 })
 		const a = await running(h, 0)
@@ -143,7 +150,26 @@ describe('RecordCollector at-least-once', () => {
 			headers: RECORD.headers,
 		})
 		expect([record, error, origin]).toEqual([RECORD, tooLarge, 'send'])
-		expect(h.logger.warnings).toContain('dropped a record whose send failed')
+		expect(h.logger.warnings).toEqual(['dropped records'])
+	})
+
+	it("records dropped after a failed send are counted and logged as the task's other drops: once a second", async () => {
+		const h = new TaskHarness({
+			build: b => pipe(b, { processor: passThrough }),
+			handlers: { production: () => 'continue' },
+		})
+		h.producer.steps.send.always(new RecordTooLargeError('output', 0, 3_000_000, 1_000_000))
+		const task = await running(h)
+		const drops = () =>
+			h.logger.warningContexts.filter((_, i) => h.logger.warnings[i] === 'dropped records').map(c => c?.dropped)
+		for (let i = 0; i < 50; i++) send(h, task, 'sink')
+		await h.collector.flush(signal())
+		expect(h.logger.warnings).toEqual(['dropped records'])
+		expect(h.logger.warningContexts[0]).toMatchObject({ reason: 'production', topic: 'output', origin: 'send' })
+		h.clock.advance(1000)
+		send(h, task, 'sink')
+		await h.collector.flush(signal())
+		expect(drops()).toEqual([1, 50])
 	})
 
 	it('the production handler sees the input record the task was processing when it sent (KS)', async () => {

@@ -9,7 +9,7 @@ export interface CollectedRecord {
 	readonly partition?: number
 	readonly key: Buffer | null
 	readonly value: Buffer | null
-	/** Undefined for changelog records (broker time). */
+	/** Undefined for changelog records: the producer stamps them with its wall-clock time. */
 	readonly timestamp?: number
 	readonly headers?: RecordHeaders
 }

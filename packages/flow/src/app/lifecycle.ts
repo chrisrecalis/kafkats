@@ -20,7 +20,10 @@ export class AppLifecycle {
 	private startPromise: Promise<void> | null = null
 	private closePromise: Promise<void> | null = null
 	private isStarted = false
+	/** A close() was asked for since the last start (the state it ends in is STOPPED). */
 	private isClosing = false
+	/** A close() has not finished yet. */
+	private closeInFlight = false
 	/** The runtime's last word: setRebalancing() more recent than setRunning(). Decides the state a start ends in. */
 	private rebalancing = false
 
@@ -37,9 +40,9 @@ export class AppLifecycle {
 		return this.isStarted
 	}
 
-	/** A close() is in flight (it ends STOPPED). */
+	/** A close() is in flight (it ends STOPPED), whatever the state already is. */
 	get closing(): boolean {
-		return this.isClosing && this.current !== 'STOPPED'
+		return this.closeInFlight
 	}
 
 	/**
@@ -95,6 +98,7 @@ export class AppLifecycle {
 			return Promise.resolve()
 		}
 		this.isClosing = true
+		this.closeInFlight = true
 		const inFlight = this.startPromise
 		this.closePromise = (async () => {
 			try {
@@ -104,6 +108,7 @@ export class AppLifecycle {
 				this.current = 'STOPPED'
 				this.isStarted = false
 				this.startPromise = null
+				this.closeInFlight = false
 			}
 		})()
 		return this.closePromise

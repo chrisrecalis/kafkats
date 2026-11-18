@@ -2,9 +2,9 @@
  * KStream-KTable and KStream-GlobalKTable joins (KS KStreamKTableJoinProcessor): a stream record looks up the table
  * value of the key it maps to (its own key for a KTable, the selector's key for a GlobalKTable) through the table's
  * value getter and is joined with it (6.14, ksdsl§8). A left join joins records without a table value with null; an
- * inner join drops them. Records without a value (null or undefined) are dropped; so are records without a lookup key in an inner join,
- * while a left join joins them with null without a lookup (KIP-962). Only stream records produce results, with their
- * key, timestamp and headers; the table is read as it is when the record is processed.
+ * inner join drops them. Records without a value (null or undefined) are dropped; so are records without a lookup key
+ * in an inner join, while a left join joins them with null without a lookup (KIP-962). Only stream records produce
+ * results, with their key, timestamp and headers; the table is read as it is when the record is processed.
  */
 import type { ValueJoiner } from '@/api/kstream.js'
 import type { KTableValueGetter, KTableValueGetterSupplier } from '@/operators/ktable-node.js'

@@ -51,7 +51,7 @@ Failures are handled as in Kafka Streams, without restarting the process:
 - A record that cannot be deserialized, processed or produced goes to its handler (`deserializationExceptionHandler`, `processingExceptionHandler`, `productionExceptionHandler`: `'fail'` by default, or `'continue'`).
 - Anything else is fatal and goes to `uncaughtExceptionHandler`: `'shutdown'` (the default) sets `app.state()` to `'ERROR'`, `'restart'` joins the group again.
 
-`app.getError()` returns the error. See the [fault tolerance guide](https://chrisrecalis.github.io/kafkats/flow/fault-tolerance); upgrading from 0.13 (`restartOnError` and the worker model were removed): see the [upgrade guide](https://chrisrecalis.github.io/kafkats/flow/upgrading).
+`app.getError()` returns the error. See the [fault tolerance guide](https://chrisrecalis.github.io/kafkats/flow/fault-tolerance); upgrading from 0.13 (the worker model and the options `numStreamThreads`, `runEach` and `stateDir` were removed): see the [upgrade guide](https://chrisrecalis.github.io/kafkats/flow/upgrading).
 
 ### Testing
 

@@ -36,14 +36,17 @@ export const APP = 'app'
 /** Keeps every message logged at warn level and above. */
 export class RecordingLogger implements Logger {
 	readonly warnings: string[] = []
+	/** The context of each warning, by index of `warnings`. */
+	readonly warningContexts: (Record<string, unknown> | undefined)[] = []
 	readonly errors: string[] = []
 
 	error(message: string): void {
 		this.errors.push(message)
 	}
 
-	warn(message: string): void {
+	warn(message: string, context?: Record<string, unknown>): void {
 		this.warnings.push(message)
+		this.warningContexts.push(context)
 	}
 
 	info(): void {}

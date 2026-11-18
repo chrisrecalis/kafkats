@@ -141,7 +141,7 @@ clicks
 	.to('hourly-clicks')
 ```
 
-Closed windows are looked for after records are processed, at most once per second of wall clock for each aggregation of each task: a window closes when a later record moves stream time past its end plus grace. Which windows were emitted is committed with the offsets, so each final result is sent once across restarts (under at-least-once a failure can send it again). This is Kafka Streams' `EmitStrategy.onWindowClose()`. [`suppress({ until: 'window-close' })`](/flow/suppress) gives the same results on any windowed table, through a buffer.
+Closed windows are looked for after records are processed, at most once per second of wall clock for each aggregation of each task: a window closes when a later record moves stream time to its end plus grace (a session: its end plus gap and grace), or past that time for sliding windows and sessions, which include their end. Which windows were emitted is committed with the offsets, so each final result is sent once across restarts (under at-least-once a failure can send it again). This is Kafka Streams' `EmitStrategy.onWindowClose()`. [`suppress({ until: 'window-close' })`](/flow/suppress) gives the same results on any windowed table, through a buffer.
 
 ## Windowed Keys
 

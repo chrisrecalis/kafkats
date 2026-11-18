@@ -89,7 +89,7 @@ All exported from `@kafkats/flow`:
 | `AssignmentError`                 | An assigned topic is not part of the topology: instances run different topologies                                                                    |
 | `TaskMigratedError`               | Fencing, a partial assignment, a failed send under exactly-once, commits failing for `taskTimeoutMs`: the instance rejoins (recovered automatically) |
 | `TaskCorruptedError`              | The state or output of tasks is unusable: they are revived in place (recovered automatically)                                                        |
-| `IllegalStateError`               | A closed store or context was used, or a task transition was invalid: a bug                                                                          |
+| `IllegalStateError`               | `start()` was called while `close()` was in flight; or a closed store or context was used, or a task transition was invalid: a bug                   |
 | `CoPartitioningError`             | Topics that must be co-partitioned have different partition counts (`start()`)                                                                       |
 | `ChangelogPartitionMismatchError` | An existing internal topic has the wrong partition count, or a source topic of a stateful task grew                                                  |
 | `SourceTopicNotFoundError`        | A source topic, or an internal topic with `changelog.autoCreate: false`, does not exist (`start()`)                                                  |

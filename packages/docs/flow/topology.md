@@ -48,7 +48,7 @@ stream
 
 ## describe()
 
-`app.describe()` builds the topology (freezing it, as `start()` does) and returns its description in Kafka Streams' shape: subtopologies with their nodes, and global stores. The DSL calls throw the `TopologyError` of a mistake they make themselves (a missing codec, an illegal or duplicate name); `describe()` throws (and `start()` rejects with) those of the rules that span the whole topology: sources of one topic with different timestamp extractors or reset policies, a topic read both by a global table and by a stream, two stores whose changelog topics or commit metadata keys collide. Defining the topology and calling `describe()` is a cheap check in a unit test.
+`app.describe()` builds the topology (freezing it, as `start()` does) and returns its description in Kafka Streams' shape: subtopologies with their nodes, and global stores. The DSL calls throw the `TopologyError` of a mistake they make themselves (a missing codec, an illegal or duplicate name); `describe()` throws (and `start()` rejects with) those of the rules that span the whole topology: sources of one topic with different timestamp extractors or reset policies, a topic read both by a global table and by a stream, two stores whose changelog topics or commit metadata keys collide, a changelog topic that is a repartition topic, a subtopology whose commit metadata would exceed the broker's limit. Defining the topology and calling `describe()` is a cheap check in a unit test.
 
 ```typescript
 const app = flow({ applicationId: 'page-views', client })
