@@ -454,6 +454,20 @@ describe('stream-stream joins', () => {
 		}
 	})
 
+	it('Joined.within: a match is at max(left, right) (0.13: the arriving record), unmatched records join null at once', async () => {
+		const driver = new TestDriver()
+		driver
+			.input('l', S)
+			.leftJoin(driver.input('r', S), joiner, { within: TimeWindows.of('10m') })
+			.to('out', S)
+		await driver.run(async ctx => {
+			await send(ctx, 'r', 'k', 'B', 1000)
+			await send(ctx, 'l', 'k', 'A', 500)
+			await send(ctx, 'l', 'k', 'C', 2_000_000)
+			expect(timed(ctx)).toEqual(['A+B@1000', 'C+null@2000000'])
+		})
+	})
+
 	it('a join without a window, or with SlidingWindows, is a TopologyError', () => {
 		const driver = new TestDriver()
 		const l = driver.input('l', S)

@@ -133,7 +133,7 @@ function joinValueGetter<K, V, VO, VR>(
 					const rightValue = await rightValues.get(key)
 					const value = leftValue?.value ?? null
 					const otherValue = rightValue?.value ?? null
-					const result = joined(outer, value, otherValue) ? joiner(value, otherValue) : null
+					const result = joined(outer, value, otherValue) ? (joiner(value, otherValue) ?? null) : null
 					const timestamp = Math.max(leftValue?.timestamp ?? -1, rightValue?.timestamp ?? -1)
 					return result === null ? null : { value: result, timestamp }
 				},
@@ -188,8 +188,9 @@ class KTableJoinProcessor<K, V, VO, VR> implements Processor<K, Change<V>, K, Ch
 		return this.otherValues.close?.()
 	}
 
+	/** A joiner returning undefined makes no value, as null does. */
 	private join(value: V | null, otherValue: VO | null): VR | null {
-		return joined(this.outer, value, otherValue) ? this.joiner(value, otherValue) : null
+		return joined(this.outer, value, otherValue) ? (this.joiner(value, otherValue) ?? null) : null
 	}
 }
 

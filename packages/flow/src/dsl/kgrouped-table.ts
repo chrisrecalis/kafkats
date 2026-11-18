@@ -38,7 +38,7 @@ export class KGroupedTableImpl<K, V> implements KGroupedTable<K, V> {
 		initializer: () => A,
 		adder: (key: K, value: V, aggregate: A) => A,
 		subtractor: (key: K, value: V, aggregate: A) => A,
-		options?: AggregateOptions<K, A>
+		options: AggregateOptions<K, A> & { value: Codec<A> }
 	): KTable<K, A> {
 		return aggregate(this, initializer, adder, subtractor, options)
 	}

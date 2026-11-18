@@ -47,7 +47,7 @@ const PREFIXES: Readonly<Record<AggregationKind, readonly [store: string, node: 
 
 /**
  * The store, the processor and the result key codec of one windowed aggregation, given its store name and key codec,
- * and how long after their end its windows may still change (`suppress()` waits that long for a window to close).
+ * and how far past a window's end stream time must be for the window to close (`suppress()` waits that long).
  */
 type Create<K, A> = (
 	ctx: DslContext,
@@ -191,8 +191,10 @@ function sessionWindowed<K, V, A>(
 		}),
 		node: new SessionWindowAggregate(name, windows, merge, emitFinal),
 		resultKeyCodec: WindowedCodecs.sessionWindowed(keyCodec),
-		// A record within the gap of a session's end still merges into it (KS SessionWindowedKStreamImpl).
-		graceMs: windows.graceMs + windows.gapMs,
+		// A record within the gap of a session's end still merges into it (KS SessionWindowedKStreamImpl), and its end
+		// is inclusive: a session still changes while end >= stream time - gap - grace, when its store's retention
+		// exceeds gap + grace (Kafka Streams' suppress() releases it one millisecond early).
+		graceMs: windows.graceMs + windows.gapMs + 1,
 	}))
 }
 

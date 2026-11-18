@@ -65,6 +65,24 @@ describe('flow()', () => {
 		await expect(app.start()).rejects.toThrow(TopologyError)
 	})
 
+	it('a DSL call that is wrong by itself throws at once; describe() throws for the rules spanning the topology', () => {
+		const strings = { key: codec.string(), value: codec.string() }
+		const app = flow({ applicationId: 'app', client })
+		const keyed = app.stream('in', { value: codec.string() }).selectKey((_key, value) => value)
+		expect(() => keyed.groupByKey().count()).toThrow(TopologyError) // no key codec for the repartition topic
+		keyed.filter(() => true, { name: 'n' })
+		expect(() => keyed.filter(() => true, { name: 'n' })).toThrow(TopologyError)
+		expect(() => keyed.filter(() => true, { name: 'bad name!' })).toThrow(TopologyError)
+		// A sink encodes with the codecs it has: values that are not Buffers fail each record, not the topology.
+		keyed.mapValues(value => ({ value })).to('out')
+		expect(() => app.describe()).not.toThrow()
+
+		const conflicting = flow({ applicationId: 'app', client })
+		conflicting.stream('users', strings).to('out', strings)
+		conflicting.globalTable('users', strings) // a topic read by a stream and by a global table
+		expect(() => conflicting.describe()).toThrow(TopologyError)
+	})
+
 	it('close() before start() marks the app STOPPED', async () => {
 		const app = flow({ applicationId: 'app', client })
 		await app.close()

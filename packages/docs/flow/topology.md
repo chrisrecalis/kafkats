@@ -44,11 +44,11 @@ stream
 - Every operator takes `{ name }` ([NamedOptions](/flow/operations#namedoptions)). An operator that registers several nodes, stores or topics names them `<name>-<suffix>`: a named inner stream-stream join has the nodes `<name>-this-join`, `<name>-other-join` and `<name>-merge`, the stores `<name>-this-join-store` and `<name>-other-join-store`, and the repartition topics `<name>-left` and `<name>-right`; a named `repartition()` has `<name>-repartition-sink` and `<name>-repartition-source`; a named table source is `<name>` with its source node `<name>-source`.
 - Stores are named by `Materialized.storeName` (or the `storeName` of an aggregation), a `Stores` definition's `name`, `StreamJoined.storeName`, or `<name>-store` for `suppress()`.
 - Repartition topics are named by `Grouped.name`, `Repartitioned.name`, `Joined.name` / `StreamJoined.name`, or, for an aggregation of an unnamed grouping, its `storeName`.
-- Names are 1 to 249 ASCII letters, digits, `.`, `_` and `-`, not `.` or `..`. An illegal name, two nodes or two stores of one name, or one repartition name claimed by two different operations throws `TopologyError` when the topology is built. All aggregations of one named grouping share its repartition topic.
+- Names are 1 to 249 ASCII letters, digits, `.`, `_` and `-`, not `.` or `..`. An illegal name, two nodes or two stores of one name, or one repartition name claimed by two different operations throws `TopologyError` from the DSL call that makes the mistake. All aggregations of one named grouping share its repartition topic.
 
 ## describe()
 
-`app.describe()` builds the topology (freezing it, as `start()` does) and returns its description in Kafka Streams' shape: subtopologies with their nodes, and global stores. An invalid topology throws its `TopologyError` here, which makes `describe()` a cheap check in a unit test.
+`app.describe()` builds the topology (freezing it, as `start()` does) and returns its description in Kafka Streams' shape: subtopologies with their nodes, and global stores. The DSL calls throw the `TopologyError` of a mistake they make themselves (a missing codec, an illegal or duplicate name); `describe()` throws (and `start()` rejects with) those of the rules that span the whole topology: sources of one topic with different timestamp extractors or reset policies, a topic read both by a global table and by a stream, two stores whose changelog topics or commit metadata keys collide. Defining the topology and calling `describe()` is a cheap check in a unit test.
 
 ```typescript
 const app = flow({ applicationId: 'page-views', client })

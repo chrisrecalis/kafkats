@@ -9,6 +9,7 @@
  * never changes state(). A new start clears both.
  */
 import type { StreamState } from '@/api/app.js'
+import { IllegalStateError } from '@/api/errors.js'
 
 const toError = (error: unknown): Error => (error instanceof Error ? error : new Error(String(error)))
 
@@ -36,16 +37,21 @@ export class AppLifecycle {
 		return this.isStarted
 	}
 
+	/** A close() is in flight (it ends STOPPED). */
 	get closing(): boolean {
-		return this.isClosing
+		return this.isClosing && this.current !== 'STOPPED'
 	}
 
 	/**
 	 * Runs `start` unless a start is in flight or succeeded (both share its promise; so does start() while ERROR after
 	 * a fatal failure, until close()). A failed start leaves state ERROR (STOPPED if a close came meanwhile) and can be
-	 * retried.
+	 * retried. While a close() is in flight, start() rejects with IllegalStateError (Kafka Streams' PENDING_SHUTDOWN):
+	 * start again once it resolved.
 	 */
 	start(start: () => Promise<void>): Promise<void> {
+		if (this.closing) {
+			return Promise.reject(new IllegalStateError('the app is closing: start() it again once close() resolved'))
+		}
 		if (this.startPromise) {
 			return this.startPromise
 		}

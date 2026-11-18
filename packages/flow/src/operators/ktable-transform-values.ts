@@ -78,7 +78,8 @@ class KTableTransformValuesProcessor<K, V, VR> implements Processor<K, Change<V>
 
 	async process(record: StreamRecord<K, Change<V>>): Promise<void> {
 		const { key, timestamp } = record
-		const newValue = await this.transformer.transform(key, record.value.newValue)
+		// A transformation to undefined is no value, as null is.
+		const newValue = (await this.transformer.transform(key, record.value.newValue)) ?? null
 		let oldValue: VR | null = null
 		if (this.store !== undefined) {
 			if (this.sendOldValues()) {
@@ -86,7 +87,7 @@ class KTableTransformValuesProcessor<K, V, VR> implements Processor<K, Change<V>
 			}
 			await (newValue === null ? this.store.delete(key) : this.store.put(key, { value: newValue, timestamp }))
 		} else if (this.sendOldValues()) {
-			oldValue = await this.transformer.transform(key, record.value.oldValue)
+			oldValue = (await this.transformer.transform(key, record.value.oldValue)) ?? null
 		}
 		await this.context.forward(record.withValue({ newValue, oldValue }))
 	}
@@ -117,7 +118,7 @@ function transformedValueGetter<K, V, VR>(
 				},
 				get: async key => {
 					const parentValue = await values.get(key)
-					const value = await transformer.transform(key, parentValue?.value ?? null)
+					const value = (await transformer.transform(key, parentValue?.value ?? null)) ?? null
 					return value === null ? null : { value, timestamp: parentValue?.timestamp ?? -1 }
 				},
 				close: async () => {

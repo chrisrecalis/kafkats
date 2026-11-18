@@ -152,8 +152,9 @@ export interface FlowApp {
 	 */
 	addStateStore(definition: StoreDefinition<StateStore>): this
 	/**
-	 * Builds the topology and describes it. Building freezes it, as start() does: later DSL calls throw TopologyError,
-	 * and an invalid topology throws its TopologyError here.
+	 * Builds the topology and describes it. Building freezes it, as start() does: later DSL calls throw TopologyError.
+	 * Breaking a rule that spans the whole topology throws its TopologyError here (a DSL call that is wrong by itself,
+	 * a missing codec or an illegal or duplicate name, throws at once).
 	 */
 	describe(): TopologyDescription
 	start(): Promise<void>

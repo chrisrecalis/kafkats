@@ -43,11 +43,12 @@ export interface KGroupedTable<K, V> {
 		subtractor: (aggregate: V, value: V) => V,
 		options?: AggregateOptions<K, V>
 	): KTable<K, V>
+	/** Aggregates always need their codec: `options.value`. */
 	aggregate<A>(
 		initializer: () => A,
 		adder: (key: K, value: V, aggregate: A) => A,
 		subtractor: (key: K, value: V, aggregate: A) => A,
-		options?: AggregateOptions<K, A>
+		options: AggregateOptions<K, A> & { value: Codec<A> }
 	): KTable<K, A>
 }
 

@@ -96,10 +96,36 @@ describe.each(GUARANTEES)('suppress until windows close (6.16; %s)', (_, config)
 		await driver.run(async ctx => {
 			for (const timestamp of [0, 3, 7]) await send(ctx, 'in', 'k', 'v', timestamp) // [0,0] and [0,3] merge into [0,7]
 			await send(ctx, 'in', 'k', 'v', 13) // a new session; [0,7] may still merge until 7 + 5 + 2
-			expect(finals(ctx, keys)).toEqual([])
 			await send(ctx, 'in', 'j', 'v', 14)
+			expect(finals(ctx, keys)).toEqual([])
+			await send(ctx, 'in', 'j', 'v', 15)
 			expect(finals(ctx, keys)).toEqual([['k', 0, 7, 3, 7]])
 		})
+	})
+
+	it('forwards a session once, when it can no longer merge, whatever the retention of its store', async () => {
+		const results: Final[][] = []
+		for (const emitFinal of [false, true]) {
+			const driver = new TestDriver(config)
+			const sessions = driver.input('in', S).groupByKey().windowedBy(SessionWindows.ofInactivityGapWithNoGrace(5))
+			const table = emitFinal
+				? sessions.count({ emit: 'on-window-close', retention: 100 })
+				: sessions.count({ retention: 100 }).suppress(FINAL)
+			table.toStream().to('out', { value: num })
+			await driver.run(async ctx => {
+				await send(ctx, 'in', 'k', 'v', 0)
+				await send(ctx, 'in', 'j', 'v', 5) // stream time 0 + 5 + 0: a record of time 5 still merges into [0,0]
+				expect(finals(ctx, WindowedCodecs.sessionWindowed(str))).toEqual([])
+				await send(ctx, 'in', 'k', 'v', 5) // [0,0] -> [0,5]
+				await send(ctx, 'in', 'x', 'v', 11)
+				results.push(finals(ctx, WindowedCodecs.sessionWindowed(str)))
+			})
+		}
+		expect(results[0]).toEqual([
+			['j', 5, 5, 1, 5],
+			['k', 0, 5, 2, 5],
+		])
+		expect(results[1]).toEqual(results[0])
 	})
 
 	it('waits the grace alone after the end of a sliding window', async () => {
@@ -117,18 +143,49 @@ describe.each(GUARANTEES)('suppress until windows close (6.16; %s)', (_, config)
 			await send(ctx, 'in', 'k', 'v', 5) // [0,10]
 			await send(ctx, 'in', 'k', 'v', 12) // [2,12], and [6,16]: the right window of 5
 			await send(ctx, 'in', 'j', 'v', 14)
-			expect(finals(ctx, keys)).toEqual([])
 			await send(ctx, 'in', 'j', 'v', 15)
+			// The end is inclusive: at stream time 10 + 5 a record of time 10 still lands in [0,10].
+			expect(finals(ctx, keys)).toEqual([])
+			await send(ctx, 'in', 'x', 'v', 16)
 			expect(finals(ctx, keys)).toEqual([['k', 0, 10, 1, 5]])
-			await send(ctx, 'in', 'j', 'v', 21)
+			await send(ctx, 'in', 'x', 'v', 22)
 			expect(finals(ctx, keys)).toEqual([
 				['k', 0, 10, 1, 5],
 				['k', 2, 12, 2, 12],
 				['j', 4, 14, 1, 14],
 				['j', 5, 15, 2, 15],
 				['k', 6, 16, 1, 12],
+				['x', 6, 16, 1, 16],
 			])
 		})
+	})
+
+	it('forwards a sliding window once, when it can no longer change: the results of emit on-window-close', async () => {
+		const inputs: Array<[key: string, timestamp: number]> = [
+			['k', 100],
+			['k', 100], // updates [90,100] at stream time 100 + 0
+			['k', 95], // and again; its right window [96,106] counts both records of 100
+			['j', 200], // closes them; [190,200] may still change
+		]
+		const results: Final[][] = []
+		for (const emitFinal of [false, true]) {
+			const driver = new TestDriver(config)
+			const counts = driver.input('in', S).groupByKey().windowedBy(SlidingWindows.ofTimeDifferenceWithNoGrace(10))
+			const table = emitFinal ? counts.count({ emit: 'on-window-close' }) : counts.count().suppress(FINAL)
+			table.toStream().to('out', { value: num })
+			await driver.run(async ctx => {
+				for (const [key, timestamp] of inputs.slice(0, -1)) await send(ctx, 'in', key, 'v', timestamp)
+				expect(finals(ctx, WindowedCodecs.timeWindowed(str, 10))).toEqual([])
+				const [key, timestamp] = inputs.at(-1)!
+				await send(ctx, 'in', key, 'v', timestamp)
+				results.push(finals(ctx, WindowedCodecs.timeWindowed(str, 10)))
+			})
+		}
+		expect(results[0]).toEqual([
+			['k', 90, 100, 3, 100],
+			['k', 96, 106, 2, 100],
+		])
+		expect(results[1]).toEqual(results[0])
 	})
 
 	it('drops deleted windows from the final results', async () => {
@@ -594,13 +651,13 @@ describe('suppress topology', () => {
 			.groupByKey()
 			.windowedBy(SessionWindows.ofInactivityGapAndGrace(5, 3))
 			.count() as KTableImpl<Windowed<string>, number>
-		expect(windowCloseGraceMs(sessions.ctx, sessions.node)).toBe(8)
+		expect(windowCloseGraceMs(sessions.ctx, sessions.node)).toBe(9) // its end is inclusive
 		const sliding = driver
 			.input('w', S)
 			.groupByKey()
 			.windowedBy(SlidingWindows.ofTimeDifferenceAndGrace(10, 4))
 			.count() as KTableImpl<Windowed<string>, number>
-		expect(windowCloseGraceMs(sliding.ctx, sliding.node)).toBe(4)
+		expect(windowCloseGraceMs(sliding.ctx, sliding.node)).toBe(5) // its end is inclusive
 	})
 
 	it('needs a windowed aggregation upstream of every parent until windows close', () => {

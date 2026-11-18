@@ -16,7 +16,7 @@ clicks
 	.to('hourly-clicks-final')
 ```
 
-- Each window is forwarded once, with its final value, when stream time passed the window's end plus the grace period of the windowed aggregation upstream. A deleted window is not forwarded.
+- Each window is forwarded once, with its final value, when stream time reached the window's end plus the grace period of the windowed aggregation upstream (a session's end plus its gap and grace; sessions and sliding windows include their end, so they are forwarded once stream time passed that time). A deleted window is not forwarded.
 - `until: 'window-close'` needs a windowed aggregation upstream; flow finds its grace period when `suppress()` is called (through repartition topics too, and the largest one when several windowed aggregations lead to the table). Otherwise `suppress()` throws `TopologyError`.
 - Like everything that depends on time in flow, windows close by stream time: a window's final result is forwarded only once a later record arrives. A key that receives no more records still has its windows closed by other keys' records in the same task.
 - The buffer never emits early: a record that overfills it fails with a `StreamsError`, which goes to the [processing exception handler](/flow/error-handling#processing-exceptions); with the default (`'fail'`) the app stops. Bound the buffer (`maxRecords`, `maxBytes`) only if you prefer stopping to growing.

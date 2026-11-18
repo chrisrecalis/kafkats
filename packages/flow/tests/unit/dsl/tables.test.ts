@@ -1031,6 +1031,7 @@ describe('KTable.groupBy and KGroupedTable', () => {
 		expect(() => t.groupBy((_k, v) => [v, v.length])).toThrow('groupBy() needs a key codec')
 		const grouped = t.groupBy((k, v) => ['all', v.length] as const, { key: str, value: num })
 		expect(() =>
+			// @ts-expect-error: the aggregate's codec is required
 			grouped.aggregate(
 				() => 0,
 				(_k, v, sum) => sum + v,

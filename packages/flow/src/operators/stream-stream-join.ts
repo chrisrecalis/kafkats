@@ -80,9 +80,9 @@ class StreamStreamJoinProcessor<K, V, VO, VR> implements Processor<K | null, V |
 		const { key, value, timestamp } = record
 		const streamTime = this.clock.advance(timestamp)
 		const { beforeMs, afterMs, joiner, outer, otherOuter } = this.spec
-		if (key === null || value === null) {
+		if (key === null || value === null || value === undefined) {
 			// KIP-962: an outer side joins a null-key record with null at once, without storing it.
-			if (outer && value !== null) {
+			if (outer && value !== null && value !== undefined) {
 				await this.context.forward(record.withValue(joiner(value, null)))
 			} else {
 				this.context.recordDropped(key === null ? 'null-key' : 'null-value')

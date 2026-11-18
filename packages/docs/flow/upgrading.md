@@ -39,7 +39,7 @@ See [Configuration](/flow/configuration) for every option.
 - **Co-partitioning is checked.** Topics feeding one stateful subtopology (both sides of a join, a stream and the table it looks up, merged streams before an aggregation) must have the same partition count, otherwise `start()` throws `CoPartitioningError`.
 - **Repartitioning.** A stream whose key may have changed (`map()`, `flatMap()`, `selectKey()`, `process()`, `KTable.toStream(mapper)`, `groupBy()`) is written to an internal topic `<applicationId>-<name>-repartition` and read back before a key-based operation. It needs key and value codecs (a `TopologyError` names the operator that lacks one); name the operation (`Grouped.name`, `Joined.name`, ...) for a stable topic name. Repartition topics are created with `cleanup.policy=delete` and `retention.ms=-1` and purged up to the committed offsets every `repartitionPurgeIntervalMs` (30000).
 - **`through(topic)`** (deprecated) continues with what it reads back from the topic, which must exist. Prefer `repartition()`.
-- **Names.** A `Grouped.name` is shared by every aggregation of its grouping (one repartition topic). Illegal names, two stores of one name and a repartition name claimed by two different operations throw `TopologyError` when the topology is built.
+- **Names.** A `Grouped.name` is shared by every aggregation of its grouping (one repartition topic). Illegal names, two stores of one name and a repartition name claimed by two different operations throw `TopologyError` from the DSL call that makes the mistake.
 
 ## Windows
 
@@ -53,8 +53,8 @@ See [Configuration](/flow/configuration) for every option.
 
 ## Joins
 
-- **Stream-stream joins take `JoinWindows` as their third argument** and `StreamJoined` options. The `Joined.within` form is deprecated and maps to `JoinWindows.of(size)`, so its results are unchanged.
-- **Left and outer joins built with the new factories emit unmatched records once their window closed** (when stream time passed `ts + after + grace`), not eagerly. Expect the `(value, null)` results later; in tests, send a later record to move stream time. The match timestamp is `max(left, right)`.
+- **Stream-stream joins take `JoinWindows` as their third argument** and `StreamJoined` options. Every match carries the timestamp `max(left, right)` (it carried the timestamp of the record that produced it), and records of one key and timestamp on a side all join (a later one replaced an earlier one). The `Joined.within` form is deprecated and maps to `JoinWindows.of(size)`: its unmatched records are still joined with `null` at once, and each side keeps the records of the last `max(24h, 2 × size)` of stream time.
+- **Left and outer joins built with the new factories emit unmatched records once their window closed** (when stream time passed `ts + after + grace`), not eagerly. Expect the `(value, null)` results later; in tests, send a later record to move stream time.
 - **`globalTable()` returns a `GlobalKTable`**, only usable as the lookup side of `KStream.join` / `leftJoin` with a key selector: `join(globalTable, (key, value) => lookupKey, joiner)`. The two-argument form is deprecated and looks up the record key.
 - Records with a null key are joined with null by the outer sides of left and outer joins (KIP-962) instead of being dropped.
 
@@ -66,7 +66,6 @@ See [Configuration](/flow/configuration) for every option.
 - **`count()` results are int64 big-endian** (Kafka Streams' `Serdes.Long`; they were 8-byte little-endian doubles). Pass `value` in the options of `count()` or of `to()` to keep another encoding.
 - **Result timestamps** follow Kafka Streams: aggregations `max(record, previous result)`, time and sliding windows the largest record timestamp of the window, sessions their end, table-table joins the larger timestamp of both sides.
 - **Stores of tables and aggregations are timestamped**: values are stored as `[int64 BE timestamp][value]`, and reading them through `getStateStore()` gives `{ value, timestamp }`.
-- **`KTable.transformValues()`** takes a `ValueTransformerWithKey` supplier (`transform(key, value)`), not a processor.
 
 ## Failures
 

@@ -1,6 +1,6 @@
 # KTable
 
-A `KTable` is a changelog read as a table: for each key, the latest value. A record with a null value (a tombstone) deletes its key. Downstream of a table, every change is an update of a row, with its new value and, where an operator needs it, its old one.
+A `KTable` is a changelog read as a table: for each key, the latest value. A record with a null value (a tombstone) deletes its key; flow treats `undefined` as `null` (Kafka Streams has only `null`), so a value or callback result of `undefined` deletes too. Downstream of a table, every change is an update of a row, with its new value and, where an operator needs it, its old one.
 
 ## Creating a Table
 
@@ -45,7 +45,7 @@ const emails = table.mapValues(user => user.email)
 const labels = table.mapValues((key: string, user: User) => `${key}: ${user.name}`)
 ```
 
-A `null` result deletes the key. As with streams, a mapper declaring two parameters receives the key.
+A `null` (or `undefined`) result deletes the key. As with streams, a mapper declaring two parameters receives the key.
 
 ### transformValues
 

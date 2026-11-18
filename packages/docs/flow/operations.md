@@ -122,7 +122,7 @@ Flow tracks the codecs it knows for a stream or table at each point of the topol
 - An aggregation's result has the codecs of its store: the key codec of the grouping, and its value codec (`count()`: int64; `reduce()`: the value codec; `aggregate()`: `value`, required when the aggregate type differs from the value type).
 - Windowed aggregations key their results with a windowed codec of the base key's codec; see [Windowed keys](/flow/windowing#windowed-keys).
 
-An operator option always wins. An operator that has to encode something (a sink, a repartition topic, a store) and finds no codec throws `TopologyError` naming itself and the missing codec, when the topology is built:
+An operator option always wins. An operator that has to encode something (a repartition topic, a store) and finds no codec throws `TopologyError` naming itself and the missing codec, from the DSL call that adds it:
 
 ```typescript
 stream

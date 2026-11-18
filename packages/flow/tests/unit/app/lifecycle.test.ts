@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import { IllegalStateError } from '@/api/errors.js'
 import { AppLifecycle } from '@/app/lifecycle.js'
 
 function deferred(): { promise: Promise<void>; resolve(): void; reject(error: unknown): void } {
@@ -103,6 +104,38 @@ describe('AppLifecycle', () => {
 		await expect(starting).rejects.toThrow('interrupted')
 		await closing
 		expect(lifecycle.state).toBe('STOPPED')
+	})
+
+	it('start() during a close rejects with IllegalStateError and leaves the close to end STOPPED', async () => {
+		const cases: Array<() => Promise<AppLifecycle>> = [
+			started,
+			async () => {
+				const lifecycle = await started()
+				lifecycle.halt(new Error('fatal'))
+				return lifecycle
+			},
+			async () => {
+				const lifecycle = new AppLifecycle()
+				await lifecycle.start(() => Promise.reject(new Error('no brokers'))).catch(() => {})
+				return lifecycle
+			},
+		]
+		for (const setup of cases) {
+			const lifecycle = await setup()
+			const close = deferred()
+			const closing = lifecycle.close(() => close.promise)
+			const second = vi.fn(async () => {})
+			await expect(lifecycle.start(second)).rejects.toBeInstanceOf(IllegalStateError)
+			expect(lifecycle.closing).toBe(true)
+			close.resolve()
+			await closing
+			expect(second).not.toHaveBeenCalled()
+			expect(lifecycle.state).toBe('STOPPED')
+			expect(lifecycle.closing).toBe(false)
+			await lifecycle.start(second)
+			expect(second).toHaveBeenCalledTimes(1)
+			expect(lifecycle.state).toBe('RUNNING')
+		}
 	})
 
 	it('can start again after a close', async () => {

@@ -35,11 +35,13 @@ class KTableSourceProcessor<K, V> implements Processor<K, V | null, K, Change<V>
 	}
 
 	async process(record: StreamRecord<K, V | null>): Promise<void> {
-		const { key, value, timestamp } = record
+		const { key, timestamp } = record
 		if (key === null || key === undefined) {
 			this.context.recordDropped('null-key', { store: this.storeName })
 			return
 		}
+		// Undefined (a mapper that returned nothing) is no value, as null is: on a table, a deletion.
+		const value = record.value ?? null
 		const old = this.sendOldValues() ? await this.store.get(key) : undefined
 		if (value === null) {
 			await this.store.delete(key)

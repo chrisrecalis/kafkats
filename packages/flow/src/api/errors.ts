@@ -9,7 +9,10 @@ export class FlowConfigError extends Error {
 	override name = 'FlowConfigError'
 }
 
-/** An invalid topology, thrown while it is built. */
+/**
+ * An invalid topology: thrown by the DSL call that makes the mistake (a missing codec, an illegal or duplicate name),
+ * or by describe() and start(), which build the topology, for the rules spanning all of it.
+ */
 export class TopologyError extends Error {
 	override name = 'TopologyError'
 }

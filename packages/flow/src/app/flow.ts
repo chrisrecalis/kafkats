@@ -88,7 +88,8 @@ class FlowAppImpl implements FlowApp {
 
 	/**
 	 * Builds the topology (later DSL calls throw), then starts a runtime and resolves once every task of the first
-	 * assignment is RUNNING (4.2). A failed start releases what it started and may be retried.
+	 * assignment is RUNNING (4.2). A failed start releases what it started and may be retried. During a close() it
+	 * rejects with IllegalStateError.
 	 */
 	start(): Promise<void> {
 		return this.lifecycle.start(async () => {

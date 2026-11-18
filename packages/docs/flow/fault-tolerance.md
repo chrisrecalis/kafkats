@@ -78,7 +78,7 @@ The backoff before rejoining starts at 0.5 s and doubles up to 30 s, and starts 
 await app.close({ timeoutMs: 30_000 }) // default 20000
 ```
 
-`close()` commits what was processed, closes the tasks, leaves the group, stops the global tables, closes the state stores, and disconnects the client if the app created it. It returns within `timeoutMs` even when the cluster is unreachable: network steps are cut short before the deadline and the tasks then close without committing; what was not committed is processed again by the next owner of the partitions. A `close()` during `start()` makes the start fail.
+`close()` commits what was processed, closes the tasks, leaves the group, stops the global tables, closes the state stores, and disconnects the client if the app created it. It returns within `timeoutMs` even when the cluster is unreachable: network steps are cut short before the deadline and the tasks then close without committing; what was not committed is processed again by the next owner of the partitions. A `close()` during `start()` makes the start fail. A `start()` during `close()` rejects with `IllegalStateError` (Kafka Streams' `PENDING_SHUTDOWN`): await the close, then start again.
 
 ## Offset Reset
 

@@ -45,7 +45,7 @@ A left record at `t` matches right records in `[t - before, t + after]`; a right
 - **Inner join**: only matches.
 - **Left join** (`leftJoin`): also every left record that matched nothing, joined with `null`. **Outer join** (`outerJoin`): unmatched records of both sides.
 - Unmatched records are joined with `null` only once their window closed (for a left record at `t`: when stream time passed `t + after + grace`), since a match can arrive until then. They wait in a shared store, and are emitted, at their own timestamp, when a later record moves stream time past their window; the check is throttled to once per second of wall clock. An unmatched record whose window already ended when it arrived is joined with `null` at once.
-- Records with a null value are dropped. Records with a null key are dropped by inner joins and joined with `null` at once by the outer sides of left and outer joins (KIP-962).
+- Records with a null (or undefined) value are dropped. Records with a null key are dropped by inner joins and joined with `null` at once by the outer sides of left and outer joins (KIP-962).
 
 Since unmatched results wait for stream time, a quiet stream emits them late. In tests, send a later record to move stream time.
 
@@ -85,7 +85,7 @@ orders.join(customers, (customerId: string, order: Order, customer: Customer) =>
 - Only stream records produce results, with the stream record's key, timestamp and headers. An update of the table produces nothing; it changes what later stream records find.
 - The table is read as it is when the stream record is processed. Within a task, records are processed in timestamp order across the stream and table partitions (see [Stream time](/flow/windowing#stream-time)), so a table update with an earlier timestamp is applied before a stream record with a later one, as long as both have arrived.
 - Inner join: records without a table value are dropped. Left join: they are joined with `null`.
-- Records with a null value are dropped. Records with a null key are dropped by the inner join and joined with `null` by the left join (KIP-962).
+- Records with a null (or undefined) value are dropped. Records with a null key are dropped by the inner join and joined with `null` by the left join (KIP-962).
 - Any table can be looked up, also a derived one that is not materialized (`filter()`, `mapValues()`, `transformValues()`, joins): its value is computed from its parent's.
 - A stream whose key changed is repartitioned first; `Joined.name` names the repartition topic and the join node, and `Joined.key` / `value` give the codecs it needs.
 
@@ -112,7 +112,7 @@ const withOptionalProduct = orders.leftJoin(
 - The key selector receives the record's key and value and returns the global table's key. The joiner may declare three parameters to receive the record's key (not the selected one).
 - No co-partitioning and no repartitioning: the stream keeps its partitioning. A key change upstream stays pending, so a key-based operation after the join still repartitions.
 - Only stream records produce results, with their key, timestamp and headers. The global table is read as it is when the record is processed; it is not synchronized with the stream's time.
-- Inner join: records the table has no value for, and records whose selector returns `null` or `undefined`, are dropped. Left join: both are joined with `null`. Records with a null value are dropped.
+- Inner join: records the table has no value for, and records whose selector returns `null` or `undefined`, are dropped. Left join: both are joined with `null`. Records with a null (or undefined) value are dropped.
 
 The two-argument form `join(globalTable, joiner)` is deprecated: it looks up the record's own key. Pass `(key) => key` as the selector instead.
 

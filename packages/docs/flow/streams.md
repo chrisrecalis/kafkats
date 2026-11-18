@@ -173,7 +173,7 @@ stream.groupBy((key, order) => order!.customerId, { key: string(), name: 'by-cus
 
 ### toTable
 
-Reads the stream as a table: the latest value per key, a null value deleting the key. Records with a null key are dropped. The table is materialized in a store; pass a `Materialized` to name it or set its codecs.
+Reads the stream as a table: the latest value per key, a null (or undefined) value deleting the key. Records with a null key are dropped. The table is materialized in a store; pass a `Materialized` to name it or set its codecs.
 
 ```typescript
 const latestOrders = stream.toTable({ storeName: 'latest-orders' })

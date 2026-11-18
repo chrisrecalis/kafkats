@@ -73,6 +73,8 @@ function slidingWindowed<K, V, A>(
 		}),
 		node: new SlidingWindowAggregate(name, windows, aggregation, emitFinal),
 		resultKeyCodec: WindowedCodecs.timeWindowed(keyCodec, windows.timeDifferenceMs),
-		graceMs: windows.graceMs,
+		// A sliding window's end is inclusive: it still changes while end >= stream time - grace (Kafka Streams'
+		// suppress() releases it one millisecond early).
+		graceMs: windows.graceMs + 1,
 	}))
 }

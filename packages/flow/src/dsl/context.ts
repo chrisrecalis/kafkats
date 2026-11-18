@@ -16,8 +16,9 @@ import type { NodeName, ProcessorDef, SourceDef, StoreBuilder } from '@/topology
 
 export class DslContext {
 	/**
-	 * The grace period of each windowed aggregation, by processor (KS GracePeriodGraphNode): how long after its end a
-	 * window may still change, for a session including its gap. `suppress()` finds when windows close through it.
+	 * When the windows of each windowed aggregation close, by processor (KS GracePeriodGraphNode): once stream time is
+	 * this far past a window's end. That is the grace period, for a session plus its gap; sessions and sliding windows
+	 * include their end, so for them 1 ms more. `suppress()` finds when windows close through it.
 	 */
 	readonly windowGraces = new Map<NodeName, number>()
 

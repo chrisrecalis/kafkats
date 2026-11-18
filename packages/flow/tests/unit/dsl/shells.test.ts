@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { KStream } from '@/api/kstream.js'
+import { codec } from '@/codec.js'
 import type { DslContext } from '@/dsl/context.js'
 import type { KTableNode } from '@/operators/ktable-node.js'
 import { BranchedKStreamImpl } from '@/dsl/branched.js'
@@ -198,8 +199,9 @@ describe('DSL shells delegate every method to its operator builder', () => {
 		expect(tableGroupBy.count).toHaveBeenCalledWith(grouped, options)
 		grouped.reduce(fn, fn, options)
 		expect(tableGroupBy.reduce).toHaveBeenCalledWith(grouped, fn, fn, options)
-		grouped.aggregate(fn, fn, fn, options)
-		expect(tableGroupBy.aggregate).toHaveBeenCalledWith(grouped, fn, fn, fn, options)
+		const aggregateOptions = { ...options, value: codec.json<number>() }
+		grouped.aggregate(fn, fn, fn, aggregateOptions)
+		expect(tableGroupBy.aggregate).toHaveBeenCalledWith(grouped, fn, fn, fn, aggregateOptions)
 	})
 
 	it('the split builder adds branches in order and returns itself', () => {

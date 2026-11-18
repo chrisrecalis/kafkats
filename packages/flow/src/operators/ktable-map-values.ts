@@ -30,7 +30,8 @@ export class KTableMapValues<K, V, VR> implements KTableNode<K, VR> {
 		mapping: ValueMapping<K, V, VR>,
 		private readonly options: MapValuesOptions = {}
 	) {
-		const map = (key: K, value: V | null) => (value === null ? null : mapping(key, value))
+		// A mapping to undefined is no value, as null is.
+		const map = (key: K, value: V | null) => (value === null ? null : (mapping(key, value) ?? null))
 		const { storeName } = options
 		this.supplier = () => new KTableMapValuesProcessor(map, options, () => this.sendOldValues)
 		this.valueGetter =

@@ -213,7 +213,7 @@ await driver.run(async ({ send }) => {
 
 ## Checking a Topology
 
-`driver.flow.describe()` (or `app.describe()`) builds the topology without running it: an invalid topology (a missing codec, a duplicate name) throws its `TopologyError`, and the description shows the subtopologies, stores and topics. See [describe()](/flow/topology#describe).
+`driver.flow.describe()` (or `app.describe()`) builds the topology without running it, and the description shows the subtopologies, stores and topics. A mistake throws `TopologyError`: a missing codec or an illegal or duplicate name from the DSL call that makes it, a conflict between parts of the topology from `describe()`. Defining the topology in a test and calling `describe()` checks both. See [describe()](/flow/topology#describe).
 
 ## Test Utilities
 
