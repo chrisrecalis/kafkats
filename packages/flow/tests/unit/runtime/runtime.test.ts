@@ -13,6 +13,7 @@ import { flow } from '@/app/flow.js'
 import { codec } from '@/codec.js'
 import { COUNT_CODEC } from '@/dsl/ops/aggregate.js'
 import { producerConfig, type KafkaIOOptions } from '@/runtime/kafka-io.js'
+import { InMemoryStateStoreProvider } from '@/state/memory.js'
 import { valueAndTimestampCodec } from '@/state/timestamped.js'
 import { deferred, type FakeIO } from '../support/fake-io.js'
 import { RuntimeHarness as Harness } from '../support/runtime-harness.js'
@@ -655,12 +656,14 @@ describe('runtime blocks of the legacy flow.test.ts', () => {
 
 	describe('instances started by flow()', () => {
 		async function started(
-			config: Partial<FlowConfig> = {}
+			config: Partial<FlowConfig> = {},
+			build: (app: FlowApp) => void = app => app.stream('events').to('out')
 		): Promise<{ app: FlowApp; options: KafkaIOOptions; io: FakeIO }> {
 			const client = new KafkaClient({ clientId: 'test-app', brokers: ['localhost:9092'] })
 			vi.spyOn(client, 'connect').mockResolvedValue()
+			vi.spyOn(client, 'disconnect').mockResolvedValue()
 			const app = flow({ applicationId: 'test-app', client, processingGuarantee: 'exactly_once', ...config })
-			app.stream('events').to('out')
+			build(app)
 			const count = kafkaIO.created.length
 			const starting = app.start()
 			await vi.waitFor(() => expect(kafkaIO.created[count]?.io.created.consumers).toHaveLength(1))
@@ -694,6 +697,60 @@ describe('runtime blocks of the legacy flow.test.ts', () => {
 		it('keep an explicit transactional id as is', async () => {
 			const { app, options } = await started({ producer: { transactionalId: 'orders-pod-0' } })
 			expect(producerConfig(options).transactionalId).toBe('orders-pod-0')
+			await app.close()
+		})
+
+		it('close({ timeoutMs }) returns within its timeout whatever hangs (D13)', async () => {
+			const { app, io } = await started()
+			const [consumer] = io.created.consumers
+			const [producer] = io.created.producers
+			producer!.steps.send.always('hang')
+			consumer!.deliver('events:0', [{ value: 'a' }])
+			await vi.waitFor(() => expect(producer!.steps.send.hung).toHaveLength(1))
+			for (const step of ['commit', 'abort', 'close'] as const) producer!.steps[step].always('hang')
+			consumer!.steps.stop.always('hang')
+			let closed = false
+			const closing = app.close({ timeoutMs: 3000 }).then(() => (closed = true))
+			await settle()
+			io.clock.advance(2500)
+			await settle()
+			expect(closed).toBe(false)
+			// The deadline is Date.now() + 3000 at close(): the fake clock started at Date.now() when the IO was created.
+			io.clock.advance(1000)
+			await vi.waitFor(() => expect(closed).toBe(true), { timeout: 1000 })
+			await closing
+			expect(app.state()).toBe('STOPPED')
+		})
+
+		it('a changelog checkpoint that fails to persist is reported by getError(), and the app keeps running', async () => {
+			const failure = new Error('disk full')
+			const checkpoints = new Map<string, bigint>()
+			class FailingCheckpoints extends InMemoryStateStoreProvider {
+				getChangelogCheckpointStore() {
+					return {
+						get: async (topic: string, partition: number) => checkpoints.get(`${topic}:${partition}`),
+						set: async (topic: string, partition: number, offset: bigint) => {
+							// The invalidation of a fresh store's checkpoint must persist (it is thrown otherwise).
+							if (offset !== -1n) throw failure
+							checkpoints.set(`${topic}:${partition}`, offset)
+						},
+					}
+				}
+			}
+			const { app, io } = await started(
+				{
+					processingGuarantee: 'at_least_once',
+					commitIntervalMs: 100,
+					stateStoreProvider: new FailingCheckpoints(),
+				},
+				counted =>
+					counted.stream('events', strings).groupByKey().count().toStream().to('out', { key: string() })
+			)
+			io.created.consumers[0]!.deliver('events:0', [{ key: 'k', value: 'a' }])
+			await vi.waitFor(() => expect(io.created.producers[0]!.sent.length).toBeGreaterThan(0))
+			io.clock.advance(100)
+			await vi.waitFor(() => expect(app.getError()).toBe(failure))
+			expect(app.state()).toBe('RUNNING')
 			await app.close()
 		})
 	})

@@ -532,23 +532,36 @@ describe('aggregations (copied from operator-semantics*.test.ts)', () => {
 		})
 	})
 
-	it('a far-future record on one partition does not make in-order records of another partition late', async () => {
-		// Stream time is kept per task (partition), so partition 0's clock does not judge partition 1's records.
-		const driver = new TestDriver()
-		const results: Array<{ s: number; v: number | null }> = []
-		driver
-			.input('in', S)
-			.groupByKey()
-			.windowedBy(TimeWindows.of(1000))
-			.count()
-			.toStream()
-			.peek((k, v) => results.push({ s: k!.window.start, v }))
-		await driver.run(async ({ send }) => {
-			await send('in', 'x', at('a', 10_000_000, 0))
-			await send('in', 'x', at('b', 5_000, 1))
-		})
-		expect(results).toContainEqual({ s: 5000, v: 1 })
-	})
+	it.each([
+		[
+			1,
+			[
+				{ s: 10_000_000, v: 1 },
+				{ s: 5000, v: 1 },
+			],
+		],
+		// Control: on the same partition the far-future record's stream time makes it late (no grace).
+		[0, [{ s: 10_000_000, v: 1 }]],
+	])(
+		'a far-future record on one partition does not make in-order records of another partition late (partition %d)',
+		async (partition, expected) => {
+			// Stream time is kept per task (partition), so partition 0's clock does not judge partition 1's records.
+			const driver = new TestDriver()
+			const results: Array<{ s: number; v: number | null }> = []
+			driver
+				.input('in', S)
+				.groupByKey()
+				.windowedBy(TimeWindows.ofSizeWithNoGrace(1000))
+				.count()
+				.toStream()
+				.peek((k, v) => results.push({ s: k!.window.start, v }))
+			await driver.run(async ({ send }) => {
+				await send('in', 'x', at('a', 10_000_000, 0))
+				await send('in', 'x', at('b', 5_000, partition))
+			})
+			expect(results).toEqual(expected)
+		}
+	)
 
 	it('sanity: partition-1 record alone is counted', async () => {
 		const driver = new TestDriver()
@@ -556,7 +569,7 @@ describe('aggregations (copied from operator-semantics*.test.ts)', () => {
 		driver
 			.input('in', S)
 			.groupByKey()
-			.windowedBy(TimeWindows.of(1000))
+			.windowedBy(TimeWindows.ofSizeWithNoGrace(1000))
 			.count()
 			.toStream()
 			.peek((k, v) => results.push({ s: k!.window.start, v }))

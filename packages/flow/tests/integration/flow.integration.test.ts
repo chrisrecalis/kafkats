@@ -887,7 +887,9 @@ describe('stream-stream joins (JoinWindows: left and outer results when the wind
 
 	it('left and outer joins hold an unmatched left record until its window and grace closed', async () => {
 		await producer.send(leftTopic, { key: 'k3', value: numberCodec.encode(9), timestamp: new Date(20_000) })
-		// Stream time reaches the end of the grace period: still open.
+		// Stream time reaches the end of the grace period: still open. The scans run at most once a second (wall clock):
+		// wait for one to be due, so that the boundary record does scan.
+		await sleep(1_100)
 		tick = 21_500
 		await producer.send(leftTopic, { key: TICK, value: numberCodec.encode(0), timestamp: new Date(tick) })
 		await sleep(1_500)
