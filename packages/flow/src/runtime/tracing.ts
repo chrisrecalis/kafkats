@@ -12,7 +12,7 @@ import type { Message } from '@kafkats/client'
 import type { ForwardResult, TaskId } from '@/processor/api.js'
 
 /** Runs a function, usually inside some asynchronous context, and returns what it returns. */
-export type Scope = <T>(run: () => T) => T
+export type FlowProcessScope = <T>(run: () => T) => T
 
 /** One record a task processes: the context of a `kafkats:flow:process` operation. */
 export interface FlowProcessDiagnostics {
@@ -29,7 +29,7 @@ export interface FlowProcessDiagnostics {
 	 * subscriber's asynchronous context (an active span). Every subscriber may ask; the scopes nest in the order they
 	 * were asked for.
 	 */
-	runIn(scope: Scope): void
+	runIn(scope: FlowProcessScope): void
 	/** Why processing failed, once it did. */
 	error?: unknown
 }
@@ -49,7 +49,7 @@ class RecordProcessing implements FlowProcessDiagnostics {
 	readonly headers: Readonly<Record<string, Buffer>>
 	error?: unknown
 	/** What subscribers asked the processing to run inside; the first to ask is the outermost. */
-	private scopes?: Scope[]
+	private scopes?: FlowProcessScope[]
 
 	constructor(
 		readonly applicationId: string,
@@ -62,7 +62,7 @@ class RecordProcessing implements FlowProcessDiagnostics {
 		this.headers = record.headers
 	}
 
-	runIn(scope: Scope): void {
+	runIn(scope: FlowProcessScope): void {
 		;(this.scopes ??= []).push(scope)
 	}
 

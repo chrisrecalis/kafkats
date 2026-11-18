@@ -45,6 +45,7 @@
 - Partitions without a committed offset start from `'earliest'` (Kafka Streams' default; it was the client's `'latest'`). Set `consumer.autoOffsetReset: 'latest'` to keep the old behaviour, or `Consumed.offsetReset` per source. A source with `'none'` and no committed offset stops the app (`NoOffsetResetError`).
 - Under at-least-once, offsets are committed every `commitIntervalMs`, default 5000; the consumer's automatic commits are off.
 - The exactly-once transactional id is `<applicationId>-<processId>`; a `producer.transactionalId` you set is used as it is.
+- Under exactly-once the producer's `transactionTimeoutMs` defaults to 10000 (Kafka Streams' default; it was the client's 60000), and `flow()` throws `FlowConfigError` when it is below `commitIntervalMs`: raise `producer.transactionTimeoutMs` together with a longer commit interval.
 - Topics feeding one stateful subtopology must have the same partition count (`CoPartitioningError`). Streams whose keys changed (`map()`, `flatMap()`, `selectKey()`, `process()`, `toStream(mapper)`, `groupBy()`) are repartitioned through `<applicationId>-<name>-repartition` before key-based operations, which needs key and value codecs (`TopologyError` otherwise). `through(topic)` (deprecated) continues with what it reads back from the topic. A `Grouped.name` is shared by every aggregation of its grouping; illegal names, duplicate store names and a repartition name claimed by two operations throw `TopologyError`.
 - Lateness is decided by grace periods. The deprecated `TimeWindows.of(size)`, `SessionWindows.withInactivityGap(gap)` and `JoinWindows.of(d)` get Kafka Streams' legacy grace (`max(24h - size, 0)`, `max(24h - gap, 0)`, `max(24h - 2d, 0)`), so their stores keep about a day of windows; switch to the new factories. `windowedBy()` returns `TimeWindowedKStream`, `SessionWindowedKStream` or `SlidingWindowedKStream` (`WindowedKGroupedStream` is gone).
 - Stream-stream joins take `JoinWindows` as their third argument (the `Joined.within` form is deprecated and maps to `JoinWindows.of`, keeping its eager results). With the new factories, unmatched left and outer results are emitted when the window closes; the match timestamp is `max(left, right)`.
@@ -55,7 +56,7 @@
 - `count()` results are int64 big-endian (Kafka Streams' `Serdes.Long`; were 8-byte little-endian doubles); pass `value` to keep another encoding. Result timestamps follow Kafka Streams.
 - `globalTable()` returns a `GlobalKTable`, usable only as the lookup side of a stream join; the two-argument join is deprecated (it looks up the record key).
 - `close()` takes `{ timeoutMs }`. `state()` is `'REBALANCING'` during rebalances, restorations and recoveries.
-- `@kafkats/flow/testing`: `driver.consumers` / `driver.producers` have one element; `vi` and `TestMessage` are no longer exported. `ChangelogTopicSpec` is no longer exported from `@kafkats/flow`.
+- `@kafkats/flow/testing`: `driver.consumers` / `driver.producers` have one element; `vi` and `TestMessage` are no longer exported. `ChangelogTopicSpec`, `ChangelogWriter`, `ChangelogBackedKeyValueStore`, `ChangelogBackedWindowStore` and `ChangelogBackedSessionStore` are no longer exported from `@kafkats/flow`: changelog logging is a store option (`logging` of `Stores` definitions, `changelog` of `Materialized`), applied by the runtime.
 
 **State store providers**
 

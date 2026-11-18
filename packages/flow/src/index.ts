@@ -19,7 +19,7 @@ export type {
 	GlobalStoreDescription,
 	TopologyNodeDescription,
 } from '@/api/app.js'
-export type { KStream, BranchedKStream, KeyValue, ValueMapper, ValueJoiner } from '@/api/kstream.js'
+export type { KStream, BranchedKStream, KeyValue, KeyValueMapper, ValueMapper, ValueJoiner } from '@/api/kstream.js'
 export type { KTable, GlobalKTable } from '@/api/ktable.js'
 export type {
 	KGroupedStream,
@@ -52,7 +52,7 @@ export type {
 	BranchOptions,
 } from '@/api/options.js'
 export type { Topic } from '@/topic.js'
-export type { ResetPolicy, TopicNameExtractor } from '@/topology/nodes.js'
+export type { ResetPolicy, TopicNameExtractor, TopicNameExtractorContext } from '@/topology/nodes.js'
 
 // Errors and handlers
 export {
@@ -104,6 +104,8 @@ export type {
 	Punctuator,
 	PunctuationType,
 	Cancellable,
+	MaybePromise,
+	ForwardResult,
 } from '@/processor/api.js'
 export { TimestampExtractors } from '@/processor/timestamps.js'
 export type { TimestampExtractor, ConsumedRecord } from '@/processor/timestamps.js'
@@ -123,11 +125,6 @@ export {
 	InMemorySessionStore,
 } from '@/state/memory.js'
 export type { InMemoryProviderOptions } from '@/state/memory.js'
-export {
-	ChangelogBackedKeyValueStore,
-	ChangelogBackedWindowStore,
-	ChangelogBackedSessionStore,
-} from '@/state/logging.js'
 export type {
 	StateStoreProvider,
 	ChangelogCheckpointStore,
@@ -151,7 +148,6 @@ export {
 	getDefaultTopicConfigs,
 	resolveChangelogConfig,
 	DEFAULT_CHANGELOG_CONFIGS,
-	ChangelogWriter,
 	ChangelogRestorer,
 	ChangelogDecodeError,
 	ChangelogPartitionMismatchError,
@@ -162,4 +158,4 @@ export type { ChangelogConfig, ChangelogRestorationOptions } from '@/changelog.j
 
 // Diagnostics: the records tasks process, on node:diagnostics_channel (`kafkats:flow:process`)
 export { flowDiagnostics } from '@/runtime/tracing.js'
-export type { FlowProcessDiagnostics } from '@/runtime/tracing.js'
+export type { FlowProcessDiagnostics, FlowProcessScope } from '@/runtime/tracing.js'

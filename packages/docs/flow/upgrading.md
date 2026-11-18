@@ -27,6 +27,7 @@ Changed defaults:
 - **Commits under at-least-once**: flow commits offsets itself every `commitIntervalMs`, default **5000** (with Kafka Streams' commit metadata); the consumer's automatic commits are off. Set `commitIntervalMs` for another interval. Exactly-once keeps 100.
 - **Offset reset**: partitions without a committed offset start from **`'earliest'`** (Kafka Streams' default; it was the client's `'latest'`). Set `consumer.autoOffsetReset: 'latest'` to keep the old behaviour, or `Consumed.offsetReset` per source. A source with `'none'` and no committed offset stops the app with `NoOffsetResetError`.
 - **Exactly-once transactional id**: `<applicationId>-<processId>` (a random process id per `start()`). A `producer.transactionalId` you set is used as it is, so it must be unique among running instances.
+- **Exactly-once transaction timeout**: the producer's `transactionTimeoutMs` defaults to **10000** (Kafka Streams' default; it was the client's 60000), and `flow()` throws `FlowConfigError` when it is below `commitIntervalMs`, since a transaction stays open for a commit interval. If you raised `commitIntervalMs` above 10 s, raise `producer.transactionTimeoutMs` with it.
 - **`close({ timeoutMs })`** returns within `timeoutMs` (default 20000), also when the cluster is unreachable.
 - **`state()`** is `'RUNNING'` only when every assigned task is restored and running; it is `'REBALANCING'` during a rebalance, a restoration or a recovery. Use it as a readiness probe.
 
@@ -85,6 +86,7 @@ See [Configuration](/flow/configuration) for every option.
 
 - `WindowedKGroupedStream`: use `TimeWindowedKStream`, `SessionWindowedKStream` or `SlidingWindowedKStream`.
 - `ChangelogTopicSpec`.
+- `ChangelogWriter`, `ChangelogBackedKeyValueStore`, `ChangelogBackedWindowStore` and `ChangelogBackedSessionStore`: the runtime adds changelog logging to every store whose definition enables it (`logging` of `Stores` definitions, `changelog` of `Materialized` and the DSL options), and sends its records with the task's output and commits.
 - `TestMessage` and `vi` from `@kafkats/flow/testing`.
 
 ## New

@@ -14,5 +14,5 @@ export {
 	CoPartitioningError,
 	SourceTopicNotFoundError,
 } from '@/changelog/errors.js'
-export { ChangelogWriter, windowedKeyCodec } from '@/changelog/writer.js'
+export { windowedKeyCodec } from '@/changelog/writer.js'
 export { ChangelogRestorer, type RestoreTarget } from '@/changelog/restorer.js'

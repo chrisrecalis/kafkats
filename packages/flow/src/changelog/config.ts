@@ -11,7 +11,7 @@ export interface ChangelogConfig {
 	enabled?: boolean
 	/** Custom topic name. Default: {appId}-{storeName}-changelog */
 	topicName?: string
-	/** Replication factor. Default: broker default */
+	/** Replication factor. Default: FlowConfig.changelog.replicationFactor, else the broker's default. */
 	replicationFactor?: number
 	/** Custom topic configs. Merged with defaults */
 	topicConfigs?: Record<string, string>
@@ -42,8 +42,9 @@ export interface ChangelogRestorationOptions {
 	 */
 	checkIntervalMs?: number
 	/**
-	 * Override the consumer's Fetch maxWaitMs during restoration to make stop() responsive.
-	 * Default: unset (uses consumer defaults).
+	 * Override the consumer's Fetch maxWaitMs during restoration to make stop() responsive. Default, in
+	 * FlowConfig.changelog.restoration: FlowConfig.consumer.maxWaitMs, else 500. For ChangelogRestorer.restore(): the
+	 * client consumer's default.
 	 */
 	consumerMaxWaitMs?: number
 	/** How many tasks restore at once (one restore consumer each). Default: 4. */

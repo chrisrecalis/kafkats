@@ -38,6 +38,7 @@ export {
 	type SendOptions,
 	type CommittedTransaction,
 } from '@/testing/mocks.js'
+export type { CommittedOffset, OffsetAndMetadata, ProducedMessage } from '@/runtime/io.js'
 export {
 	ResultCollector,
 	testRecord,
