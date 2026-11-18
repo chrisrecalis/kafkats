@@ -68,7 +68,7 @@ Some send failures are never offered to the handler:
 - `'shutdown'` (default): the app stops processing and moves to `ERROR`; `app.getError()` returns the error. Its tasks close without committing. Call `close()` to release the stores and the client.
 - `'restart'`: the failed group membership is abandoned (tasks close dirty, the consumer leaves) and the instance joins again after a backoff, from the committed offsets, as after an infrastructure failure. A deterministic failure (the same record failing again) will repeat.
 
-A failure of a global table always shuts down. Before `start()` resolved, every failure rejects `start()` instead (except a corrupted task, which is revived in place).
+A failure of a global table always shuts down. Until every task of the first assignment is `RUNNING` (when `start()` resolves), every failure rejects `start()` instead (except a corrupted task, which is revived in place).
 
 ## Timestamps
 

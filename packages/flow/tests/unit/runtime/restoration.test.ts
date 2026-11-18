@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { OffsetOutOfRangeError } from '@kafkats/client'
 import { TaskCorruptedError } from '@/api/errors.js'
 import { windowedKeyCodec } from '@/changelog/writer.js'
@@ -14,7 +14,7 @@ import { TaskIdRegistry } from '@/runtime/task-id.js'
 import { TaskManager } from '@/runtime/task-manager.js'
 import type { KeyValueStore, StateStore } from '@/state.js'
 import { Checkpoints } from '@/state/checkpoints.js'
-import { inMemory } from '@/state/memory.js'
+import { InMemoryKeyValueStore, inMemory } from '@/state/memory.js'
 import { StateDirectory } from '@/state/state-directory.js'
 import type { RegisteredStore } from '@/state/state-manager.js'
 import { keyValueStoreBuilder, sessionStoreBuilder, windowStoreBuilder } from '@/state/store-builders.js'
@@ -299,8 +299,8 @@ describe('RestorationPool (4.7.1)', () => {
 	})
 })
 
-describe('RestorationPool in the TaskManager: a corrupted restore revives the task with its state wiped (4.7.5, DL7a)', () => {
-	it('out of range mid-restore -> TaskCorruptedError -> revive({ wipe: true }) rebuilds from the new log start and runs', async () => {
+describe('RestorationPool in the TaskManager: a corrupted restore revives the task, which rebuilds its state (4.7.5, DL7a)', () => {
+	it('out of range mid-restore -> TaskCorruptedError -> revive({ rebuild: true }) rebuilds from the new log start and runs', async () => {
 		const changelog = `${APP}-s-changelog`
 		const h = new PoolHarness()
 		h.write(changelog, 0, ...Array.from({ length: 10 }, (_, i): [string, string] => [`k${i}`, `v${i}`]))
@@ -330,9 +330,21 @@ describe('RestorationPool in the TaskManager: a corrupted restore revives the ta
 		expect(corrupted!.state).toBe('RESTORING')
 		expect(await h.checkpoints.get(changelog, 0)).toBe(2n)
 
-		// FlowRuntime.fail's reaction to a corruption (4.6.1).
-		await manager.exclusive.run(() => manager.manager.revive([corrupted!], { wipe: true }))
+		// FlowRuntime.fail's reaction to a corruption (4.6.1). Inside exclusive, the revival only invalidates the
+		// checkpoint: the store is cleared by the restore of the new incarnation, outside exclusive (a store of millions
+		// of entries must not hold up slices, commits and rebalance hooks meanwhile).
+		const remove = vi.spyOn(InMemoryKeyValueStore.prototype, 'delete')
+		const scan = vi.spyOn(InMemoryKeyValueStore.prototype, 'all')
+		let insideExclusive: unknown[] | undefined
+		await manager.exclusive.run(async () => {
+			await manager.manager.revive([corrupted!], { rebuild: true })
+			insideExclusive = [remove.mock.calls.length, scan.mock.calls.length, await h.checkpoints.get(changelog, 0)]
+		})
+		expect(insideExclusive).toEqual([0, 0, -1n])
 		await waitFor(() => manager.manager.allRunning)
+		expect(remove.mock.calls.map(([key]) => key)).toEqual(['k0', 'k1'])
+		remove.mockRestore()
+		scan.mockRestore()
 
 		const [revived] = manager.manager.tasks()
 		expect(revived).not.toBe(corrupted)

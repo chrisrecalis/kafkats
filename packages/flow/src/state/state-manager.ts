@@ -210,8 +210,8 @@ export class TaskStateManager {
 		return this.closed
 	}
 
-	/** Returns the provider stores to the state directory (`wipe`: invalidated and cleared first). */
-	async release(options?: { wipe?: boolean }): Promise<void> {
+	/** Returns the provider stores to the state directory (`invalidate`: their changelog checkpoints invalidated first). */
+	async release(options?: { invalidate?: boolean }): Promise<void> {
 		const leased = this.leased
 		this.leased = []
 		this.registered = []

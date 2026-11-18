@@ -5,7 +5,8 @@
  *
  * Failures (4.6.2): corrupted tasks are revived in place; a migration abandons the run and joins again with a new one
  * after a backoff (D10); a fatal failure goes to the uncaught exception handler, which halts the app (state ERROR)
- * unless it answers 'restart'. Before start() resolved, every failure but a corruption rejects it instead.
+ * unless it answers 'restart'. Until the first assignment is RUNNING, every failure but a corruption rejects start()
+ * instead.
  */
 import type { Logger } from '@kafkats/client'
 import { StreamsError, type TaskCorruptedError } from '@/api/errors.js'
@@ -85,7 +86,10 @@ export class FlowRuntime {
 	private readonly recoveryAbort = new AbortController()
 	/** Recoveries since a run last committed: the backoff doubles with them (runtime§6.50). */
 	private attempt = 0
-	/** Aborted with the failure that fails a start in flight, or with the start timeout. */
+	/**
+	 * Aborted with the failure that fails a start in flight, or with the start timeout. Set until start() returns; a
+	 * failure fails the start only until the first assignment is RUNNING (`run.tasks.started`).
+	 */
 	private starting: AbortController | undefined
 	private stopping: Promise<void> | undefined
 
@@ -168,11 +172,12 @@ export class FlowRuntime {
 		}
 		const kind = classify(error, site)
 		if (kind === 'corrupted') {
-			this.run?.revive(error as TaskCorruptedError, { wipe: site === 'restore' })
+			this.run?.revive(error as TaskCorruptedError, { rebuild: site === 'restore' })
 			return
 		}
-		if (this.starting !== undefined) {
-			// start() rejects with it (4.2 step 8); the start's stop closes the run dirty.
+		if (this.starting !== undefined && !this.run?.tasks.started) {
+			// start() rejects with it (4.2 step 8); the start's stop closes the run dirty. Once the first assignment is
+			// RUNNING, start() resolves whatever fails: a failure meanwhile is handled like any later one.
 			this.run?.markFailed()
 			this.starting.abort(error)
 			return

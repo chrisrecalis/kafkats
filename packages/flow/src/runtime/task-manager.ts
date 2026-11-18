@@ -91,6 +91,8 @@ export class TaskManager {
 	private readonly taskConfig: TaskConfig
 	private metadata: ConsumerGroupMetadata | undefined
 	private running = false
+	/** Set with the first change to allRunning and never reset: whenAllRunning has resolved. */
+	private ranAll = false
 	private assigning = false
 	/** Assignments that completed without a failure: only they count for allRunning (CR14). */
 	private assignments = 0
@@ -125,6 +127,14 @@ export class TaskManager {
 
 	get allRunning(): boolean {
 		return this.running
+	}
+
+	/**
+	 * Every task of an assignment was RUNNING at least once. Set synchronously when whenAllRunning resolves (its
+	 * waiters run a few microtasks later), so that the runtime knows its start is over before any slice runs.
+	 */
+	get started(): boolean {
+		return this.ranAll
 	}
 
 	/**
@@ -258,9 +268,11 @@ export class TaskManager {
 	 * Closes the tasks dirty and re-creates them in place without leaving the group (4.7.5, KS closeDirtyAndRevive):
 	 * from their last commit, partitions paused and rewound to it, through the restore pipeline. A task corrupted again
 	 * within 60 s escalates to a migration. A task suspended meanwhile is only closed: its partitions were revoked, so
-	 * the next assignment re-creates it from its commit. Tasks replaced meanwhile are skipped.
+	 * the next assignment re-creates it from its commit. Tasks replaced meanwhile are skipped. `rebuild`: their logged
+	 * stores are rebuilt from the changelogs (a restore that found its records gone): their checkpoints are only
+	 * invalidated here, the restore of the new incarnation clears and replays them outside exclusive, interruptibly.
 	 */
-	async revive(tasks: readonly StreamTask[], options: { wipe: boolean }): Promise<void> {
+	async revive(tasks: readonly StreamTask[], options: { rebuild: boolean }): Promise<void> {
 		if (this.deps.failed()) {
 			return
 		}
@@ -279,7 +291,7 @@ export class TaskManager {
 			for (const task of current) {
 				if (this.deps.failed()) return
 				this.revivedAt.set(task.id, now)
-				await this.reviveTask(task, options.wipe)
+				await this.reviveTask(task, options.rebuild)
 			}
 		} catch (error) {
 			this.fail(error, 'assignment')
@@ -414,11 +426,11 @@ export class TaskManager {
 	}
 
 	/** One task of revive(): a suspended one is only closed, its partitions are no longer this member's. */
-	private async reviveTask(task: StreamTask, wipe: boolean): Promise<void> {
+	private async reviveTask(task: StreamTask, rebuild: boolean): Promise<void> {
 		const { consumer } = this.deps
 		if (task.state === 'SUSPENDED') {
 			this.forget(task)
-			await task.close('dirty', { wipe })
+			await task.close('dirty', { invalidate: rebuild })
 			return
 		}
 		// First: nothing more of these partitions reaches either incarnation (C5).
@@ -430,7 +442,7 @@ export class TaskManager {
 		}
 		const starts = task.restartStarts()
 		this.forget(task)
-		await task.close('dirty', { wipe })
+		await task.close('dirty', { invalidate: rebuild })
 		const revived = await this.create(task.id, task.subtopology, task.inputPartitions)
 		if (revived === undefined) {
 			return
@@ -492,6 +504,9 @@ export class TaskManager {
 			return
 		}
 		this.running = running
+		if (running) {
+			this.ranAll = true
+		}
 		this.deps.onAllRunningChanged(running)
 		if (running) {
 			for (const waiter of this.waiters) waiter.resolve()

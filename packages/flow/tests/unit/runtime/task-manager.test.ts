@@ -219,8 +219,8 @@ class Harness {
 		return this.exclusive.run(() => this.manager.handleLost(keys.map(tp)))
 	}
 
-	revive(tasks: readonly StreamTask[], wipe = false): Promise<void> {
-		return this.exclusive.run(() => this.manager.revive(tasks, { wipe }))
+	revive(tasks: readonly StreamTask[], rebuild = false): Promise<void> {
+		return this.exclusive.run(() => this.manager.revive(tasks, { rebuild }))
 	}
 
 	closeAll(mode: 'clean' | 'dirty', signal = this.hardStop.signal): Promise<void> {
@@ -581,7 +581,7 @@ describe('TaskManager: restore pipelines (4.7.1)', () => {
 		expect(h.failures).toEqual([{ error, site: 'restore' }])
 	})
 
-	it('a restore-time corruption does not fail the start: the task is revived in place with wiped stores', async () => {
+	it('a restore-time corruption does not fail the start: the task is revived in place and rebuilds its stores', async () => {
 		const h = new Harness()
 		h.restorer.manual = true
 		await h.assign('input:0')
@@ -688,19 +688,22 @@ describe('TaskManager: revive in place (4.7.5)', () => {
 		expect(h.restorer.restored).toEqual([task, revived])
 	})
 
-	it.each([
-		[true, undefined],
-		[false, 'v'],
-	])('wipe %s: the revived task restores into cleared stores, or into the kept ones', async (wipe, value) => {
-		const h = await running()
-		const [task] = h.tasks()
-		h.enqueue('input:0', { key: 'k', value: 'v' })
-		await h.process(task!)
-		await h.revive([task!], wipe)
-		await h.settle()
-		const store = h.tasks()[0]!.store('s') as KeyValueStore<string, string>
-		expect(await store.get('k')).toBe(value)
-	})
+	it.each([true, false])(
+		'rebuild %s: the stores are released with their checkpoints invalidated (or not), never cleared here',
+		async rebuild => {
+			const h = await running()
+			const [task] = h.tasks()
+			h.enqueue('input:0', { key: 'k', value: 'v' })
+			await h.process(task!)
+			const release = vi.spyOn(h.stateDirectory, 'release')
+			await h.revive([task!], rebuild)
+			await h.settle()
+			expect(release.mock.calls.map(call => call[3])).toEqual([{ invalidate: rebuild }])
+			// Clearing a logged store is the restore's, outside exclusive; an unlogged one keeps its state either way.
+			const store = h.tasks()[0]!.store('s') as KeyValueStore<string, string>
+			expect(await store.get('k')).toBe('v')
+		}
+	)
 
 	it.each([
 		[59_999, true],
@@ -759,7 +762,7 @@ describe('TaskManager: an op that outlives the end of its run (Run.end closes th
 		const wiped = deferred()
 		const release = h.stateDirectory.release.bind(h.stateDirectory)
 		vi.spyOn(h.stateDirectory, 'release').mockImplementation(async (owner, store, partition, options) => {
-			if (options?.wipe) await wiped.promise
+			if (options?.invalidate) await wiped.promise
 			return release(owner, store, partition, options)
 		})
 		const reviving = h.revive([task!], true)

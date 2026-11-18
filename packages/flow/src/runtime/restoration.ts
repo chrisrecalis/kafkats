@@ -45,7 +45,7 @@ export class RestorationPool implements TaskRestorer {
 	 * Restores the task's logged stores that restore (raw stores, runtime§6.36) and resolves to the max key time
 	 * applied to each window and session store. An aborted job rejects with an AbortError: a queued one at once, a
 	 * running one once its store write in flight is done and its progress is checkpointed. A changelog that lost
-	 * records the restore needed (C7) is a TaskCorruptedError: the task is revived with its state wiped (4.7.5).
+	 * records the restore needed (C7) is a TaskCorruptedError: the task is revived and rebuilds its stores (4.7.5).
 	 */
 	async restore(task: RestoringTask, signal: AbortSignal): Promise<{ storeTimes: ReadonlyMap<string, number> }> {
 		const restoring = task.stores.flatMap(store => {

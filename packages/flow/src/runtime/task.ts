@@ -269,9 +269,10 @@ export class StreamTask {
 	/**
 	 * Clean (from SUSPENDED): closes the store stacks and releases the stores; uncommitted work or a failure closes
 	 * dirty instead (KS). Dirty (any state): suspends if needed, drops buffered writes and releases the stores without
-	 * a checkpoint (`wipe`: invalidated and cleared); never throws. Returns the mode used.
+	 * a checkpoint (`invalidate`: their changelog checkpoints invalidated, so that the next owner rebuilds them); never
+	 * throws. Returns the mode used.
 	 */
-	async close(mode: 'clean' | 'dirty', options: { wipe?: boolean } = {}): Promise<'clean' | 'dirty'> {
+	async close(mode: 'clean' | 'dirty', options: { invalidate?: boolean } = {}): Promise<'clean' | 'dirty'> {
 		if (this.closedAs !== undefined) {
 			return this.closedAs
 		}
@@ -572,7 +573,7 @@ export class StreamTask {
 		}
 	}
 
-	private async closeDirty(options: { wipe?: boolean }): Promise<'dirty'> {
+	private async closeDirty(options: { invalidate?: boolean }): Promise<'dirty'> {
 		const swallow = async (step: string, run: () => unknown) => {
 			try {
 				await run()

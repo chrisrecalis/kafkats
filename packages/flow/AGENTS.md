@@ -77,8 +77,9 @@ test`, `pnpm -C packages/flow-state-rocksdb test`).
   other non-fatal Kafka errors, retriable send failures under exactly-once, at-least-once commit timeouts lasting
   `taskTimeoutMs`; `fatal` goes to the uncaught exception handler (`'shutdown'`: state ERROR; `'restart'`: a new
   run). Record failures go to the deserialization, processing and production handlers first (`'fail'` |
-  `'continue'`); under exactly-once a send failure never reaches the production handler. Before `start()` resolved,
-  every failure but a corruption rejects it.
+  `'continue'`); under exactly-once a send failure never reaches the production handler. Until every task of the
+  first assignment is RUNNING, every failure but a corruption rejects `start()`; a corruption revives the task in place
+  (a changelog out of range: its checkpoints are invalidated, its restore clears and rebuilds the stores).
 - **Global tables**: a consumer per table outside the group (read_committed, no commits): wiped and loaded to the
   end offsets before processing, then followed; an out-of-range position reloads in place while processing waits; a
   row failure fails the start, or halts the app afterwards.

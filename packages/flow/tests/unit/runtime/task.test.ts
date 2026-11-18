@@ -205,7 +205,7 @@ describe('StreamTask lifecycle (4.4)', () => {
 	}
 
 	for (const from of STATES) {
-		it(`a dirty close from ${from} suspends, drops buffers and releases (wipe), and never throws`, async () => {
+		it(`a dirty close from ${from} suspends, drops buffers and releases (invalidate), and never throws`, async () => {
 			let failClose = false
 			const h = new TaskHarness({
 				build: b =>
@@ -223,7 +223,7 @@ describe('StreamTask lifecycle (4.4)', () => {
 			const state = h.state(task)
 			const discardsBefore = state.bufferDiscards
 			state.release = () => Promise.reject(new Error('release failed'))
-			expect(await task.close('dirty', { wipe: true })).toBe(from === 'CLOSED' ? 'clean' : 'dirty')
+			expect(await task.close('dirty', { invalidate: true })).toBe(from === 'CLOSED' ? 'clean' : 'dirty')
 			expect(task.state).toBe('CLOSED')
 			if (from !== 'CLOSED') {
 				expect(state.stackClosed).toBe(true)
@@ -232,11 +232,11 @@ describe('StreamTask lifecycle (4.4)', () => {
 		})
 	}
 
-	it('a dirty close passes wipe to the release', async () => {
+	it('a dirty close passes invalidate to the release', async () => {
 		const h = new TaskHarness({ build: b => pipe(b, { processor: passThrough }) })
 		const task = await inState(h, 'RUNNING')
-		await task.close('dirty', { wipe: true })
-		expect(h.state(task).released).toEqual({ wipe: true })
+		await task.close('dirty', { invalidate: true })
+		expect(h.state(task).released).toEqual({ invalidate: true })
 	})
 
 	it('a clean close of a task with uncommitted work closes dirty (KS)', async () => {

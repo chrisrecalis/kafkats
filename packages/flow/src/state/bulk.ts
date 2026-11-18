@@ -1,5 +1,5 @@
 import type { Codec } from '@/codec.js'
-import { abortError } from '@/runtime/signals.js'
+import { abortError, yieldIfDue } from '@/runtime/signals.js'
 import type { KeyValueStore } from '@/state.js'
 
 /**
@@ -52,7 +52,8 @@ export async function writeChanges<K, V>(
 }
 
 /**
- * Remove every entry from a store. Rejects with an AbortError once `signal` aborts, between two rounds of removals:
+ * Remove every entry from a store. Yields to the event loop as it goes (a store with millions of entries must not hold
+ * up timers and network callbacks), and rejects with an AbortError once `signal` aborts, before a round of removals:
  * the caller must have invalidated the store's checkpoint, since the store is then partly cleared.
  */
 export async function clearStore<K, V>(store: KeyValueStore<K, V>, signal?: AbortSignal): Promise<void> {
@@ -60,8 +61,11 @@ export async function clearStore<K, V>(store: KeyValueStore<K, V>, signal?: Abor
 	const keys: K[] = []
 	for await (const [key] of store.all()) {
 		keys.push(key)
+		const turn = yieldIfDue()
+		if (turn !== undefined) await turn
 	}
 	for (let start = 0; start < keys.length; start += WIPE_ROUND) {
+		await yieldIfDue()
 		if (signal?.aborted) {
 			throw abortError(signal)
 		}

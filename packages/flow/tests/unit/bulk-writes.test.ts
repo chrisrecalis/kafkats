@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { codec } from '../../src/index.js'
 import { InMemoryKeyValueStore } from '../../src/state/memory.js'
 import { clearStore, latestPerKey, writeChanges } from '../../src/state/bulk.js'
@@ -79,5 +79,29 @@ describe('bulk writes to a store', () => {
 		await expect(clearStore(store, stopped.signal)).rejects.toThrow(expect.objectContaining({ name: 'AbortError' }))
 
 		expect(await store.approximateNumEntries()).toBe(1)
+	})
+
+	it('lets timers and I/O run while it clears a large store (it yields to the event loop as it goes)', async () => {
+		const store = new InMemoryKeyValueStore<string, string>('s', { keyCodec: str, valueCodec: str })
+		const entries = Array.from({ length: 25_000 }, (_, i) => ({ key: Buffer.from(`k${i}`), value: Buffer.from('v') }))
+		await writeChanges(store, str, str, entries)
+		// Every check finds a yield due: what runs in between is what a slow store would let run.
+		let now = performance.now()
+		const clock = vi.spyOn(performance, 'now').mockImplementation(() => (now += 20))
+		let turns = 0
+		let ticking = true
+		const tick = (): void => {
+			turns++
+			if (ticking) setImmediate(tick)
+		}
+		setImmediate(tick)
+		try {
+			await clearStore(store)
+		} finally {
+			ticking = false
+			clock.mockRestore()
+		}
+		expect(turns).toBeGreaterThan(3)
+		expect(await store.approximateNumEntries()).toBe(0)
 	})
 })

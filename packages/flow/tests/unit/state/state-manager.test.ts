@@ -255,7 +255,7 @@ describe('TaskStateManager - closing and releasing', () => {
 		expect(await kv(next, 'counts').get('k')).toBe('kept')
 	})
 
-	it('release({ wipe }) invalidates the checkpoints and clears the stores', async () => {
+	it('release({ invalidate }) invalidates the checkpoints and keeps the stores (the next restore clears them)', async () => {
 		const durable = checkpointStore()
 		const checkpoints = new Checkpoints(durable, () => {})
 		const { state, stateDirectory } = manager([counts], { checkpoints })
@@ -263,12 +263,12 @@ describe('TaskStateManager - closing and releasing', () => {
 		await kv(state, 'counts').put('k', 'v')
 		await checkpoints.set('app-counts-changelog', 2, 10n)
 
-		await state.release({ wipe: true })
+		await state.release({ invalidate: true })
 
 		expect(durable.values.get('app-counts-changelog:2')).toBe(-1n)
 		const next = manager([counts], { stateDirectory, checkpoints }).state
 		await next.register()
-		expect(await rawKv(next).approximateNumEntries()).toBe(0)
+		expect(await rawKv(next).approximateNumEntries()).toBe(1)
 	})
 
 	it('register() releases what it leased when a lease fails', async () => {

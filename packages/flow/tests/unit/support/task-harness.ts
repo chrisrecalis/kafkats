@@ -63,12 +63,12 @@ export class RecordingLogger implements Logger {
 export class StateProbe {
 	registered = false
 	stackClosed = false
-	released: { wipe?: boolean } | undefined
+	released: { invalidate?: boolean } | undefined
 	bufferApplies = 0
 	bufferDiscards = 0
 	readonly checkpoints: { positions: ReadonlyMap<string, bigint>; eos: boolean }[] = []
 	/** Replaces the release when set (reject to make it fail). */
-	release: ((options?: { wipe?: boolean }) => Promise<void>) | undefined
+	release: ((options?: { invalidate?: boolean }) => Promise<void>) | undefined
 
 	constructor(
 		readonly manager: TaskStateManager,

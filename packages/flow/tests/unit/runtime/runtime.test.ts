@@ -8,7 +8,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { KafkaClient, string, TimeoutError } from '@kafkats/client'
 import type { FlowApp, FlowConfig } from '@/api/app.js'
-import { FailedProcessingError, NoOffsetResetError } from '@/api/errors.js'
+import { FailedProcessingError, NoOffsetResetError, TaskMigratedError } from '@/api/errors.js'
 import { flow } from '@/app/flow.js'
 import { codec } from '@/codec.js'
 import { COUNT_CODEC } from '@/dsl/ops/aggregate.js'
@@ -215,6 +215,75 @@ describe('recovery (task migration, 4.10.2)', () => {
 		await vi.waitFor(() => expect(h.io.created.globalConsumers.map(c => c.calls.at(-1))).toEqual(['stop']))
 		await h.stop()
 		expect(h.lifecycle.state).toBe('STOPPED')
+	})
+})
+
+describe('start (4.2)', () => {
+	/**
+	 * `in` (2 partitions) -> a processor that throws `failure()` for the value 'boom'; its init() for partition 1 waits
+	 * for `gate`, so that task 0_0 runs while the completion op of task 0_1 holds the scheduler.
+	 */
+	function gatedStart(failure: () => Error) {
+		const gate = deferred()
+		const processed: string[] = []
+		const h = new Harness(
+			app => {
+				app.stream('in', strings).process(() => ({
+					init: async context => {
+						if (context.taskId.partition === 1) await gate.promise
+					},
+					process: record => {
+						if (record.value === 'boom') throw failure()
+						processed.push(record.value!)
+					},
+				}))
+			},
+			{},
+			{ partitions: { in: 2, out: 1 } }
+		)
+		return { h, gate, processed }
+	}
+
+	/**
+	 * A record of the RUNNING task 0_0 waits while 0_1 completes; the first slice after the last completion runs it
+	 * before start() returns (start() resolves a few microtasks after the tasks are all RUNNING).
+	 */
+	async function failingAsTheStartEnds(h: Harness, gate: { resolve(): void }): Promise<'resolved' | unknown> {
+		const starting = h.start()
+		await h.joined()
+		void h.consumer.rebalance('in:0', 'in:1')
+		await vi.waitFor(() => expect(h.consumer.partitions.get('in:0')?.paused).toBe(false))
+		h.consumer.deliver('in:0', [{ key: 'k', value: 'boom' }])
+		await settle()
+		gate.resolve()
+		return starting.then(
+			() => 'resolved',
+			(error: unknown) => error
+		)
+	}
+
+	it('a fatal failure right after the first assignment is RUNNING goes to the uncaught handler: ERROR, not lost', async () => {
+		const { h, gate, processed } = gatedStart(() => new Error('boom'))
+		expect(await failingAsTheStartEnds(h, gate)).toBe('resolved')
+		await vi.waitFor(() => expect(h.lifecycle.state).toBe('ERROR'))
+		expect(h.lifecycle.error).toBeInstanceOf(FailedProcessingError)
+		expect(h.logger.errors).toContain('the app stopped after a failure: close() releases it')
+		await vi.waitFor(() => expect(h.consumer.calls.at(-1)).toBe('stop'))
+		expect(processed).toEqual([])
+		await h.stop()
+	})
+
+	it('a migration right after the first assignment is RUNNING joins the group again', async () => {
+		const { h, gate } = gatedStart(() => new TaskMigratedError('fenced'))
+		expect(await failingAsTheStartEnds(h, gate)).toBe('resolved')
+		await vi.waitFor(() => expect(h.lifecycle.state).toBe('REBALANCING'))
+		expect(h.lifecycle.error).toBeInstanceOf(TaskMigratedError)
+		await vi.waitFor(() => expect(h.producer.closed).toBe(true))
+		expect(h.consumer.calls.at(-1)).toBe('stop')
+		await settle()
+		h.io.clock.advance(500)
+		await h.joined(2)
+		await h.stop()
 	})
 })
 

@@ -79,45 +79,39 @@ describe('StateDirectory', () => {
 		await expect(dir.lease(T0, counts, 0)).resolves.toBeDefined()
 	})
 
-	it('release with wipe invalidates the checkpoint, then clears the store', async () => {
+	it('release with invalidate only invalidates the checkpoint: the next owner\'s restore clears the store', async () => {
 		const durable = checkpointStore()
 		const checkpoints = new Checkpoints(durable, () => {})
 		const { directory: dir } = directory({ checkpoints })
 		const store = (await dir.lease(T0, counts, 0)) as KeyValueStore<string, string>
 		await store.put('k', 'v')
 		await checkpoints.set('app-counts-changelog', 0, 10n)
-		let entriesWhenInvalidated: number | undefined
-		const set = durable.set
-		durable.set = async (topic, partition, offset) => {
-			if (offset === -1n) entriesWhenInvalidated = await store.approximateNumEntries()
-			return set(topic, partition, offset)
-		}
+		const remove = vi.spyOn(store, 'delete')
+		const scan = vi.spyOn(store, 'all')
 
-		await dir.release(T0, 'counts', 0, { wipe: true })
+		await dir.release(T0, 'counts', 0, { invalidate: true })
 
-		expect(entriesWhenInvalidated).toBe(1)
 		expect(durable.values.get('app-counts-changelog:0')).toBe(-1n)
-		expect(await store.approximateNumEntries()).toBe(0)
+		expect([remove.mock.calls, scan.mock.calls]).toEqual([[], []])
 		await expect(dir.lease(T1, counts, 0)).resolves.toBe(store)
 	})
 
-	it('release with wipe of a store without changelog only clears it', async () => {
+	it('release with invalidate of a store without changelog keeps it as is', async () => {
 		const { directory: dir, checkpoints } = directory()
 		const invalidate = vi.spyOn(checkpoints, 'invalidate')
 		const store = (await dir.lease(T0, unlogged, 0)) as KeyValueStore<string, string>
 		await store.put('k', 'v')
-		await dir.release(T0, 'scratch', 0, { wipe: true })
+		await dir.release(T0, 'scratch', 0, { invalidate: true })
 		expect(invalidate).not.toHaveBeenCalled()
-		expect(await store.approximateNumEntries()).toBe(0)
+		expect(await store.get('k')).toBe('v')
 	})
 
-	it('a release whose wipe fails still ends the lease, and rejects', async () => {
+	it('a release whose invalidation fails still ends the lease, and rejects', async () => {
 		const { directory: dir, checkpoints } = directory()
 		vi.spyOn(checkpoints, 'invalidate').mockRejectedValue(new Error('disk full'))
 		const store = (await dir.lease(T0, counts, 0)) as KeyValueStore<string, string>
 		await store.put('k', 'v')
-		await expect(dir.release(T0, 'counts', 0, { wipe: true })).rejects.toThrow('disk full')
-		// Never cleared without an invalidated checkpoint.
+		await expect(dir.release(T0, 'counts', 0, { invalidate: true })).rejects.toThrow('disk full')
 		expect(await store.get('k')).toBe('v')
 		await expect(dir.lease(T1, counts, 0)).resolves.toBe(store)
 	})

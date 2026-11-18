@@ -78,10 +78,11 @@ export class StateDirectory {
 	}
 
 	/**
-	 * Ends `owner`'s lease. `wipe`: first invalidates the store's changelog checkpoint, then clears the store, so that
-	 * its state is rebuilt from the changelog by the next owner.
+	 * Ends `owner`'s lease, also when `invalidate` fails. `invalidate`: first invalidates the store's changelog
+	 * checkpoint, so that the next owner's restore clears the store and rebuilds it from the changelog (a write and a
+	 * flush here: the clear is the restore's, which a stop interrupts).
 	 */
-	async release(owner: TaskId, store: string, partition: number, options?: { wipe?: boolean }): Promise<void> {
+	async release(owner: TaskId, store: string, partition: number, options?: { invalidate?: boolean }): Promise<void> {
 		const id = instanceId(store, partition)
 		const instance = this.instances.get(id)
 		if (instance === undefined || this.leases.get(id) !== owner) {
@@ -90,7 +91,7 @@ export class StateDirectory {
 			)
 		}
 		try {
-			if (options?.wipe) await this.wipe(instance)
+			if (options?.invalidate) await this.invalidate(instance)
 		} finally {
 			this.endLease(id)
 		}
@@ -197,9 +198,13 @@ export class StateDirectory {
 		return opened.ready
 	}
 
-	private async wipe(instance: Instance): Promise<void> {
+	private async invalidate(instance: Instance): Promise<void> {
 		const { logging } = instance.builder
 		if (logging.enabled) await this.checkpoints.invalidate(logging.topic, instance.partition)
+	}
+
+	private async wipe(instance: Instance): Promise<void> {
+		await this.invalidate(instance)
 		await clearStore(instance.store as KeyValueStore<unknown, unknown>)
 	}
 }

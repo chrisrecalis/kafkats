@@ -160,7 +160,6 @@ export class Run {
 		})
 		this.pruneTimer = new PruneTimer({
 			stateDirectory: deps.stateDirectory,
-			exclusive: fn => this.scheduler.exclusive(fn),
 			clock: io.clock,
 			signal: this.hardStop.signal,
 			logger,
@@ -194,10 +193,10 @@ export class Run {
 
 	/**
 	 * Closes the corrupted tasks dirty and re-creates them from their last commit, without a rebalance (4.7.5, KS
-	 * `closeDirtyAndRevive`); `wipe` clears their state first (a restore that found its records gone). The other
-	 * tasks go on.
+	 * `closeDirtyAndRevive`); `rebuild`: their logged stores are rebuilt from the changelogs (a restore that found its
+	 * records gone). The other tasks go on.
 	 */
-	revive(error: TaskCorruptedError, options: { wipe: boolean }): void {
+	revive(error: TaskCorruptedError, options: { rebuild: boolean }): void {
 		const ids = new Set(error.tasks)
 		const tasks = this.tasks.tasks().filter(task => ids.has(task.id))
 		if (tasks.length === 0) {
@@ -205,7 +204,7 @@ export class Run {
 		}
 		this.deps.logger.warn('tasks are revived from their last commit', {
 			tasks: tasks.map(task => task.id.key),
-			wipe: options.wipe,
+			rebuild: options.rebuild,
 			...errorFields(error),
 		})
 		this.scheduler
