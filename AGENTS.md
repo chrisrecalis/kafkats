@@ -8,17 +8,17 @@ This is a pnpm monorepo containing a pure-protocol TypeScript Kafka client and s
 
 ## Packages
 
-| Package | Description |
-|---------|-------------|
-| `@kafkats/client` | Core Kafka client (producer, consumer, protocol) |
-| `@kafkats/flow` | Kafka Streams-style stream processing: DSL, Processor API, task runtime |
-| `@kafkats/flow-state-lmdb` | Persistent LMDB state stores for flow |
-| `@kafkats/flow-state-rocksdb` | Persistent RocksDB state stores for flow |
-| `@kafkats/flow-state-testkit` | Private: test suites shared by the state store providers |
-| `@kafkats/codec-zod` | Zod-based serialization codecs |
-| `@kafkats/opentelemetry` | OpenTelemetry traces and metrics for the client and flow |
-| `@kafkats/benchmark` | Performance benchmarks vs kafkajs |
-| `docs` | VitePress documentation site |
+| Package                       | Description                                                             |
+| ----------------------------- | ----------------------------------------------------------------------- |
+| `@kafkats/client`             | Core Kafka client (producer, consumer, protocol)                        |
+| `@kafkats/flow`               | Kafka Streams-style stream processing: DSL, Processor API, task runtime |
+| `@kafkats/flow-state-lmdb`    | Persistent LMDB state stores for flow                                   |
+| `@kafkats/flow-state-rocksdb` | Persistent RocksDB state stores for flow                                |
+| `@kafkats/flow-state-testkit` | Private: test suites shared by the state store providers                |
+| `@kafkats/codec-zod`          | Zod-based serialization codecs                                          |
+| `@kafkats/opentelemetry`      | OpenTelemetry traces and metrics for the client and flow                |
+| `@kafkats/benchmark`          | Performance benchmarks vs kafkajs                                       |
+| `docs`                        | VitePress documentation site                                            |
 
 Each package has its own `AGENTS.md` with package-specific guidance. **Read the package's AGENTS.md for testing instructions before running tests.**
 
@@ -53,6 +53,7 @@ pnpm docs:build    # Build static site
 **Read the package-specific `AGENTS.md` for detailed testing instructions.** Each package has different test commands and requirements.
 
 General notes:
+
 - Integration tests use testcontainers to spin up Kafka brokers (Docker required), or the brokers in `KAFKA_BROKERS` when it is set (e.g. `KAFKA_BROKERS=127.0.0.1:19092`)
 - `@kafkats/flow` and the other packages read `@kafkats/client` from its `dist`: run `pnpm -C packages/client build` after changing the client
 - Flow's chaos suite (broker kills, pauses and restarts against Docker brokers) runs with `packages/flow/tests/chaos/run-all.sh`; see `packages/flow/AGENTS.md`
@@ -60,6 +61,7 @@ General notes:
 - Set `KAFKA_TS_LOG_LEVEL=debug` for verbose client logs
 
 **WARNING: VS Code Dev Containers**
+
 - Do NOT kill or stop Docker containers when running inside a VS Code dev container
 - The dev container itself runs as a Docker container, and killing containers can terminate your development session
 - Run `docker ps` to see running containers before attempting any cleanup
