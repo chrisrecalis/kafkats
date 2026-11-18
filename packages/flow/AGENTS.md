@@ -1,293 +1,209 @@
 # @kafkats/flow
 
-Kafka Streams-like flow APIs built on top of @kafkats/client.
+Kafka Streams' processing model on top of `@kafkats/client`: the DSL (`KStream`, `KTable`, `GlobalKTable`, windows,
+joins, `suppress()`), the Processor API, and a task runtime with Kafka Streams' commit protocol for at-least-once and
+exactly-once. User documentation: `packages/docs/flow/*.md` (where flow deliberately differs from Kafka Streams:
+`kafka-streams.md`; breaking changes: `upgrading.md`).
 
 ## Commands
 
 ```bash
-pnpm build      # Build the package
-pnpm test       # Run tests
-pnpm typecheck  # Type checking
+pnpm build             # tsdown: dist/index, dist/testing (@kafkats/flow/testing), dist/state (@kafkats/flow/state)
+pnpm typecheck         # tsc over src, tests and bench
+pnpm test:unit         # unit tests (TestDriver, per-component suites); no broker needed
+pnpm bench:task-core   # micro-benchmark of the task core against bench/baseline.json (--record rewrites it)
+
+# Integration tests read the client from its dist: build it first.
+pnpm -C packages/client build
+# Against the shared broker (otherwise the global setup starts a testcontainers broker):
+KAFKA_BROKERS=127.0.0.1:19092 VITEST_MAX_WORKERS=2 pnpm -C packages/flow exec vitest run -c vitest.integration.config.ts [files]
+
+# Chaos suite (27 scenarios; single broker kafka-chaos at 127.0.0.1:29092, three-broker cluster kafka-mb1..3 at
+# 127.0.0.1:39091-39093, both brought up by tests/chaos/brokers.sh). Patterns are globs on scenario names.
+packages/flow/tests/chaos/run-all.sh ['1b-*' | '3b-*' | <name>...]
 ```
+
+- `VITEST_MAX_WORKERS=2` on shared machines: integration and chaos runs are memory-heavy. The three-broker scenarios
+  wait for `CHAOS_MIN_FREE_MB` (default 5000) of available memory and stop the cluster containers they started.
+- `run-all.sh` holds a lock (`CHAOS_LOCK`, default `/tmp/kafkats-brokers.lock`) so chaos, integration and perf runs do
+  not overlap; one log per scenario goes to `CHAOS_LOG_DIR`. A scenario passes when its harness prints `RESULT ...: PASS`.
+- The state store providers run the shared suites of `@kafkats/flow-state-testkit` (`pnpm -C packages/flow-state-lmdb
+test`, `pnpm -C packages/flow-state-rocksdb test`).
+- `KAFKA_TS_LOG_LEVEL=debug` for verbose client and flow logs.
+
+## Runtime Model
+
+- **Topology**: the DSL registers nodes, stores and internal topics with the `InternalTopologyBuilder`; `build()`
+  (at `start()` or `describe()`, after which DSL calls throw `TopologyError`) cuts it into subtopologies: nodes
+  connected by parent edges, processors sharing a store and sources of one topic are united; repartition and through
+  topics separate them. Names come from `{ name }` options or counters in DSL-call order (Kafka Streams' rules).
+- **Tasks**: one `StreamTask` per subtopology and input partition (`TaskId` `<sub>_<partition>`, interned). A task
+  owns its record queues (`PartitionGroup`: timestamp-ordered selection, KIP-695 idling with `maxTaskIdleMs`), its
+  processor graph, its store instances (`TaskStateManager`), its clocks, offsets and commit metadata, and goes through
+  Kafka Streams' states CREATED, RESTORING, RUNNING, SUSPENDED, CLOSED.
+- **One runtime per start**: `FlowRuntime` connects, prepares the topics (partition counts, co-partitioning, creation
+  of changelog and repartition topics), loads the global tables, then runs one `Run` per group membership: one group
+  consumer (eager `range` assignor), one producer (transactional under exactly-once: one transaction for all tasks,
+  transactional id `<applicationId>-<processId>`), a `TaskManager`, a `Scheduler`, a `RecordCollector` and a
+  `CommitCoordinator`. A failed run is never revived: recovery builds a new one.
+- **Callbacks, no poll loop**: consumer handlers only append records to task queues (pausing a partition at
+  `bufferedRecordsPerPartition`). The scheduler runs task slices concurrently (records of one task strictly one at a
+  time), punctuates, and commits at barriers: `Scheduler.exclusive()` starts once every slice settled and no slice
+  starts while it runs. Never await `consumer.stop()` (or anything awaiting the client's run loop) inside `exclusive`.
+- **Commits** (Kafka Streams' protocol): at-least-once flushes every send, commits offsets with the commit metadata
+  (`consumer.commit()`), then writes checkpoints; exactly-once flushes, `sendOffsets` with the group metadata, commits
+  the transaction, applies the buffered store writes (`state/transactional.ts`), then writes checkpoints. Triggers:
+  `commitIntervalMs` (5000 at-least-once, 100 exactly-once), revocation (inside the awaited revocation hook), close,
+  `context.commit()`. Timer commits are skipped while a rebalance is pending.
+- **Time**: partition time per input partition, task stream time, and a clock per windowed operator, join and
+  suppression (`ObservedStreamTime`, keyed by store name). Partition times and these clocks are persisted in the
+  offset commit metadata (Kafka Streams' `TopicPartitionMetadata` format) and seed the task when it starts again.
+  Grace periods decide lateness; stores are clipped by their store clock and retention (`state/time-clipping.ts`).
+- **State**: every task has its own instance of each store of its subtopology (provider name
+  `<applicationId>.<storeName>.p<partition>`), stacked provider store -> exactly-once write buffer -> changelog
+  logging -> clock/clipping; DSL stores are timestamped (`[int64BE timestamp][value]`). `StateDirectory` keeps
+  instances open across task lifetimes (a re-assigned task catches up from its checkpoint); unowned in-memory
+  instances are pruned 30 s after the run is RUNNING.
+- **Restoration**: a restore job per task that is not RUNNING (at most `changelog.restoration.maxConcurrentTasks`),
+  its partitions paused meanwhile: replay to the end offsets captured at the start, checkpoint trust rules (within the
+  log and the store not empty, else wipe and rebuild), progress checkpoints, stall detection, open transactions
+  waited out. `start()` resolves once every task of the first assignment is RUNNING.
+- **Rebalances** (C4 hooks, all awaited): revocation commits and suspends; assignment resumes re-assigned tasks
+  through the restore pipeline, creates new ones and closes the rest; loss closes tasks dirty. A member holding only
+  some input partitions of a stateful task migrates.
+- **Failures** (`runtime/errors.ts`, by error class): `corrupted` revives the affected tasks in place (a retriable
+  at-least-once send failure, a changelog out of range); `migrate` closes every task dirty and joins again with a new
+  run after a backoff (0.5 s doubling to 30 s): fencing, lost partitions, `CommitFailedError`, connection failures and
+  other non-fatal Kafka errors, retriable send failures under exactly-once, at-least-once commit timeouts lasting
+  `taskTimeoutMs`; `fatal` goes to the uncaught exception handler (`'shutdown'`: state ERROR; `'restart'`: a new
+  run). Record failures go to the deserialization, processing and production handlers first (`'fail'` |
+  `'continue'`); under exactly-once a send failure never reaches the production handler. Before `start()` resolved,
+  every failure but a corruption rejects it.
+- **Global tables**: a consumer per table outside the group (read_committed, no commits): wiped and loaded to the
+  end offsets before processing, then followed; an out-of-range position reloads in place while processing waits; a
+  row failure fails the start, or halts the app afterwards.
+- **close({ timeoutMs })**: graceful (commit, clean close) unless the run failed; network awaits are cut 1 s before
+  the deadline, so `close()` returns within its timeout even with the cluster unreachable.
+- **Tracing**: `runtime/tracing.ts` publishes one `kafkats:flow:process` operation per processed record
+  (`flowDiagnostics`); nothing is built without subscribers. `@kafkats/opentelemetry` subscribes by channel name.
+
+Dependency rule: `dsl -> topology -> processor` (API types); `operators -> processor, state` (and `topology` types),
+never `runtime`; `runtime -> topology, processor, state, operators` (through suppliers only); `app -> dsl, topology,
+runtime`; `testing -> app/internal, runtime, state`. Nothing imports `node:async_hooks`.
 
 ## Architecture
 
 ```
 src/
-├── flow.ts        # flow() / FlowAppImpl: DSL entry points, start/close lifecycle, wiring of runtime/
-├── types.ts       # Public types (FlowApp, KStream, KTable, FlowConfig, ...)
-├── changelog.ts   # Stable import path re-exporting changelog/
-├── changelog/
-│   ├── config.ts    # Changelog config, restoration options, topic naming
-│   ├── errors.ts    # ChangelogPartitionMismatchError, SourceTopicNotFoundError, CoPartitioningError
-│   ├── writer.ts    # ChangelogWriter, changelog key format for windowed stores
-│   └── restorer.ts  # ChangelogRestorer: checkpoint trust, replay to the log end, stall detection
-├── codec.ts       # Serialization codecs (string, json, buffer)
-├── state.ts       # State store interfaces
-├── state/
-│   ├── memory.ts       # In-memory state store implementation
-│   ├── partitioned.ts  # Per-partition slices of a store (<applicationId>.<storeName>.p<partition>)
-│   ├── ordered.ts      # Stores over any byte-ordered engine (OrderedByteStore); used by the LMDB and RocksDB providers
-│   ├── ordered-keys.ts # Key layouts of window and session stores in such an engine, and the ranges their queries scan
-│   ├── buffered.ts     # Transactional write buffer (exactly_once)
-│   ├── bulk.ts         # Writing many entries at once (loading a table or changelog, wiping a store)
-│   └── changelog.ts    # Changelog-backed store wrappers
-├── streams/       # KStream / KTable / grouped stream implementations (the DSL)
-│   └── topology-builder.ts # TopologyBuilder: the only part of the app the DSL may use (stores, topology, output)
-├── processors/    # Processor nodes (aggregations, joins, table nodes)
+├── index.ts               # Public exports of @kafkats/flow; flowVersion is the package version
+├── testing.ts             # @kafkats/flow/testing: TestDriver, mocks, helpers
+├── state-kit.ts           # @kafkats/flow/state: what a state store provider for a new storage engine is built from
+├── codec.ts, topic.ts     # Codecs re-exported from @kafkats/client; topic() with its codecs
+├── state.ts               # Store and provider interfaces (KeyValueStore, WindowStore, SessionStore, timestamped stores)
+├── changelog.ts           # Re-exports changelog/
+├── api/                   # Public types only
+│   ├── app.ts             # FlowConfig, FlowApp, StreamState, CloseOptions, TopologyDescription
+│   ├── kstream.ts, ktable.ts, grouped.ts   # KStream, BranchedKStream, KTable, GlobalKTable, grouped and windowed streams
+│   ├── options.ts         # Consumed, Produced, Grouped, Materialized, StreamJoined, Joined, Repartitioned, SuppressOptions, ...
+│   ├── stores.ts          # Stores definitions (StoreDefinition, options)
+│   ├── handlers.ts        # Exception handler types and ErrorHandlerContext
+│   └── errors.ts          # FlowConfigError, TopologyError, StreamsError and its subclasses
+├── app/
+│   ├── flow.ts            # flow() and FlowAppImpl: DSL entry points, describe(), start/close through one FlowRuntime per start
+│   ├── config.ts          # FlowConfig validation, defaults, removed keys, handler resolution
+│   ├── lifecycle.ts       # StreamState, getError(), memoized start and close
+│   └── internal.ts        # What the TestDriver needs of an app (topology, settings), behind a symbol
+├── dsl/                   # The DSL: resolves options, codecs (format.ts), names (naming.ts) and repartitioning
+│   ├── kstream.ts, ktable.ts, kgrouped-*.ts, *-windowed-kstream.ts, global-ktable.ts   # DSL objects
+│   ├── context.ts         # What the DSL objects of one app share (builder, changelog defaults, window graces)
+│   ├── windows.ts         # TimeWindows, SessionWindows, SlidingWindows, JoinWindows (+ deprecated factories)
+│   ├── retention.ts       # Retention of window and session stores (minimums, Materialized.retention)
+│   ├── branched.ts        # split() / BranchedKStream
+│   ├── deprecation.ts     # One DeprecationWarning per process and deprecated API
+│   └── ops/               # One file per operator family: stateless, to, repartition, grouping, aggregate,
+│                          # windowed-aggregate, sliding-aggregate, table-source, table-ops, table-group-by, table-join,
+│                          # stream-stream-join, stream-table-join, global-join, suppress, process
+├── operators/             # Processor suppliers of the DSL (Kafka Streams' KStream*/KTable* processors)
+│   ├── stateless.ts, fixed-key.ts                    # filter/map/..., processValues
+│   ├── kstream-aggregate.ts, window-aggregate.ts, session-aggregate.ts, sliding-aggregate.ts, windowed-processor.ts
+│   ├── emit-final.ts                                 # emit: 'on-window-close'
+│   ├── ktable-*.ts, change.ts                        # table nodes, Change<V>, value getters, groupBy repartition map
+│   ├── stream-stream-join.ts, join-buffer.ts, outer-join-store.ts, list-value.ts, stream-table-join.ts
+│   ├── suppress.ts, suppress-buffer.ts, suppress-entry.ts
+│   └── windowed.ts                                   # WindowedCodecs and the base-key partitioner
+├── processor/             # Processor API and the per-task processor internals
+│   ├── api.ts             # Processor, ProcessorContext, punctuators, TaskId, internal context
+│   ├── record.ts          # StreamRecord, FixedKeyRecord
+│   ├── context.ts, context-views.ts   # Task and processor contexts; restricted views (fixed key, transformers)
+│   ├── node.ts            # ProcessorNode: processing, punctuation, the processing handler route
+│   ├── source.ts, sink.ts, output.ts  # Source and sink nodes; TaskOutput port (implemented by RecordCollector)
+│   ├── punctuation.ts, time-tracker.ts, metadata.ts   # Punctuation queues, processor clocks, commit metadata format
+│   └── timestamps.ts      # TimestampExtractor and the built-in extractors
+├── topology/
+│   ├── builder.ts, nodes.ts, names.ts, built-topology.ts   # InternalTopologyBuilder, node defs, name rules, build result
+│   ├── subtopologies.ts   # Union-find into subtopologies, numbering, source checks
+│   ├── partition-counts.ts, internal-topics.ts   # Partition counts, co-partitioning, creation/validation of internal topics
+│   ├── null-keys.ts       # Which repartition sinks keep null keys (relaxed joins downstream)
+│   └── describe.ts        # describe(): Kafka Streams' TopologyDescription
 ├── runtime/
-│   ├── context.ts         # Record context (worker + source partition) via AsyncLocalStorage
-│   ├── status.ts          # App state, last error, closing/started flags, shutdown signal
-│   ├── errors.ts          # Failure classification (fatal vs recoverable), restart backoff
-│   ├── topology.ts        # What the DSL registered (sources, internal topics, co-partition groups, global tables)
-│   ├── store-registry.ts  # State stores: per-partition stacks, provider names, changelog specs/writers
-│   ├── checkpoints.ts     # Changelog checkpoints (durable or in-process); pending checkpoints of an open transaction
-│   ├── internal-topics.ts # Co-partitioning checks, creation of changelog/repartition topics
-│   ├── restoration.ts     # Restore queue, app-/partition-scoped restore, release/prune of unowned state
-│   ├── start-positions.ts # Start position of partitions without a committed offset
-│   ├── transactions.ts    # Exactly-once batch of one worker (begin/commit/abort, commit timer)
-│   ├── worker-pool.ts     # WorkerPool: starts/stops the stream workers, commit on close
-│   ├── stream-worker.ts   # StreamWorker: run/restart loop, message handling, rebalance events
-│   ├── keyed-turns.ts     # One task at a time per key (at-least-once batches of one partition number)
-│   ├── worker-config.ts   # Per-worker producer/consumer/run config (transactional id, group instance id, timeouts)
-│   ├── global-tables.ts   # Loading and following global tables
-│   └── output.ts          # RecordOutput: encoding, partitioner, transactional send
-├── testing.ts     # TestDriver, MockProducer/MockConsumer (`@kafkats/flow/testing`)
-├── state-kit.ts   # What state store providers are built from (`@kafkats/flow/state`)
-└── index.ts       # Public exports
+│   ├── runtime.ts         # FlowRuntime: start, failure handling (revive, migrate, halt), recovery backoff, stop
+│   ├── run.ts             # Run: one group membership (consumer, producer, TaskManager, Scheduler, commits, purge)
+│   ├── task-manager.ts    # Assignment -> tasks: create, resume, suspend, close, revive; rebalance hooks
+│   ├── task.ts, task-topology.ts, task-offsets.ts, task-id.ts   # StreamTask, its processor graph, offsets, TaskId
+│   ├── partition-group.ts, record-queue.ts, record-decoder.ts   # Queues, selection, readiness, decoding, extraction
+│   ├── scheduler.ts       # Slices, punctuation, commit barriers, exclusive(), time slicing
+│   ├── commit.ts          # CommitCoordinator: at-least-once and exactly-once commits
+│   ├── record-collector.ts # Sends of every task, deferred acks, send failure classification, the open transaction
+│   ├── restoration.ts, restore-pipelines.ts, start-positions.ts   # Restore jobs, pipelines, 'latest' pins
+│   ├── global-tables.ts, global-reader.ts, global-store.ts        # Global tables
+│   ├── assignment.ts, purge.ts, prune-timer.ts, partition-count-cache.ts, signals.ts
+│   ├── errors.ts          # Failure classification and backoff constants
+│   ├── tracing.ts         # kafkats:flow:process tracing channel
+│   ├── config.ts          # Resolved internal config types
+│   └── io.ts, kafka-io.ts, kafka-consumers.ts, kafka-producer.ts, kafka-admin.ts   # IO ports and their Kafka adapters
+├── state/
+│   ├── state-directory.ts, state-manager.ts, store-builders.ts   # Store instances across tasks, per-task stacks, Stores
+│   ├── transactional.ts, held-deletes.ts, logging.ts, time-clipping.ts, timestamped.ts, handles.ts   # Store layers
+│   ├── checkpoints.ts, bulk.ts   # Changelog checkpoints; bulk loads and wipes
+│   ├── memory.ts          # inMemory() provider
+│   └── ordered.ts, ordered-keys.ts   # Stores over a byte-ordered engine (LMDB, RocksDB providers)
+├── changelog/
+│   ├── config.ts          # ChangelogConfig, restoration options, changelog and repartition topic configs
+│   ├── restorer.ts, replay.ts, writer.ts   # ChangelogRestorer (trust rules, replay), changelog writes
+│   └── errors.ts          # ChangelogPartitionMismatchError, SourceTopicNotFoundError, CoPartitioningError, ChangelogDecodeError
+└── testing/
+    ├── driver.ts, loop.ts, test-io.ts   # TestDriver over the production TaskManager with deterministic ports
+    ├── mocks.ts, helpers.ts, globals.ts, partitioner.ts, store-writes.ts
 ```
 
-### Key Abstractions
+## Tests
 
-- **flow()**: Creates a FlowApp for building streaming topologies
-- **KStream**: Unbounded stream of key-value records
-- **KTable**: Changelog stream representing a table
-- **KGroupedStream**: Stream grouped by key for aggregations
-- **Windowing**: TimeWindows, SessionWindows (SlidingWindows is not implemented and throws)
+- `tests/unit/`: per-component suites (`runtime/`, `state/`, `operators/`, `dsl/`, `topology/`, ...) and DSL
+  semantics through the `TestDriver`. `tests/unit/support/` has the task harness and fake IO ports.
+- `tests/integration/`: against a broker (`test-helpers.ts`: clients, topics, reading committed output, injected
+  commit failures); every app owns its client. The log end of a transactionally written topic passes its last commit
+  marker only after the broker wrote it: wait for it before comparing positions.
+- `tests/chaos/`: the chaos harness (`kill-chaos.ts`, `broker-chaos.ts`, `close-chaos.ts`, `worker.ts`, `verdict.ts`,
+  `brokers.sh`, `run-all.sh`). Never remove broker containers; `brokers.sh` only creates, starts or unpauses them.
 
-### Runtime Model
-
-- **Partitioned state**: every source partition has its own slice of every state store. State partition N is logged to changelog partition N and restored from it. Provider-level store names are `<applicationId>.<storeName>.p<partition>` (default LMDB `maxDbs` is 4096 for that reason).
-- **Co-partitioning**: all topics feeding one stateful operation must have the same partition count, otherwise `start()` throws `CoPartitioningError`. Consumers always use the `range` assignor so partition N of every co-partitioned topic lands on the same worker.
-- **Repartitioning**: `groupBy()`, and `selectKey()`/`map()` or the results of a windowed aggregation followed by `groupByKey()`, a join or `toTable()`, write through an internal topic `<applicationId>-<name | repartition-N>-repartition` and read it back. `through(topic)` does the same with a user topic. Both are read from the beginning when the group has no committed offset. Needs key and value codecs.
-- **Global tables**: `globalTable()` is read in full by every instance outside the consumer group, loaded before processing starts, has no changelog and is only usable as the lookup side of a stream join. A row that cannot be applied fails `start()` during the load; afterwards it halts the app the same way.
-- **Exactly-once**: offsets, outputs and changelog records commit in one transaction. Store writes are buffered (`state/buffered.ts`) and applied only after the commit; an abort or crash never leaves uncommitted updates in a store.
-- **Fail-stop workers**: a worker that fails never continues past the failure. Recoverable failures (Kafka/infrastructure errors) abort the transaction, drop buffered state, rejoin and resume from committed offsets with backoff (0.5s to 30s), unless `restartOnError: false`. A broker-aborted transaction (fenced producer after `transactionTimeoutMs`) is recoverable too. User-code errors and fatal Kafka errors stop every worker of the app for good and set `state()` to `'ERROR'` (`FlowAppImpl.halt`, like Kafka Streams' default `SHUTDOWN_CLIENT`); see `app.getError()`.
-- **Restoration**: newly assigned partitions are paused, restored from the changelog, then resumed. A restore with no progress for `changelog.restoration.idleTimeoutMs` (default 30000) fails. Checkpoints are ignored (wipe + rebuild) when outside the changelog offset range or when the local store is empty.
-- **Stream time** is tracked per source partition (late-record dropping, window expiry). Clocks are in memory and are re-seeded from the restored window/session store after a restart, rebalance or abort. Time-window aggregations count it in window starts (the newest window a record opened), which is exactly what the store shows, so a re-seeded clock decides lateness as before.
-- **Start position**: source partitions read from `'latest'` with no committed offset are pinned to the position the process first started at until the first commit. The pinned position is also committed (best effort) so a process restart resumes from it.
-- **Partition concurrency** (at-least-once, `consumerRun.partitionConcurrency` > 1): a worker processes one batch at a time per partition number (`runtime/keyed-turns.ts`), since co-partitioned topics share the state of that partition number. Exactly-once always processes one record at a time.
-- **Deferred acknowledgements**: output and changelog sends are not awaited per record. Each worker collects them in `PendingSends` (`runtime/pending-sends.ts`) and flushes before committing: at the end of each consumed batch under at-least-once, before `sendOffsets` under exactly-once. A failed send fails the worker; an aborted transaction discards its pending sends (late acknowledgements are ignored).
-- **Known limitations**: stream-stream left/outer joins emit the unmatched result eagerly; derived tables (`filter`/`mapValues`/joins/windowed results) are not materialized and cannot be a join lookup side.
-
-User-facing documentation: `packages/docs/flow/fault-tolerance.md`.
-
-### Codecs
-
-```typescript
-import { codec, string, json, buffer, type Codec } from '@kafkats/flow'
-
-// Built-in codec factories (re-exported from @kafkats/client)
-string()      // UTF-8 string
-json<T>()     // JSON serialization
-buffer()      // Raw Buffer passthrough
-codec.json<T>() // `codec` is a namespace of the same factories
-
-// Custom codec: any object implementing Codec<T>
-const myCodec: Codec<MyType> = {
-  encode: (value) => Buffer.from(...),
-  decode: (buffer) => ...,
-}
-```
-
-## Example
-
-```typescript
-import { flow, topic, string, json } from '@kafkats/flow'
-
-const app = flow({
-	applicationId: 'my-app',
-	client: { clientId: 'my-app', brokers: ['localhost:9092'] },
-})
-
-const input = topic('input', { key: string(), value: json<Event>() })
-const output = topic('output', { key: string(), value: json<Result>() })
-
-app.stream(input)
-	.filter((k, v) => v.type === 'click')
-	.mapValues(v => ({ count: 1, ...v }))
-	.to(output.name, output) // to() takes the topic name; codecs via options
-
-await app.start()
-```
-
-## State Stores
-
-Pluggable state stores for stateful stream processing (aggregations, joins, windowing).
-
-### Interfaces
-
-- **KeyValueStore<K, V>** - Basic key-value store
-- **WindowStore<K, V>** - Time-windowed state
-- **SessionStore<K, V>** - Session window state
-- **StateStoreProvider** - Factory for creating stores
-
-### Built-in Provider
-
-```typescript
-import { codec, inMemory } from '@kafkats/flow'
-
-const provider = inMemory()
-const store = provider.createKeyValueStore('my-store', {
-	keyCodec: codec.string(),
-	valueCodec: codec.json<MyValue>(),
-})
-```
-
-### LMDB Provider (Persistent)
-
-```typescript
-import { lmdb } from '@kafkats/flow-state-lmdb'
-
-const provider = lmdb({ stateDir: './state' })
-```
-
-## Changelog Topics
-
-State stores are backed by changelog topics for fault tolerance. Key features:
-
-### Partition Count Inference
-
-Changelog topics are automatically created with the same partition count as source topics:
-
-```typescript
-// Source "orders" has 8 partitions → changelog gets 8 partitions
-app.stream('orders', { key: codec.string(), value: codec.json<Order>() }).groupByKey().count()
-```
-
-Topics that feed the same stateful operation (merged streams, join sides) must have the same partition count; a mismatch throws `CoPartitioningError` from `start()`. Repartition topics are created with the largest partition count of the topics feeding them.
-
-### Configuration
-
-Global config in `FlowConfig`:
-
-```typescript
-flow({
-	applicationId: 'my-app',
-	client: { clientId: 'my-app', brokers: ['localhost:9092'] },
-	changelog: {
-		replicationFactor: 3,
-		topicConfigs: { 'min.insync.replicas': '2' },
-		autoCreate: false, // Production: pre-create topics
-	},
-})
-```
-
-Per-store config in `Materialized`:
-
-```typescript
-stream.groupByKey().count({
-	changelog: {
-		topicName: 'custom-changelog',
-		replicationFactor: 2,
-	},
-})
-```
-
-### Error Handling
-
-- **ChangelogPartitionMismatchError** - Existing changelog has wrong partition count
-- **SourceTopicNotFoundError** - Source topic doesn't exist, can't infer partitions
-
-### Key Files
-
-- `src/changelog/` - ChangelogConfig, error classes, ChangelogWriter/Restorer
-- `src/runtime/internal-topics.ts` - validateAndCreateInternalTopics(); `src/runtime/restoration.ts` - restoration; `src/runtime/stream-worker.ts` - worker lifecycle
-- `src/state/partitioned.ts`, `src/state/buffered.ts` - per-partition stores and the transactional write buffer
-
-## Testing Infrastructure
-
-The package provides a testing module at `@kafkats/flow/testing` for writing tests with minimal boilerplate.
-
-### TestDriver
-
-The main test utility that mocks Kafka and manages lifecycle:
+## Testing Utilities (`@kafkats/flow/testing`)
 
 ```typescript
 import { TestDriver, ResultCollector } from '@kafkats/flow/testing'
-import { codec } from '@kafkats/flow'
+import { string, json } from '@kafkats/flow'
 
-const driver = new TestDriver()
-
-// Build topology
+const driver = new TestDriver() // takes FlowConfig options (no client), commitEvery, partitions, initialWallClockTimeMs
 driver
-	.input('orders', { value: codec.json<Order>() })
-	.mapValues(order => ({ ...order, processed: true }))
-	.filter((_, v) => v.total > 100)
-	.to('large-orders', { value: codec.json() })
+	.input('orders', { key: string(), value: json<Order>() })
+	.filter((_, order) => order !== null && order.total > 100)
+	.to('large-orders', { key: string(), value: json() })
 
-// Run test with automatic lifecycle management
-await driver.run(async ({ send, output }) => {
-	await send('orders', { id: 'o1', total: 250 })
-	await send('orders', { id: 'o2', total: 50 })
-
-	const results = output('large-orders', { value: codec.json() })
-	expect(results).toHaveLength(1)
+await driver.run(async ({ send, output, advanceWallClockTime, getStateStore }) => {
+	await send('orders', { total: 250 }, { keyValue: 'o1', keyCodec: string() }) // resolves once fully processed
+	expect(output('large-orders', { value: json<Order>() })).toHaveLength(1)
 })
 ```
 
-### ResultCollector
-
-For capturing stream output without sending to a topic:
-
-```typescript
-const results = new ResultCollector<string, Order>()
-
-driver
-	.input('orders', { key: codec.string(), value: codec.json<Order>() })
-	.filter((_, v) => v.amount > 100)
-	.peek(results.collector())
-
-await driver.run(async ({ send }) => {
-	await send('orders', { id: '1', amount: 150 }, { key: Buffer.from('k1') })
-
-	expect(results.values).toHaveLength(1)
-	expect(results.first?.value.amount).toBe(150)
-})
-```
-
-### Utilities
-
-- **Loopback**: records written to a topic the topology also reads (`through()`, repartition topics) are fed back into the topology automatically
-- **MockProducer** records `timestamp` and `headers` of produced messages
-- **testRecord(topic, key, value, options?)**: Create a test record for processor testing
-- **testRecordSequence(topic, items, options?)**: Create a sequence of records with incrementing timestamps (`{ startTimestamp, timestampIncrement, partition }`, bigint)
-- **createFactory(generator)**: Create test data factories (`create()`, `createMany()`, `reset()`)
-- **timestamps(baseTime?)**: Create timestamp helpers for time-based testing (`at()`, `after()`, `base`, `advance()`; bigint ms)
-- **quickTest(fn, config?)**: Minimal setup for simple tests
-
-`send()` takes `Buffer` keys (or `keyValue` + `keyCodec`) and `bigint` timestamps, and JSON-encodes values unless a `codec` is given.
-
-### Example: Stream-Table Join
-
-```typescript
-const driver = new TestDriver()
-const results = new ResultCollector<string, EnrichedEvent>()
-
-const users = driver.table('users', { key: codec.string(), value: codec.json<User>() })
-
-driver
-	.input('events', { key: codec.string(), value: codec.json<Event>() })
-	.join(users, (event, user) => ({ ...event, userName: user.name }))
-	.peek(results.collector())
-
-await driver.run(async ({ send }) => {
-	// Populate table
-	await send('users', { name: 'Alice' }, { key: Buffer.from('user1') })
-
-	// Send event
-	await send('events', { action: 'click' }, { key: Buffer.from('user1') })
-
-	expect(results.first?.value.userName).toBe('Alice')
-})
-```
+The driver runs the production task runtime deterministically: records written to topics the topology reads are fed
+back in, offsets are committed after every record by default, and the wall clock moves only with
+`advanceWallClockTime()`. See `packages/docs/flow/testing.md`.

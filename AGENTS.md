@@ -11,12 +11,12 @@ This is a pnpm monorepo containing a pure-protocol TypeScript Kafka client and s
 | Package | Description |
 |---------|-------------|
 | `@kafkats/client` | Core Kafka client (producer, consumer, protocol) |
-| `@kafkats/flow` | Kafka Streams-like DSL for stream processing |
+| `@kafkats/flow` | Kafka Streams-style stream processing: DSL, Processor API, task runtime |
 | `@kafkats/flow-state-lmdb` | Persistent LMDB state stores for flow |
 | `@kafkats/flow-state-rocksdb` | Persistent RocksDB state stores for flow |
 | `@kafkats/flow-state-testkit` | Private: test suites shared by the state store providers |
 | `@kafkats/codec-zod` | Zod-based serialization codecs |
-| `@kafkats/opentelemetry` | OpenTelemetry traces and metrics for the client |
+| `@kafkats/opentelemetry` | OpenTelemetry traces and metrics for the client and flow |
 | `@kafkats/benchmark` | Performance benchmarks vs kafkajs |
 | `docs` | VitePress documentation site |
 
@@ -41,7 +41,7 @@ pnpm format        # Format all files
 pnpm -C packages/client build
 pnpm -C packages/client test:unit
 pnpm -C packages/flow build
-pnpm -C packages/flow test
+pnpm -C packages/flow test:unit
 
 # Documentation
 pnpm docs:dev      # Start dev server
@@ -53,7 +53,9 @@ pnpm docs:build    # Build static site
 **Read the package-specific `AGENTS.md` for detailed testing instructions.** Each package has different test commands and requirements.
 
 General notes:
-- Integration tests use testcontainers to spin up Kafka brokers (Docker required)
+- Integration tests use testcontainers to spin up Kafka brokers (Docker required), or the brokers in `KAFKA_BROKERS` when it is set (e.g. `KAFKA_BROKERS=127.0.0.1:19092`)
+- `@kafkats/flow` and the other packages read `@kafkats/client` from its `dist`: run `pnpm -C packages/client build` after changing the client
+- Flow's chaos suite (broker kills, pauses and restarts against Docker brokers) runs with `packages/flow/tests/chaos/run-all.sh`; see `packages/flow/AGENTS.md`
 - Default parallelism: 3 workers (configurable via `VITEST_MAX_WORKERS`)
 - Set `KAFKA_TS_LOG_LEVEL=debug` for verbose client logs
 

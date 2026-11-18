@@ -1,0 +1,62 @@
+---
+'@kafkats/client': minor
+'@kafkats/flow': minor
+'@kafkats/codec-zod': minor
+'@kafkats/flow-state-lmdb': minor
+'@kafkats/flow-state-rocksdb': minor
+'@kafkats/opentelemetry': minor
+---
+
+`@kafkats/flow` is rebuilt on Kafka Streams' processing model: tasks per subtopology and partition, each with its own record queues, processors, state stores, stream time, offsets and commit metadata; Kafka Streams' commit protocol for at-least-once and exactly-once; its grace, retention and late-record rules; and its Processor API. This release breaks state formats and several defaults: read the upgrade guide (`docs/flow/upgrading`) before deploying.
+
+**Runtime**
+
+- One group consumer and one producer per instance, on Node's event loop: consumer callbacks only queue records, and a scheduler processes the tasks with records concurrently (the records of one task one at a time, in timestamp order across its partitions, with KIP-695 idling through `maxTaskIdleMs`), runs punctuators and commits at barriers. Scale out with more instances.
+- Commits follow Kafka Streams: under at-least-once flow commits offsets with Kafka Streams' commit metadata every `commitIntervalMs` (default 5000), at revocation (inside the awaited rebalance hook), at close and on `context.commit()`; under exactly-once every task of the instance writes into one transaction (default every 100 ms), offsets are fenced by the group generation, and store writes are applied only after the commit.
+- Partition times and the clocks of windowed operators, joins and suppressions are committed with the offsets and restored with the task, so lateness decisions survive restarts and rebalances.
+- State is per task: each input partition has its own instance of every store, logged to the same partition of the store's changelog. Restoration runs as bounded jobs per task (`changelog.restoration.maxConcurrentTasks`, default 4) while other tasks keep processing; `start()` resolves once every task of the first assignment is restored and running. Store instances stay open across rebalances, so a task assigned back catches up from its checkpoint.
+- Failures are handled like Kafka Streams': record failures go to the new `deserializationExceptionHandler`, `processingExceptionHandler` and `productionExceptionHandler` (`'fail'` by default, or `'continue'`, or a function); corrupted tasks are revived in place; fencing, lost partitions and failed commits make the instance rejoin with a new membership after a backoff (0.5 s to 30 s), without limit; fatal errors go to `uncaughtExceptionHandler` (`'shutdown'` by default, or `'restart'`).
+- `close({ timeoutMs })` (default 20000) returns within its timeout even when the cluster is unreachable. `state()` is `'RUNNING'` only while every assigned task is running.
+- Repartition topics are created with Kafka Streams' configs (`cleanup.policy=delete`, `retention.ms=-1`) and purged up to the committed offsets every `repartitionPurgeIntervalMs` (default 30000).
+- Global tables are read in full by every instance outside the group, loaded before processing starts and followed afterwards; a position out of range reloads the table in place while processing waits.
+- Every processed record is published on the `kafkats:flow:process` tracing channel (`flowDiagnostics`), which `@kafkats/opentelemetry` turns into spans.
+
+**DSL and Processor API**
+
+- Windows with grace periods: `TimeWindows.ofSizeWithNoGrace` / `ofSizeAndGrace` (and `advanceBy`), `SessionWindows.ofInactivityGapWithNoGrace` / `ofInactivityGapAndGrace`, `SlidingWindows.ofTimeDifferenceWithNoGrace` / `ofTimeDifferenceAndGrace`, `JoinWindows.ofTimeDifferenceWithNoGrace` / `ofTimeDifferenceAndGrace` with `before()` / `after()`. Sliding window aggregations, `Materialized.retention`, and `emit: 'on-window-close'` for final results.
+- `KTable.suppress({ until: 'window-close' })` and `suppress({ until: 'time-limit', timeLimit })` with buffer limits, in a changelogged buffer.
+- Windowed keys use Kafka Streams' formats (`WindowedCodecs`), and windowed results are partitioned by their base key.
+- Stream-stream left and outer joins emit unmatched records once their window closed; joins accept records with a null key on their outer sides (KIP-962). Any table can be joined, derived tables included; table operations and joins take `{ name, materialized }`.
+- `globalTable()` returns a `GlobalKTable`, joined with a key selector: `stream.join(globalTable, (key, value) => lookupKey, joiner)`.
+- `split()` with named, default and chained branches; `repartition()`; `flatMap()`, `filterNot()`, `foreach()`, `toStream(mapper)`, key-aware `mapValues()` / `flatMapValues()`, topic name extractors in `to()`, per-source `timestampExtractor` and `offsetReset`.
+- The Processor API: `process()`, `processValues()`, `KTable.transformValues()`, typed stores made by `Stores` and registered with `addStateStore()` or connected through `{ stores }`, stream-time and wall-clock punctuators.
+- `{ name }` on every operator, with Kafka Streams' naming rules, and `app.describe()`, which returns the topology in Kafka Streams' `TopologyDescription` shape and text format.
+- `flowVersion` reports the package version.
+
+**Testing**
+
+- `@kafkats/flow/testing`'s `TestDriver` runs the production task runtime deterministically, like Kafka Streams' `TopologyTestDriver`: `send()` resolves once the record and everything it led to were processed, offsets are committed after every record by default (`commitEvery`), and the wall clock moves with `advanceWallClockTime()`. New: `getStateStore(name, partition?)`, `driver.globalTable()`, `initialWallClockTimeMs`, `partitions`, `emitIntervalMs`.
+
+**Breaking changes and migration**
+
+- **Stop all instances and reset the application's state before upgrading** (no rolling upgrade): delete its internal topics and local state, or use a new `applicationId`. Stores of tables and aggregations are timestamped (`[int64BE timestamp][value]`), state is partitioned, windowed keys use new formats, and the consumer group uses the `range` assignor.
+- `numStreamThreads`, `runEach` and `stateDir` (and `consumerRun`, `restartOnError` of pre-release builds) are removed: passing one throws `FlowConfigError` naming its replacement. Run more instances; pass the directory to the provider (`lmdb({ stateDir })`); use `uncaughtExceptionHandler`.
+- `consumer.groupId`, `consumer.onBeforeRebalance` and the consumer rebalance hooks cannot be set, and `consumer.partitionAssignmentStrategy` must be `'range'` (`FlowConfigError`).
+- Partitions without a committed offset start from `'earliest'` (Kafka Streams' default; it was the client's `'latest'`). Set `consumer.autoOffsetReset: 'latest'` to keep the old behaviour, or `Consumed.offsetReset` per source. A source with `'none'` and no committed offset stops the app (`NoOffsetResetError`).
+- Under at-least-once, offsets are committed every `commitIntervalMs`, default 5000; the consumer's automatic commits are off.
+- The exactly-once transactional id is `<applicationId>-<processId>`; a `producer.transactionalId` you set is used as it is.
+- Topics feeding one stateful subtopology must have the same partition count (`CoPartitioningError`). Streams whose keys changed (`map()`, `flatMap()`, `selectKey()`, `process()`, `toStream(mapper)`, `groupBy()`) are repartitioned through `<applicationId>-<name>-repartition` before key-based operations, which needs key and value codecs (`TopologyError` otherwise). `through(topic)` (deprecated) continues with what it reads back from the topic. A `Grouped.name` is shared by every aggregation of its grouping; illegal names, duplicate store names and a repartition name claimed by two operations throw `TopologyError`.
+- Lateness is decided by grace periods. The deprecated `TimeWindows.of(size)`, `SessionWindows.withInactivityGap(gap)` and `JoinWindows.of(d)` get Kafka Streams' legacy grace (`max(24h - size, 0)`, `max(24h - gap, 0)`, `max(24h - 2d, 0)`), so their stores keep about a day of windows; switch to the new factories. `windowedBy()` returns `TimeWindowedKStream`, `SessionWindowedKStream` or `SlidingWindowedKStream` (`WindowedKGroupedStream` is gone).
+- Stream-stream joins take `JoinWindows` as their third argument (the `Joined.within` form is deprecated and maps to `JoinWindows.of`, keeping its eager results). With the new factories, unmatched left and outer results are emitted when the window closes; the match timestamp is `max(left, right)`.
+- Windowed keys on topics: time and sliding windows `[key][start int64BE]`, sessions `[key][end int64BE][start int64BE]`, partitioned by the base key at `to()` and at repartition topics.
+- Time and session window aggregations pass null values to the aggregator or reducer, and `count()` counts them (typed `V | null`). Session aggregations retract every merged session before forwarding the merged one, and `aggregate()` takes the merger as its third argument (the `merger` option is deprecated).
+- Every callback takes `(key, value)`: swap the arguments of `selectKey()` callbacks. Table `filter()`, `filterNot()`, `mapValues()`, `groupBy()` and joins no longer see deletes (their parameters are not nullable); `transformValues()` takes a `ValueTransformerWithKey` supplier.
+- Grouped tables keep their aggregate when a group empties (a count goes to 0) and send no tombstone. `KTable.groupBy()`'s mapper may change the value type.
+- `count()` results are int64 big-endian (Kafka Streams' `Serdes.Long`; were 8-byte little-endian doubles); pass `value` to keep another encoding. Result timestamps follow Kafka Streams.
+- `globalTable()` returns a `GlobalKTable`, usable only as the lookup side of a stream join; the two-argument join is deprecated (it looks up the record key).
+- `close()` takes `{ timeoutMs }`. `state()` is `'REBALANCING'` during rebalances, restorations and recoveries.
+- `@kafkats/flow/testing`: `driver.consumers` / `driver.producers` have one element; `vi` and `TestMessage` are no longer exported. `ChangelogTopicSpec` is no longer exported from `@kafkats/flow`.
+
+**State store providers**
+
+- `@kafkats/flow-state-lmdb`: the default `maxDbs` is 4096 (one database per store and partition), and the environment is reopened on demand, so an app can be started again after `close()`.
