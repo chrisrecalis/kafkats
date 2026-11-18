@@ -54,8 +54,15 @@ class StreamStreamJoinProcessor<K, V, VO, VR> implements Processor<K | null, V |
 	private other!: JoinBuffer<K, VO>
 	private clock!: ObservedStreamTime
 	private outerStore: OuterJoinStore<K, V, VO> | undefined
+	/** The shortest wait past its timestamp of a pending record: `after` for this side's, `before` for the other's. */
+	private readonly lookBack: number
 
-	constructor(private readonly spec: JoinSideSpec<K, V, VO, VR>) {}
+	constructor(private readonly spec: JoinSideSpec<K, V, VO, VR>) {
+		this.lookBack = Math.min(
+			spec.outer ? spec.afterMs : Number.POSITIVE_INFINITY,
+			spec.otherOuter ? spec.beforeMs : Number.POSITIVE_INFINITY
+		)
+	}
 
 	async init(context: ProcessorContext<K | null, VR>): Promise<void> {
 		const { thisStore, otherStore, outerStore, side } = this.spec
@@ -110,11 +117,19 @@ class StreamStreamJoinProcessor<K, V, VO, VR> implements Processor<K | null, V |
 
 	/**
 	 * Joined with null at once without an outer-join store, or when no record can match it any more: its window ended
-	 * before the stream time (an out-of-order record, KS `testLowerWindowBound`). Otherwise it waits.
+	 * before the stream time (an out-of-order record, KS `testLowerWindowBound`), or its window and grace did (only with
+	 * a negative `after` at stream time 0, where KS stores it until the next scan; an emitted entry of its timestamp may
+	 * still wait for the commit to be deleted). Otherwise it waits.
 	 */
 	private async unmatched(record: StreamRecord<K, V>, streamTime: number): Promise<void> {
 		const outerStore = this.outerStore
-		if (outerStore === undefined || Math.max(0, record.timestamp + this.spec.afterMs) < streamTime) {
+		const { afterMs, graceMs } = this.spec
+		const { timestamp } = record
+		if (
+			outerStore === undefined ||
+			Math.max(0, timestamp + afterMs) < streamTime ||
+			timestamp + afterMs + graceMs < streamTime
+		) {
 			await this.context.forward(record.withValue(this.spec.joiner(record.value, null)))
 			return
 		}
@@ -126,8 +141,9 @@ class StreamStreamJoinProcessor<K, V, VO, VR> implements Processor<K | null, V |
 	 * Joins the pending records whose window and grace closed with null, oldest first, each at its own timestamp with the
 	 * headers of the record that triggered the scan (KS `emitNonJoinedOuterRecords`, ksdsl§7.4, KF11), and deletes each
 	 * entry once all its values were forwarded. A record of this side waits `after` past its timestamp, one of the other
-	 * side `before` (this side's view). Skipped while the oldest pending record cannot have closed, and throttled to one
-	 * scan per `emitIntervalMs` of wall clock per task.
+	 * side `before` (this side's view). Skipped while no pending record can have closed: the oldest one plus the shorter
+	 * wait of the sides that pend (KS adds the triggering side's `after`, which skips a scan that a record of the other
+	 * side would need). Throttled to one scan per `emitIntervalMs` of wall clock per task.
 	 */
 	private async emitClosed(
 		outerStore: OuterJoinStore<K, V, VO>,
@@ -136,7 +152,7 @@ class StreamStreamJoinProcessor<K, V, VO, VR> implements Processor<K | null, V |
 	): Promise<void> {
 		const { beforeMs, afterMs, graceMs, joiner, outer, otherOuter } = this.spec
 		const state = outerStore.emitState
-		if (state.minTime + afterMs + graceMs >= streamTime) return
+		if (state.minTime + this.lookBack + graceMs >= streamTime) return
 		const now = this.context.currentSystemTimeMs()
 		if (now < state.nextEmit) return
 		state.nextEmit = now + this.context.config.emitIntervalMs

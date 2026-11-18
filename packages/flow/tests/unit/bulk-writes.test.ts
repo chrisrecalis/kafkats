@@ -83,7 +83,10 @@ describe('bulk writes to a store', () => {
 
 	it('lets timers and I/O run while it clears a large store (it yields to the event loop as it goes)', async () => {
 		const store = new InMemoryKeyValueStore<string, string>('s', { keyCodec: str, valueCodec: str })
-		const entries = Array.from({ length: 25_000 }, (_, i) => ({ key: Buffer.from(`k${i}`), value: Buffer.from('v') }))
+		const entries = Array.from({ length: 25_000 }, (_, i) => ({
+			key: Buffer.from(`k${i}`),
+			value: Buffer.from('v'),
+		}))
 		await writeChanges(store, str, str, entries)
 		// Every check finds a yield due: what runs in between is what a slow store would let run.
 		let now = performance.now()

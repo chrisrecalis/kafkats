@@ -288,16 +288,16 @@ describe.each(GUARANTEES)('stream-stream join results (%s)', (_guarantee, config
 		}
 	})
 
-	it('asymmetric windows: a left record waits after + grace, a right one before + grace (KS lookBack)', async () => {
+	it('asymmetric windows: a left record waits after + grace, a right one before + grace', async () => {
 		// A left record at t joins right records in [t - 10, t + 100], a right record left ones in [t - 100, t + 10].
 		const driver = windowJoin('outerJoin', JoinWindows.ofTimeDifferenceWithNoGrace(100).before(10), config)
 		await driver.run(async ctx => {
 			await send(ctx, 'l', 'a', 'A', 1000)
 			await send(ctx, 'r', 'b', 'B', 1000)
-			// B closed after 1010, but a left record scans only once the oldest pending record could have closed by its
-			// own side's after, 1000 + 100 (KS checks the triggering side's after).
+			// B closed after 1010: a left record past it scans, although no left record can have closed by its own side's
+			// after, 1000 + 100 (KS checks the triggering side's after and would wait for D).
 			await send(ctx, 'l', 'c', 'C', 1020)
-			expect(timed(ctx)).toEqual([])
+			expect(timed(ctx)).toEqual(['null+B@1000'])
 			await send(ctx, 'r', 'd', 'D', 1030)
 			expect(timed(ctx)).toEqual(['null+B@1000'])
 			// Out of order on the right: X's window [800, 910] ended before the stream time 1030.
@@ -306,6 +306,54 @@ describe.each(GUARANTEES)('stream-stream join results (%s)', (_guarantee, config
 			// A closes after 1100, D after 1040; C stays pending until after 1120.
 			await send(ctx, 'l', 'e', 'E', 1101)
 			expect(timed(ctx)).toEqual(['null+B@1000', 'null+X@900', 'A+null@1000', 'null+D@1030'])
+		})
+	})
+
+	it('a record of the side with the longer wait emits a closed record of the other side before a late match removes it', async () => {
+		// A left record at t joins right records in [t - 3, t + 4], a right record left ones in [t - 4, t + 3].
+		const driver = windowJoin('outerJoin', JoinWindows.ofTimeDifferenceWithNoGrace(3).after(4), config)
+		await driver.run(async ctx => {
+			await send(ctx, 'r', 'b', 'R109', 109)
+			await send(ctx, 'r', 'a', 'R113', 113)
+			expect(timed(ctx)).toEqual(['null+R109@109'])
+			await send(ctx, 'r', 'b', 'R110', 110)
+			// R110's window (left records in [106, 113]) closed at stream time 114.
+			await send(ctx, 'l', 'c', 'L114', 114)
+			expect(timed(ctx)).toEqual(['null+R109@109', 'null+R110@110'])
+			// Late, within no grace of the left buffer's clock, L107 still joins both; R110 had been emitted already.
+			await send(ctx, 'l', 'b', 'L107', 107)
+			await send(ctx, 'l', 'z', 'L200', 200)
+			expect(timed(ctx)).toEqual([
+				'null+R109@109',
+				'null+R110@110',
+				'L107+R109@109',
+				'L107+R110@110',
+				'null+R113@113',
+				'L114+null@114',
+			])
+		})
+	})
+
+	it("a left join scans by the left records' wait, whichever side triggers", async () => {
+		// A left record at t joins right records in [t - 4, t + 3]: it is pending until stream time passes t + 3.
+		const driver = windowJoin('leftJoin', JoinWindows.ofTimeDifferenceWithNoGrace(3).before(4), config)
+		await driver.run(async ctx => {
+			await send(ctx, 'l', 'a', 'A', 100)
+			await send(ctx, 'r', 'z', 'Z', 103)
+			expect(timed(ctx)).toEqual([])
+			// KS's right side adds its own after (4) and would skip this scan.
+			await send(ctx, 'r', 'z', 'Z', 104)
+			expect(timed(ctx)).toEqual(['A+null@100'])
+		})
+	})
+
+	it('a record whose window and grace closed when it arrived is joined with null at once (negative after, time 0)', async () => {
+		// A left record at t joins right records in [t - 10, t - 5]: at stream time 0, a left record at 0 is closed.
+		const driver = windowJoin('leftJoin', JoinWindows.ofTimeDifferenceWithNoGrace(10).after(-5), config)
+		await driver.run(async ctx => {
+			await send(ctx, 'l', 'k', 'A', 0)
+			await send(ctx, 'l', 'k', 'B', 0)
+			expect(timed(ctx)).toEqual(['A+null@0', 'B+null@0'])
 		})
 	})
 
@@ -683,5 +731,43 @@ describe('stream-stream joins', () => {
 		// Revived as after a failed send: the replay finds A again.
 		await uncommitted(await h.revive(first))
 		expect(h.output('out').map(o => o.value)).toEqual(['A+R', 'A+R'])
+	})
+
+	it('at-least-once: a null result forwarded after the last commit is forwarded again by the revived task', async () => {
+		const h = new TaskHarness({
+			build: builder => {
+				const ctx = new DslContext(builder, { applicationId: APP })
+				const left: KStream<string, string> = ctx.stream('l', S)
+				const right: KStream<string, string> = ctx.stream('r', S)
+				left.leftJoin(right, joiner, JoinWindows.ofTimeDifferenceWithNoGrace(10)).to('out', S)
+			},
+		})
+		const first = await h.start(h.task())
+		h.enqueue(first, 'l', [{ key: 'k', value: 'L', timestamp: 100 }])
+		await h.process(first)
+		expect(await h.commit()).toBe('committed')
+		const closing = async (task: StreamTask) => {
+			h.enqueue(task, 'l', [{ key: 'other', value: 'O', timestamp: 200 }])
+			await h.process(task)
+		}
+		await closing(first)
+		expect(h.output('out').map(o => [o.key, o.value, o.timestamp])).toEqual([['k', 'L+null', 100]])
+		// Revived as after a failed send of that result: the deletion of L's entry waited for the commit, so the replay
+		// finds it again.
+		const revived = await h.revive(first)
+		await closing(revived)
+		expect(h.output('out').map(o => [o.key, o.value, o.timestamp])).toEqual([
+			['k', 'L+null', 100],
+			['k', 'L+null', 100],
+		])
+		// Once committed, L's entry is gone: a restarted task forwards it no more (O, added by both incarnations, closes
+		// twice: at-least-once, as in Kafka Streams' list store).
+		expect(await h.commit('revocation')).toBe('committed')
+		await revived.suspend()
+		expect(await revived.close('clean')).toBe('clean')
+		const restarted = await h.restart()
+		h.enqueue(restarted, 'l', [{ key: 'last', value: 'Z', timestamp: 300 }])
+		await h.process(restarted)
+		expect(h.output('out').map(o => o.value)).toEqual(['L+null', 'L+null', 'O+null', 'O+null'])
 	})
 })

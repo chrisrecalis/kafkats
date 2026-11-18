@@ -79,7 +79,7 @@ describe('StateDirectory', () => {
 		await expect(dir.lease(T0, counts, 0)).resolves.toBeDefined()
 	})
 
-	it('release with invalidate only invalidates the checkpoint: the next owner\'s restore clears the store', async () => {
+	it("release with invalidate only invalidates the checkpoint: the next owner's restore clears the store", async () => {
 		const durable = checkpointStore()
 		const checkpoints = new Checkpoints(durable, () => {})
 		const { directory: dir } = directory({ checkpoints })

@@ -5,6 +5,10 @@
  * it iterates by timestamp, then right before left, then key; the value is the list of the values with that timestamp,
  * side and key (6.25). Both join processors of a task read and write it, each from its own side's point of view, and
  * share its emission state.
+ *
+ * Under at-least-once its deletes wait for the task's next commit (like a suppress buffer's evictions): an entry joined
+ * with null after the last commit is found again by a revived or restarted task, whose replay of the trigger record
+ * forwards its result again instead of losing it with a failed send. Under exactly-once the transaction does the same.
  */
 import type { ChangelogConfig, ChangelogDefaults } from '@/changelog/config.js'
 import { buffer, type Codec } from '@/codec.js'
@@ -22,7 +26,10 @@ export function outerJoinStoreBuilder(
 	defaults: ChangelogDefaults,
 	options: { readonly name: string; readonly logging?: boolean | ChangelogConfig }
 ): StoreBuilder<RawStore> {
-	return keyValueStoreBuilder(defaults, { ...options, keyCodec: buffer(), valueCodec: listCodec(buffer()) })
+	return {
+		...keyValueStoreBuilder(defaults, { ...options, keyCodec: buffer(), valueCodec: listCodec(buffer()) }),
+		holdDeletes: true,
+	}
 }
 
 /**
@@ -87,7 +94,10 @@ export class OuterJoinStore<K, V, VO> {
 		}
 	}
 
-	/** Adds an unmatched record of this side after the others with its key and timestamp. */
+	/**
+	 * Adds an unmatched record of this side after the others with its key and timestamp. Never an entry whose delete
+	 * waits for the commit: that one closed, and so did every record of its timestamp and side (the caller forwards them).
+	 */
 	async add(key: K, timestamp: number, value: V): Promise<void> {
 		const storeKey = this.storeKey(timestamp, this.ownSide, key)
 		const values = (await this.store.get(storeKey)) ?? []
