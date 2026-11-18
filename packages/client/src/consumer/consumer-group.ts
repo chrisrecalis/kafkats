@@ -79,6 +79,13 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 	private pendingRevocation: TopicPartition[] = [] // Partitions pending revoke in phase 1
 	private rebalanceProtocol: RebalanceProtocol = 'eager' // Set from broker-selected protocol
 	private selectedProtocolName: string | null = null // Broker-selected protocol name from JoinGroup
+	/**
+	 * Leader only (Kafka's assignment snapshot): the partition count, per subscribed topic, of the metadata the last
+	 * assignment was computed from, 0 for a topic that metadata did not show. Null on a member that does not lead.
+	 */
+	private assignedPartitionCounts: Map<string, number> | null = null
+	/** The metadata check in flight, started after a heartbeat (never awaited by the heartbeat loop). */
+	private metadataCheck: Promise<void> | null = null
 
 	constructor(cluster: Cluster, config: ConsumerConfig, logger?: Logger, assignor?: PartitionAssignor) {
 		super()
@@ -600,6 +607,9 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 				protocolName: response.protocolName,
 			})
 			await this.computeAssignments(topics, response.members, response.protocolName)
+		} else {
+			// Only the leader watches the metadata of the subscribed topics.
+			this.assignedPartitionCounts = null
 		}
 
 		this.state = ConsumerGroupState.AWAITING_SYNC
@@ -707,6 +717,60 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 
 		// Compute assignments using the selected assignor
 		this.leaderAssignments = assignor.assign(memberSubscriptions, topicPartitions)
+		this.assignedPartitionCounts = new Map(topics.map(topic => [topic, topicPartitions.get(topic)?.length ?? 0]))
+	}
+
+	/**
+	 * Kafka's leader metadata watch (ConsumerCoordinator.rejoinNeededOrPending), started after each heartbeat: the
+	 * leader asks for a rebalance once the partition counts of the subscribed topics differ from those it assigned
+	 * with, so that a topic metadata did not show yet at the assignment (one created moments before), added partitions
+	 * and a deleted topic are assigned again. A topic missing at the assignment is looked up again at every heartbeat
+	 * until it shows up; other changes are seen once a metadata refresh brings them. One check at a time, and the
+	 * heartbeat loop never waits for it (a slow metadata request must not delay heartbeats into a session timeout).
+	 */
+	private checkAssignedMetadata(): void {
+		if (this.metadataCheck || !this.assignedPartitionCounts) {
+			return
+		}
+		this.metadataCheck = this.rejoinIfAssignedMetadataChanged()
+			.catch((error: Error) => this.logger.warn('metadata check failed', { error: error.message }))
+			.finally(() => {
+				this.metadataCheck = null
+			})
+	}
+
+	private async rejoinIfAssignedMetadataChanged(): Promise<void> {
+		const assigned = this.assignedPartitionCounts
+		if (!assigned) {
+			return
+		}
+		const missing = [...assigned].filter(([, count]) => count === 0).map(([topic]) => topic)
+		if (missing.length > 0) {
+			try {
+				await this.cluster.refreshMetadata(missing)
+			} catch (error) {
+				this.logger.debug('metadata refresh of unassigned topics failed', {
+					topics: missing,
+					error: (error as Error).message,
+				})
+				return
+			}
+		}
+		// A rejoin or a loss while the refresh was in flight replaced or invalidated the snapshot.
+		if (this.assignedPartitionCounts !== assigned || this.state !== ConsumerGroupState.STABLE) {
+			return
+		}
+		const topics = this.cluster.getMetadata()?.topics
+		const count = (topic: string) => topics?.get(topic)?.partitions.size ?? 0
+		const changed = [...assigned].filter(([topic, assignedCount]) => count(topic) !== assignedCount)
+		if (changed.length === 0) {
+			return
+		}
+		this.logger.info('partitions of subscribed topics changed since the assignment, rejoining', {
+			topics: changed.map(([topic, assignedCount]) => ({ topic, assigned: assignedCount, now: count(topic) })),
+		})
+		this.assignedPartitionCounts = null
+		this.emit('rebalance')
 	}
 
 	// Temporary storage for leader assignments (used in syncGroup)
@@ -882,7 +946,9 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 						// May flip state to non-STABLE (UnknownMemberId, FencedInstanceId);
 						// the finally guard skips the reschedule in that case.
 						await this.handleHeartbeatError(response.errorCode)
+						return
 					}
+					this.checkAssignedMetadata()
 				})
 				.catch(async error => {
 					this.logger.error('heartbeat failed', { error: (error as Error).message })

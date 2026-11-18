@@ -43,8 +43,12 @@ interface ReceivedCommit {
  * logs, so a real Consumer with its ConsumerGroup, OffsetManager and FetchManager runs against it. `calls`
  * records the group requests in order (and `Fetch <partitions>` for each fetch).
  */
-export function fakeBroker(options: { partitions?: number } = {}) {
+export function fakeBroker(options: { partitions?: number; topicVisible?: boolean } = {}) {
 	const partitionCount = options.partitions ?? 2
+	/** Whether metadata shows {@link TOPIC} yet (a topic created moments ago may not show). */
+	let topicVisible = options.topicVisible ?? true
+	let metadataRefreshes = 0
+	let heartbeats = 0
 	const calls: string[] = []
 	const logs = new Map<number, Log>(Array.from({ length: partitionCount }, (_, p) => [p, { start: 0n, end: 0n }]))
 	const committed = new Map<number, { offset: bigint; metadata: string | null }>()
@@ -111,6 +115,7 @@ export function fakeBroker(options: { partitions?: number } = {}) {
 		},
 
 		async heartbeat() {
+			heartbeats++
 			return { throttleTimeMs: 0, errorCode: heartbeatErrors.shift() ?? ErrorCode.None }
 		},
 
@@ -230,9 +235,20 @@ export function fakeBroker(options: { partitions?: number } = {}) {
 		getCoordinator: async () => coordinator,
 		invalidateCoordinator: () => {},
 		getLeaderForPartition: async () => coordinator,
-		refreshMetadata: async () => ({
-			topics: new Map([[TOPIC, { partitions: new Map(Array.from(logs.keys(), p => [p, { leader: 1 }])) }]]),
-		}),
+		/** The metadata of the last refresh, as the real cluster caches it. */
+		metadata: null as unknown,
+		refreshMetadata: async () => {
+			metadataRefreshes++
+			cluster.metadata = {
+				topics: new Map(
+					topicVisible
+						? [[TOPIC, { partitions: new Map(Array.from(logs.keys(), p => [p, { leader: 1 }])) }]]
+						: []
+				),
+			}
+			return cluster.metadata
+		},
+		getMetadata: () => cluster.metadata,
 	}
 
 	return {
@@ -246,6 +262,20 @@ export function fakeBroker(options: { partitions?: number } = {}) {
 		gates,
 		get generationId() {
 			return generationId
+		},
+		get metadataRefreshes() {
+			return metadataRefreshes
+		},
+		get heartbeats() {
+			return heartbeats
+		},
+		/** Metadata shows the topic from now on. */
+		showTopic(): void {
+			topicVisible = true
+		},
+		/** Add a partition with an empty log to the topic (the next metadata refresh shows it). */
+		addPartition(): void {
+			logs.set(logs.size, { start: 0n, end: 0n })
 		},
 		/** Append `count` records to a partition's log. */
 		produce(partition: number, count: number): void {

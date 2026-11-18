@@ -550,6 +550,8 @@ const consumer = client.consumer({
 | `'sticky'`             | Minimize movement, eager rebalance                     |
 | `'range'`              | Simple per-topic assignment                            |
 
+As in the Java client, the member that computed the assignment (the group leader) keeps the partition counts of the subscribed topics it assigned with, and starts a rebalance once metadata shows different ones: a topic that metadata did not show yet when the group formed (one created moments before) is looked up again at every heartbeat and assigned once it shows up; partitions added to a topic, or a deleted topic, are noticed at the next metadata refresh (`metadataRefreshIntervalMs`).
+
 ## Isolation Level
 
 Control visibility of transactional messages:
