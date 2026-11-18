@@ -5,7 +5,8 @@
  * States: CREATED (until a start succeeds) -> RUNNING <-> REBALANCING (BC17: RUNNING only while every assigned task
  * is RUNNING; REBALANCING during a rebalance, a restore or a recovery); ERROR after a fatal failure (sticky until
  * close) or a failed start; STOPPED after close. getError(): the fatal error while there is one, else the most recent
- * recoverable error (a failed start, a recovery's cause), which never changes state(). A new start clears both.
+ * recoverable error (a failed start, a revival's or a recovery's cause, a checkpoint that failed to persist), which
+ * never changes state(). A new start clears both.
  */
 import type { StreamState } from '@/api/app.js'
 

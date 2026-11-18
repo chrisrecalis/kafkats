@@ -161,7 +161,8 @@ export interface FlowApp {
 	state(): StreamState
 	/**
 	 * The fatal error while ERROR (the first one; kept until close()); otherwise the most recent recoverable
-	 * error, which never changes state(). Cleared when a new start begins. Use state() for health.
+	 * error (the TaskCorruptedError of a revival in place, the cause of a rejoin, a checkpoint that failed to
+	 * persist), which never changes state(). Cleared when a new start begins. Use state() for health.
 	 */
 	getError(): Error | null
 }

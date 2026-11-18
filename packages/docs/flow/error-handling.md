@@ -78,21 +78,21 @@ A timestamp extractor that throws, or returns something other than an integer, i
 
 All exported from `@kafkats/flow`:
 
-| Error                             | Raised when                                                                                                     |
-| --------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `FlowConfigError`                 | `flow()` got an invalid or removed option                                                                       |
-| `TopologyError`                   | The topology is invalid: a missing codec, an illegal or duplicate name, an invalid window or option             |
-| `StreamsError`                    | Base of the errors raised while the app runs; `taskId` names the task when there is one                         |
-| `FailedProcessingError`           | A handler answered `'fail'` or threw; `cause` is the original error                                             |
-| `InvalidTimestampError`           | A timestamp extractor returned an invalid timestamp                                                             |
-| `NoOffsetResetError`              | A source with reset policy `'none'` has no committed offset, or its position is out of range                    |
-| `AssignmentError`                 | An assigned topic is not part of the topology: instances run different topologies                               |
-| `TaskMigratedError`               | Fencing, lost partitions, a failed commit, a partial assignment: the instance rejoins (recovered automatically) |
-| `TaskCorruptedError`              | The state or output of tasks is unusable: they are revived in place (recovered automatically)                   |
-| `IllegalStateError`               | A closed store or context was used, or a task transition was invalid: a bug                                     |
-| `CoPartitioningError`             | Topics that must be co-partitioned have different partition counts (`start()`)                                  |
-| `ChangelogPartitionMismatchError` | An existing internal topic has the wrong partition count, or a source topic of a stateful task grew             |
-| `SourceTopicNotFoundError`        | A source topic, or an internal topic with `changelog.autoCreate: false`, does not exist (`start()`)             |
-| `ChangelogDecodeError`            | A changelog record cannot be decoded with its store's codecs while restoring                                    |
+| Error                             | Raised when                                                                                                                                          |
+| --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `FlowConfigError`                 | `flow()` got an invalid or removed option                                                                                                            |
+| `TopologyError`                   | The topology is invalid: a missing codec, an illegal or duplicate name, an invalid window or option                                                  |
+| `StreamsError`                    | Base of the errors raised while the app runs; `taskId` names the task when there is one                                                              |
+| `FailedProcessingError`           | A handler answered `'fail'` or threw; `cause` is the original error                                                                                  |
+| `InvalidTimestampError`           | A timestamp extractor returned an invalid timestamp                                                                                                  |
+| `NoOffsetResetError`              | A source with reset policy `'none'` has no committed offset, or its position is out of range                                                         |
+| `AssignmentError`                 | An assigned topic is not part of the topology: instances run different topologies                                                                    |
+| `TaskMigratedError`               | Fencing, a partial assignment, a failed send under exactly-once, commits failing for `taskTimeoutMs`: the instance rejoins (recovered automatically) |
+| `TaskCorruptedError`              | The state or output of tasks is unusable: they are revived in place (recovered automatically)                                                        |
+| `IllegalStateError`               | A closed store or context was used, or a task transition was invalid: a bug                                                                          |
+| `CoPartitioningError`             | Topics that must be co-partitioned have different partition counts (`start()`)                                                                       |
+| `ChangelogPartitionMismatchError` | An existing internal topic has the wrong partition count, or a source topic of a stateful task grew                                                  |
+| `SourceTopicNotFoundError`        | A source topic, or an internal topic with `changelog.autoCreate: false`, does not exist (`start()`)                                                  |
+| `ChangelogDecodeError`            | A changelog record cannot be decoded with its store's codecs while restoring                                                                         |
 
-`TaskMigratedError` and `TaskCorruptedError` are reported by `getError()` as the most recent recoverable error; they do not change `state()`.
+`getError()` reports the cause of each recovery as the most recent recoverable error, without changing `state()`: the `TaskCorruptedError` of tasks revived in place, and for a rejoin the error that caused it, a `TaskMigratedError` when flow raised one, otherwise the client's error (a `CommitFailedError`, a lost connection, ...).

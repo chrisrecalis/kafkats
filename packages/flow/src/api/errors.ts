@@ -64,7 +64,10 @@ export class AssignmentError extends StreamsError {
 	override name = 'AssignmentError'
 }
 
-/** Reset policy 'none' and no committed offset, or an out-of-range position (fatal). */
+/**
+ * Reset policy 'none' and no committed offset (its cause is the client's NoOffsetForPartitionError), or an out-of-range
+ * position (fatal).
+ */
 export class NoOffsetResetError extends StreamsError {
 	override name = 'NoOffsetResetError'
 }

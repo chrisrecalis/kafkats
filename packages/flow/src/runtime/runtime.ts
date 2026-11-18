@@ -172,6 +172,8 @@ export class FlowRuntime {
 		}
 		const kind = classify(error, site)
 		if (kind === 'corrupted') {
+			// Reported by getError(): the revived tasks reprocess from their last commit.
+			lifecycle.recordError(error)
 			this.run?.revive(error as TaskCorruptedError, { rebuild: site === 'restore' })
 			return
 		}

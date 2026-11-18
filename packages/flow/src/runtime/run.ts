@@ -4,7 +4,7 @@
  * (4.3). Created by FlowRuntime.start and by every recovery; never revived: a Run ends once, gracefully (close) or
  * abandoned (failure). Corrupted tasks are revived in place within it (4.7.5).
  */
-import type { Logger } from '@kafkats/client'
+import { NoOffsetForPartitionError, type Logger } from '@kafkats/client'
 import { NoOffsetResetError, StreamsError, type TaskCorruptedError } from '@/api/errors.js'
 import type { AppLifecycle } from '@/app/lifecycle.js'
 import { CommitCoordinator } from '@/runtime/commit.js'
@@ -349,11 +349,21 @@ export class Run {
 		this.deps.onFailure(error, site)
 	}
 
-	/** The consumer's run ended or failed; expected only once the run stops it (4.10.1). */
+	/**
+	 * The consumer's run ended or failed; expected only once the run stops it (4.10.1). A partition without a committed
+	 * offset under reset policy 'none' is flow's NoOffsetResetError, like an out-of-range position (KS wraps both
+	 * halves of `InvalidOffsetException` in one StreamsException).
+	 */
 	private consumerEnded(error: unknown): void {
-		if (!this.stopping) {
-			this.fail(error, 'consumer-run')
+		if (this.stopping) {
+			return
 		}
+		if (error instanceof NoOffsetForPartitionError) {
+			const message = `'${error.topic}' partition ${error.partition} has no committed offset and its reset policy is 'none'`
+			this.fail(new NoOffsetResetError(message, { cause: error }), 'consumer-run')
+			return
+		}
+		this.fail(error, 'consumer-run')
 	}
 
 	/** Static sink topics, so that partitioners read their counts synchronously from the first record (best effort). */

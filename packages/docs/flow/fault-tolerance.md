@@ -70,7 +70,7 @@ Interval commits are skipped while a rebalance is pending. The app is `REBALANCI
 
 The backoff before rejoining starts at 0.5 s and doubles up to 30 s, and starts over once a membership committed. Migrations are retried without limit: a broker outage only delays processing. A failed membership processes and commits nothing more; under exactly-once its open transaction is aborted and its buffered store writes are dropped, so the stores keep their committed state.
 
-`app.getError()` returns the most recent recoverable failure (it does not change the state), or the fatal error while the app is `ERROR`.
+`app.getError()` returns the most recent recoverable failure, the cause of a revival in place or of a rejoin (it does not change the state), or the fatal error while the app is `ERROR`.
 
 ## Closing
 

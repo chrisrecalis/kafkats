@@ -6,9 +6,9 @@
  * not processed under either guarantee, a halt stops the whole runtime, also a recovery waiting out its backoff.
  */
 import { describe, expect, it, vi } from 'vitest'
-import { KafkaClient, string, TimeoutError } from '@kafkats/client'
+import { KafkaClient, NoOffsetForPartitionError, string, TimeoutError } from '@kafkats/client'
 import type { FlowApp, FlowConfig } from '@/api/app.js'
-import { FailedProcessingError, NoOffsetResetError, TaskMigratedError } from '@/api/errors.js'
+import { FailedProcessingError, NoOffsetResetError, TaskCorruptedError, TaskMigratedError } from '@/api/errors.js'
 import { flow } from '@/app/flow.js'
 import { codec } from '@/codec.js'
 import { COUNT_CODEC } from '@/dsl/ops/aggregate.js'
@@ -288,6 +288,39 @@ describe('start (4.2)', () => {
 })
 
 describe('halt (4.10.3)', () => {
+	it("reset policy 'none' without a committed offset is a NoOffsetResetError: start() rejects with it", async () => {
+		const h = new Harness(stateless)
+		const starting = h.start()
+		await h.joined()
+		h.consumer.fail(new NoOffsetForPartitionError('in', 0))
+		const failure = await starting.catch((error: unknown) => error)
+		expect(failure).toBeInstanceOf(NoOffsetResetError)
+		expect((failure as Error).message).toBe(
+			"'in' partition 0 has no committed offset and its reset policy is 'none'"
+		)
+		expect((failure as Error).cause).toBeInstanceOf(NoOffsetForPartitionError)
+		expect(h.lifecycle.error).toBe(failure)
+		await h.stop()
+	})
+
+	it("reset policy 'none' without a committed offset after the start: the uncaught handler gets a NoOffsetResetError", async () => {
+		const seen: Error[] = []
+		const h = new Harness(stateless, {
+			uncaughtExceptionHandler: error => {
+				seen.push(error)
+				return 'shutdown'
+			},
+		})
+		await h.started()
+		// A rebalance assigned a partition without a committed offset: the client's run fails.
+		h.consumer.fail(new NoOffsetForPartitionError('in', 1))
+		await vi.waitFor(() => expect(h.lifecycle.state).toBe('ERROR'))
+		expect(seen).toEqual([expect.any(NoOffsetResetError)])
+		expect(h.lifecycle.error).toBe(seen[0])
+		expect(seen[0]!.cause).toBeInstanceOf(NoOffsetForPartitionError)
+		await h.stop()
+	})
+
 	it('the hooks of an abandoned run return at once and acknowledge nothing (CR11)', async () => {
 		const h = new Harness(stateless, { processingGuarantee: 'exactly_once' })
 		await h.started()
@@ -331,9 +364,11 @@ describe('revive in place (4.7.5)', () => {
 		await vi.waitFor(() => expect(h.producer.sent).toHaveLength(3))
 		h.consumer.calls.length = 0
 		h.io.clock.advance(1000)
-		// Paused and rewound to its last commit; the processed records come again.
+		// Paused and rewound to its last commit; the processed records come again. getError() reports it.
 		await vi.waitFor(() => expect(h.consumer.calls).toEqual(['pause in:0', 'seek in:0 1', 'resume in:0']))
 		expect(h.committed()).toBe(1n)
+		expect(h.lifecycle.error).toBeInstanceOf(TaskCorruptedError)
+		expect(h.lifecycle.state).toBe('RUNNING')
 		h.consumer.deliver('in:0', [
 			{ key: 'k', value: 'b' },
 			{ key: 'k', value: 'c' },
