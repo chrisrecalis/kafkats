@@ -139,12 +139,14 @@ A `partitioner` returns the partition of a record, or `undefined` for the produc
 Writes the stream to an internal topic and reads it back, even if keys did not change:
 
 ```typescript
-stream.selectKey((key, order) => order!.customerId).repartition({
-	name: 'orders-by-customer', // topic <applicationId>-orders-by-customer-repartition
-	key: string(),
-	value: json<Order>(),
-	numberOfPartitions: 12,
-})
+stream
+	.selectKey((key, order) => order!.customerId)
+	.repartition({
+		name: 'orders-by-customer', // topic <applicationId>-orders-by-customer-repartition
+		key: string(),
+		value: json<Order>(),
+		numberOfPartitions: 12,
+	})
 ```
 
 `Repartitioned` options: `name` (else `repartition-<n>` is generated), codecs (the stream's otherwise; both are required), `numberOfPartitions` (default: the largest partition count of the topics the stream comes from, or the count of the topics it is co-partitioned with downstream, which an explicit count must then equal), and a `partitioner`. Key-based operations after `repartition()` do not repartition again.
@@ -184,7 +186,11 @@ Streams join other streams within a window, tables on the current value of the k
 ```typescript
 orders.join(payments, (order, payment) => ({ order, payment }), JoinWindows.ofTimeDifferenceWithNoGrace('10m'))
 orders.leftJoin(customers, (order, customer) => ({ ...order, customer }))
-orders.join(products, (key, order) => order.productId, (order, product) => ({ ...order, product }))
+orders.join(
+	products,
+	(key, order) => order.productId,
+	(order, product) => ({ ...order, product })
+)
 ```
 
 ## Custom Processing
@@ -195,8 +201,8 @@ orders.join(products, (key, order) => order.productId, (order, product) => ({ ..
 
 Operations that work per key (aggregations, joins with streams and tables, `toTable()`) need every record of a key in the same partition of their input. When the key of a stream may have changed since it was read (after `map()`, `flatMap()`, `selectKey()`, `process()`, `KTable.toStream(mapper)`, or a `groupBy()`), the operation first writes the stream to an internal repartition topic, partitioned by the new key, and reads it back.
 
-| Changes keys (repartition downstream)                                | Keeps the key                                                                                   |
-| -------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| Changes keys (repartition downstream)                                   | Keeps the key                                                                                         |
+| ----------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
 | `map`, `flatMap`, `selectKey`, `process`, `toStream(mapper)`, `groupBy` | `filter`, `filterNot`, `mapValues`, `flatMapValues`, `peek`, `split` branches, `processValues`, joins |
 
 - The repartition topic is `<applicationId>-<name>-repartition`. Its name comes from the operator's `name` (`Grouped.name`, `Joined.name`, `Repartitioned.name`, ...), else from an aggregation's `storeName`, else a generated `repartition-<n>`. Name repartitioning operations: generated names depend on the order of the DSL calls, and a renamed topic is a new topic.

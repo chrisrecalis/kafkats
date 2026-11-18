@@ -76,7 +76,7 @@ If not installed, kafkats falls back to a pure TypeScript CRC32C implementation.
 For schema validation with Zod:
 
 ```bash
-pnpm add @kafkats/flow-codec-zod zod
+pnpm add @kafkats/codec-zod zod
 ```
 
 ### LMDB State Store

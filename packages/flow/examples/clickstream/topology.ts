@@ -40,26 +40,21 @@ export function buildTopology(app: FlowApp): void {
 	// ============================================
 	// Branching: Route by user tier
 	// ============================================
-	const [premiumEvents, freeEvents] = enrichedEvents.branch(
-		(_, e) => e?.userTier === 'premium',
-		(_, e) => e?.userTier === 'free'
-	)
-
-	// Premium users go to priority topic
-	if (premiumEvents) {
-		premiumEvents.to(TOPICS.PREMIUM_EVENTS, {
-			key: codec.string(),
-			value: codec.json<EnrichedEvent>(),
+	// Each event goes to the first branch whose predicate matches; events of no tier are dropped
+	enrichedEvents
+		.split({ name: 'tier-' })
+		.branch((_, e) => e?.userTier === 'premium', {
+			name: 'premium',
+			// Premium users go to the priority topic
+			chain: premium =>
+				premium.to(TOPICS.PREMIUM_EVENTS, { key: codec.string(), value: codec.json<EnrichedEvent>() }),
 		})
-	}
-
-	// Free users go to standard topic
-	if (freeEvents) {
-		freeEvents.to(TOPICS.FREE_EVENTS, {
-			key: codec.string(),
-			value: codec.json<EnrichedEvent>(),
+		.branch((_, e) => e?.userTier === 'free', {
+			name: 'free',
+			// Free users go to the standard topic
+			chain: free => free.to(TOPICS.FREE_EVENTS, { key: codec.string(), value: codec.json<EnrichedEvent>() }),
 		})
-	}
+		.noDefaultBranch()
 
 	// ============================================
 	// Session Windows: Detect user sessions
@@ -67,7 +62,7 @@ export function buildTopology(app: FlowApp): void {
 	// A session ends after 30 seconds of inactivity (short for demo purposes)
 	enrichedEvents
 		.groupByKey()
-		.windowedBy(SessionWindows.withInactivityGap('30s'))
+		.windowedBy(SessionWindows.ofInactivityGapAndGrace('30s', '10s'))
 		.aggregate<SessionSummary>(
 			() => ({
 				userId: '',
@@ -125,7 +120,7 @@ export function buildTopology(app: FlowApp): void {
 	events
 		.filter((_, e) => e?.type === 'page_view')
 		.groupBy((_, e) => (e as { page: string }).page, { key: codec.string() })
-		.windowedBy(TimeWindows.of('1m'))
+		.windowedBy(TimeWindows.ofSizeAndGrace('1m', '10s'))
 		.count()
 		.toStream()
 		.map((windowed: Windowed<string> | null, count): KeyValue<string, PageStats> => [
@@ -148,7 +143,7 @@ export function buildTopology(app: FlowApp): void {
 	console.log('    |')
 	console.log('    +--[join user-profiles]-->')
 	console.log('    |     |')
-	console.log('    |     +--[branch]-->  premium-events')
+	console.log('    |     +--[split]-->  premium-events')
 	console.log('    |     |               free-events')
 	console.log('    |     |')
 	console.log('    |     +--[session windows 30s]-->  user-sessions')

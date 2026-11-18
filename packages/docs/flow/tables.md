@@ -19,11 +19,11 @@ A table can also come from a stream (`stream.toTable()`), an aggregation (`count
 
 ## Stream vs Table
 
-| KStream                                  | KTable                                       |
-| ---------------------------------------- | -------------------------------------------- |
-| Every record is an event                 | Every record updates the row of its key      |
-| Two records of a key are two events      | The second record replaces the first         |
-| A null value is a record with null value | A null value deletes the key                 |
+| KStream                                  | KTable                                  |
+| ---------------------------------------- | --------------------------------------- |
+| Every record is an event                 | Every record updates the row of its key |
+| Two records of a key are two events      | The second record replaces the first    |
+| A null value is a record with null value | A null value deletes the key            |
 
 ## Transformations
 

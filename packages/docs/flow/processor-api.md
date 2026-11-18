@@ -24,7 +24,9 @@ function changesOnly(): Processor<string | null, number | null, string, number> 
 	}
 }
 
-app.stream('readings', { key: string(), value: json<number>() }).process(changesOnly).to('changes', { key: string(), value: json() })
+app.stream('readings', { key: string(), value: json<number>() })
+	.process(changesOnly)
+	.to('changes', { key: string(), value: json() })
 ```
 
 (The `Map` above is for illustration: state that must survive restarts and rebalances belongs in a [state store](#state-stores).)
@@ -46,16 +48,16 @@ record.withKey('other').withValue({ amount: 2 }).withTimestamp(0).withHeaders({}
 
 ## The Processor Context
 
-| Member                           | Description                                                                                                                   |
-| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `forward(record, childName?)`    | Sends a record to the processor's children (or to one of them by name), depth-first.                                          |
-| `schedule(intervalMs, type, fn)` | Schedules a punctuator; returns a `Cancellable`.                                                                             |
-| `getStateStore(definition \| name)` | A state store the processor is connected to (typed when given its definition).                                           |
-| `commit()`                       | Requests a commit of every task at the next commit point, without waiting for the commit interval.                            |
-| `recordMetadata()`               | Topic, partition, offset of the input record; `null` in `init()` and punctuators.                                             |
-| `currentStreamTimeMs()`          | The task's stream time; `-1` while unknown.                                                                                   |
-| `currentSystemTimeMs()`          | The wall clock, as of the start of the current processing slice.                                                              |
-| `applicationId`, `taskId`, `processorName` | Where the processor runs; `taskId` is `{ subtopology, partition, key }`.                                            |
+| Member                                     | Description                                                                                        |
+| ------------------------------------------ | -------------------------------------------------------------------------------------------------- |
+| `forward(record, childName?)`              | Sends a record to the processor's children (or to one of them by name), depth-first.               |
+| `schedule(intervalMs, type, fn)`           | Schedules a punctuator; returns a `Cancellable`.                                                   |
+| `getStateStore(definition \| name)`        | A state store the processor is connected to (typed when given its definition).                     |
+| `commit()`                                 | Requests a commit of every task at the next commit point, without waiting for the commit interval. |
+| `recordMetadata()`                         | Topic, partition, offset of the input record; `null` in `init()` and punctuators.                  |
+| `currentStreamTimeMs()`                    | The task's stream time; `-1` while unknown.                                                        |
+| `currentSystemTimeMs()`                    | The wall clock, as of the start of the current processing slice.                                   |
+| `applicationId`, `taskId`, `processorName` | Where the processor runs; `taskId` is `{ subtopology, partition, key }`.                           |
 
 ### Forwarding
 
@@ -92,7 +94,13 @@ init(ctx) {
 `Stores` creates typed store definitions. Connect a processor to a store by naming the definition in its `stores` option, and read it with `context.getStateStore(definition)`:
 
 ```typescript
-import { Stores, StreamRecord, type Processor, type ProcessorContext, type TimestampedKeyValueStore } from '@kafkats/flow'
+import {
+	Stores,
+	StreamRecord,
+	type Processor,
+	type ProcessorContext,
+	type TimestampedKeyValueStore,
+} from '@kafkats/flow'
 
 const lastSeen = Stores.timestampedKeyValueStore({ name: 'last-seen', key: string(), value: json<Reading>() })
 
@@ -117,13 +125,13 @@ function dedupe(): Processor<string | null, Reading | null, string, Reading> {
 readings.process(dedupe, { name: 'dedupe', stores: [lastSeen] })
 ```
 
-| Factory                                    | Store                                                       |
-| ------------------------------------------ | ----------------------------------------------------------- |
-| `Stores.keyValueStore(options)`            | `KeyValueStore<K, V>`                                       |
+| Factory                                    | Store                                                           |
+| ------------------------------------------ | --------------------------------------------------------------- |
+| `Stores.keyValueStore(options)`            | `KeyValueStore<K, V>`                                           |
 | `Stores.timestampedKeyValueStore(options)` | `TimestampedKeyValueStore<K, V>`: values `{ value, timestamp }` |
-| `Stores.windowStore(options)`              | `WindowStore<K, V>`                                         |
-| `Stores.timestampedWindowStore(options)`   | `TimestampedWindowStore<K, V>`                              |
-| `Stores.sessionStore(options)`             | `SessionStore<K, V>`                                        |
+| `Stores.windowStore(options)`              | `WindowStore<K, V>`                                             |
+| `Stores.timestampedWindowStore(options)`   | `TimestampedWindowStore<K, V>`                                  |
+| `Stores.sessionStore(options)`             | `SessionStore<K, V>`                                            |
 
 Options: `name` (unique in the app; it keys the persisted state and names the changelog `<applicationId>-<name>-changelog`), `key` and `value` codecs, and `logging` (`true` by default, `false`, or a [`ChangelogConfig`](/flow/state-stores#per-store-settings)). Window stores also take `retention` and `windowSize`, session stores `retention`; durations are validated when the definition is made.
 
@@ -183,7 +191,10 @@ function versioned(): ValueTransformerWithKey<string, Profile, Profile & { versi
 }
 
 const profiles = app.table('profiles', { key: string(), value: json<Profile>() })
-profiles.transformValues(versioned, { stores: [versions], materialized: { storeName: 'versioned-profiles', value: json() } })
+profiles.transformValues(versioned, {
+	stores: [versions],
+	materialized: { storeName: 'versioned-profiles', value: json() },
+})
 ```
 
 Without `materialized.storeName`, the result is not stored, and a lookup of it (a join) transforms the parent's current value with a transformer of its own; the transformer then also runs in the joining task, connected to the same stores. A transformer whose results depend on more than the current value should be materialized.

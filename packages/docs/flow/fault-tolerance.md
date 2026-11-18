@@ -59,14 +59,14 @@ Interval commits are skipped while a rebalance is pending. The app is `REBALANCI
 
 ## Failure Handling
 
-| Failure                                                                                         | Handling                                                                                                        |
-| ----------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| A record that cannot be decoded, processed, encoded or sent                                     | The [exception handlers](/flow/error-handling) decide: drop it (`'continue'`) or fail (`'fail'`, fatal)          |
-| At-least-once: a send that failed with a retriable error after the producer's retries           | The affected tasks are revived in place: they close dirty, reopen and reprocess from their last commit            |
-| At-least-once: interval commits timing out                                                      | Retried at the next interval; after `taskTimeoutMs`, as a migration                                             |
-| A changelog that cannot be restored from its position (records deleted)                         | The task's stores are wiped and rebuilt in place                                                                |
-| Fenced producer, aborted transaction, failed commit, lost partitions, partial assignment, a lost connection, any other Kafka error | **Migration**: every task closes dirty, the consumer leaves the group, and a new membership joins after a backoff and resumes from the committed offsets |
-| Fatal errors: a handler answered `'fail'`, a processor's `init()`/`close()` threw, authorization, invalid configuration, mismatched partition counts, an invalid timestamp | The [uncaught exception handler](/flow/error-handling#uncaught-exceptions): `'shutdown'` (state `ERROR`) or `'restart'` |
+| Failure                                                                                                                                                                    | Handling                                                                                                                                                 |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A record that cannot be decoded, processed, encoded or sent                                                                                                                | The [exception handlers](/flow/error-handling) decide: drop it (`'continue'`) or fail (`'fail'`, fatal)                                                  |
+| At-least-once: a send that failed with a retriable error after the producer's retries                                                                                      | The affected tasks are revived in place: they close dirty, reopen and reprocess from their last commit                                                   |
+| At-least-once: interval commits timing out                                                                                                                                 | Retried at the next interval; after `taskTimeoutMs`, as a migration                                                                                      |
+| A changelog that cannot be restored from its position (records deleted)                                                                                                    | The task's stores are wiped and rebuilt in place                                                                                                         |
+| Fenced producer, aborted transaction, failed commit, lost partitions, partial assignment, a lost connection, any other Kafka error                                         | **Migration**: every task closes dirty, the consumer leaves the group, and a new membership joins after a backoff and resumes from the committed offsets |
+| Fatal errors: a handler answered `'fail'`, a processor's `init()`/`close()` threw, authorization, invalid configuration, mismatched partition counts, an invalid timestamp | The [uncaught exception handler](/flow/error-handling#uncaught-exceptions): `'shutdown'` (state `ERROR`) or `'restart'`                                  |
 
 The backoff before rejoining starts at 0.5 s and doubles up to 30 s, and starts over once a membership committed. Migrations are retried without limit: a broker outage only delays processing. A failed membership processes and commits nothing more; under exactly-once its open transaction is aborted and its buffered store writes are dropped, so the stores keep their committed state.
 
@@ -97,13 +97,13 @@ Each global table is read by a consumer of its own, outside the group, with `rea
 
 ## Application States
 
-| State         | Meaning                                                                                       |
-| ------------- | --------------------------------------------------------------------------------------------- |
-| `CREATED`     | Not started, or `start()` in progress                                                         |
-| `RUNNING`     | Every assigned task is restored and processing                                                |
-| `REBALANCING` | A rebalance, a restoration, or a recovery (backoff and rejoin) is in progress                |
-| `ERROR`       | A fatal error stopped the app, or `start()` failed; see `getError()`. `close()` releases it   |
-| `STOPPED`     | Closed                                                                                        |
+| State         | Meaning                                                                                     |
+| ------------- | ------------------------------------------------------------------------------------------- |
+| `CREATED`     | Not started, or `start()` in progress                                                       |
+| `RUNNING`     | Every assigned task is restored and processing                                              |
+| `REBALANCING` | A rebalance, a restoration, or a recovery (backoff and rejoin) is in progress               |
+| `ERROR`       | A fatal error stopped the app, or `start()` failed; see `getError()`. `close()` releases it |
+| `STOPPED`     | Closed                                                                                      |
 
 ## Monitoring
 

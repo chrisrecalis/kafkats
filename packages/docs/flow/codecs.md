@@ -211,11 +211,11 @@ const kvCodec: Codec<KeyValue> = {
 
 Operators find the codecs they need in their options first, then in what the stream still knows (see [How codecs are resolved](/flow/operations#how-codecs-are-resolved)). A few results have codecs of their own:
 
-| Result                                   | Codec                                                                                       |
-| ---------------------------------------- | ------------------------------------------------------------------------------------------- |
-| `count()` values                         | 8-byte big-endian integers (Kafka Streams' `Serdes.Long`); `value` in the options to change |
-| Keys of time and sliding window results  | `WindowedCodecs.timeWindowed(keyCodec, windowSize)`: `[key][start int64 BE]`                |
-| Keys of session window results           | `WindowedCodecs.sessionWindowed(keyCodec)`: `[key][end int64 BE][start int64 BE]`           |
+| Result                                  | Codec                                                                                       |
+| --------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `count()` values                        | 8-byte big-endian integers (Kafka Streams' `Serdes.Long`); `value` in the options to change |
+| Keys of time and sliding window results | `WindowedCodecs.timeWindowed(keyCodec, windowSize)`: `[key][start int64 BE]`                |
+| Keys of session window results          | `WindowedCodecs.sessionWindowed(keyCodec)`: `[key][end int64 BE][start int64 BE]`           |
 
 To read counts written by another flow or Kafka Streams application:
 

@@ -35,14 +35,14 @@ When the buffer is full (more than `maxRecords` keys or `maxBytes` bytes), it fo
 
 ## Options
 
-| Option       | Description                                                                                                |
-| ------------ | ---------------------------------------------------------------------------------------------------------- |
-| `until`      | `'window-close'` or `'time-limit'`                                                                         |
+| Option       | Description                                                                                                                  |
+| ------------ | ---------------------------------------------------------------------------------------------------------------------------- |
+| `until`      | `'window-close'` or `'time-limit'`                                                                                           |
 | `timeLimit`  | `'time-limit'` only: how long after a key's first buffered update it is forwarded (a [duration](/flow/operations#durations)) |
-| `maxRecords` | Most keys buffered. Default: unbounded                                                                     |
-| `maxBytes`   | Most bytes buffered (encoded keys and entries). Default: unbounded                                         |
-| `whenFull`   | `'time-limit'` only: `'emit-early'` (default) or `'shutdown'`. `'window-close'` never emits early        |
-| `name`       | Names the processor, and its buffer store `<name>-store` (else `KTABLE-SUPPRESS-STATE-STORE-<n>`)          |
+| `maxRecords` | Most keys buffered. Default: unbounded                                                                                       |
+| `maxBytes`   | Most bytes buffered (encoded keys and entries). Default: unbounded                                                           |
+| `whenFull`   | `'time-limit'` only: `'emit-early'` (default) or `'shutdown'`. `'window-close'` never emits early                            |
+| `name`       | Names the processor, and its buffer store `<name>-store` (else `KTABLE-SUPPRESS-STATE-STORE-<n>`)                            |
 
 ## Buffer State
 

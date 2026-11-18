@@ -38,7 +38,7 @@ export default defineConfig({
 				items: [
 					{ text: '@kafkats/client', link: '/client/' },
 					{ text: '@kafkats/flow', link: '/flow/' },
-					{ text: '@kafkats/flow-codec-zod', link: '/flow-codec-zod/' },
+					{ text: '@kafkats/codec-zod', link: '/flow-codec-zod/' },
 					{ text: '@kafkats/flow-state-lmdb', link: '/flow-state-lmdb/' },
 					{ text: '@kafkats/flow-state-rocksdb', link: '/flow-state-rocksdb/' },
 				],
@@ -115,6 +115,9 @@ export default defineConfig({
 					items: [
 						{ text: 'Overview', link: '/flow/' },
 						{ text: 'Getting Started', link: '/flow/getting-started' },
+						{ text: 'Configuration', link: '/flow/configuration' },
+						{ text: 'Upgrading to 0.14', link: '/flow/upgrading' },
+						{ text: 'Differences from Kafka Streams', link: '/flow/kafka-streams' },
 					],
 				},
 				{
@@ -123,6 +126,7 @@ export default defineConfig({
 						{ text: 'KStream', link: '/flow/streams' },
 						{ text: 'KTable', link: '/flow/tables' },
 						{ text: 'Operations', link: '/flow/operations' },
+						{ text: 'Topology and Naming', link: '/flow/topology' },
 					],
 				},
 				{
@@ -130,9 +134,17 @@ export default defineConfig({
 					items: [
 						{ text: 'Windowing', link: '/flow/windowing' },
 						{ text: 'Aggregations', link: '/flow/aggregations' },
+						{ text: 'Suppression', link: '/flow/suppress' },
 						{ text: 'Joins', link: '/flow/joins' },
 						{ text: 'State Stores', link: '/flow/state-stores' },
+						{ text: 'Processor API', link: '/flow/processor-api' },
+					],
+				},
+				{
+					text: 'Running',
+					items: [
 						{ text: 'Fault Tolerance', link: '/flow/fault-tolerance' },
+						{ text: 'Error Handling', link: '/flow/error-handling' },
 					],
 				},
 				{
@@ -146,7 +158,7 @@ export default defineConfig({
 
 			'/flow-codec-zod/': [
 				{
-					text: '@kafkats/flow-codec-zod',
+					text: '@kafkats/codec-zod',
 					items: [
 						{ text: 'Overview', link: '/flow-codec-zod/' },
 						{ text: 'Usage', link: '/flow-codec-zod/usage' },

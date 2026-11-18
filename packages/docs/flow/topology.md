@@ -20,15 +20,15 @@ Names matter for what outlives a deployment: **store names** key the persisted s
 
 Without explicit names, everything is named from counters, in the order of the DSL calls, as Kafka Streams does:
 
-| What                         | Generated name                                               |
-| ---------------------------- | ------------------------------------------------------------ |
-| Nodes                        | `KSTREAM-FILTER-0000000003`, `KTABLE-SOURCE-0000000001`, ... |
-| Aggregation stores           | `count-store-<n>`, `reduce-store-<n>`, `aggregate-store-<n>`, `window-count-store-<n>`, ... |
-| Table stores                 | `table-<topic>-<n>`, `global-table-<topic>-<n>`, `toTable-store-<n>` |
-| Stream-stream join stores    | `stream-join-left-<n>`, `stream-join-right-<n>` (left joins `stream-left-join-...`, outer joins `stream-outer-join-...`) |
-| Suppress buffers             | `KTABLE-SUPPRESS-STATE-STORE-<n>`                            |
-| Repartition topics           | `<applicationId>-repartition-<n>-repartition`                |
-| Changelog topics             | `<applicationId>-<storeName>-changelog`                      |
+| What                      | Generated name                                                                                                           |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| Nodes                     | `KSTREAM-FILTER-0000000003`, `KTABLE-SOURCE-0000000001`, ...                                                             |
+| Aggregation stores        | `count-store-<n>`, `reduce-store-<n>`, `aggregate-store-<n>`, `window-count-store-<n>`, ...                              |
+| Table stores              | `table-<topic>-<n>`, `global-table-<topic>-<n>`, `toTable-store-<n>`                                                     |
+| Stream-stream join stores | `stream-join-left-<n>`, `stream-join-right-<n>` (left joins `stream-left-join-...`, outer joins `stream-outer-join-...`) |
+| Suppress buffers          | `KTABLE-SUPPRESS-STATE-STORE-<n>`                                                                                        |
+| Repartition topics        | `<applicationId>-repartition-<n>-repartition`                                                                            |
+| Changelog topics          | `<applicationId>-<storeName>-changelog`                                                                                  |
 
 Adding, removing or reordering an operator can therefore change the generated names after it. A changed store name means a new, empty store (and changelog); a changed repartition topic means a new topic. Name the stores and repartitioning operations of an application that will evolve.
 

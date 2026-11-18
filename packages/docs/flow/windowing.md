@@ -2,12 +2,12 @@
 
 Windowed aggregations group the records of each key by time. Flow has Kafka Streams' four kinds of windows, with the same factories, grace periods, retention rules, late-record rules and result formats.
 
-| Windows          | Shape                                            | Typical use                         |
-| ---------------- | ------------------------------------------------ | ----------------------------------- |
-| `TimeWindows`    | Fixed size; tumbling or hopping                  | Counts per minute, hourly metrics   |
-| `SessionWindows` | Activity separated by gaps of inactivity         | User sessions                       |
-| `SlidingWindows` | Fixed size, sliding with the records             | "N events within 10 minutes"        |
-| `JoinWindows`    | A time range around each record                  | [Stream-stream joins](/flow/joins)  |
+| Windows          | Shape                                    | Typical use                        |
+| ---------------- | ---------------------------------------- | ---------------------------------- |
+| `TimeWindows`    | Fixed size; tumbling or hopping          | Counts per minute, hourly metrics  |
+| `SessionWindows` | Activity separated by gaps of inactivity | User sessions                      |
+| `SlidingWindows` | Fixed size, sliding with the records     | "N events within 10 minutes"       |
+| `JoinWindows`    | A time range around each record          | [Stream-stream joins](/flow/joins) |
 
 ```typescript
 import { TimeWindows } from '@kafkats/flow'
@@ -66,12 +66,12 @@ Sizes, gaps, graces and advances are milliseconds or strings with a unit: `'500m
 
 Every record gets a timestamp when it is consumed, from the source's timestamp extractor (`Consumed.timestampExtractor`, else `FlowConfig.defaultTimestampExtractor`):
 
-| Extractor                                        | Behaviour                                                                                 |
-| ------------------------------------------------ | ----------------------------------------------------------------------------------------- |
-| `TimestampExtractors.failOnInvalid` (default)    | The record's timestamp; a negative one stops the app (`InvalidTimestampError`)            |
-| `TimestampExtractors.logAndSkipOnInvalid`        | The record's timestamp; a record with a negative one is dropped                           |
-| `TimestampExtractors.usePartitionTimeOnInvalid`  | The record's timestamp; a negative one is replaced by the partition's time                |
-| `TimestampExtractors.wallClock`                  | The time the record is consumed (processing time)                                         |
+| Extractor                                       | Behaviour                                                                                                |
+| ----------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `TimestampExtractors.failOnInvalid` (default)   | The record's timestamp; a negative one stops the app (`InvalidTimestampError`)                           |
+| `TimestampExtractors.logAndSkipOnInvalid`       | The record's timestamp; a record with a negative one is dropped                                          |
+| `TimestampExtractors.usePartitionTimeOnInvalid` | The record's timestamp; a negative one is replaced by the partition's time (fatal while that is unknown) |
+| `TimestampExtractors.wallClock`                 | The time the record is consumed (processing time)                                                        |
 
 A custom extractor receives the decoded record (`topic`, `partition`, `offset`, `key`, `value`, `timestamp`, `headers`) and the partition's time (the largest timestamp seen on the partition, `-1` while unknown):
 
@@ -83,7 +83,7 @@ app.stream('orders', {
 })
 ```
 
-A negative result drops the record; a result that is not an integer, or an extractor that throws, stops the app. Downstream, records keep their timestamps; processors set new ones explicitly (`record.withTimestamp()`).
+A negative result drops the record; a result that is not an integer, or an extractor that throws, is a fatal error (see the [uncaught exception handler](/flow/error-handling#uncaught-exceptions)). Downstream, records keep their timestamps; processors set new ones explicitly (`record.withTimestamp()`).
 
 ## Stream Time
 
@@ -95,18 +95,18 @@ Windows close by **stream time**, which only moves with the timestamps of the re
 
 Processor clocks are committed with the offsets (in the offset commit metadata, as Kafka Streams does), and restored when a task starts again elsewhere, after a rebalance or after a failure. A record is therefore late, or not, regardless of restarts.
 
-A task with several input partitions (a join, a merge) waits for data on all of them before it picks the next record, so that records are processed in timestamp order: as long as the consumer knows a partition has records on the broker, and for `maxTaskIdleMs` (default 0) once it is caught up. With `-1` it never waits.
+A task with several input partitions (a join, a merge) waits for data on all of them before it picks the next record, so that records are processed in timestamp order (KIP-695): it waits for an empty partition while its lag is unknown or positive (records are on the broker), and for `maxTaskIdleMs` (default 0) once the partition is caught up; then it processes what it has. With `-1` it never waits.
 
 ## Grace Periods and Late Records
 
 A window **closes** once its operator's stream time passed its end by the grace period. A record whose windows are all closed is **late** and dropped (and logged); stream time does not move back for it.
 
-| Windows          | A record at `ts` is dropped for a window when                                             |
-| ---------------- | ----------------------------------------------------------------------------------------- |
-| `TimeWindows`    | `window end <= streamTime - grace` (a hopping record may still update its newer windows)  |
-| `SessionWindows` | the merged session ends before `streamTime - grace - gap`                                 |
-| `SlidingWindows` | `ts + timeDifference < streamTime - grace` (the whole record)                              |
-| `JoinWindows`    | see [Stream-stream joins](/flow/joins#stream-stream-joins)                                |
+| Windows          | A record at `ts` is dropped for a window when                                            |
+| ---------------- | ---------------------------------------------------------------------------------------- |
+| `TimeWindows`    | `window end <= streamTime - grace` (a hopping record may still update its newer windows) |
+| `SessionWindows` | the merged session ends before `streamTime - grace - gap`                                |
+| `SlidingWindows` | `ts + timeDifference < streamTime - grace` (the whole record)                            |
+| `JoinWindows`    | see [Stream-stream joins](/flow/joins#stream-stream-joins)                               |
 
 The grace period is a trade-off: a longer one accepts later records, keeps windows longer in the store, and delays final results.
 
@@ -114,11 +114,11 @@ The grace period is a trade-off: a longer one accepts later records, keeps windo
 
 A windowed aggregation's store keeps a window for its retention, measured back from the newest window end it holds. The default, which is also the minimum, keeps what a record can still update:
 
-| Windows          | Default and minimum retention        |
-| ---------------- | ------------------------------------ |
-| `TimeWindows`    | size + grace                         |
-| `SessionWindows` | gap + grace                          |
-| `SlidingWindows` | 2 × time difference + grace          |
+| Windows          | Default and minimum retention |
+| ---------------- | ----------------------------- |
+| `TimeWindows`    | size + grace                  |
+| `SessionWindows` | gap + grace                   |
+| `SlidingWindows` | 2 × time difference + grace   |
 
 `Materialized.retention` keeps windows longer (for lookups through joins, for example); a smaller value throws `TopologyError`:
 
@@ -156,10 +156,10 @@ interface Windowed<K> {
 
 Written to a topic, windowed keys use Kafka Streams' formats, so Java applications can read them with `WindowedSerdes`:
 
-| Windows                      | Key bytes                                   | Codec                                         |
-| ---------------------------- | ------------------------------------------- | --------------------------------------------- |
-| Time and sliding windows     | `[key][start int64 BE]`                     | `WindowedCodecs.timeWindowed(keyCodec, size)` |
-| Sessions                     | `[key][end int64 BE][start int64 BE]`       | `WindowedCodecs.sessionWindowed(keyCodec)`    |
+| Windows                  | Key bytes                             | Codec                                         |
+| ------------------------ | ------------------------------------- | --------------------------------------------- |
+| Time and sliding windows | `[key][start int64 BE]`               | `WindowedCodecs.timeWindowed(keyCodec, size)` |
+| Sessions                 | `[key][end int64 BE][start int64 BE]` | `WindowedCodecs.sessionWindowed(keyCodec)`    |
 
 The time-windowed format does not carry the end: decoding computes it from the size (for sliding windows, the time difference). The results of a windowed aggregation know their codec, so `toStream().to(topic)` writes them without options. To read such a topic in another app:
 
@@ -174,11 +174,11 @@ Windowed records are written to the partition of their **base key**, both by `to
 
 ## Result Timestamps
 
-| Aggregation          | Timestamp of a result                       |
-| -------------------- | ------------------------------------------- |
-| Time windows         | The largest timestamp of the window's records |
-| Session windows      | The session's end                           |
-| Sliding windows      | The largest timestamp of the window's records |
+| Aggregation     | Timestamp of a result                         |
+| --------------- | --------------------------------------------- |
+| Time windows    | The largest timestamp of the window's records |
+| Session windows | The session's end                             |
+| Sliding windows | The largest timestamp of the window's records |
 
 ## Null Values
 
@@ -188,12 +188,12 @@ Records with a null key are dropped by every aggregation. Time and session windo
 
 The factories of earlier versions still work, with Kafka Streams' legacy behaviour, and warn once per process:
 
-| Deprecated                             | Behaves as                                                     | Use instead                                          |
-| -------------------------------------- | -------------------------------------------------------------- | ---------------------------------------------------- |
-| `TimeWindows.of(size)`                 | grace `max(24h - size, 0)`: windows accept records a day late  | `ofSizeWithNoGrace(size)` / `ofSizeAndGrace(size, grace)` |
-| `SessionWindows.withInactivityGap(gap)`| grace `max(24h - gap, 0)`                                      | `ofInactivityGapWithNoGrace` / `ofInactivityGapAndGrace` |
-| `SlidingWindows.of(d)`, `.gracePeriod(g)` | the same windows                                            | `ofTimeDifferenceWithNoGrace` / `ofTimeDifferenceAndGrace` |
-| `JoinWindows.of(d)`                    | grace `max(24h - 2d, 0)`, unmatched left/outer results eagerly | `ofTimeDifferenceWithNoGrace` / `ofTimeDifferenceAndGrace` |
+| Deprecated                                | Behaves as                                                     | Use instead                                                |
+| ----------------------------------------- | -------------------------------------------------------------- | ---------------------------------------------------------- |
+| `TimeWindows.of(size)`                    | grace `max(24h - size, 0)`: windows accept records a day late  | `ofSizeWithNoGrace(size)` / `ofSizeAndGrace(size, grace)`  |
+| `SessionWindows.withInactivityGap(gap)`   | grace `max(24h - gap, 0)`                                      | `ofInactivityGapWithNoGrace` / `ofInactivityGapAndGrace`   |
+| `SlidingWindows.of(d)`, `.gracePeriod(g)` | the same windows                                               | `ofTimeDifferenceWithNoGrace` / `ofTimeDifferenceAndGrace` |
+| `JoinWindows.of(d)`                       | grace `max(24h - 2d, 0)`, unmatched left/outer results eagerly | `ofTimeDifferenceWithNoGrace` / `ofTimeDifferenceAndGrace` |
 
 The long legacy grace keeps about a day of windows in the store, and delays final results by as much. Switch to the new factories to bound both.
 

@@ -183,10 +183,10 @@ const nullableCodec = codec<string | null>(
 
 ## Using with Zod
 
-For runtime validation, use [@kafkats/flow-codec-zod](/flow-codec-zod/):
+For runtime validation, use [@kafkats/codec-zod](/flow-codec-zod/):
 
 ```typescript
-import { zodCodec } from '@kafkats/flow-codec-zod'
+import { zodCodec } from '@kafkats/codec-zod'
 import { z } from 'zod'
 
 const UserSchema = z.object({

@@ -97,7 +97,8 @@ const SCENARIOS: Scenario[] = [
 				app
 					.stream(t.input, { key: str, value: event })
 					.groupByKey()
-					.windowedBy(TimeWindows.of('1m'))
+					// A grace of an hour: no record of a run is ever late, so every record reaches the sink.
+					.windowedBy(TimeWindows.ofSizeAndGrace('1m', '1h'))
 					.count({ storeName: 'windowed-counts', value: num })
 					.toStream()
 					.map(
@@ -117,7 +118,7 @@ const SCENARIOS: Scenario[] = [
 				app
 					.stream(t.input, { key: str, value: event })
 					.groupByKey()
-					.windowedBy(SessionWindows.withInactivityGap('1m'))
+					.windowedBy(SessionWindows.ofInactivityGapAndGrace('1m', '1h'))
 					.count({ storeName: 'session-counts', value: num })
 					.toStream()
 					// Merging a record into a session retracts the previous session (a null value).

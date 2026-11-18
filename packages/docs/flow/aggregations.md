@@ -69,14 +69,12 @@ import { TimeWindows, SessionWindows, SlidingWindows } from '@kafkats/flow'
 
 const perMinute = byUser.windowedBy(TimeWindows.ofSizeAndGrace('1m', '10s')).count()
 
-const sessions = byUser
-	.windowedBy(SessionWindows.ofInactivityGapWithNoGrace('30m'))
-	.aggregate(
-		() => 0,
-		(userId, click, clicks) => clicks + 1,
-		(userId, a, b) => a + b, // merges the aggregates of sessions a record joins together
-		{ value: json<number>() }
-	)
+const sessions = byUser.windowedBy(SessionWindows.ofInactivityGapWithNoGrace('30m')).aggregate(
+	() => 0,
+	(userId, click, clicks) => clicks + 1,
+	(userId, a, b) => a + b, // merges the aggregates of sessions a record joins together
+	{ value: json<number>() }
+)
 
 const bursts = byUser.windowedBy(SlidingWindows.ofTimeDifferenceWithNoGrace('10s')).count()
 ```
@@ -98,7 +96,11 @@ interface Employee {
 const employees = app.table('employees', { key: string(), value: json<Employee>() })
 
 const payroll = employees
-	.groupBy((id, e) => [e.department, e.salary] as const, { key: string(), value: json<number>(), name: 'by-department' })
+	.groupBy((id, e) => [e.department, e.salary] as const, {
+		key: string(),
+		value: json<number>(),
+		name: 'by-department',
+	})
 	.aggregate(
 		() => 0,
 		(department, salary, total) => total + salary, // adder

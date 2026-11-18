@@ -81,13 +81,13 @@ The topology is fixed by the first `start()` (or `describe()`): later DSL calls 
 
 ### Application States
 
-| State         | Meaning                                                                                            |
-| ------------- | -------------------------------------------------------------------------------------------------- |
-| `CREATED`     | Not started, or a start is in progress                                                             |
-| `RUNNING`     | Every assigned task is restored and processing                                                     |
-| `REBALANCING` | A rebalance, a restoration or a recovery after a failure is in progress                            |
-| `ERROR`       | `start()` failed, or a fatal error stopped the app (see `app.getError()`); `close()` releases it   |
-| `STOPPED`     | Closed                                                                                             |
+| State         | Meaning                                                                                          |
+| ------------- | ------------------------------------------------------------------------------------------------ |
+| `CREATED`     | Not started, or a start is in progress                                                           |
+| `RUNNING`     | Every assigned task is restored and processing                                                   |
+| `REBALANCING` | A rebalance, a restoration or a recovery after a failure is in progress                          |
+| `ERROR`       | `start()` failed, or a fatal error stopped the app (see `app.getError()`); `close()` releases it |
+| `STOPPED`     | Closed                                                                                           |
 
 `state()` works as a readiness probe: it is `RUNNING` only while every assigned task is running. `getError()` returns the fatal error while the state is `ERROR`, otherwise the most recent recoverable error, which does not change the state. See [Fault Tolerance](/flow/fault-tolerance) and [Error Handling](/flow/error-handling).
 

@@ -1,11 +1,11 @@
 # Joins
 
-| Left side | Right side    | Joins             | Result  | Kinds               | Co-partitioning |
-| --------- | ------------- | ----------------- | ------- | ------------------- | --------------- |
-| KStream   | KStream       | within a window   | KStream | inner, left, outer  | required        |
-| KStream   | KTable        | on the key        | KStream | inner, left         | required        |
-| KStream   | GlobalKTable  | on a selected key | KStream | inner, left         | not needed      |
-| KTable    | KTable        | on the key        | KTable  | inner, left, outer  | required        |
+| Left side | Right side   | Joins             | Result  | Kinds              | Co-partitioning |
+| --------- | ------------ | ----------------- | ------- | ------------------ | --------------- |
+| KStream   | KStream      | within a window   | KStream | inner, left, outer | required        |
+| KStream   | KTable       | on the key        | KStream | inner, left        | required        |
+| KStream   | GlobalKTable | on a selected key | KStream | inner, left        | not needed      |
+| KTable    | KTable       | on the key        | KTable  | inner, left, outer | required        |
 
 Co-partitioned topics have the same partition count and the same partitioning of keys, so that a key is in the same partition on both sides. Joins that need it put both sides in one task per partition, and `start()` throws `CoPartitioningError` when the counts differ. A stream side whose key changed upstream is repartitioned first (by the join's key), so only the topics you read have to agree.
 
@@ -139,9 +139,7 @@ const merged = users.outerJoin(addresses, (user, address) => ({ user, address })
 orders.join(customers, joiner) // start() throws CoPartitioningError
 
 // Repartition the stream to the table's partition count first
-orders
-	.repartition({ name: 'orders-for-join', numberOfPartitions: 4 })
-	.join(customers, joiner)
+orders.repartition({ name: 'orders-for-join', numberOfPartitions: 4 }).join(customers, joiner)
 ```
 
 A re-keyed stream is repartitioned to the right count automatically: its repartition topic takes the partition count of the topics it is joined with. Producers of the topics must partition keys the same way (the default partitioner of `@kafkats/client` and the Java client both use murmur2 of the serialized key).

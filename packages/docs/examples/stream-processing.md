@@ -5,8 +5,7 @@ Basic stream transformations with @kafkats/flow.
 ## Code
 
 ```typescript
-import { flow, topic } from '@kafkats/flow'
-import { string, json } from '@kafkats/client'
+import { flow, topic, string, json } from '@kafkats/flow'
 
 // Input event
 interface RawEvent {
@@ -26,20 +25,7 @@ interface ProcessedEvent {
 }
 
 // Define topics
-const rawEvents = topic('raw-events', {
-	key: string(),
-	value: json<RawEvent>(),
-})
-
-const processedEvents = topic('processed-events', {
-	key: string(),
-	value: json<ProcessedEvent>(),
-})
-
-const errorEvents = topic('error-events', {
-	key: string(),
-	value: json<RawEvent>(),
-})
+const rawEvents = topic('raw-events', { key: string(), value: json<RawEvent>() })
 
 async function main() {
 	const app = flow({
@@ -48,51 +34,49 @@ async function main() {
 	})
 
 	// Build processing topology
-	const [valid, invalid] = app
+	const { 'events-valid': valid, 'events-invalid': invalid } = app
 		.stream(rawEvents)
 		// Log incoming events
 		.peek((key, event) => {
-			console.log(`Received: ${event.type} from ${event.userId}`)
+			console.log(`Received: ${event?.type} from ${event?.userId}`)
 		})
-		// Split valid and invalid events
-		.branch(
-			(_, event) => event.type !== 'heartbeat' && event.userId.length > 0,
-			() => true
-		)
+		// Split valid and invalid events: each event goes to the first branch that matches
+		.split({ name: 'events-' })
+		.branch((_, event) => event !== null && event.type !== 'heartbeat' && event.userId.length > 0, {
+			name: 'valid',
+		})
+		.defaultBranch({ name: 'invalid' })
 
 	// Process valid events
-	valid
-		.mapValues(
-			event =>
-				({
-					type: event.type,
-					userId: event.userId,
-					data: event.data,
-					processedAt: Date.now(),
-					source: 'event-processor',
-				}) as ProcessedEvent
-		)
+	valid!
+		.mapValues((event): ProcessedEvent => ({
+			type: event!.type,
+			userId: event!.userId,
+			data: event!.data,
+			processedAt: Date.now(),
+			source: 'event-processor',
+		}))
 		.peek((key, event) => {
-			console.log(`Processed: ${event.type}`)
+			console.log(`Processed: ${event?.type}`)
 		})
-		.to(processedEvents)
+		.to('processed-events', { key: string(), value: json<ProcessedEvent>() })
 
-	// Route invalid events to error topic
-	invalid
+	// Route invalid events to the error topic
+	invalid!
 		.peek((key, event) => {
 			console.log(`Invalid event: ${JSON.stringify(event)}`)
 		})
-		.to(errorEvents)
+		.to('error-events')
 
 	// Handle shutdown
-	process.on('SIGTERM', async () => {
+	process.on('SIGTERM', () => {
 		console.log('Shutting down...')
-		await app.close()
+		void app.close()
 	})
 
 	// Start processing
-	console.log('Starting stream processor...')
 	await app.start()
+	console.log('Stream processor started')
 }
 
 main().catch(console.error)
@@ -102,7 +86,7 @@ main().catch(console.error)
 
 1. **Read** from `raw-events` topic
 2. **Peek** to log each event (side effect)
-3. **Branch** into valid and invalid streams
+3. **Split** into valid and invalid streams (`split()` with a named branch and a default branch)
 4. **Transform** valid events with processing metadata
 5. **Write** to respective output topics
 
@@ -113,7 +97,7 @@ raw-events
     │
     ├──► peek (log)
     │
-    ├──► branch
+    ├──► split
     │       │
     │       ├── valid ──► mapValues ──► peek ──► processed-events
     │       │

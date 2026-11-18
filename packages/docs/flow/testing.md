@@ -56,12 +56,12 @@ A topic the topology reads gets as many partitions as the records sent to it nee
 ### Reading output
 
 ```typescript
-const records = output('large-orders', { key: string(), value: json<Order>() }) // [{ topic, key, value, partition }]
+const records = output('large-orders', { key: string(), value: json<Order>() }) // [{ topic, key, value, partition? }]
 producer.messagesFor('large-orders') // raw: Buffer key and value, partition, timestamp (bigint), headers
 clear() // forget what was produced so far
 ```
 
-`producer` (a `MockProducer`) records every send, including repartition and changelog records, and under exactly-once the committed transactions (`producer.transactions`). `consumer.committed` holds the committed offsets by `topic:partition`, with their commit metadata.
+`partition` is set only when the sink chose one (a `partitioner`, or the base key's partition of a windowed key); otherwise the record went to the producer's default partitioning. `producer` (a `MockProducer`) records every send, including repartition and changelog records, and under exactly-once the committed transactions (`producer.transactions`). `consumer.committed` holds the committed offsets by `topic:partition`, with their commit metadata.
 
 ## Time
 
@@ -98,12 +98,12 @@ await driver.run(async ({ send, getStateStore }) => {
 
 `new TestDriver(config)` takes every `FlowConfig` option except `client` (`applicationId` defaults to `'test-app'`), so tests can set `processingGuarantee`, handlers, `maxTaskIdleMs` or a state store provider, plus:
 
-| Option                   | Default            | Description                                                                                                  |
-| ------------------------ | ------------------ | ------------------------------------------------------------------------------------------------------------ |
-| `initialWallClockTimeMs` | `Date.now()`       | Start of the mock wall clock                                                                                 |
-| `partitions`             | -                  | Partition counts by topic, as partitioners and co-partitioning see them                                      |
-| `commitEvery`            | `'record'`         | Commit after every record, only when the driver stops (`'stop'`), or every N ms of mock wall clock           |
-| `emitIntervalMs`         | `0`                | Throttle of emit-on-window-close and outer-join results, on the mock wall clock                              |
+| Option                   | Default      | Description                                                                                        |
+| ------------------------ | ------------ | -------------------------------------------------------------------------------------------------- |
+| `initialWallClockTimeMs` | `Date.now()` | Start of the mock wall clock                                                                       |
+| `partitions`             | -            | Partition counts by topic, as partitioners and co-partitioning see them                            |
+| `commitEvery`            | `'record'`   | Commit after every record, only when the driver stops (`'stop'`), or every N ms of mock wall clock |
+| `emitIntervalMs`         | `0`          | Throttle of emit-on-window-close and outer-join results, on the mock wall clock                    |
 
 ## Failures
 
