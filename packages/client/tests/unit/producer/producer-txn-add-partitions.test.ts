@@ -5,6 +5,8 @@ import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import { createMockBroker, createMockCluster, type MockBroker } from './_helpers.js'
 
 const TOPIC = 'test-topic'
+/** The epoch check of an open transaction whose producer was not fenced. */
+const sameEpoch = (): void => {}
 
 describe('Producer.addPartitionsToTransaction top-level error handling', () => {
 	let mockCluster: ReturnType<typeof createMockCluster>
@@ -41,7 +43,7 @@ describe('Producer.addPartitionsToTransaction top-level error handling', () => {
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const p = producer as any
 
-		await expect(p.addPartitionsToTransaction(TOPIC, [0])).rejects.toThrow()
+		await expect(p.addPartitionsToTransaction(TOPIC, [0], sameEpoch)).rejects.toThrow()
 		expect(p.partitionsInTransaction.has(`${TOPIC}:0`)).toBe(false)
 	})
 
@@ -56,7 +58,7 @@ describe('Producer.addPartitionsToTransaction top-level error handling', () => {
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const p = producer as any
 
-		await expect(p.addPartitionsToTransaction(TOPIC, [0])).rejects.toThrow()
+		await expect(p.addPartitionsToTransaction(TOPIC, [0], sameEpoch)).rejects.toThrow()
 		expect(mockCluster.invalidateCoordinator).toHaveBeenCalledWith('TRANSACTION', 'tx-1')
 	})
 
@@ -71,7 +73,7 @@ describe('Producer.addPartitionsToTransaction top-level error handling', () => {
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const p = producer as any
 
-		await p.addPartitionsToTransaction(TOPIC, [0])
+		await p.addPartitionsToTransaction(TOPIC, [0], sameEpoch)
 		expect(p.partitionsInTransaction.has(`${TOPIC}:0`)).toBe(true)
 	})
 })
@@ -102,8 +104,9 @@ describe('Producer: concurrent transactional sends register a partition once', (
 		return p
 	}
 
-	const send = (p: { transactionalSend: (topic: unknown, message: unknown) => Promise<unknown> }) =>
-		p.transactionalSend({ topic: TOPIC }, { value: Buffer.from('v'), partition: 0 })
+	const send = (p: {
+		transactionalSend: (topic: unknown, message: unknown, assertEpoch: () => void) => Promise<unknown>
+	}) => p.transactionalSend({ topic: TOPIC }, { value: Buffer.from('v'), partition: 0 }, sameEpoch)
 
 	it('issues a single AddPartitionsToTxn for sends started before it returns', async () => {
 		txnCoordinator.addPartitionsToTxn.mockImplementation(async () => {

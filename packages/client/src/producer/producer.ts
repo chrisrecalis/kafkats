@@ -1085,6 +1085,8 @@ export class Producer extends EventEmitter<ProducerEvents> {
 
 		this.idempotentState = 'fenced'
 		this.accumulator.setFenced(true)
+		// The open transaction ended with this epoch: it can only abort.
+		this.recordTransactionalSendFailure(error)
 
 		for (const p of allPrepared) {
 			for (const msg of p.messagesToSend) {
@@ -1406,16 +1408,22 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		return this.cachedPartitionCount(topic)
 	}
 
-	/** Append messages to the accumulator. Must run inside {@link inSendOrder}. */
+	/**
+	 * Append messages to the accumulator. Must run inside {@link inSendOrder}. A send of a transaction passes its
+	 * `assertEpoch`, run right before the append: the transaction's producer is initialized when the transaction
+	 * begins, never here.
+	 */
 	private async append<V, K>(
 		topicDef: TopicDefinition<V, K>,
-		msgArray: ProducerMessage<V, K>[]
+		msgArray: ProducerMessage<V, K>[],
+		assertEpoch?: () => void
 	): Promise<Promise<SendResult>[]> {
-		await this.ensureInitialized()
+		if (assertEpoch === undefined) await this.ensureInitialized()
 		const partitionCount = await this.getPartitionCount(topicDef.topic)
 		// disconnect() returned while this send was preparing: it has been rejected there and
 		// must not be produced any more.
 		if (this.state === 'idle') throw new Error(DISCONNECTED)
+		assertEpoch?.()
 		return this.enqueueMessages(topicDef, msgArray, partitionCount)
 	}
 
@@ -1760,6 +1768,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		// What this handle did with its transaction; the producer's own state can change under it (a fenced producer
 		// re-initializes, which ends the transaction).
 		let status: TransactionState | 'committed' | 'aborted' = 'in_transaction'
+		const { producerId, producerEpoch } = this
 		let markEnded!: () => void
 		const ended = new Promise<void>(resolve => {
 			markEnded = resolve
@@ -1770,6 +1779,25 @@ export class Producer extends EventEmitter<ProducerEvents> {
 			if (state !== 'in_transaction') {
 				throw new InvalidTxnStateError(transactionalId, state, ['in_transaction'])
 			}
+		}
+		// What the transaction sends (records, partitions and offsets to add) goes out under the producer id and epoch
+		// it began with, or not at all: once the producer is fenced, the transaction can only abort. A send must not
+		// wait for the re-initialization: under the new epoch it would be part of no transaction (Java fails sends in
+		// an error state and bumps the epoch only when a transaction aborts or the producer initializes). Checked
+		// when a send starts and right before each of its requests and its append; past its start, only the epoch is
+		// checked, since a commit flushes the sends made before it.
+		const assertEpoch = (): void => {
+			const sameEpoch =
+				this.idempotentState === 'running' &&
+				this.producerId === producerId &&
+				this.producerEpoch === producerEpoch
+			if (!sameEpoch) {
+				throw new TransactionAbortedError(transactionalId, this.transactionAbortCause ?? undefined)
+			}
+		}
+		const assertSendable = (): void => {
+			if (status === 'in_transaction') assertEpoch()
+			assertOpen()
 		}
 		const end = (next: 'committing' | 'aborting', run: () => Promise<void>): Promise<void> => {
 			status = next
@@ -1818,11 +1846,11 @@ export class Producer extends EventEmitter<ProducerEvents> {
 				topic: string | TopicDefinition<unknown, unknown>,
 				messages: ProducerMessage<unknown, unknown> | ProducerMessage<unknown, unknown>[]
 			): Promise<SendResult | SendResult[]> => {
-				assertOpen()
+				assertSendable()
 				const topicDef =
 					typeof topic === 'string' ? ({ topic } satisfies TopicDefinition<Buffer, Buffer>) : topic
 				const promise = this.trackSend(
-					this.tracedSend(topicDef, messages, true, m => this.transactionalSend(topicDef, m))
+					this.tracedSend(topicDef, messages, true, m => this.transactionalSend(topicDef, m, assertEpoch))
 				)
 				// Even a fire-and-forget failure must poison the transaction so commit aborts.
 				promise.catch(error => this.recordTransactionalSendFailure(error))
@@ -1833,8 +1861,8 @@ export class Producer extends EventEmitter<ProducerEvents> {
 				contextOrParams: ConsumeContext | SendOffsetsParams,
 				offsets?: TransactionOffset[]
 			): Promise<void> => {
-				assertOpen()
-				await this.prepareOffsetsForCommit(this.resolveSendOffsetsParams(contextOrParams, offsets))
+				assertSendable()
+				await this.prepareOffsetsForCommit(this.resolveSendOffsetsParams(contextOrParams, offsets), assertEpoch)
 			},
 
 			commit: async (options?: ProducerCallOptions): Promise<void> => {
@@ -1863,11 +1891,13 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	}
 
 	/**
-	 * Send within a transaction - adds partition to transaction first
+	 * Send within a transaction - adds partition to transaction first. `assertEpoch` (the transaction's) runs right
+	 * before every request and append, so that nothing goes out once its producer was fenced.
 	 */
 	private async transactionalSend<V, K>(
 		topicDef: TopicDefinition<V, K>,
-		messages: ProducerMessage<V, K> | ProducerMessage<V, K>[]
+		messages: ProducerMessage<V, K> | ProducerMessage<V, K>[],
+		assertEpoch: () => void
 	): Promise<SendResult | SendResult[]> {
 		const isSingle = !Array.isArray(messages)
 		const msgArray = Array.isArray(messages) ? messages : [messages]
@@ -1878,6 +1908,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		const resolvedNow =
 			partitionCount === undefined ? undefined : this.resolveMessagePartitions(topicDef, msgArray, partitionCount)
 		if (resolvedNow && this.partitionsNotInTransaction(topicDef.topic, resolvedNow).length === 0) {
+			assertEpoch()
 			return settleSend(this.enqueueMessages(topicDef, resolvedNow, partitionCount!), isSingle)
 		}
 
@@ -1890,9 +1921,9 @@ export class Producer extends EventEmitter<ProducerEvents> {
 				this.resolveMessagePartitions(topicDef, msgArray, await this.getPartitionCount(topicDef.topic))
 			const partitionsToAdd = this.partitionsNotInTransaction(topicDef.topic, resolved)
 			if (partitionsToAdd.length > 0) {
-				await this.addPartitionsToTransaction(topicDef.topic, partitionsToAdd)
+				await this.addPartitionsToTransaction(topicDef.topic, partitionsToAdd, assertEpoch)
 			}
-			return this.append(topicDef, resolved)
+			return this.append(topicDef, resolved, assertEpoch)
 		})
 
 		return settleSend(promises, isSingle)
@@ -1933,12 +1964,15 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		})
 	}
 
-	/**
-	 * Add partitions to the current transaction
-	 */
-	private async addPartitionsToTransaction(topic: string, partitions: number[]): Promise<void> {
+	/** Add partitions to the current transaction; `assertEpoch` runs before every attempt. */
+	private async addPartitionsToTransaction(
+		topic: string,
+		partitions: number[],
+		assertEpoch: () => void
+	): Promise<void> {
 		const transactionalId = this.config.transactionalId!
 		await this.coordinatorRequest('TRANSACTION', transactionalId, async coordinator => {
+			assertEpoch()
 			const response = await coordinator.addPartitionsToTxn({
 				transactionalId,
 				producerId: this.producerId,
@@ -2006,7 +2040,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	 * Register the transaction's offsets of a group (AddOffsetsToTxn); they are committed with TxnOffsetCommit when
 	 * the transaction commits.
 	 */
-	private async prepareOffsetsForCommit(params: SendOffsetsParams): Promise<void> {
+	private async prepareOffsetsForCommit(params: SendOffsetsParams, assertEpoch: () => void): Promise<void> {
 		const groupMetadata = params.consumerGroupMetadata
 		const groupId = groupMetadata?.groupId ?? params.groupId
 		if (!groupId) {
@@ -2018,6 +2052,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 
 		const transactionalId = this.config.transactionalId!
 		await this.coordinatorRequest('TRANSACTION', transactionalId, async coordinator => {
+			assertEpoch()
 			const response = await coordinator.addOffsetsToTxn({
 				transactionalId,
 				producerId: this.producerId,

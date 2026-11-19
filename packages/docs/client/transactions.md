@@ -354,8 +354,11 @@ committing one that is aborting, or beginning a transaction on a producer in the
 
 When another producer with the same `transactionalId` initializes, this producer's open transaction can no longer
 commit: it is aborted with `TransactionAbortedError`, whose `cause` is the broker's answer (a `KafkaProtocolError` with
-`errorCode` `ErrorCode.ProducerFenced` or `ErrorCode.InvalidProducerEpoch`). An idempotent producer fenced while
-producing rejects its sends with `ProducerFencedError`.
+`errorCode` `ErrorCode.ProducerFenced` or `ErrorCode.InvalidProducerEpoch`). From the fence on, the transaction's
+`send()` and `sendOffsets()` reject with `TransactionAbortedError` (whose `cause` is what fenced it), also while the
+producer initializes again under a new epoch: nothing of the transaction goes out under that epoch, which no
+transaction of its own contains. An idempotent producer fenced while producing rejects its sends with
+`ProducerFencedError`.
 
 ```typescript
 import { ErrorCode, KafkaError, TransactionAbortedError } from '@kafkats/client'

@@ -44,8 +44,8 @@ export function createMockBroker(nodeId: number): MockBroker {
  * A cluster whose transaction coordinator, group coordinator and partition leader answer every transactional request
  * of `topic` partition 0 with success (producer id 1, epoch 0).
  */
-export function createTransactionalMocks(topic = 'test-topic') {
-	const cluster = createMockCluster()
+export function createTransactionalMocks(topic = 'test-topic', options: { partitionCount?: number } = {}) {
+	const cluster = createMockCluster(options)
 	const txnCoordinator = createMockBroker(1)
 	const groupCoordinator = createMockBroker(2)
 	const leader = createMockBroker(3)

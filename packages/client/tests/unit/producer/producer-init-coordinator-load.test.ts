@@ -159,11 +159,18 @@ describe('Producer InitProducerId retries CoordinatorLoadInProgress', () => {
 		expect((timedOut as TimeoutError).cause).toBeInstanceOf(KafkaProtocolError)
 		expect(answered).toBeGreaterThan(1)
 
+		// The next begin initializes again: one more InitProducerId, whose identity the transaction then uses.
+		const before = answered
 		ready = true
 		const transaction = await producer.beginTransaction()
-		await transaction.abort()
-		expect(txnCoordinator.initProducerId).toHaveBeenLastCalledWith(
-			expect.objectContaining({ transactionalId: 'tx-1' })
+		expect(answered).toBe(before + 1)
+		await transaction.sendOffsets({ groupId: 'g1', offsets: [{ topic: 'test-topic', partition: 0, offset: 1n }] })
+		await transaction.commit()
+		expect(txnCoordinator.addOffsetsToTxn).toHaveBeenCalledWith(
+			expect.objectContaining({ transactionalId: 'tx-1', producerId: 9n, producerEpoch: 1 })
+		)
+		expect(txnCoordinator.endTxn).toHaveBeenCalledWith(
+			expect.objectContaining({ producerId: 9n, producerEpoch: 1, committed: true })
 		)
 		await producer.disconnect({ timeoutMs: 100 })
 	})
