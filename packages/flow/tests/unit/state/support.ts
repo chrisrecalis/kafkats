@@ -53,11 +53,20 @@ export function metadata(): ProcessorMetadataImpl {
 	return new ProcessorMetadataImpl()
 }
 
-/** A durable checkpoint store over a Map, with the flushes it saw. */
-export function checkpointStore(): ChangelogCheckpointStore & { values: Map<string, bigint>; flushes: number } {
+/**
+ * A durable checkpoint store over a Map, with the flushes it saw and `flushed`: the values as of the last flush, what a
+ * crash would leave.
+ */
+export function checkpointStore(): ChangelogCheckpointStore & {
+	values: Map<string, bigint>
+	flushed: ReadonlyMap<string, bigint>
+	flushes: number
+} {
 	const values = new Map<string, bigint>()
+	const flushed = new Map<string, bigint>()
 	const store = {
 		values,
+		flushed,
 		flushes: 0,
 		get: (topic: string, partition: number) => Promise.resolve(values.get(`${topic}:${partition}`)),
 		set: (topic: string, partition: number, offset: bigint) => {
@@ -66,6 +75,7 @@ export function checkpointStore(): ChangelogCheckpointStore & { values: Map<stri
 		},
 		flush: () => {
 			store.flushes += 1
+			for (const [key, value] of values) flushed.set(key, value)
 			return Promise.resolve()
 		},
 	}

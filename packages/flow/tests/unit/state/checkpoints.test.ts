@@ -58,6 +58,23 @@ describe('Checkpoints', () => {
 		expect(store.values.get('changelog:0')).toBe(4n)
 	})
 
+	it('beginClear() and endClear() each write and flush the marker; clearing() is true only between them', async () => {
+		const store = checkpointStore()
+		const checkpoints = new Checkpoints(store, () => {})
+		expect(await checkpoints.clearing('app.counts', 2)).toBe(false)
+
+		await checkpoints.beginClear('app.counts', 2)
+		expect([store.flushed.get('clearing app.counts:2'), store.flushes]).toEqual([1n, 1])
+		expect(await checkpoints.clearing('app.counts', 2)).toBe(true)
+		// Per store and partition.
+		expect(await checkpoints.clearing('app.counts', 1)).toBe(false)
+		expect(await checkpoints.clearing('app.other', 2)).toBe(false)
+
+		await checkpoints.endClear('app.counts', 2)
+		expect([store.flushed.get('clearing app.counts:2'), store.flushes]).toEqual([0n, 2])
+		expect(await checkpoints.clearing('app.counts', 2)).toBe(false)
+	})
+
 	it('invalidates in-process checkpoints the same way', async () => {
 		const checkpoints = new Checkpoints(undefined, () => {})
 		await checkpoints.set('changelog', 0, 10n)

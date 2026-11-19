@@ -488,9 +488,12 @@ describe('TaskManager: restore pipelines (4.7.1)', () => {
 		// The entries of the store when its restore starts (read at the call): a restore replaying the changelog while
 		// the clear still deletes the keys it collected would lose what it restored.
 		const entriesAtRestore: Promise<number>[] = []
+		// The pipeline's clear yields by wall time, so how many turns it takes before the restore varies with load.
+		const restoreCalled = deferred()
 		const restore = h.restorer.restore.bind(h.restorer)
 		vi.spyOn(h.restorer, 'restore').mockImplementation((task, signal) => {
 			entriesAtRestore.push(raw.approximateNumEntries())
+			restoreCalled.resolve()
 			return restore(task, signal)
 		})
 
@@ -502,7 +505,7 @@ describe('TaskManager: restore pipelines (4.7.1)', () => {
 		// The hook returned with the store partly cleared: no clear of millions of entries inside it.
 		expect(await raw.approximateNumEntries()).toBe(15_000)
 		const [task] = h.tasks()
-		await h.settle()
+		await restoreCalled.promise
 		expect(h.restorer.restored.at(-1)).toBe(task)
 		expect(await Promise.all(entriesAtRestore)).toEqual([0])
 		h.restorer.job(task!).finish()

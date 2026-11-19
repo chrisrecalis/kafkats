@@ -80,8 +80,10 @@ const instanceId = (store: string, partition: number): string => `${store}\u0000
  * rebuilds it. close() stops the clears before it closes the provider. With durable checkpoints, every clear (a
  * prune's, its owner's, a restore's rebuild: clear()) is marked in progress in the checkpoint store from before its
  * first delete until it is done, so that the next start's lease gets a store whose clear a close or a crash stopped
- * partly cleared, and its owner finishes the clear. The mark, not the invalidated checkpoint, records it: the store's changelog settings may differ
- * at the next start, and an invalidated checkpoint has a restore rebuild the store only while it is logged and restored.
+ * partly cleared, and its owner finishes the clear; a prune that drops the state an earlier start left without opening
+ * the store only marks it. The mark, not the invalidated checkpoint, records it: the store's changelog settings may
+ * differ at the next start, and an invalidated checkpoint has a restore rebuild the store only while it is logged and
+ * restored.
  */
 export class StateDirectory {
 	private readonly instances = new Map<string, Instance>()
@@ -200,11 +202,12 @@ export class StateDirectory {
 
 	/**
 	 * Drops the state of an unleased instance (another instance of the application owns it by now): invalidates its
-	 * checkpoint, clears the store and forgets it. Of a registered partition no lease opened, only invalidates the
-	 * checkpoint when the restore of its next lease rebuilds it (opening the store just to clear it would cost a provider
-	 * database); the state of a store nothing restores is opened and cleared. Does nothing if a task leased it meanwhile.
-	 * Resolves when a lease or close stopped it (the instance stays partly cleared); rejects when it failed (the
-	 * instance stays, to be pruned again or cleared by its next owner).
+	 * checkpoint, clears the store and forgets it. Of a registered partition no lease opened, when the restore of its
+	 * next lease rebuilds it, only marks its clear in progress and invalidates the checkpoint (opening the store just to
+	 * clear it would cost a provider database): the next lease gets it partly cleared, so its owner clears it whatever
+	 * the store's changelog settings are by then; the state of a store nothing restores is opened and cleared. Does
+	 * nothing if a task leased it meanwhile. Resolves when a lease or close stopped it (the instance stays partly
+	 * cleared); rejects when it failed (the instance stays, to be pruned again or cleared by its next owner).
 	 */
 	async prune(store: string, partition: number, signal: AbortSignal): Promise<void> {
 		signal.throwIfAborted()
@@ -212,7 +215,7 @@ export class StateDirectory {
 		if (this.leases.has(id) || this.wipes.has(id)) return
 		const unopened = this.unopened.get(id)
 		if (unopened !== undefined && rebuiltByRestore(unopened.builder)) {
-			await this.track(id, () => this.invalidateUnopened(unopened))
+			await this.track(id, () => this.dropUnopened(unopened))
 			this.unopened.delete(id)
 			return
 		}
@@ -419,8 +422,14 @@ export class StateDirectory {
 		return [`${this.applicationId}.${store}`, partition]
 	}
 
-	/** Invalidates the checkpoint an earlier start left, if it would be trusted (a write and a flush otherwise saved). */
-	private async invalidateUnopened({ builder, partition }: Unopened): Promise<void> {
+	/**
+	 * Drops the state an earlier start may have left of a store partition without opening the store: marks its clear in
+	 * progress first, durably (the record of the drop, whatever the store's changelog settings are at its next lease),
+	 * then invalidates the checkpoint. Each only when not done already (a write and a flush saved).
+	 */
+	private async dropUnopened({ builder, partition }: Unopened): Promise<void> {
+		const marker = this.marker(builder.name, partition)
+		if (!(await this.checkpoints.clearing(...marker))) await this.checkpoints.beginClear(...marker)
 		const { logging } = builder
 		if (!logging.enabled) return
 		const checkpoint = await this.checkpoints.get(logging.topic, partition)

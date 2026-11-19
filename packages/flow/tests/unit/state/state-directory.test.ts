@@ -344,26 +344,38 @@ describe('StateDirectory', () => {
 			expect(await next.get('k')).toBeUndefined()
 		})
 
-		it('register(): the partitions an earlier start left on disk count from now; their prune only invalidates a trusted checkpoint', async () => {
+		it('register(): the partitions an earlier start left on disk count from now; their prune marks the clear and invalidates a trusted checkpoint, without opening the store', async () => {
 			const d = durable()
 			d.store.values.set('app-counts-changelog:1', 42n)
 			d.store.values.set('app-counts-changelog:2', -1n)
+			d.store.values.set('clearing app.counts:3', 1n)
 			const create = vi.spyOn(d.provider, 'createKeyValueStore')
 			await d.directory.lease(T0, counts, 0)
 			d.clock.now = 2000
-			d.directory.register([{ builder: counts, partitions: 3 }])
+			d.directory.register([{ builder: counts, partitions: 4 }])
 			// Partition 0 is leased: it counts from its release, like any other instance.
 			expect(d.directory.unleased()).toEqual([
 				{ store: 'counts', partition: 1, prunableAt: 602_000 },
 				{ store: 'counts', partition: 2, prunableAt: 602_000 },
+				{ store: 'counts', partition: 3, prunableAt: 602_000 },
 			])
 
 			const flushes = d.store.flushes
-			for (const partition of [1, 2]) await d.directory.prune('counts', partition, new AbortController().signal)
+			for (const partition of [1, 2, 3])
+				await d.directory.prune('counts', partition, new AbortController().signal)
 
-			expect(d.store.values.get('app-counts-changelog:1')).toBe(-1n)
-			// Already invalid: nothing written or flushed for it, and no store was opened to prune.
-			expect(d.store.flushes).toBe(flushes + 1)
+			expect(
+				[1, 2, 3].map(p => [
+					d.store.flushed.get(`clearing app.counts:${p}`),
+					d.store.flushed.get(`app-counts-changelog:${p}`),
+				])
+			).toEqual([
+				[1n, -1n],
+				[1n, -1n],
+				[1n, undefined],
+			])
+			// Partition 1: the marker and the invalidation; 2: the marker only (already invalid); 3: neither (marked already).
+			expect(d.store.flushes).toBe(flushes + 3)
 			expect(create).toHaveBeenCalledTimes(1)
 			expect(d.directory.unleased()).toEqual([])
 		})
@@ -421,7 +433,7 @@ describe('StateDirectory', () => {
 			])
 		})
 
-		describe('a clear that a close stopped', () => {
+		describe('a clear or drop that the next start finishes', () => {
 			/** One store partition, `app.scratch.p0`, under each changelog config a start may give it. */
 			const configs = {
 				unlogged,
@@ -467,7 +479,8 @@ describe('StateDirectory', () => {
 				const first = start(provider, durable, config)
 				await first.lease(T0, configs[config], 0)
 				await first.release(T0, 'scratch', 0)
-				const round = blockFirstDelete(left)
+				const markedAtDelete: (bigint | undefined)[] = []
+				const round = blockFirstDelete(left, () => markedAtDelete.push(durable.flushed.get(MARKER)))
 				const pruned = first.prune('scratch', 0, new AbortController().signal)
 				await round.started
 				const closed = first.close()
@@ -476,6 +489,9 @@ describe('StateDirectory', () => {
 				await pruned
 				vi.mocked(left.delete).mockRestore()
 				expect(await left.approximateNumEntries()).toBe(15_000)
+				// Marked durably before the first delete: a crash at any delete leaves the marker.
+				expect(markedAtDelete).toHaveLength(10_000)
+				expect(new Set(markedAtDelete)).toEqual(new Set([1n]))
 				return { provider, left, durable }
 			}
 
@@ -546,6 +562,30 @@ describe('StateDirectory', () => {
 				expect(await left.get('valid')).toBe('state')
 			})
 
+			// The prune of a partition an earlier start left, which drops a restored store without opening it, records the
+			// drop the same way: the next start clears it before its task uses it, also when it no longer restores it.
+			it.each(Object.keys(configs) as Config[])(
+				'restored, dropped unopened, then %s at the next start: the dropped state is cleared',
+				async after => {
+					const { provider, left } = durableProvider()
+					const durable = checkpointStore()
+					await left.put('k', 'stale')
+					durable.values.set(CHECKPOINT, 5n)
+					const first = start(provider, durable, 'restored')
+					await first.prune('scratch', 0, new AbortController().signal)
+					expect(await left.get('k')).toBe('stale')
+					expect([durable.flushed.get(MARKER), durable.flushed.get(CHECKPOINT)]).toEqual([1n, -1n])
+					await first.close()
+
+					// Its task gets the partition at once, long before this start's cleanup delay.
+					const second = start(provider, durable, after)
+					await second.lease(T0, configs[after], 0)
+					await second.finishClears(T0, new AbortController().signal)
+					expect(await left.get('k')).toBeUndefined()
+					expect(durable.values.get(MARKER)).toBe(0n)
+				}
+			)
+
 			it("clear(): a restore's rebuild cut short is finished by the next start, whatever its config", async () => {
 				const { provider, left } = durableProvider()
 				const durable = checkpointStore()
@@ -554,7 +594,8 @@ describe('StateDirectory', () => {
 				await first.lease(T0, configs.restored, 0)
 				// The restore invalidated the checkpoint before it clears the store for its rebuild.
 				durable.values.set(CHECKPOINT, -1n)
-				const round = blockFirstDelete(left)
+				const markedAtDelete: (bigint | undefined)[] = []
+				const round = blockFirstDelete(left, () => markedAtDelete.push(durable.flushed.get(MARKER)))
 				const cleared = first.clear(T0, 'scratch', 0, new AbortController().signal)
 				await round.started
 				const closed = first.close()
@@ -563,7 +604,7 @@ describe('StateDirectory', () => {
 				await expect(cleared).rejects.toMatchObject({ name: 'AbortError' })
 				vi.mocked(left.delete).mockRestore()
 				expect(await left.approximateNumEntries()).toBe(15_000)
-				expect(durable.values.get(MARKER)).toBe(1n)
+				expect(new Set(markedAtDelete)).toEqual(new Set([1n]))
 
 				const second = start(provider, durable, 'skipRestoration')
 				await second.lease(T0, configs.skipRestoration, 0)
@@ -609,7 +650,7 @@ describe('StateDirectory', () => {
 			})
 		})
 
-		it('a lease during the prune of a partition of an earlier start waits for its invalidated checkpoint', async () => {
+		it('a lease during the prune of a partition of an earlier start waits until the drop is recorded', async () => {
 			const d = durable()
 			d.store.values.set('app-counts-changelog:0', 42n)
 			d.directory.register([{ builder: counts, partitions: 1 }])
@@ -630,6 +671,7 @@ describe('StateDirectory', () => {
 			await pruned
 			await lease
 			expect(d.store.values.get('app-counts-changelog:0')).toBe(-1n)
+			expect(d.store.values.get('clearing app.counts:0')).toBe(1n)
 		})
 	})
 
