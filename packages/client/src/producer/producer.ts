@@ -2462,13 +2462,15 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	/**
 	 * Initialize idempotent producer by obtaining producer ID from broker
 	 *
-	 * Transitions: idle/fenced -> initializing -> running (or error)
+	 * Transitions: idle/fenced -> initializing -> running, error (a non-retriable failure), or back to idle/fenced (a
+	 * timeout or a disconnect: the next use initializes again)
 	 */
 	private async initializeIdempotentProducer(): Promise<void> {
+		const from = this.idempotentState
 		this.idempotentState = 'initializing'
 		this.logger.debug('initializing idempotent producer')
 
-		this.initPromise = this.doInitializeIdempotentProducer()
+		this.initPromise = this.doInitializeIdempotentProducer(from)
 
 		try {
 			await this.initPromise
@@ -2478,9 +2480,11 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	}
 
 	/**
-	 * Actual initialization logic - separated for proper promise handling
+	 * Actual initialization logic - separated for proper promise handling. Past maxBlockMs it rejects with a
+	 * TimeoutError and goes back to `from`, so that the next use tries again (Java: `initTransactions()` may be called
+	 * again after its TimeoutException).
 	 */
-	private async doInitializeIdempotentProducer(): Promise<void> {
+	private async doInitializeIdempotentProducer(from: IdempotentState): Promise<void> {
 		// Retry coordinator discovery + InitProducerId until maxBlockMs, riding through a loading or
 		// briefly-unreachable coordinator. Non-retriable protocol errors fail fast (Java: a fatal
 		// TransactionManager error). A disconnect stops it at once: a producer given up must not bump
@@ -2492,7 +2496,7 @@ export class Producer extends EventEmitter<ProducerEvents> {
 			maxDelayMs: this.config.maxRetryBackoffMs,
 			maxAttempts: Number.MAX_SAFE_INTEGER,
 		})
-		let lastError: Error = new Error('InitProducerId timed out before the coordinator was ready')
+		let lastError: Error = new Error('no attempt completed')
 		const retryAfter = async (error: Error): Promise<void> => {
 			lastError = error
 			const delay = backoff.nextDelay()
@@ -2581,9 +2585,14 @@ export class Producer extends EventEmitter<ProducerEvents> {
 			return
 		}
 
-		this.idempotentState = 'error'
-		this.initFailure = lastError
-		throw lastError
+		this.idempotentState = from
+		const id = this.config.transactionalId
+		const timeout = new TimeoutError(
+			`InitProducerId${id ? ` of transactional id '${id}'` : ''} did not complete within maxBlockMs: ${lastError.message}`,
+			this.config.maxBlockMs
+		)
+		timeout.cause = lastError
+		throw timeout
 	}
 
 	/** A non-retriable initialization failure: the producer stays in the error state, which rethrows it. */

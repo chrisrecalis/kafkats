@@ -122,7 +122,8 @@ export interface ProducerConfig {
 	transactionTimeoutMs?: number
 	/**
 	 * Maximum time in ms to block while initializing a transactional or idempotent producer,
-	 * retrying coordinator discovery and InitProducerId before failing (default: 60000).
+	 * retrying coordinator discovery and InitProducerId before failing with a `TimeoutError`
+	 * (default: 60000). A timed-out initialization is tried again by the next send or transaction.
 	 */
 	maxBlockMs?: number
 }

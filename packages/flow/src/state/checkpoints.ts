@@ -3,6 +3,15 @@ import type { ChangelogCheckpointStore } from '@/state.js'
 /** The checkpoint of an invalidated store: below every earliest offset, so never trusted. */
 const INVALID = -1n
 
+/**
+ * The checkpoint store key of a clear marker: a space is not allowed in a topic name, so it never meets a changelog's.
+ * Its value is {@link CLEARING} while the clear is in progress, {@link CLEARED} once it is done (the store API has no
+ * delete).
+ */
+const clearMarker = (store: string): string => `clearing ${store}`
+const CLEARING = 1n
+const CLEARED = 0n
+
 const tpKey = (topic: string, partition: number): string => `${topic}:${partition}`
 
 const toError = (error: unknown): Error => (error instanceof Error ? error : new Error(String(error)))
@@ -68,6 +77,30 @@ export class Checkpoints {
 		this.floors.delete(tpKey(topic, partition))
 		await this.store.set(topic, partition, INVALID)
 		await this.store.flush?.()
+	}
+
+	/**
+	 * Marks the clear of `store` (`<applicationId>.<store>`) on `partition` in progress, durably (a write and a flush)
+	 * before anything is deleted: the only record that a store nothing restores (no changelog, or `skipRestoration`) is
+	 * partly cleared once a close or a crash stopped its clear. Throws when that fails.
+	 */
+	async beginClear(store: string, partition: number): Promise<void> {
+		await this.store.set(clearMarker(store), partition, CLEARING)
+		await this.store.flush?.()
+	}
+
+	/**
+	 * Marks the clear done, durably before the store is used again: a marker left in progress would have the next start
+	 * clear the state written since. Throws when that fails.
+	 */
+	async endClear(store: string, partition: number): Promise<void> {
+		await this.store.set(clearMarker(store), partition, CLEARED)
+		await this.store.flush?.()
+	}
+
+	/** Whether a clear of `store` on `partition` began and did not finish (beginClear() without endClear()). */
+	async clearing(store: string, partition: number): Promise<boolean> {
+		return (await this.store.get(clearMarker(store), partition)) === CLEARING
 	}
 
 	/** Makes every checkpoint set so far durable; once per commit. */

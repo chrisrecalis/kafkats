@@ -454,6 +454,8 @@ export class Run {
 			eos: config.eos,
 			handlers: config.handlers,
 			counts: this.partitionCounts,
+			taskTimeoutMs: config.taskTimeoutMs,
+			clock: this.deps.io.clock,
 			logger,
 		})
 		// A failure is the pipelines' to report: their initialize() tries again.

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 
 import { Producer } from '@/producer/producer.js'
-import { KafkaProtocolError } from '@/client/errors.js'
+import { KafkaProtocolError, TimeoutError } from '@/client/errors.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import { createMockBroker, createMockCluster, type MockBroker } from './_helpers.js'
 
@@ -128,6 +128,44 @@ describe('Producer InitProducerId retries CoordinatorLoadInProgress', () => {
 		await expect(producer.beginTransaction()).rejects.toBe(denied)
 		expect(mockCluster.getCoordinator).toHaveBeenCalledTimes(1)
 		expect(txnCoordinator.initProducerId).not.toHaveBeenCalled()
+	})
+
+	it('past maxBlockMs a TimeoutError naming the transactional id; the next begin initializes again (Java)', async () => {
+		const busy = {
+			throttleTimeMs: 0,
+			errorCode: ErrorCode.ConcurrentTransactions,
+			producerId: -1n,
+			producerEpoch: -1,
+		}
+		let answered = 0
+		let ready = false
+		txnCoordinator.initProducerId.mockImplementation(async () => {
+			answered++
+			return ready ? { throttleTimeMs: 0, errorCode: ErrorCode.None, producerId: 9n, producerEpoch: 1 } : busy
+		})
+		const producer = new Producer(mockCluster, {
+			lingerMs: 0,
+			retryBackoffMs: 5,
+			maxRetryBackoffMs: 5,
+			maxBlockMs: 50,
+			transactionalId: 'tx-1',
+		})
+
+		const timedOut: unknown = await producer.beginTransaction().catch((error: unknown) => error)
+		expect(timedOut).toBeInstanceOf(TimeoutError)
+		expect((timedOut as TimeoutError).message).toMatch(
+			/^InitProducerId of transactional id 'tx-1' did not complete within maxBlockMs: .*ConcurrentTransactions/
+		)
+		expect((timedOut as TimeoutError).cause).toBeInstanceOf(KafkaProtocolError)
+		expect(answered).toBeGreaterThan(1)
+
+		ready = true
+		const transaction = await producer.beginTransaction()
+		await transaction.abort()
+		expect(txnCoordinator.initProducerId).toHaveBeenLastCalledWith(
+			expect.objectContaining({ transactionalId: 'tx-1' })
+		)
+		await producer.disconnect({ timeoutMs: 100 })
 	})
 
 	it('a disconnect stops the retries: a producer given up never bumps the epoch after its successor', async () => {

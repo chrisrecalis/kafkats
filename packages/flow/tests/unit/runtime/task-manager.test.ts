@@ -191,6 +191,8 @@ class Harness {
 			eos: this.config.eos,
 			handlers: this.config.handlers,
 			counts: { get: () => 1, load: () => Promise.resolve(1) },
+			taskTimeoutMs: this.config.taskTimeoutMs,
+			clock: this.clock,
 			logger: this.logger,
 		})
 	}

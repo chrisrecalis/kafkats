@@ -365,6 +365,8 @@ describe('RecordCollector at-least-once', () => {
 					return Promise.resolve(3)
 				},
 			},
+			taskTimeoutMs: 300_000,
+			clock: h.clock,
 			logger: h.logger,
 		})
 		h.collector = collector
@@ -392,6 +394,8 @@ describe('RecordCollector at-least-once', () => {
 				load: (_topic, s) =>
 					new Promise((_resolve, reject) => s.addEventListener('abort', () => reject(s.reason))),
 			},
+			taskTimeoutMs: 300_000,
+			clock: h.clock,
 			logger: h.logger,
 		})
 		const task = await running(h)
@@ -702,6 +706,8 @@ describe('sink partitioner (runtime§6.60)', () => {
 				eos: false,
 				handlers: h.handlers,
 				counts: { get: () => 2, load: () => Promise.resolve(2) },
+				taskTimeoutMs: 300_000,
+				clock: h.clock,
 				logger: h.logger,
 			})
 			const task = await running(h)

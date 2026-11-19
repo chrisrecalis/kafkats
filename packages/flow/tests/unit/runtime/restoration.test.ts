@@ -388,6 +388,8 @@ function taskManager(h: PoolHarness) {
 		eos: false,
 		handlers: config.handlers,
 		counts: { get: () => 1, load: () => Promise.resolve(1) },
+		taskTimeoutMs: config.taskTimeoutMs,
+		clock,
 		logger,
 	})
 	const exclusive = new SerialExclusive()

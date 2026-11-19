@@ -26,7 +26,7 @@ export type ValueMapperWithKey<K, V, VR> = (key: K, value: V) => VR
 export type ValueJoiner<V, VO, VR> = (value: V, otherValue: VO) => VR
 /**
  * Joins a value with the value of the other side, knowing the record's key (Kafka Streams' `ValueJoinerWithKey`), for
- * `joinWithKey()` and `leftJoinWithKey()`; the key is read-only.
+ * `joinWithKey()`, `leftJoinWithKey()` and `outerJoinWithKey()`; the key is read-only.
  */
 export type ValueJoinerWithKey<K, V, VO, VR> = (key: K, value: V, otherValue: VO) => VR
 /** Computes something, such as the key a stream-global table join looks up, from a record's key and value. */
@@ -162,6 +162,13 @@ export interface KStream<K, V> {
 	/** @deprecated Pass a key selector: `leftJoin(globalTable, (key) => key, joiner)` (the record key is looked up). */
 	leftJoin<GV, VR>(globalTable: GlobalKTable<K, GV>, joiner: (value: V, globalValue: GV | null) => VR): KStream<K, VR>
 
+	/** Like the windowed stream-stream `join()`, with a joiner that also receives the records' key (Kafka Streams' `ValueJoinerWithKey`). */
+	joinWithKey<VO, VR>(
+		other: KStream<K, VO>,
+		joiner: ValueJoinerWithKey<K, V, VO, VR>,
+		windows: JoinWindows,
+		options?: StreamJoined<K, V, VO>
+	): KStream<K, VR>
 	/** Like the stream-table `join()`, with a joiner that also receives the record's key (Kafka Streams' `ValueJoinerWithKey`). */
 	joinWithKey<VT, VR>(
 		table: KTable<K, VT>,
@@ -174,6 +181,16 @@ export interface KStream<K, V> {
 		keySelector: KeyValueMapper<K | null, V, GK | null>,
 		joiner: ValueJoinerWithKey<K | null, V, GV, VR>,
 		options?: NamedOptions
+	): KStream<K, VR>
+	/**
+	 * Like the windowed stream-stream `leftJoin()`, with a joiner that also receives the records' key, null for a record
+	 * of this stream without a key (joined with null, KIP-962).
+	 */
+	leftJoinWithKey<VO, VR>(
+		other: KStream<K, VO>,
+		joiner: ValueJoinerWithKey<K | null, V, VO | null, VR>,
+		windows: JoinWindows,
+		options?: StreamJoined<K, V, VO>
 	): KStream<K, VR>
 	/** Like the stream-table `leftJoin()`, with a joiner that also receives the record's key, null in a null-key join. */
 	leftJoinWithKey<VT, VR>(
@@ -201,6 +218,16 @@ export interface KStream<K, V> {
 		other: KStream<K, VO>,
 		joiner: (value: V | null, otherValue: VO | null) => VR,
 		options: Joined<K, V, VO>
+	): KStream<K, VR>
+	/**
+	 * Like `outerJoin()`, with a joiner that also receives the records' key, null for a record without a key (joined
+	 * with null, KIP-962).
+	 */
+	outerJoinWithKey<VO, VR>(
+		other: KStream<K, VO>,
+		joiner: ValueJoinerWithKey<K | null, V | null, VO | null, VR>,
+		windows: JoinWindows,
+		options?: StreamJoined<K, V, VO>
 	): KStream<K, VR>
 
 	/**

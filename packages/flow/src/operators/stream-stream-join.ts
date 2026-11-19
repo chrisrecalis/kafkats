@@ -27,8 +27,11 @@ export interface JoinSideSpec<K, V, VO, VR> {
 	readonly beforeMs: number
 	readonly afterMs: number
 	readonly graceMs: number
-	/** This side's value first; null for the missing side of a left or outer result. */
-	readonly joiner: (value: V | null, otherValue: VO | null) => VR
+	/**
+	 * The record's key (null in a KIP-962 result of a null-key record), then this side's value; null for the missing
+	 * side of a left or outer result.
+	 */
+	readonly joiner: (key: K | null, value: V | null, otherValue: VO | null) => VR
 	/** Whether unmatched records of this side are joined with null. */
 	readonly outer: boolean
 	/** Whether those of the other side are: only then may the outer-join store hold records of the other side. */
@@ -83,7 +86,7 @@ class StreamStreamJoinProcessor<K, V, VO, VR> implements Processor<K | null, V |
 		if (key === null || value === null || value === undefined) {
 			// KIP-962: an outer side joins a null-key record with null at once, without storing it.
 			if (outer && value !== null && value !== undefined) {
-				await this.context.forward(record.withValue(joiner(value, null)))
+				await this.context.forward(record.withValue(joiner(key, value, null)))
 			} else {
 				this.context.recordDropped(key === null ? 'null-key' : 'null-value')
 			}
@@ -102,7 +105,7 @@ class StreamStreamJoinProcessor<K, V, VO, VR> implements Processor<K | null, V |
 			}
 			const result = keyed.withTimestamp(Math.max(timestamp, otherTimestamp))
 			for (const otherValue of otherValues) {
-				await this.context.forward(result.withValue(joiner(value, otherValue)))
+				await this.context.forward(result.withValue(joiner(key, value, otherValue)))
 			}
 		}
 		if (outer && !matched) {
@@ -130,7 +133,7 @@ class StreamStreamJoinProcessor<K, V, VO, VR> implements Processor<K | null, V |
 			Math.max(0, timestamp + afterMs) < streamTime ||
 			timestamp + afterMs + graceMs < streamTime
 		) {
-			await this.context.forward(record.withValue(this.spec.joiner(record.value, null)))
+			await this.context.forward(record.withValue(this.spec.joiner(record.key, record.value, null)))
 			return
 		}
 		outerStore.emitState.minTime = Math.min(outerStore.emitState.minTime, record.timestamp)
@@ -168,10 +171,11 @@ class StreamStreamJoinProcessor<K, V, VO, VR> implements Processor<K | null, V |
 				if (open.own && open.other) break
 				continue
 			}
+			const key = entry.key()
 			const results = entry.own
-				? entry.values().map(v => joiner(v, null))
-				: entry.values().map(v => joiner(null, v))
-			const result = trigger.withKey(entry.key()).withTimestamp(entry.timestamp)
+				? entry.values().map(v => joiner(key, v, null))
+				: entry.values().map(v => joiner(key, null, v))
+			const result = trigger.withKey(key).withTimestamp(entry.timestamp)
 			for (const joined of results) {
 				await this.context.forward(result.withValue(joined))
 			}

@@ -335,6 +335,8 @@ export class TestLoop {
 				get: topic => this.partitions.reported(topic),
 				load: topic => Promise.resolve(this.partitions.reported(topic)),
 			},
+			taskTimeoutMs: this.settings.taskTimeoutMs,
+			clock: this.clock,
 			logger: this.app.logger,
 		})
 	}

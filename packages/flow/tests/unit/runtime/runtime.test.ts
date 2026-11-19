@@ -639,6 +639,84 @@ describe('exactly-once: the producer is initialized before any restore (KS Recor
 		expect(restoreReads()).not.toEqual([])
 		await h.stop()
 	})
+
+	it(
+		'an InitProducerId answered after more than 10 s holds the start back, not failed: the member stays',
+		{ timeout: 20_000 },
+		async () => {
+			const h = new Harness(counting, { processingGuarantee: 'exactly_once' })
+			h.io.scriptProducer = producer => producer.steps.initTransactions.next('hang')
+			let failed: unknown
+			const starting = h.start().catch((error: unknown) => (failed = error))
+			await h.joined()
+			await h.consumer.rebalance('in:0')
+			// Real time: the client bounds each attempt by its maxBlockMs (60 s by default), flow adds no bound of its own.
+			await new Promise(resolve => setTimeout(resolve, 10_500))
+			expect(failed).toBeUndefined()
+			expect(h.lifecycle.state).not.toBe('ERROR')
+			expect(h.consumer.calls).not.toContain('stop')
+
+			h.producer.steps.initTransactions.hung[0]!.answer()
+			await starting
+			expect(failed).toBeUndefined()
+			expect(h.lifecycle.state).toBe('RUNNING')
+			expect(h.io.created.consumers).toHaveLength(1)
+			await h.stop()
+		}
+	)
+
+	it('an initialization that timed out (maxBlockMs) is tried again after a backoff, within taskTimeoutMs (KS)', async () => {
+		const h = new Harness(counting, { processingGuarantee: 'exactly_once' })
+		const timedOut = () => new TimeoutError("InitProducerId of transactional id 'app-p' did not complete", 60_000)
+		h.io.scriptProducer = producer => producer.steps.initTransactions.next(timedOut(), timedOut())
+		const starting = h.start()
+		await h.joined()
+		await h.consumer.rebalance('in:0')
+		await settle()
+		const init = h.producer.steps.initTransactions
+		const warning = h.logger.warnings.indexOf('initializing the exactly-once producer timed out: it is tried again')
+		expect(h.logger.warningContexts[warning]).toMatchObject({
+			error: expect.stringContaining('InitProducerId'),
+			retryInMs: 1000,
+			giveUpInMs: 300_000,
+		})
+		// The backoffs: 1 s, then 2 s.
+		h.io.clock.advance(1000)
+		await settle()
+		h.io.clock.advance(1999)
+		await settle()
+		expect(h.producer.initialized).toBe(0)
+		h.io.clock.advance(1)
+		await starting
+		expect(h.producer.initialized).toBe(1)
+		expect(init.hung).toEqual([])
+		expect(h.consumer.calls).not.toContain('stop')
+		expect(h.io.created.producers).toHaveLength(1)
+		await h.stop()
+	})
+
+	it('initializations timing out for longer than taskTimeoutMs fail with a TaskMigratedError that says so', async () => {
+		const h = new Harness(counting, { processingGuarantee: 'exactly_once', taskTimeoutMs: 5000 })
+		const timedOut = new TimeoutError("InitProducerId of transactional id 'app-p' did not complete", 60_000)
+		h.io.scriptProducer = producer => producer.steps.initTransactions.always(timedOut)
+		let failed: unknown
+		const starting = h.start().catch((error: unknown) => (failed = error))
+		await h.joined()
+		await h.consumer.rebalance('in:0')
+		// Tried at 0, 1 s, 3 s and 7 s: past the 5 s, the last one fails the start.
+		for (const backoff of [1000, 2000, 4000]) {
+			await settle()
+			expect(failed).toBeUndefined()
+			h.io.clock.advance(backoff)
+		}
+		await starting
+		expect(failed).toBeInstanceOf(TaskMigratedError)
+		expect((failed as Error).message).toMatch(
+			/^the exactly-once producer did not initialize within taskTimeoutMs \(5000 ms\): InitProducerId of transactional id 'app-p'/
+		)
+		expect((failed as Error).cause).toBe(timedOut)
+		await h.stop()
+	})
 })
 
 describe('exactly-once: a producer that cannot be initialized', () => {

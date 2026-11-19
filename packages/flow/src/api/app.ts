@@ -26,7 +26,10 @@ export interface FlowConfig {
 	processingGuarantee?: 'at_least_once' | 'exactly_once'
 	/** How often offsets (and under exactly_once the transaction) are committed. Default 100 under exactly_once, 5000 under at_least_once. */
 	commitIntervalMs?: number
-	/** at_least_once: how long commits may keep failing with timeouts before the app rejoins the group. Default 300000. */
+	/**
+	 * How long a timeout may keep failing what is retried before the app rejoins the group: at_least_once, interval
+	 * commits; exactly_once, the producer's initialization (each attempt bounded by `producer.maxBlockMs`). Default 300000.
+	 */
 	taskTimeoutMs?: number
 	/** Default inMemory(). */
 	stateStoreProvider?: StateStoreProvider

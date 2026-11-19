@@ -241,6 +241,8 @@ export class TaskHarness {
 			eos: this.eos,
 			handlers: this.handlers,
 			counts: { get: () => 1, load: () => Promise.resolve(1) },
+			taskTimeoutMs: 300_000,
+			clock: this.clock,
 			logger: this.logger,
 		})
 	}

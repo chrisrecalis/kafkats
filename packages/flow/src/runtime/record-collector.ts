@@ -3,15 +3,15 @@
  * per-task failure attribution and changelog positions, and the open transaction under exactly-once.
  */
 import type { ConsumerGroupMetadata, Logger, SendResult } from '@kafkats/client'
-import { TransactionAbortedError } from '@kafkats/client'
+import { TimeoutError, TransactionAbortedError } from '@kafkats/client'
 import { FailedProcessingError, IllegalStateError, StreamsError, TaskMigratedError } from '@/api/errors.js'
 import type { ErrorHandlerContext } from '@/api/handlers.js'
 import { applyHandler } from '@/processor/node.js'
 import type { CollectedRecord, SendKind, TaskOutput } from '@/processor/output.js'
 import type { PartitionCountCache, ResolvedHandlers } from '@/runtime/config.js'
 import { errorMessage, isFatalSendError, isFencedError, isRetriableError } from '@/runtime/errors.js'
-import type { OffsetAndMetadata, ProducedMessage, ProducerPort, TransactionPort } from '@/runtime/io.js'
-import { raceSignal } from '@/runtime/signals.js'
+import type { Clock, OffsetAndMetadata, ProducedMessage, ProducerPort, TransactionPort } from '@/runtime/io.js'
+import { delay, raceSignal } from '@/runtime/signals.js'
 import { tpKey } from '@/runtime/task-id.js'
 import type { StreamTask } from '@/runtime/task.js'
 
@@ -22,8 +22,15 @@ export interface RecordCollectorOptions {
 	readonly eos: boolean
 	readonly handlers: ResolvedHandlers
 	readonly counts: PartitionCountCache
+	/** Exactly-once: how long an initialization of the producer that times out is tried again (FlowConfig.taskTimeoutMs). */
+	readonly taskTimeoutMs: number
+	readonly clock: Clock
 	readonly logger: Logger
 }
+
+/** Backoff between the initializations of a producer that timed out: Kafka Streams' task initialization backoff. */
+const INIT_RETRY_INITIAL_BACKOFF_MS = 1000
+const INIT_RETRY_MAX_BACKOFF_MS = 10_000
 
 /**
  * The sends of one generation of the collector that were not answered yet. A generation ends when its sends are given
@@ -97,13 +104,51 @@ export class RecordCollector {
 		if (!this.options.eos || this.isClosed) {
 			return
 		}
-		this.initializing ??= this.producer
-			.initTransactions({ signal: this.lifetime.signal })
-			.catch((error: unknown) => {
-				this.initializing = undefined
-				throw error
-			})
+		this.initializing ??= this.initTransactions().catch((error: unknown) => {
+			this.initializing = undefined
+			throw error
+		})
 		await raceSignal(this.initializing, signal)
+	}
+
+	/**
+	 * The producer's initialization, each attempt blocking up to the producer's `maxBlockMs` (KS
+	 * `StreamsProducer.initTransaction`). An attempt that times out is tried again like Kafka Streams tries a task's
+	 * initialization again (`TaskManager.addTaskToStateUpdater`): after a backoff, until `taskTimeoutMs` passed since the
+	 * first timeout, then a TaskMigratedError. Stops with close().
+	 */
+	private async initTransactions(): Promise<void> {
+		const { taskTimeoutMs, clock, logger } = this.options
+		const { signal } = this.lifetime
+		let deadline: number | undefined
+		for (
+			let backoff = INIT_RETRY_INITIAL_BACKOFF_MS;
+			;
+			backoff = Math.min(backoff * 2, INIT_RETRY_MAX_BACKOFF_MS)
+		) {
+			try {
+				await this.producer.initTransactions({ signal })
+				return
+			} catch (error) {
+				if (!(error instanceof TimeoutError) || signal.aborted) {
+					throw error
+				}
+				const now = clock.now()
+				deadline ??= now + taskTimeoutMs
+				if (now > deadline) {
+					throw new TaskMigratedError(
+						`the exactly-once producer did not initialize within taskTimeoutMs (${taskTimeoutMs} ms): ${error.message}`,
+						{ cause: error }
+					)
+				}
+				logger.warn('initializing the exactly-once producer timed out: it is tried again', {
+					error: error.message,
+					retryInMs: backoff,
+					giveUpInMs: deadline - now,
+				})
+				await delay(clock, backoff, signal)
+			}
+		}
 	}
 
 	/** Exactly-once: begins a transaction unless one is open; awaited before any slice that may send. */

@@ -421,6 +421,77 @@ describe('StateDirectory', () => {
 			])
 		})
 
+		describe('a clear of a store nothing restores that a close stopped', () => {
+			/** A durable provider over memory: close() keeps its stores, and the next start reopens them by name. */
+			function durableProvider() {
+				const provider = new InMemoryStateStoreProvider()
+				vi.spyOn(provider, 'close').mockResolvedValue()
+				const left = provider.createKeyValueStore<string, string>('app.scratch.p0', {
+					keyCodec: str,
+					valueCodec: str,
+				})
+				return { provider: reopening(provider, [left]), left }
+			}
+			const start = (provider: InMemoryStateStoreProvider, store: ReturnType<typeof checkpointStore>) => {
+				const clock = { now: 1000 }
+				const checkpoints = new Checkpoints(store, () => {})
+				const cleanup: StateCleanup = { delayMs: 600_000, now: () => clock.now }
+				const { directory: dir } = directory({ provider, checkpoints, cleanup })
+				dir.register([{ builder: unlogged, partitions: 1 }])
+				return dir
+			}
+
+			it("is finished by the next start's owner before it uses the store", async () => {
+				const { provider, left } = durableProvider()
+				const durable = checkpointStore()
+				await filled(left, 25_000)
+				const first = start(provider, durable)
+				const round = blockFirstDelete(left)
+				const pruned = first.prune('scratch', 0, new AbortController().signal)
+				await round.started
+				const closed = first.close()
+				round.release()
+				await closed
+				await pruned
+				expect(await left.approximateNumEntries()).toBe(15_000)
+				expect(durable.values.get('clearing app.scratch:0')).toBe(1n)
+
+				// The next start leases it at once, long before its cleanup delay.
+				const second = start(provider, durable)
+				expect(await second.lease(T0, unlogged, 0)).toBe(left)
+				await second.finishClears(T0, new AbortController().signal)
+
+				expect(await left.approximateNumEntries()).toBe(0)
+				expect(durable.values.get('clearing app.scratch:0')).toBe(0n)
+			})
+
+			it('a finished clear is marked done: the next start keeps what was written since', async () => {
+				const { provider, left } = durableProvider()
+				const durable = checkpointStore()
+				await filled(left, 10)
+				const first = start(provider, durable)
+				await first.prune('scratch', 0, new AbortController().signal)
+				expect(await left.approximateNumEntries()).toBe(0)
+				await first.lease(T0, unlogged, 0)
+				await left.put('k', 'new')
+				await first.close()
+
+				const second = start(provider, durable)
+				await second.lease(T0, unlogged, 0)
+				await second.finishClears(T0, new AbortController().signal)
+				expect(await left.get('k')).toBe('new')
+			})
+
+			it('a logged store that restores is not marked: its invalidated checkpoint has the restore rebuild it', async () => {
+				const d = durable()
+				const store = (await d.directory.lease(T0, counts, 0)) as KeyValueStore<string, string>
+				await store.put('k', 'v')
+				await d.directory.release(T0, 'counts', 0)
+				await d.directory.prune('counts', 0, new AbortController().signal)
+				expect([...d.store.values.keys()]).toEqual(['app-counts-changelog:0'])
+			})
+		})
+
 		it('a lease during the prune of a partition of an earlier start waits for its invalidated checkpoint', async () => {
 			const d = durable()
 			d.store.values.set('app-counts-changelog:0', 42n)

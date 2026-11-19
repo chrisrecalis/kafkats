@@ -28,9 +28,15 @@ import type { StoreBuilder } from '@/topology/nodes.js'
  * `(joiner, windows, options?)`, or the deprecated `(joiner, joined)` whose `within` gives the window. The
  * joiner receives null for the missing side of left and outer results.
  */
-export type StreamStreamJoinArgs<K, V, VO, VR> =
-	| [joiner: (value: V, otherValue: VO) => VR, windows: JoinWindows, options?: StreamJoined<K, V, VO>]
-	| [joiner: (value: V, otherValue: VO) => VR, joined: Joined<K, V, VO>]
+export type StreamStreamJoinArgs<K, V, VO, J> =
+	| [joiner: J, windows: JoinWindows, options?: StreamJoined<K, V, VO>]
+	| [joiner: J, joined: Joined<K, V, VO>]
+
+/**
+ * A joiner as the join processors call it (Kafka Streams' `ValueJoinerWithKey`): the record's key, null in a KIP-962
+ * result of a null-key record, then the two values, null for the missing side of a left or outer result.
+ */
+export type KeyedStreamJoiner<K, V, VO, VR> = (key: K | null, value: V | null, otherValue: VO | null) => VR
 
 type JoinKind = 'inner' | 'left' | 'outer'
 
@@ -45,7 +51,7 @@ export function streamStreamJoin<K, V, VO, VR>(
 	stream: KStreamImpl<K, V>,
 	kind: JoinKind,
 	other: KStream<K, VO>,
-	...args: StreamStreamJoinArgs<K, V, VO, VR>
+	...args: StreamStreamJoinArgs<K, V, VO, KeyedStreamJoiner<K, V, VO, VR>>
 ): KStream<K, VR> {
 	const operator = OPERATOR[kind]
 	if (!(other instanceof KStreamImpl) || other.ctx !== stream.ctx) {
@@ -111,7 +117,7 @@ export function streamStreamJoin<K, V, VO, VR>(
 			otherStore: thisStore,
 			beforeMs: windows.afterMs,
 			afterMs: windows.beforeMs,
-			joiner: (otherValue, thisValue) => joiner(thisValue, otherValue),
+			joiner: (key, otherValue, thisValue) => joiner(key, thisValue, otherValue),
 			outer: kind === 'outer',
 			otherOuter: kind !== 'inner',
 			outerStore:
@@ -167,19 +173,17 @@ function addStores<K, V, VO>(
 }
 
 interface JoinArguments<K, V, VO, VR> {
-	/** Called with null for the missing side of left and outer results. */
-	readonly joiner: (value: V | null, otherValue: VO | null) => VR
+	readonly joiner: KeyedStreamJoiner<K, V, VO, VR>
 	readonly windows: JoinWindows
 	readonly options: StreamJoined<K, V, VO> | Joined<K, V, VO>
 }
 
 function joinArguments<K, V, VO, VR>(
 	operator: string,
-	[joiner, windows, options]: StreamStreamJoinArgs<K, V, VO, VR>
+	[joiner, windows, options]: StreamStreamJoinArgs<K, V, VO, KeyedStreamJoiner<K, V, VO, VR>>
 ): JoinArguments<K, V, VO, VR> {
-	const join = joiner as JoinArguments<K, V, VO, VR>['joiner']
 	if (windows instanceof JoinWindows) {
-		return { joiner: join, windows, options: options ?? {} }
+		return { joiner, windows, options: options ?? {} }
 	}
-	return { joiner: join, windows: joinWindowsWithin(windows?.within, operator), options: windows ?? {} }
+	return { joiner, windows: joinWindowsWithin(windows?.within, operator), options: windows ?? {} }
 }

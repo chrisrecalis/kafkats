@@ -72,7 +72,7 @@ export interface TaskManagerDeps {
 	readonly logger: Logger
 }
 
-/** Bound of the transaction a task's init() may write into, and of the producer's initialization before a restore (EOS). */
+/** Bound of the opening of the transaction a task's init() may write into (EOS). */
 const TRANSACTION_TIMEOUT_MS = 10_000
 const REVOCATION_COMMIT_MAX_MS = 30_000
 /** A task corrupted again within this window escalates to a migration (4.7.5). */
@@ -103,7 +103,8 @@ export class TaskManager {
 	constructor(private readonly deps: TaskManagerDeps) {
 		this.taskConfig = taskConfig(deps.config, deps.topology)
 		this.pipelines = new RestorePipelines({
-			initializeOutput: signal => deps.outputs.initialize(cap(signal, TRANSACTION_TIMEOUT_MS)),
+			// Unbounded here: each attempt blocks up to maxBlockMs, the collector tries again within taskTimeoutMs.
+			initializeOutput: signal => deps.outputs.initialize(signal),
 			finishClears: (task, signal) => deps.stateDirectory.finishClears(task.id, signal),
 			restorer: deps.restorer,
 			startPositions: deps.startPositions,
