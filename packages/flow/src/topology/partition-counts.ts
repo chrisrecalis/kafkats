@@ -31,14 +31,14 @@ export function resolvePartitionCounts(
 	for (const subtopology of topology.subtopologies) {
 		for (const topic of subtopology.sourceTopics) {
 			if (isRepartition(topic)) continue
-			counts.set(topic, externalCount(external, topic, subtopology.stores[0]?.name ?? 'topology'))
+			counts.set(topic, externalCount(external, topic, { subtopology: subtopology.id }))
 		}
 		for (const topic of subtopology.sinkTopics) {
 			for (const source of subtopology.sourceTopics) upstream.get(topic)?.add(source)
 		}
 	}
 	for (const global of topology.globalStores) {
-		counts.set(global.topic, externalCount(external, global.topic, global.store.name))
+		counts.set(global.topic, externalCount(external, global.topic, { globalStore: global.store.name }))
 	}
 
 	const pinned = new Map(explicit)
@@ -53,9 +53,13 @@ export function resolvePartitionCounts(
 	return counts
 }
 
-function externalCount(external: ReadonlyMap<string, number>, topic: string, neededBy: string): number {
+function externalCount(
+	external: ReadonlyMap<string, number>,
+	topic: string,
+	readBy: SourceTopicNotFoundError['readBy']
+): number {
 	const count = external.get(topic)
-	if (count === undefined || count < 1) throw new SourceTopicNotFoundError(topic, neededBy)
+	if (count === undefined || count < 1) throw new SourceTopicNotFoundError(topic, readBy)
 	return count
 }
 

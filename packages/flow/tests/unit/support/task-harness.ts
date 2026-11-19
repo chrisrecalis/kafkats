@@ -116,7 +116,6 @@ export class StateProbe {
 	}
 }
 
-/** An unlogged in-memory key-value store of strings. */
 /** The start of a partition committed at `offset` with the processor `metadata` and partition time. */
 export function committed(metadata: Record<string, number>, partitionTime: number, offset = 10n): PartitionStart {
 	const encoded = new ProcessorMetadataImpl()
@@ -124,6 +123,7 @@ export function committed(metadata: Record<string, number>, partitionTime: numbe
 	return { committed: { offset, metadata: encodeCommitMetadata(partitionTime, encoded) }, resolved: offset }
 }
 
+/** An unlogged in-memory key-value store of strings. */
 export function kvStore(name: string, extra: Partial<StoreBuilder> = {}): StoreBuilder {
 	const builder = keyValueStoreBuilder(
 		{ applicationId: APP },

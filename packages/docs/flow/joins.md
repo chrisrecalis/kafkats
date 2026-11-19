@@ -9,7 +9,7 @@
 
 Co-partitioned topics have the same partition count and the same partitioning of keys, so that a key is in the same partition on both sides. Joins that need it put both sides in one task per partition, and `start()` throws `CoPartitioningError` when the counts differ. A stream side whose key changed upstream is repartitioned first (by the join's key), so only the topics you read have to agree.
 
-Joiners take the two values (Kafka Streams' `ValueJoiner`), whatever parameters the function declares. For a joiner that also receives the record's key (`ValueJoinerWithKey`), stream-table and stream-global table joins have `joinWithKey()` and `leftJoinWithKey()`.
+Joiners take the two values (Kafka Streams' `ValueJoiner`), whatever parameters the function declares. For a joiner that also receives the record's key (`ValueJoinerWithKey`), stream joins have `joinWithKey()` and `leftJoinWithKey()`, and stream-stream joins `outerJoinWithKey()` too.
 
 ## Stream-Stream Joins
 

@@ -239,10 +239,16 @@ describe('walking skeleton', () => {
 
 		it('start() rejects when a source topic does not exist; close() stops the app', async () => {
 			const instance = app(uniqueTopicName('skeleton-missing'))
-			instance.stream(uniqueTopicName('skeleton-missing-in'), strings).to(uniqueTopicName('skeleton-x'), strings)
+			const missing = uniqueTopicName('skeleton-missing-in')
+			instance.stream(missing, strings).to(uniqueTopicName('skeleton-x'), strings)
 			await expect(instance.start()).rejects.toThrow(SourceTopicNotFoundError)
 			expect(instance.state()).toBe('ERROR')
 			expect(instance.getError()).toBeInstanceOf(SourceTopicNotFoundError)
+			expect(instance.getError()).toMatchObject({
+				topic: missing,
+				readBy: { subtopology: 0 },
+				message: `Source topic "${missing}" of subtopology 0 does not exist. Create it first.`,
+			})
 			await instance.close()
 			expect(instance.state()).toBe('STOPPED')
 		}, 30_000)

@@ -225,7 +225,7 @@ class GlobalTable {
 		const { topic } = this.def
 		const count = (await this.deps.io.admin.describeTopics([topic], { signal })).get(topic)
 		if (!count) {
-			throw new SourceTopicNotFoundError(topic, this.name)
+			throw new SourceTopicNotFoundError(topic, { globalStore: this.name })
 		}
 		return Array.from({ length: count }, (_, partition) => ({ topic, partition }))
 	}

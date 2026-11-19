@@ -20,19 +20,19 @@ export class ChangelogPartitionMismatchError extends Error {
 }
 
 /**
- * Error thrown when a source topic does not exist and partition count cannot be inferred.
+ * Error thrown by start() when a topic the topology reads does not exist (Kafka Streams' `MissingSourceTopicException`).
  */
 export class SourceTopicNotFoundError extends Error {
 	override readonly name = 'SourceTopicNotFoundError'
 
 	constructor(
 		public readonly topic: string,
-		public readonly storeName: string
+		/** What reads it: a subtopology (its number in `describe()`), or the store of a global table. */
+		public readonly readBy: { readonly subtopology: number } | { readonly globalStore: string }
 	) {
-		super(
-			`Source topic "${topic}" does not exist. Cannot determine partition count for ` +
-				`changelog topic of store "${storeName}". Create the source topic first.`
-		)
+		const reader =
+			'subtopology' in readBy ? `subtopology ${readBy.subtopology}` : `global store "${readBy.globalStore}"`
+		super(`Source topic "${topic}" of ${reader} does not exist. Create it first.`)
 	}
 }
 

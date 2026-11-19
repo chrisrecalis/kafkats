@@ -192,7 +192,9 @@ export type ReadOnlyTimestampedKeyValueStore<K, V> = Pick<
  * Durable store for tracking changelog restore/write progress.
  *
  * Implementations should be colocated with state storage so offsets are not
- * reused across incompatible local state directories.
+ * reused across incompatible local state directories. Flow also records other
+ * progress of a store here, under names that are not topic names (the clear
+ * of a store in progress): store any string as `topic`.
  */
 export interface ChangelogCheckpointStore {
 	/**

@@ -485,6 +485,14 @@ describe('TaskManager: restore pipelines (4.7.1)', () => {
 		h.restorer.manual = true
 		const pruned = h.stateDirectory.prune('s', 0, new AbortController().signal)
 		await round.promise
+		// The entries of the store when its restore starts (read at the call): a restore replaying the changelog while
+		// the clear still deletes the keys it collected would lose what it restored.
+		const entriesAtRestore: Promise<number>[] = []
+		const restore = h.restorer.restore.bind(h.restorer)
+		vi.spyOn(h.restorer, 'restore').mockImplementation((task, signal) => {
+			entriesAtRestore.push(raw.approximateNumEntries())
+			return restore(task, signal)
+		})
 
 		const assigned = h.assign('input:0')
 		await tick()
@@ -496,7 +504,7 @@ describe('TaskManager: restore pipelines (4.7.1)', () => {
 		const [task] = h.tasks()
 		await h.settle()
 		expect(h.restorer.restored.at(-1)).toBe(task)
-		expect(await raw.approximateNumEntries()).toBe(0)
+		expect(await Promise.all(entriesAtRestore)).toEqual([0])
 		h.restorer.job(task!).finish()
 		await h.settle()
 		expect(task!.state).toBe('RUNNING')

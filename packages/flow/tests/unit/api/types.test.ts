@@ -81,6 +81,20 @@ function overloads(
 	expectTypeOf(
 		stream.outerJoin(other, (value, otherValue) => [value, otherValue] as const, windows.join)
 	).toEqualTypeOf<KStream<string, readonly [number | null, boolean | null]>>()
+	// Stream-stream key-aware joiners: an inner join's key is never null; a left or outer result may be of a null key.
+	expectTypeOf(
+		stream.joinWithKey(other, (key, value, otherValue) => [key, value, otherValue] as const, windows.join)
+	).toEqualTypeOf<KStream<string, readonly [string, number, boolean]>>()
+	expectTypeOf(
+		stream.leftJoinWithKey(other, (key, value, otherValue) => [key, value, otherValue] as const, windows.join, {
+			name: 'left',
+		})
+	).toEqualTypeOf<KStream<string, readonly [string | null, number, boolean | null]>>()
+	expectTypeOf(
+		stream.outerJoinWithKey(other, (key, value, otherValue) => [key, value, otherValue] as const, windows.join)
+	).toEqualTypeOf<KStream<string, readonly [string | null, number | null, boolean | null]>>()
+	// @ts-expect-error a joiner of three parameters goes to outerJoinWithKey()
+	stream.outerJoin(other, (key: string, value: number, otherValue: boolean) => key + value + otherValue, windows.join)
 
 	const grouped = stream.groupByKey()
 	expectTypeOf(grouped).toEqualTypeOf<KGroupedStream<string, number>>()

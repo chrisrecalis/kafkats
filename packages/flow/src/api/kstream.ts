@@ -34,7 +34,10 @@ export type KeyValueMapper<K, V, R> = (key: K, value: V) => R
 
 /**
  * An unbounded stream of key-value records. Keys and values may be null (a null value is a tombstone in a
- * topic read as a table). Every callback takes `(key, value)`.
+ * topic read as a table). Callbacks that receive the record take `(key, value)` and see `K | null` and `V | null`
+ * (`filter()`, `map()`, `selectKey()`, `peek()`, ...); `mapValues()` and `flatMapValues()` take the value alone (their
+ * key-aware forms are `mapValuesWithKey()` and `flatMapValuesWithKey()`); joiners take the two values, after the key in
+ * the `...WithKey()` joins.
  */
 export interface KStream<K, V> {
 	/** The records the predicate accepts. */

@@ -62,7 +62,7 @@ See [Configuration](/flow/configuration) for every option.
 
 ## Tables and Aggregations
 
-- **Every callback takes `(key, value)`.** `selectKey((key, value) => ...)` was `(value, key)`: swap the arguments. `mapValues()` and `flatMapValues()` still pass the value alone, to any function; the key-aware forms are the new `mapValuesWithKey()` and `flatMapValuesWithKey()`. Joiners likewise always get the two values; a stream-table or stream-global table joiner that needs the key goes to the new `joinWithKey()` or `leftJoinWithKey()`.
+- **Callbacks that take the key take it first: `(key, value)`.** `selectKey((key, value) => ...)` was `(value, key)`: swap the arguments. `mapValues()` and `flatMapValues()` still pass the value alone, to any function; the key-aware forms are the new `mapValuesWithKey()` and `flatMapValuesWithKey()`. Joiners likewise always get the two values; a joiner that needs the key goes to the new `joinWithKey()`, `leftJoinWithKey()` or (stream-stream) `outerJoinWithKey()`.
 - **Table callbacks never receive `null`.** `KTable.filter()`, `filterNot()`, `mapValues()`, `groupBy()` and the table joins pass deletes on as deletes, so their parameters are typed without `null`. Where a delete retracts a row, they are called with the row's previous value: `groupBy()`'s selector always, the others when old values are computed downstream. `transformValues()` and `toStream(mapper)` see deletes as a `null` value.
 - **Grouped tables keep their aggregate when a group empties** (a count goes to 0) and send no tombstone, as Kafka Streams does. Filter zeros downstream if needed. `KTable.groupBy()`'s mapper may change the value type (give `Grouped.value`).
 - **`count()` results are int64 big-endian** (Kafka Streams' `Serdes.Long`; they were 8-byte little-endian doubles). Pass `value` in the options of `count()` or of `to()` to keep another encoding.
@@ -72,6 +72,7 @@ See [Configuration](/flow/configuration) for every option.
 ## Failures
 
 - Errors of your code and fatal Kafka errors go through Kafka Streams-style handlers: `deserializationExceptionHandler`, `processingExceptionHandler`, `productionExceptionHandler` (`'fail'` by default) and `uncaughtExceptionHandler` (`'shutdown'` by default, state `ERROR`). See [Error Handling](/flow/error-handling).
+- `SourceTopicNotFoundError` names what reads the missing topic, `readBy` (`{ subtopology }` or `{ globalStore }`), instead of `storeName`, which named an arbitrary store of the topology or none.
 - Infrastructure failures always recover: a send that failed after the producer's retries (at-least-once) revives the affected tasks in place, commit timeouts are retried at the next interval, and fencing, lost partitions and failed commits make the instance rejoin the group after a backoff.
 
 ## Testing

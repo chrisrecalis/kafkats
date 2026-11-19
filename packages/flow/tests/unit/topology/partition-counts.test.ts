@@ -30,18 +30,42 @@ describe('resolvePartitionCounts', () => {
 	})
 
 	it.each<Record<string, number>>([{}, { a: 0 }])(
-		'throws SourceTopicNotFoundError for a missing source topic (%o)',
+		'throws SourceTopicNotFoundError for a missing source topic (%o), naming its subtopology',
 		external => {
 			const b = builder()
 			chain(b, 'a', ['a'], 'p')
 			expect(() => counts(b, external)).toThrow(SourceTopicNotFoundError)
+			expect(() => counts(b, external)).toThrow(
+				expect.objectContaining({ topic: 'a', readBy: { subtopology: 0 } })
+			)
 		}
 	)
 
-	it('throws SourceTopicNotFoundError for a missing global topic', () => {
+	it('a missing source topic of a stateful subtopology names the subtopology, not a store or its changelog', () => {
+		const b = builder()
+		chain(b, 'x', ['x'], 'px')
+		b.addSource({ name: 'a', topics: ['a', 'b'], internal: false })
+		stateful(b, 'agg', ['a'])
+		expect(() => counts(b, { x: 1, a: 1 })).toThrow(
+			expect.objectContaining({
+				topic: 'b',
+				readBy: { subtopology: 1 },
+				message: 'Source topic "b" of subtopology 1 does not exist. Create it first.',
+			})
+		)
+	})
+
+	it('throws SourceTopicNotFoundError for a missing global topic, naming the global store', () => {
 		const b = builder()
 		b.addGlobalStore(globalStore('lookup', 'g'))
-		expect(() => counts(b, {})).toThrow(SourceTopicNotFoundError)
+		expect(() => counts(b, {})).toThrow(
+			expect.objectContaining({
+				name: 'SourceTopicNotFoundError',
+				topic: 'g',
+				readBy: { globalStore: 'lookup' },
+				message: 'Source topic "g" of global store "lookup" does not exist. Create it first.',
+			})
+		)
 	})
 
 	it('sizes a repartition topic by the max source count of its writer, through chained repartitions', () => {

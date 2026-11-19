@@ -387,6 +387,52 @@ describe.each(GUARANTEES)('stream-stream join results (%s)', (_guarantee, config
 })
 
 describe('stream-stream joins', () => {
+	it('the WithKey joins pass the key first: to matches of either side, closed unmatched records and KIP-962 results', async () => {
+		const keyed = (k: string | null, a: string | null, b: string | null) => `${k}:${a}+${b}`
+		const expected = {
+			joinWithKey: ['k:L+R', 'k:L+S'],
+			leftJoinWithKey: ['k:L+R', 'k:L+S', 'null:N+null', 'a:A+null'],
+			outerJoinWithKey: ['k:L+R', 'k:L+S', 'null:N+null', 'null:null+M', 'b:null+B', 'a:A+null'],
+		}
+		for (const kind of ['joinWithKey', 'leftJoinWithKey', 'outerJoinWithKey'] as const) {
+			const driver = new TestDriver()
+			const l = driver.input('l', S)
+			const r = driver.input('r', S)
+			const windows = JoinWindows.ofTimeDifferenceWithNoGrace(100)
+			const joined =
+				kind === 'joinWithKey'
+					? l.joinWithKey(r, keyed, windows)
+					: kind === 'leftJoinWithKey'
+						? l.leftJoinWithKey(r, keyed, windows)
+						: l.outerJoinWithKey(r, keyed, windows)
+			joined.to('out', S)
+			await driver.run(async ctx => {
+				await send(ctx, 'r', 'k', 'R', 100)
+				// A match the left side makes, then one the right side makes.
+				await send(ctx, 'l', 'k', 'L', 150)
+				await send(ctx, 'r', 'k', 'S', 160)
+				await send(ctx, 'l', 'a', 'A', 200)
+				await send(ctx, 'r', 'b', 'B', 200)
+				await ctx.send('l', Buffer.from('N'), { timestamp: 300 })
+				await ctx.send('r', Buffer.from('M'), { timestamp: 300 })
+				// Closes the windows of A and B.
+				await send(ctx, 'l', 'z', 'Z', 1000)
+				expect(values(ctx)).toEqual(expected[kind])
+			})
+		}
+		// join() never passes the key, whatever the joiner declares.
+		const driver = new TestDriver()
+		driver
+			.input('l', S)
+			.join(driver.input('r', S), keyed as never, JoinWindows.ofTimeDifferenceWithNoGrace(100))
+			.to('out', S)
+		await driver.run(async ctx => {
+			await send(ctx, 'l', 'k', 'L', 100)
+			await send(ctx, 'r', 'k', 'R', 100)
+			expect(values(ctx)).toEqual(['L:R+undefined'])
+		})
+	})
+
 	it('KF12: the repartition before a left join keeps null keys; the one before an inner join drops them', async () => {
 		const driver = new TestDriver()
 		// 'none' gets a null key, which the repartition topic before the join passes on.

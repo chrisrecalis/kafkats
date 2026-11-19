@@ -364,15 +364,16 @@ describe('changelog', () => {
 			expect(error.message).toContain('events')
 		})
 
-		it('SourceTopicNotFoundError names the topic and the store', () => {
-			const error = new SourceTopicNotFoundError('orders', 'order-counts')
+		it('SourceTopicNotFoundError names the topic and what reads it: a subtopology or a global store', () => {
+			const error = new SourceTopicNotFoundError('orders', { subtopology: 2 })
 			expect(error).toBeInstanceOf(Error)
 			expect(error.name).toBe('SourceTopicNotFoundError')
 			expect(error.topic).toBe('orders')
-			expect(error.storeName).toBe('order-counts')
-			expect(error.message).toContain('orders')
-			expect(error.message).toContain('order-counts')
-			expect(error.message).toContain('does not exist')
+			expect(error.readBy).toEqual({ subtopology: 2 })
+			expect(error.message).toBe('Source topic "orders" of subtopology 2 does not exist. Create it first.')
+			expect(new SourceTopicNotFoundError('users', { globalStore: 'users-store' }).message).toBe(
+				'Source topic "users" of global store "users-store" does not exist. Create it first.'
+			)
 		})
 	})
 })

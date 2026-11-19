@@ -79,7 +79,11 @@ export interface FlowConfig {
 	changelog?: {
 		/** Default replication factor of changelog and repartition topics. */
 		replicationFactor?: number
-		/** Applied to every changelog and repartition topic, below per-store configs. */
+		/**
+		 * Applied to every changelog and repartition topic, over the defaults and below a store's own `topicConfigs`.
+		 * A window or session store's changelog keeps its own `retention.ms` (the store's retention plus a day) unless
+		 * the store's own topicConfigs set one (Kafka Streams' `WindowedChangelogTopicConfig`).
+		 */
 		topicConfigs?: Record<string, string>
 		/** How changelogs are restored. */
 		restoration?: ChangelogRestorationOptions

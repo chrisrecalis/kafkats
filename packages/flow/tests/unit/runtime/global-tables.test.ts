@@ -215,7 +215,9 @@ describe('GlobalStateManager: bootstrap', () => {
 
 		const missing = new Harness()
 		missing.io.cluster.topics.delete('users')
-		await expect(missing.bootstrap()).rejects.toThrow(SourceTopicNotFoundError)
+		const failure = await missing.bootstrap().catch((error: unknown) => error)
+		expect(failure).toBeInstanceOf(SourceTopicNotFoundError)
+		expect(failure).toMatchObject({ topic: 'users', readBy: { globalStore: 'users' } })
 		await missing.stop()
 	})
 

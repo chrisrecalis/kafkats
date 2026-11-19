@@ -97,7 +97,10 @@ export function resolveChangelogConfig(changelog: boolean | ChangelogConfig | un
 /** What the changelog of every store of an application is resolved against. */
 export interface ChangelogDefaults {
 	readonly applicationId: string
-	/** `FlowConfig.changelog.topicConfigs`: applied over the defaults, below a store's own topic configs. */
+	/**
+	 * `FlowConfig.changelog.topicConfigs`: applied over the defaults, below a store's own topic configs and, for a
+	 * window or session store, below its retention (resolveStoreChangelog()).
+	 */
 	readonly topicConfigs?: Readonly<Record<string, string>>
 }
 

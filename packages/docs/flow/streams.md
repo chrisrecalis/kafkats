@@ -2,7 +2,7 @@
 
 A `KStream` is an unbounded stream of key-value records. Each record is an independent event: two records with the same key are two events, not an update of one row (that is a [KTable](/flow/tables)).
 
-Keys and values of a stream may be `null`: a record without a key, or a tombstone. Every stream callback takes `(key, value)` and sees `K | null` and `V | null`.
+Keys and values of a stream may be `null`: a record without a key, or a tombstone. Callbacks that receive the record (`filter()`, `map()`, `selectKey()`, `peek()`, ...) take `(key, value)` and see `K | null` and `V | null`. `mapValues()` and `flatMapValues()` take the value alone (their key-aware forms are `mapValuesWithKey()` and `flatMapValuesWithKey()`), and [joiners](/flow/joins) take the two values.
 
 ## Creating a Stream
 

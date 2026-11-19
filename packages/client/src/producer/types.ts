@@ -239,9 +239,6 @@ export type ProducerState = 'idle' | 'running' | 'stopping'
  */
 export type IdempotentState = 'idle' | 'initializing' | 'running' | 'fenced' | 'error'
 
-/**
- * Producer events
- */
 /** What is waiting inside a producer at one moment (see `Producer.metrics()`). */
 export interface ProducerMetrics {
 	/** Batches, records and bytes ready to send but waiting behind a request in flight for their partition. */
@@ -254,6 +251,9 @@ export interface ProducerMetrics {
 	unacknowledgedSends: number
 }
 
+/**
+ * Producer events
+ */
 export interface ProducerEvents {
 	error: [error: Error]
 	/**

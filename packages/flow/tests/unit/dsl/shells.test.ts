@@ -111,16 +111,57 @@ describe('DSL shells delegate every method to its operator builder', () => {
 		// Users hold the public interface, whose overloads type the arguments.
 		const api: KStream<string, number> = stream
 
-		api.join(other, inner, windows, options)
-		expect(streamStreamJoin.streamStreamJoin).toHaveBeenCalledWith(stream, 'inner', other, inner, windows, options)
-		api.leftJoin(other, left, { within: windows })
-		expect(streamStreamJoin.streamStreamJoin).toHaveBeenCalledWith(stream, 'left', other, left, { within: windows })
-		api.outerJoin(other, outer, windows)
-		expect(streamStreamJoin.streamStreamJoin).toHaveBeenCalledWith(stream, 'outer', other, outer, windows)
-
-		// join() and leftJoin() call a table joiner with the values only; the WithKey forms pass it on as it is.
+		// join(), leftJoin() and outerJoin() call a joiner with the values only; the WithKey forms pass it on as it is.
 		const joinerOf = (spy: unknown, at: number) =>
 			vi.mocked(spy as (...args: unknown[]) => unknown).mock.lastCall![at] as (...args: unknown[]) => unknown
+		api.join(other, inner, windows, options)
+		expect(streamStreamJoin.streamStreamJoin).toHaveBeenCalledWith(
+			stream,
+			'inner',
+			other,
+			expect.any(Function),
+			windows,
+			options
+		)
+		expect(joinerOf(streamStreamJoin.streamStreamJoin, 3)('k', 1, 2)).toBe(3)
+		api.leftJoin(other, left, { within: windows })
+		expect(streamStreamJoin.streamStreamJoin).toHaveBeenCalledWith(stream, 'left', other, expect.any(Function), {
+			within: windows,
+		})
+		expect(joinerOf(streamStreamJoin.streamStreamJoin, 3)('k', 1, null)).toBe(1)
+		api.outerJoin(other, outer, windows)
+		expect(streamStreamJoin.streamStreamJoin).toHaveBeenCalledWith(
+			stream,
+			'outer',
+			other,
+			expect.any(Function),
+			windows
+		)
+		expect(joinerOf(streamStreamJoin.streamStreamJoin, 3)('k', null, 2)).toBe(2)
+		const keyedInner = (key: string, value: number, otherValue: number) => `${key}${value}${otherValue}`
+		api.joinWithKey(other, keyedInner, windows, options)
+		expect(streamStreamJoin.streamStreamJoin).toHaveBeenCalledWith(
+			stream,
+			'inner',
+			other,
+			keyedInner,
+			windows,
+			options
+		)
+		const keyedStreams = (key: string | null, value: number | null, otherValue: number | null) =>
+			`${key}${value}${otherValue}`
+		api.leftJoinWithKey(other, keyedStreams, windows)
+		expect(streamStreamJoin.streamStreamJoin).toHaveBeenCalledWith(stream, 'left', other, keyedStreams, windows)
+		api.outerJoinWithKey(other, keyedStreams, windows)
+		expect(streamStreamJoin.streamStreamJoin).toHaveBeenCalledWith(
+			stream,
+			'outer',
+			other,
+			keyedStreams,
+			windows,
+			undefined
+		)
+
 		api.join(table, inner, options)
 		expect(streamTableJoin.streamTableJoin).toHaveBeenCalledWith(
 			stream,

@@ -58,7 +58,7 @@ const users = app.table('users', { key: string(), value: json<{ name: string }>(
 app.stream(pageViews).groupByKey().count().toStream().to('page-views-per-user')
 ```
 
-Every callback takes `(key, value)`. In a stream, keys and values may be `null` (a record without a key, a tombstone), so stream callbacks see `K | null` and `V | null`.
+Callbacks that receive the record, such as `filter()`'s predicate, take `(key, value)`. In a stream, keys and values may be `null` (a record without a key, a tombstone), so they see `K | null` and `V | null`. `mapValues()` and `flatMapValues()` take the value alone, as above (`mapValuesWithKey()` and `flatMapValuesWithKey()` take the key too), and joiners take the two values (see [Joins](/flow/joins)).
 
 `to()` writes with the codecs of its options, else the ones the stream knows; `count()` results are int64 numbers, so `page-views-per-user` above gets string keys and 8-byte big-endian counts. See [Operations](/flow/operations#how-codecs-are-resolved).
 
