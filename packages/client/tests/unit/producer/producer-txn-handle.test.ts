@@ -164,11 +164,43 @@ describe('Producer.beginTransaction()', () => {
 
 			const producer = makeProducer()
 			const tx = await producer.beginTransaction()
-			void tx.send(TOPIC, { value }).catch(() => {})
+			const sent = tx.send(TOPIC, { value })
 			await vi.waitFor(() => expect(mocks.leader.produce).toHaveBeenCalled())
 
 			await tx.abort()
 			expect(events).toEqual(['produce:settled', 'endTxn'])
+			// A produce already sent settles with the broker's answer (Java); the abort marker discards its records.
+			await expect(sent).resolves.toMatchObject({ topic: TOPIC, partition: 0 })
+		})
+
+		it('lets a produce already sent retry before EndTxn(abort), like the Java client (its sequence is taken)', async () => {
+			const events: string[] = []
+			let firstSent!: () => void
+			const sentOnce = new Promise<void>(resolve => (firstSent = resolve))
+			const answer = (errorCode: ErrorCode) =>
+				buildProduceResponse([{ name: TOPIC, partitions: [{ partitionIndex: 0, errorCode }] }])
+			mocks.leader.produce
+				.mockImplementationOnce(async () => {
+					events.push('produce')
+					firstSent()
+					return answer(ErrorCode.NotLeaderOrFollower)
+				})
+				.mockImplementationOnce(async () => {
+					events.push('produce (retry)')
+					return answer(ErrorCode.None)
+				})
+			mocks.txnCoordinator.endTxn.mockImplementation(async () => {
+				events.push('endTxn')
+				return { throttleTimeMs: 0, errorCode: ErrorCode.None }
+			})
+			const producer = makeProducer({ retryBackoffMs: 100 })
+			const tx = await producer.beginTransaction()
+			const sent = tx.send(TOPIC, { value })
+			await sentOnce
+
+			await tx.abort()
+			expect(events).toEqual(['produce', 'produce (retry)', 'endTxn'])
+			await expect(sent).resolves.toMatchObject({ topic: TOPIC, partition: 0 })
 		})
 
 		it('is triggered by the begin signal, and passes the turn on', async () => {
@@ -223,9 +255,15 @@ describe('Producer.beginTransaction()', () => {
 			const tx = await producer.beginTransaction()
 			await tx.send(TOPIC, { value })
 
-			await expect(tx.abort({ timeoutMs: 30 })).rejects.toThrow(TimeoutError)
+			const aborting = tx.abort({ timeoutMs: 30 })
+			// Called while the first one runs: it rejects too once that failed (Java rethrows in an error state).
+			const again = tx.abort()
+			await expect(aborting).rejects.toThrow(TimeoutError)
+			await expect(again).rejects.toMatchObject({ name: 'InvalidTxnStateError', currentState: 'error' })
 			expect(producer.transactionState).toBe('error')
+			await expect(tx.abort()).rejects.toMatchObject({ name: 'InvalidTxnStateError', currentState: 'error' })
 			await expect(producer.beginTransaction()).rejects.toThrow(InvalidTxnStateError)
+			expect(mocks.txnCoordinator.endTxn).toHaveBeenCalledTimes(1)
 			await expect(producer.disconnect()).resolves.toBeUndefined()
 		})
 	})
@@ -284,6 +322,35 @@ describe('Producer.beginTransaction()', () => {
 			)
 			expect(transactionalIds).toEqual(new Set(['tx-1', 'tx-1-1']))
 		})
+
+		it('a pooled producer with a fenced lane begins nothing any more; a transaction open on another lane still commits', async () => {
+			const producer = makeProducer({ transactionConcurrency: 2 })
+			const healthy = await producer.beginTransaction()
+			await healthy.send(TOPIC, { value })
+			const doomed = await producer.beginTransaction()
+			mocks.leader.produce.mockResolvedValueOnce(
+				buildProduceResponse([
+					{ name: TOPIC, partitions: [{ partitionIndex: 0, errorCode: ErrorCode.ProducerFenced }] },
+				])
+			)
+			const fenced = await doomed.send(TOPIC, { value }).catch((e: unknown) => e)
+			expect(fenced).toBeInstanceOf(ProducerFencedError)
+			expect(producer.transactionState).toBe('error')
+
+			await expect(doomed.abort()).rejects.toBe(fenced)
+			await healthy.commit()
+			expect(producer.transactionState).toBe('error')
+			// Both lanes are free, one of them healthy: like a single producer in the 'error' state, the pool refuses.
+			const concurrent = await Promise.all(
+				[0, 1].map(() => producer.transaction(async tx => void (await tx.send(TOPIC, { value }))).catch(e => e))
+			)
+			expect(concurrent).toEqual([fenced, fenced])
+			await expect(producer.beginTransaction()).rejects.toBe(fenced)
+			expect(mocks.txnCoordinator.initProducerId).toHaveBeenCalledTimes(2)
+			expect(mocks.txnCoordinator.endTxn).toHaveBeenCalledExactlyOnceWith(
+				expect.objectContaining({ committed: true })
+			)
+		})
 	})
 
 	describe('commit outcome under timeoutMs and signal', () => {
@@ -300,7 +367,39 @@ describe('Producer.beginTransaction()', () => {
 			// The commit may have been applied: no abort is attempted.
 			expect(mocks.txnCoordinator.endTxn).toHaveBeenCalledTimes(1)
 			expect(producer.transactionState).toBe('error')
-			await expect(tx.abort()).resolves.toBeUndefined()
+			// Not aborted: the broker may have committed it (Java refuses an abort after a commit that timed out).
+			await expect(tx.abort()).rejects.toMatchObject({ name: 'InvalidTxnStateError', currentState: 'error' })
+			expect(mocks.txnCoordinator.endTxn).toHaveBeenCalledTimes(1)
+		})
+
+		it('abort() rejects after a commit whose EndTxn lost its connection, and sends nothing', async () => {
+			mocks.txnCoordinator.endTxn.mockRejectedValue(new ConnectionClosedError('connection lost'))
+			const producer = makeProducer()
+			const tx = await producer.beginTransaction()
+			await tx.send(TOPIC, { value })
+
+			const error = await tx.commit().catch((e: unknown) => e)
+			expect(error).toMatchObject({ name: 'TransactionAbortedError', outcome: 'unknown' })
+			const sent = mocks.txnCoordinator.endTxn.mock.calls.length
+			expect(mocks.txnCoordinator.endTxn.mock.calls.every(([r]) => r.committed)).toBe(true)
+
+			await expect(tx.abort()).rejects.toMatchObject({ name: 'InvalidTxnStateError', currentState: 'error' })
+			expect(mocks.txnCoordinator.endTxn).toHaveBeenCalledTimes(sent)
+			expect(producer.transactionState).toBe('error')
+		})
+
+		it('a timeoutMs of Infinity puts no deadline on the commit', async () => {
+			mocks.txnCoordinator.endTxn.mockImplementation(async () => {
+				// Later than a timer armed with Infinity, which Node runs after 1 ms.
+				await tick(5)
+				return { throttleTimeMs: 0, errorCode: ErrorCode.None }
+			})
+			const producer = makeProducer()
+			const tx = await producer.beginTransaction()
+			await tx.send(TOPIC, { value })
+
+			await expect(tx.commit({ timeoutMs: Infinity })).resolves.toBeUndefined()
+			expect(producer.transactionState).toBe('idle')
 		})
 
 		it('sends no EndTxn once the signal aborts the commit before it', async () => {
@@ -642,6 +741,122 @@ describe('Producer.beginTransaction()', () => {
 					'EndTxn(abort, 0)',
 					`InitProducerId(1, 0): ${ErrorCode[errorCode]}`,
 				])
+			})
+		})
+
+		/**
+		 * INVALID_PRODUCER_ID_MAPPING: the coordinator maps the transactional id to no producer id any more (it expired)
+		 * or to another one. Java's abortableErrorIfPossible: the abort skips EndTxn, which the coordinator rejects too,
+		 * and InitProducerId bumps the epoch (with no mapping: a new producer id, epoch 0).
+		 */
+		describe('INVALID_PRODUCER_ID_MAPPING (the transactional id expired)', () => {
+			/** A transaction committed, then the transactional id expired. */
+			async function expired() {
+				const producer = makeProducer()
+				const errors: unknown[] = []
+				producer.on('error', error => errors.push(error))
+				const first = await producer.beginTransaction()
+				await first.send(TOPIC, { value, partition: 0 })
+				await first.commit()
+				coordinator.expire()
+				return { producer, errors }
+			}
+			const committed = ['InitProducerId()', 'AddPartitionsToTxn(0)', 'EndTxn(commit, 0)']
+
+			/** The next transaction runs under producer id 2. */
+			async function runsUnderNewProducerId(producer: Producer) {
+				const next = await producer.beginTransaction()
+				await next.send(TOPIC, { value, partition: 0 })
+				await next.commit()
+				expect(coordinator.requests.slice(-2)).toEqual(['AddPartitionsToTxn(0)', 'EndTxn(commit, 0)'])
+				expect((await produced()).at(-1)).toBe('pid 2 epoch 0 transactional')
+				expect(mocks.txnCoordinator.endTxn).toHaveBeenLastCalledWith(
+					expect.objectContaining({ producerId: 2n, producerEpoch: 0, committed: true })
+				)
+			}
+
+			it.each([
+				{
+					request: 'AddPartitionsToTxn',
+					register: (tx: TransactionHandle) => tx.send(TOPIC, { value, partition: 0 }),
+				},
+				{
+					request: 'AddOffsetsToTxn',
+					register: (tx: TransactionHandle) => tx.sendOffsets({ groupId: 'g1', offsets }),
+				},
+			])(
+				'to $request fails the epoch: the abort skips EndTxn and gets a new producer id',
+				async ({ request, register }) => {
+					const { producer, errors } = await expired()
+					const tx = await producer.beginTransaction()
+
+					const failed = await caught(register(tx))
+					expect(failed).toBeInstanceOf(TransactionAbortedError)
+					expect(failed).toMatchObject({ cause: { errorCode: ErrorCode.InvalidProducerIdMapping } })
+					await expect(tx.send(TOPIC, { value, partition: 1 })).rejects.toThrow(TransactionAbortedError)
+					expect(producer.transactionState).toBe('in_transaction')
+
+					await tx.abort()
+					expect(producer.transactionState).toBe('idle')
+					expect(coordinator.requests).toEqual([
+						...committed,
+						`${request}(0): InvalidProducerIdMapping`,
+						'InitProducerId(1, 0)',
+					])
+					await runsUnderNewProducerId(producer)
+					expect(errors).toEqual([])
+				}
+			)
+
+			it.each(['commit', 'abort'] as const)(
+				'to EndTxn(%s) of a transaction that timed out: no EndTxn more, and a new producer id',
+				async end => {
+					const producer = makeProducer()
+					const tx = await producer.beginTransaction()
+					await tx.send(TOPIC, { value, partition: 0 })
+					// The broker aborts the transaction after transactionTimeoutMs, then the id expires.
+					coordinator.expire()
+
+					const ended = await caught(tx[end]())
+					if (end === 'commit') {
+						expect(ended).toBeInstanceOf(TransactionAbortedError)
+						expect(ended).toMatchObject({
+							outcome: 'aborted',
+							cause: { errorCode: ErrorCode.InvalidProducerIdMapping },
+						})
+					} else {
+						expect(ended).toBeUndefined()
+					}
+					expect(coordinator.requests).toEqual([
+						'InitProducerId()',
+						'AddPartitionsToTxn(0)',
+						`EndTxn(${end}, 0): InvalidProducerIdMapping`,
+						'InitProducerId(1, 0)',
+					])
+					expect(producer.transactionState).toBe('idle')
+					await runsUnderNewProducerId(producer)
+				}
+			)
+
+			it("a successor holding another producer id fences the bump, which leaves the successor's transaction alone", async () => {
+				const { producer, errors } = await expired()
+				coordinator.successor()
+				coordinator.successorBegins()
+				const tx = await producer.beginTransaction()
+				await caught(tx.send(TOPIC, { value, partition: 0 }))
+
+				const fenced = await caught(tx.abort())
+				expect(fenced).toBeInstanceOf(ProducerFencedError)
+				expect(producer.transactionState).toBe('error')
+				expect(errors).toEqual([fenced])
+				await expect(producer.beginTransaction()).rejects.toBe(fenced)
+				expect(coordinator.requests).toEqual([
+					...committed,
+					'AddPartitionsToTxn(0): InvalidProducerIdMapping',
+					'InitProducerId(1, 0): ProducerFenced',
+				])
+				expect(coordinator.fenceAborts).toBe(0)
+				expect(coordinator.successorEndTxn(true)).toBe(ErrorCode.None)
 			})
 		})
 

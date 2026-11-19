@@ -83,6 +83,8 @@ export interface ProducerConfig {
 	 * - Transactional-ID zombie fencing applies per lane. For consume-transform-produce,
 	 *   pass `consumerGroupMetadata` to sendOffsets() (KIP-447) so zombie commits are
 	 *   fenced by consumer group generation regardless of which lane they ran on.
+	 * - Once a lane is fenced (or otherwise in the 'error' state), so is the pool: it begins
+	 *   no transaction any more, like a single producer in that state; replace it.
 	 * - Requires transactionalId. Only affects transaction().
 	 */
 	transactionConcurrency?: number
@@ -125,10 +127,13 @@ export interface ProducerConfig {
 	 * retrying coordinator discovery and InitProducerId before failing with a `TimeoutError`
 	 * (default: 60000), requests in flight included. A timed-out initialization is tried again by
 	 * the next send or transaction, which first awaits an InitProducerId left unanswered (Java).
-	 * A coordinator lookup that answers once the initialization timed out (or the producer
-	 * disconnected) sends no InitProducerId: it would bump the epoch of the transactional id
-	 * behind a producer that replaced this one. One already sent may still be applied, like in
-	 * the Java client.
+	 * A coordinator lookup that answers once the initialization gave up (timed out, the signal of
+	 * the `beginTransaction()` waiting for it aborted, or the producer disconnected) sends no
+	 * InitProducerId: it would bump the epoch of the transactional id behind a producer that
+	 * replaced this one. One already sent may still be applied, like in the Java client.
+	 *
+	 * It also bounds the epoch bump of an abort (InitProducerId after a failed epoch). A bump that
+	 * times out is not tried again: the abort rejects and the producer is in the 'error' state.
 	 */
 	maxBlockMs?: number
 }
@@ -345,10 +350,11 @@ export interface ProducerCallOptions {
  */
 export interface BeginTransactionOptions {
 	/**
-	 * Aborting it rejects a call still waiting to begin, and aborts the transaction once it is open, until
-	 * `commit()` or `abort()` is called on the handle; from then on it has no effect, and those calls are bounded
-	 * only by their own `timeoutMs` and `signal`. Without it, an open transaction has no client-side timeout (the
-	 * broker's `transactionTimeoutMs` applies).
+	 * Aborting it rejects a call still waiting to begin (also stopping the producer's initialization that call waits
+	 * for: no InitProducerId is sent after it, though one already sent may still be applied), and aborts the
+	 * transaction once it is open, until `commit()` or `abort()` is called on the handle; from then on it has no
+	 * effect, and those calls are bounded only by their own `timeoutMs` and `signal`. Without it, an open transaction
+	 * has no client-side timeout (the broker's `transactionTimeoutMs` applies).
 	 */
 	signal?: AbortSignal
 }
@@ -449,18 +455,22 @@ export interface TransactionHandle extends ProducerTransaction {
 	/**
 	 * Abort: reject the queued sends, wait for those in flight, EndTxn(abort)
 	 *
-	 * Sends and offset registrations still in progress start no request any more; records not
-	 * sent yet are rejected; a request already sent is awaited (so that EndTxn follows it), and
-	 * what it is answered is not added: they reject with `TransactionAbortedError`. Nothing of the
-	 * transaction reaches the next one. EndTxn is sent once the coordinator may have begun the
-	 * transaction, also when the answer to a registration was lost (then a coordinator that never
-	 * began it answers INVALID_TXN_STATE, and the abort resolves).
+	 * Offset registrations, and sends whose records were not taken for sending yet, start no
+	 * request any more and reject with `TransactionAbortedError`, also when a registration already
+	 * sent is answered afterwards (what it added is not used); their records are dropped. A produce
+	 * request already sent, and its retries, is awaited (EndTxn follows it), and its send resolves
+	 * or rejects with the broker's answer, like in the Java client (the abort marker discards its
+	 * records). Nothing of the transaction reaches the next one. EndTxn is sent once the
+	 * coordinator may have begun the transaction, also when the answer to a registration was lost
+	 * (then a coordinator that never began it answers INVALID_TXN_STATE, and the abort resolves).
 	 *
 	 * When the producer's epoch failed during the transaction (an out-of-order sequence, a send
-	 * whose outcome its retries left unknown, InvalidProducerEpoch on a produce), its sends were
-	 * rejected and nothing more went out; after EndTxn, InitProducerId bumps the epoch (Java
-	 * parity), and the producer runs the next transaction under the new one (`disconnect()` skips
-	 * the bump, also one in progress).
+	 * whose outcome its retries left unknown, InvalidProducerEpoch on a produce, or
+	 * INVALID_PRODUCER_ID_MAPPING from the coordinator: the transactional id expired), its sends
+	 * were rejected and nothing more went out; after EndTxn (skipped for INVALID_PRODUCER_ID_MAPPING,
+	 * which the coordinator answers EndTxn too), InitProducerId bumps the epoch (Java parity; once the
+	 * id expired, it gets a new producer id), and the producer runs the next transaction under the
+	 * new one (`disconnect()` skips the bump, also one in progress).
 	 *
 	 * If that does not finish (EndTxn or the bump fails, `timeoutMs` passes or `signal` aborts),
 	 * the producer enters the 'error' state and this rejects. A fenced producer (another one with
@@ -469,9 +479,10 @@ export interface TransactionHandle extends ProducerTransaction {
 	 * coordinator) is in the 'error' state for good, never initialized again: this sends nothing
 	 * (the broker aborted the transaction) and rejects with the `ProducerFencedError`, also once
 	 * the transaction ended, like every later call of the handle and every later begin; replace
-	 * the producer. Otherwise it resolves once that settled when the transaction already ended or
-	 * is ending without a commit, and rejects with `InvalidTxnStateError` while committing or once
-	 * committed.
+	 * the producer. Otherwise, on a transaction that already ended or is ending, it resolves once
+	 * that aborted it, and rejects with `InvalidTxnStateError` while committing, once committed, and
+	 * once it ended in the 'error' state: its abort did not finish, or its commit's outcome is
+	 * unknown (the broker may have committed it; Java refuses that abort too).
 	 */
 	abort(options?: ProducerCallOptions): Promise<void>
 }

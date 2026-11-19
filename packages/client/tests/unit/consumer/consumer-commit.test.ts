@@ -133,6 +133,26 @@ describe('Consumer.commit() and committed()', () => {
 		await run
 	})
 
+	it('defaultApiTimeoutMs and timeoutMs of Infinity put no deadline on the committed offsets of a rebalance and of committed()', async () => {
+		const broker = fakeBroker()
+		broker.committed.set(0, { offset: 2n, metadata: 'meta' })
+		// Every OffsetFetch answers after 5 ms, later than a timer armed with Infinity, which Node runs after 1 ms.
+		Object.defineProperty(broker.gates, 'offsetFetch', { get: () => sleep(5) })
+		const consumer = groupConsumer(broker, { defaultApiTimeoutMs: Infinity })
+		const { run, assigned } = await Promise.race([
+			running(consumer),
+			sleep(1_000).then(() => Promise.reject(new Error('the rebalance did not fetch the committed offsets'))),
+		])
+
+		const committed = { offset: 2n, metadata: 'meta' }
+		expect(assigned).toContainEqual({ ...tp(0), offset: 2n, committed })
+		expect(await consumer.committed([tp(0)])).toEqual(new Map([[`${TOPIC}:0`, committed]]))
+		expect(await consumer.committed([tp(0)], { timeoutMs: Infinity })).toEqual(new Map([[`${TOPIC}:0`, committed]]))
+
+		consumer.stop()
+		await run
+	})
+
 	it('gives each assigned partition its committed offset and metadata, or null', async () => {
 		const broker = fakeBroker()
 		broker.produce(1, 4)

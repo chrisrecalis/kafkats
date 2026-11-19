@@ -321,6 +321,63 @@ describe('Producer InitProducerId retries CoordinatorLoadInProgress', () => {
 			expect(txnCoordinator.initProducerId).not.toHaveBeenCalled()
 		})
 
+		it("a lookup answering after a begin's signal aborted sends no InitProducerId; the next begin looks up again", async () => {
+			txnCoordinator.initProducerId.mockResolvedValue(ok)
+			const lookup = holdLookup()
+			const producer = transactional({ maxBlockMs: 60_000 })
+			const controller = new AbortController()
+			const begin = producer.beginTransaction({ signal: controller.signal })
+			await vi.waitFor(() => expect(mockCluster.getCoordinator).toHaveBeenCalled())
+
+			controller.abort(new Error('gave up'))
+			await expect(begin).rejects.toThrow('gave up')
+			lookup.release()
+			await new Promise(resolve => setTimeout(resolve, 20))
+			expect(txnCoordinator.initProducerId).not.toHaveBeenCalled()
+
+			const transaction = await producer.beginTransaction()
+			expect(mockCluster.getCoordinator).toHaveBeenCalledTimes(2)
+			expect(txnCoordinator.initProducerId).toHaveBeenCalledTimes(1)
+			await transaction.abort()
+			await producer.disconnect({ timeoutMs: 100 })
+		})
+
+		it("a begin's signal stops the retries of the initialization", async () => {
+			txnCoordinator.initProducerId.mockResolvedValue({ ...ok, errorCode: ErrorCode.ConcurrentTransactions })
+			const producer = transactional({ maxBlockMs: 60_000 })
+			const controller = new AbortController()
+			const begin = producer.beginTransaction({ signal: controller.signal })
+			await vi.waitFor(() => expect(txnCoordinator.initProducerId.mock.calls.length).toBeGreaterThanOrEqual(2))
+
+			controller.abort(new Error('gave up'))
+			await expect(begin).rejects.toThrow('gave up')
+			const calls = txnCoordinator.initProducerId.mock.calls.length
+			await new Promise(resolve => setTimeout(resolve, 50))
+			expect(txnCoordinator.initProducerId).toHaveBeenCalledTimes(calls)
+			await producer.disconnect({ timeoutMs: 100 })
+		})
+
+		it("an InitProducerId sent before a begin's signal aborted is awaited by the next begin instead of sending another", async () => {
+			let answer!: (response: typeof ok) => void
+			txnCoordinator.initProducerId.mockImplementationOnce(
+				() => new Promise<typeof ok>(resolve => (answer = resolve))
+			)
+			const producer = transactional({ maxBlockMs: 60_000 })
+			const controller = new AbortController()
+			const begin = producer.beginTransaction({ signal: controller.signal })
+			await vi.waitFor(() => expect(txnCoordinator.initProducerId).toHaveBeenCalledTimes(1))
+
+			controller.abort(new Error('gave up'))
+			await expect(begin).rejects.toThrow('gave up')
+			const next = producer.beginTransaction()
+			await new Promise(resolve => setTimeout(resolve, 20))
+			expect(txnCoordinator.initProducerId).toHaveBeenCalledTimes(1)
+			answer(ok)
+			await (await next).abort()
+			expect(txnCoordinator.initProducerId).toHaveBeenCalledTimes(1)
+			await producer.disconnect({ timeoutMs: 100 })
+		})
+
 		it('a lookup answering once maxBlockMs passed sends nothing, even before the deadline timer ran', async () => {
 			vi.useFakeTimers({ toFake: ['Date'] })
 			try {

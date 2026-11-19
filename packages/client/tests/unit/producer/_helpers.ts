@@ -85,23 +85,28 @@ type TransactionalMocks = ReturnType<typeof createTransactionalMocks>
 type TransactionStatus = 'Empty' | 'Ongoing' | 'PrepareCommit' | 'PrepareAbort' | 'CompleteCommit' | 'CompleteAbort'
 
 /**
- * The transaction coordinator of one transactional id (producer id 1) and the partition leader, after Kafka 3.9
+ * The transaction coordinator of one transactional id and the partition leader, after Kafka 3.9
  * (TransactionCoordinator.handleInitProducerId, prepareInitProducerIdTransit, endTransaction,
  * handleAddPartitionsToTransaction; TransactionMetadata.prepareFenceProducerEpoch, prepareIncrementProducerEpoch),
  * installed on the mocks:
  *
+ * - The first InitProducerId creates the transactional id's metadata with a new producer id (1, then 2, ...) and no
+ *   epoch yet; so does one sent once the id expired (`expire()`).
+ * - InitProducerId with a producer id other than the metadata's is PRODUCER_FENCED, unless the metadata has no epoch
+ *   yet (it was just created: Kafka's `isValidProducerId`).
  * - InitProducerId during an ongoing transaction fences its epoch: the coordinator aborts the transaction under
  *   epoch + 1 and forgets the last epoch, answering CONCURRENT_TRANSACTIONS, so a retry with the epoch of before is
  *   PRODUCER_FENCED. It only checks the producer id, so a fenced producer's InitProducerId aborts its successor's
  *   ongoing transaction (`fenceAborts` counts those aborts).
  * - InitProducerId with the current epoch bumps it, with the last one (a retry) answers the current one, with another
  *   one is PRODUCER_FENCED; without an identity (a new producer) it bumps the epoch.
- * - EndTxn, AddPartitionsToTxn and AddOffsetsToTxn require the current epoch (else PRODUCER_FENCED). EndTxn of a
- *   transaction that was never ongoing is INVALID_TXN_STATE (unless it repeats the outcome it completed with).
+ * - EndTxn, AddPartitionsToTxn and AddOffsetsToTxn require the metadata's producer id (else, or once the id expired,
+ *   INVALID_PRODUCER_ID_MAPPING) and the current epoch (else PRODUCER_FENCED). EndTxn of a transaction that was never
+ *   ongoing is INVALID_TXN_STATE (unless it repeats the outcome it completed with).
  * - Markers are written lazily: the first request after EndTxn or a fence (whose epoch is current) is answered
  *   CONCURRENT_TRANSACTIONS and completes them.
- * - The leader rejects a batch whose epoch is below that of the last markers with INVALID_PRODUCER_EPOCH (KIP-588);
- *   answers queued with `mockResolvedValueOnce` take precedence.
+ * - The leader rejects a batch whose epoch is below that of the last markers of its producer id with
+ *   INVALID_PRODUCER_EPOCH (KIP-588); answers queued with `mockResolvedValueOnce` take precedence.
  *
  * `successor()` is a new producer with the same transactional id initializing, `successorBegins()` its first
  * AddPartitionsToTxn, `successorEndTxn()` its EndTxn. `requests` lists what this producer sent, with the answers.
@@ -110,18 +115,22 @@ type TransactionStatus = 'Empty' | 'Ongoing' | 'PrepareCommit' | 'PrepareAbort' 
  */
 export function modelTransactions({ txnCoordinator, leader }: Pick<TransactionalMocks, 'txnCoordinator' | 'leader'>) {
 	const model = {
+		/** The producer id of the transactional id's metadata; null before the first InitProducerId and once expired. */
+		producerId: null as bigint | null,
 		epoch: -1,
 		lastEpoch: -1,
 		status: 'Empty' as TransactionStatus,
 		staleEpochError: ErrorCode.ProducerFenced as ErrorCode,
-		/** Epoch of the last transaction markers written. */
+		/** Producer id and epoch of the last transaction markers written. */
+		markerProducerId: -1n,
 		markerEpoch: -1,
-		/** Ongoing transactions aborted by an InitProducerId that fenced their epoch. */
+		/** Ongoing transactions aborted by an InitProducerId that fenced their epoch, or by their timeout. */
 		fenceAborts: 0,
 		requests: [] as string[],
 		/** The epoch the last `successor()` initialized with. */
 		successorEpoch: -1,
 		successor(): number {
+			create()
 			completeMarkers()
 			if (model.status === 'Ongoing') fenceOngoing()
 			completeMarkers()
@@ -130,16 +139,38 @@ export function modelTransactions({ txnCoordinator, leader }: Pick<Transactional
 			return model.epoch
 		},
 		successorBegins(): void {
-			if (add(model.successorEpoch) !== ErrorCode.None) throw new Error('the successor could not begin')
+			if (add(model.producerId!, model.successorEpoch) !== ErrorCode.None) {
+				throw new Error('the successor could not begin')
+			}
 		},
 		successorEndTxn(committed: boolean): ErrorCode {
-			return endTxn(model.successorEpoch, committed)
+			return endTxn(model.producerId!, model.successorEpoch, committed)
+		},
+		/**
+		 * The transactional id expires (`transactional.id.expiration.ms` without a transaction): the coordinator forgets
+		 * its metadata. A transaction still ongoing timed out before (aborted under epoch + 1, like a fence).
+		 */
+		expire(): void {
+			completeMarkers()
+			if (model.status === 'Ongoing') fenceOngoing()
+			completeMarkers()
+			model.producerId = null
 		},
 	}
 
+	let nextProducerId = 1n
+	/** Metadata for a transactional id that has none: a new producer id, no epoch yet. */
+	const create = (): void => {
+		if (model.producerId !== null) return
+		model.producerId = nextProducerId++
+		model.epoch = -1
+		model.lastEpoch = -1
+		model.status = 'Empty'
+	}
 	const completeMarkers = (): boolean => {
 		if (model.status !== 'PrepareCommit' && model.status !== 'PrepareAbort') return false
 		model.status = model.status === 'PrepareCommit' ? 'CompleteCommit' : 'CompleteAbort'
+		model.markerProducerId = model.producerId!
 		model.markerEpoch = model.epoch
 		return true
 	}
@@ -154,7 +185,8 @@ export function modelTransactions({ txnCoordinator, leader }: Pick<Transactional
 		model.epoch += 1
 		model.status = 'Empty'
 	}
-	const endTxn = (epoch: number, committed: boolean): ErrorCode => {
+	const endTxn = (producerId: bigint, epoch: number, committed: boolean): ErrorCode => {
+		if (producerId !== model.producerId) return ErrorCode.InvalidProducerIdMapping
 		if (epoch !== model.epoch) return model.staleEpochError
 		if (completeMarkers()) return ErrorCode.ConcurrentTransactions
 		if (model.status === 'Ongoing') {
@@ -166,7 +198,8 @@ export function modelTransactions({ txnCoordinator, leader }: Pick<Transactional
 			: ErrorCode.InvalidTxnState
 	}
 	/** AddPartitionsToTxn and AddOffsetsToTxn. */
-	const add = (epoch: number): ErrorCode => {
+	const add = (producerId: bigint, epoch: number): ErrorCode => {
+		if (producerId !== model.producerId) return ErrorCode.InvalidProducerIdMapping
 		if (epoch !== model.epoch) return model.staleEpochError
 		if (completeMarkers()) return ErrorCode.ConcurrentTransactions
 		model.status = 'Ongoing'
@@ -182,9 +215,13 @@ export function modelTransactions({ txnCoordinator, leader }: Pick<Transactional
 		const answer = (errorCode: ErrorCode) => ({
 			throttleTimeMs: 0,
 			errorCode: record(`InitProducerId(${identity})`, errorCode),
-			producerId: errorCode === ErrorCode.None ? 1n : -1n,
+			producerId: errorCode === ErrorCode.None ? model.producerId! : -1n,
 			producerEpoch: errorCode === ErrorCode.None ? model.epoch : -1,
 		})
+		create()
+		if (producerId !== undefined && producerId !== model.producerId && model.epoch !== -1) {
+			return answer(ErrorCode.ProducerFenced)
+		}
 		if (completeMarkers()) return answer(ErrorCode.ConcurrentTransactions)
 		if (model.status === 'Ongoing') {
 			fenceOngoing()
@@ -197,15 +234,15 @@ export function modelTransactions({ txnCoordinator, leader }: Pick<Transactional
 		}
 		return answer(ErrorCode.None)
 	})
-	txnCoordinator.endTxn.mockImplementation(async ({ producerEpoch, committed }) => ({
+	txnCoordinator.endTxn.mockImplementation(async ({ producerId, producerEpoch, committed }) => ({
 		throttleTimeMs: 0,
 		errorCode: record(
 			`EndTxn(${committed ? 'commit' : 'abort'}, ${producerEpoch})`,
-			endTxn(producerEpoch, committed)
+			endTxn(producerId, producerEpoch, committed)
 		),
 	}))
-	txnCoordinator.addPartitionsToTxn.mockImplementation(async ({ producerEpoch, topics }) => {
-		const errorCode = record(`AddPartitionsToTxn(${producerEpoch})`, add(producerEpoch))
+	txnCoordinator.addPartitionsToTxn.mockImplementation(async ({ producerId, producerEpoch, topics }) => {
+		const errorCode = record(`AddPartitionsToTxn(${producerEpoch})`, add(producerId, producerEpoch))
 		return {
 			throttleTimeMs: 0,
 			errorCode: ErrorCode.None,
@@ -215,22 +252,23 @@ export function modelTransactions({ txnCoordinator, leader }: Pick<Transactional
 			})),
 		}
 	})
-	txnCoordinator.addOffsetsToTxn.mockImplementation(async ({ producerEpoch }) => ({
+	txnCoordinator.addOffsetsToTxn.mockImplementation(async ({ producerId, producerEpoch }) => ({
 		throttleTimeMs: 0,
-		errorCode: record(`AddOffsetsToTxn(${producerEpoch})`, add(producerEpoch)),
+		errorCode: record(`AddOffsetsToTxn(${producerEpoch})`, add(producerId, producerEpoch)),
 	}))
 	leader.produce.mockImplementation(async ({ topics }) => {
 		const answers = await Promise.all(
 			topics.map(async ({ name, partitions }) => ({
 				name,
 				partitions: await Promise.all(
-					partitions.map(async ({ partitionIndex, records }) => ({
-						partitionIndex,
-						errorCode:
-							(await decodeRecordBatch(records)).producerEpoch < model.markerEpoch
-								? ErrorCode.InvalidProducerEpoch
-								: ErrorCode.None,
-					}))
+					partitions.map(async ({ partitionIndex, records }) => {
+						const { producerId, producerEpoch } = await decodeRecordBatch(records)
+						const superseded = producerId === model.markerProducerId && producerEpoch < model.markerEpoch
+						return {
+							partitionIndex,
+							errorCode: superseded ? ErrorCode.InvalidProducerEpoch : ErrorCode.None,
+						}
+					})
 				),
 			}))
 		)
