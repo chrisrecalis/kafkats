@@ -4,17 +4,16 @@ import { Cluster } from '@/client/cluster.js'
 import { Broker } from '@/client/broker.js'
 import {
 	BrokerNotAvailableError,
-	ConnectionError,
 	CoordinatorNotAvailableError,
-	KafkaProtocolError,
 	LeaderNotAvailableError,
 	NoBrokersAvailableError,
-	TimeoutError,
+	UnsupportedVersionError,
 } from '@/client/errors.js'
 import { encodeSubscriptionMetadata } from '@/consumer/assignors/index.js'
 import { ConsumerGroup } from '@/consumer/consumer-group.js'
 import { OffsetManager } from '@/consumer/offset-manager.js'
-import { ConnectionClosedError } from '@/network/errors.js'
+import { ConnectionClosedError, RequestTimeoutError } from '@/network/errors.js'
+import { ApiKey } from '@/protocol/messages/api-keys.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
 
 /**
@@ -331,10 +330,9 @@ describe('Cluster', () => {
 		}
 
 		it('throws the retriable LeaderNotAvailableError, caused by the failure, when the refresh reaches no broker', async () => {
-			const { cluster, mockBroker } = await leaderlessCluster()
+			const { cluster } = await leaderlessCluster()
 			// The broker went away: the refresh finds no broker to ask.
-			;(mockBroker as unknown as { isConnected: boolean }).isConnected = false
-			mockBroker.connect.mockRejectedValue(new ConnectionClosedError('Connection refused'))
+			vi.spyOn(cluster, 'getAnyBroker').mockRejectedValueOnce(new NoBrokersAvailableError())
 
 			const error = await cluster.getLeaderForPartition('t', 0).catch((cause: unknown) => cause)
 
@@ -344,8 +342,8 @@ describe('Cluster', () => {
 		})
 
 		it.each([
-			['a connection failure', new ConnectionError('broker-1', 9092)],
-			['a timeout', new TimeoutError('Metadata request', 30_000)],
+			['a connection failure', new ConnectionClosedError('Connection closed')],
+			['a timeout', new RequestTimeoutError(1, 30_000)],
 		])('throws LeaderNotAvailableError when the refresh fails with %s', async (_, failure) => {
 			const { cluster, mockBroker } = await leaderlessCluster()
 			mockBroker.metadata.mockRejectedValueOnce(failure)
@@ -356,12 +354,12 @@ describe('Cluster', () => {
 			expect((error as LeaderNotAvailableError).cause).toBe(failure)
 		})
 
-		it("passes on a broker's definitive answer to the refresh", async () => {
+		it('passes on a refresh failure that is not a connectivity failure', async () => {
 			const { cluster, mockBroker } = await leaderlessCluster()
-			const denied = new KafkaProtocolError(ErrorCode.TopicAuthorizationFailed, 'Metadata for t')
-			mockBroker.metadata.mockRejectedValueOnce(denied)
+			const unsupported = new UnsupportedVersionError(ApiKey.Metadata, 12, { min: 0, max: 0 })
+			mockBroker.metadata.mockRejectedValueOnce(unsupported)
 
-			await expect(cluster.getLeaderForPartition('t', 0)).rejects.toBe(denied)
+			await expect(cluster.getLeaderForPartition('t', 0)).rejects.toBe(unsupported)
 		})
 
 		it('lets an offset lookup retry a leader lookup whose refresh reached no broker', async () => {

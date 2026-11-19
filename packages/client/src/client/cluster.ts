@@ -11,7 +11,6 @@ import {
 	NotCoordinatorError,
 	BrokerNotAvailableError,
 	NoBrokersAvailableError,
-	TimeoutError,
 	isConnectionFailure,
 	shouldRefreshMetadata,
 	throwIfError,
@@ -344,8 +343,9 @@ export class Cluster extends EventEmitter<ClusterEvents> {
 			try {
 				await this.refreshMetadata([topic])
 			} catch (error) {
-				// A broker's definitive answer goes to the caller as it is; not reaching one leaves the leader unknown.
-				if (!isConnectionFailure(error) && !(error instanceof TimeoutError)) throw error
+				// A failure other than not reaching a broker goes to the caller as it is; not reaching one
+				// leaves the leader unknown.
+				if (!isConnectionFailure(error)) throw error
 				throw new LeaderNotAvailableError(topic, partition, error as Error)
 			}
 			leaderId = this.cachedLeaderId(topic, partition)
