@@ -81,8 +81,9 @@ export class Checkpoints {
 
 	/**
 	 * Marks the clear of `store` (`<applicationId>.<store>`) on `partition` in progress, durably (a write and a flush)
-	 * before anything is deleted: the only record that a store nothing restores (no changelog, or `skipRestoration`) is
-	 * partly cleared once a close or a crash stopped its clear. Throws when that fails.
+	 * before anything is deleted: the record that the store is partly cleared once a close or a crash stopped its clear,
+	 * whatever its changelog settings are at the next start (an invalidated checkpoint has only a restore rebuild it).
+	 * Throws when that fails.
 	 */
 	async beginClear(store: string, partition: number): Promise<void> {
 		await this.store.set(clearMarker(store), partition, CLEARING)

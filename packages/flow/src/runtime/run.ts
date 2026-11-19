@@ -130,6 +130,8 @@ export class Run {
 				options: config.restoration,
 				applicationId: config.applicationId,
 				commitIntervalMs: config.commitIntervalMs,
+				clear: (task, store, signal) =>
+					deps.stateDirectory.clear(task.id, store.builder.name, task.id.partition, signal),
 				logger,
 			}),
 			startPositions: deps.startPositions.settler(this.consumer),

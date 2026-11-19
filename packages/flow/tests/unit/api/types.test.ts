@@ -64,8 +64,10 @@ function overloads(
 	expectTypeOf(stream.leftJoinWithKey(table, (key, _value, tableValue) => [key, tableValue] as const)).toEqualTypeOf<
 		KStream<string, readonly [string | null, Date | null]>
 	>()
+	// Parameters of any type: only its arity makes it a key-aware joiner.
+	const ofThree = (key: unknown, value: unknown, otherValue: unknown) => [key, value, otherValue]
 	// @ts-expect-error a joiner of three parameters goes to joinWithKey()
-	stream.join(table, (key: string, value: number, tableValue: Date) => key + value + tableValue.getTime())
+	stream.join(table, ofThree)
 	// An optional third parameter is just that: join() calls it with the values.
 	expectTypeOf(
 		stream.join(table, (value: number, tableValue: Date, scale?: number) => value * (scale ?? 1))
@@ -94,7 +96,7 @@ function overloads(
 		stream.outerJoinWithKey(other, (key, value, otherValue) => [key, value, otherValue] as const, windows.join)
 	).toEqualTypeOf<KStream<string, readonly [string | null, number | null, boolean | null]>>()
 	// @ts-expect-error a joiner of three parameters goes to outerJoinWithKey()
-	stream.outerJoin(other, (key: string, value: number, otherValue: boolean) => key + value + otherValue, windows.join)
+	stream.outerJoin(other, ofThree, windows.join)
 
 	const grouped = stream.groupByKey()
 	expectTypeOf(grouped).toEqualTypeOf<KGroupedStream<string, number>>()

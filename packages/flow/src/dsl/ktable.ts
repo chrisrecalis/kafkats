@@ -40,11 +40,11 @@ export class KTableImpl<K, V> implements KTable<K, V> {
 	}
 
 	mapValues<VR>(mapper: ValueMapper<V, VR | null>, options?: TableOptions<K, VR>): KTable<K, VR> {
-		return tableOps.mapValues(this, (_key, value) => mapper(value), options)
+		return tableOps.mapValues(this, 'mapValues()', (_key, value) => mapper(value), options)
 	}
 
 	mapValuesWithKey<VR>(mapper: ValueMapperWithKey<K, V, VR | null>, options?: TableOptions<K, VR>): KTable<K, VR> {
-		return tableOps.mapValues(this, mapper, options)
+		return tableOps.mapValues(this, 'mapValuesWithKey()', mapper, options)
 	}
 
 	transformValues<VR>(

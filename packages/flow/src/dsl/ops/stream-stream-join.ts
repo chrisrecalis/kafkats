@@ -40,20 +40,20 @@ export type KeyedStreamJoiner<K, V, VO, VR> = (key: K | null, value: V | null, o
 
 type JoinKind = 'inner' | 'left' | 'outer'
 
-const OPERATOR: Readonly<Record<JoinKind, string>> = { inner: 'join()', left: 'leftJoin()', outer: 'outerJoin()' }
 const STORE_PREFIX: Readonly<Record<JoinKind, string>> = {
 	inner: StorePrefix.STREAM_JOIN,
 	left: StorePrefix.STREAM_LEFT_JOIN,
 	outer: StorePrefix.STREAM_OUTER_JOIN,
 }
 
+/** `operator`: the method called (`join()`, `leftJoinWithKey()`, ...), as the topology errors name it. */
 export function streamStreamJoin<K, V, VO, VR>(
 	stream: KStreamImpl<K, V>,
 	kind: JoinKind,
+	operator: string,
 	other: KStream<K, VO>,
 	...args: StreamStreamJoinArgs<K, V, VO, KeyedStreamJoiner<K, V, VO, VR>>
 ): KStream<K, VR> {
-	const operator = OPERATOR[kind]
 	if (!(other instanceof KStreamImpl) || other.ctx !== stream.ctx) {
 		throw new TopologyError(`${operator} needs a stream of the same app`)
 	}

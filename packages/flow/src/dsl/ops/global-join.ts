@@ -17,18 +17,19 @@ import { streamTableJoinProcessor } from '@/operators/stream-table-join.js'
 
 /**
  * `joiner` gets the record's key (`join()` and `leftJoin()` pass one that ignores it); a left join's joiner receives
- * null values.
+ * null values. `operator`: the method called, as the topology errors name it.
  */
 export function globalJoin<K, V, GK, GV, VR>(
 	stream: KStreamImpl<K, V>,
 	kind: 'inner' | 'left',
+	operator: string,
 	table: GlobalKTableImpl<GK, GV>,
 	keySelector: KeyValueMapper<K | null, V, GK | null>,
 	joiner: ValueJoinerWithKey<K | null, V, GV | null, VR>,
 	options?: NamedOptions
 ): KStream<K, VR> {
 	if (table.ctx !== stream.ctx) {
-		throw new TopologyError(`${kind === 'inner' ? 'join()' : 'leftJoin()'} needs a global table of the same app`)
+		throw new TopologyError(`${operator} needs a global table of the same app`)
 	}
 	const supplier = streamTableJoinProcessor<K, V, GK, GV, VR>({
 		valueGetter: storeValueGetter(table.storeName),

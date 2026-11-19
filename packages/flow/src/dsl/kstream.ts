@@ -186,7 +186,7 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 		other: KStream<K, VO>,
 		...[joiner, ...rest]: StreamStreamJoinArgs<K, V, VO, ValueJoiner<V | null, VO | null, VR>>
 	): KStream<K, VR> {
-		return streamStreamJoin(this, 'outer', other, withoutKey(joiner), ...rest)
+		return streamStreamJoin(this, 'outer', 'outerJoin()', other, withoutKey(joiner), ...rest)
 	}
 
 	outerJoinWithKey<VO, VR>(
@@ -195,7 +195,7 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 		windows: JoinWindows,
 		options?: StreamJoined<K, V, VO>
 	): KStream<K, VR> {
-		return streamStreamJoin(this, 'outer', other, joiner, windows, options)
+		return streamStreamJoin(this, 'outer', 'outerJoinWithKey()', other, joiner, windows, options)
 	}
 
 	process<KR, VR>(
@@ -214,7 +214,7 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 
 	/**
 	 * Dispatches a join on the kind of the other side. `withKey`: the joiner takes the record's key first
-	 * (joinWithKey, leftJoinWithKey); otherwise it is called with the values only.
+	 * (joinWithKey, leftJoinWithKey); otherwise it is called with the values only. Errors name the method called.
 	 */
 	private joinWith<VO, VR>(
 		kind: 'inner' | 'left',
@@ -223,6 +223,7 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 		withKey: boolean
 	): KStream<K, VR> {
 		type Joiner = KeyedStreamJoiner<K, V, VO, VR>
+		const operator = `${kind === 'inner' ? 'join' : 'leftJoin'}${withKey ? 'WithKey' : ''}()`
 		const keyed = (joiner: unknown): Joiner =>
 			withKey ? (joiner as Joiner) : withoutKey(joiner as ValueJoiner<V | null, VO | null, VR>)
 		if (other instanceof GlobalKTableImpl) {
@@ -231,6 +232,7 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 			return globalJoin(
 				this,
 				kind,
+				operator,
 				other,
 				keySelector as KeyValueMapper<K | null, V, unknown>,
 				keyed(joiner),
@@ -239,10 +241,10 @@ export class KStreamImpl<K, V> implements KStream<K, V> {
 		}
 		if (other instanceof KTableImpl) {
 			const [joiner, options] = args
-			return streamTableJoin(this, kind, other, keyed(joiner), options as Joined<K, V, VO> | undefined)
+			return streamTableJoin(this, kind, operator, other, keyed(joiner), options as Joined<K, V, VO> | undefined)
 		}
 		const [joiner, ...rest] = args as StreamStreamJoinArgs<K, V, VO, unknown>
-		return streamStreamJoin(this, kind, other as KStream<K, VO>, keyed(joiner), ...rest)
+		return streamStreamJoin(this, kind, operator, other as KStream<K, VO>, keyed(joiner), ...rest)
 	}
 }
 

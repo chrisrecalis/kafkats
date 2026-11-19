@@ -17,16 +17,16 @@ import { streamTableJoinProcessor } from '@/operators/stream-table-join.js'
 
 /**
  * `joiner` gets the record's key (`join()` and `leftJoin()` pass one that ignores it), null for a missing table value
- * (left join), and the key may then be null.
+ * (left join), and the key may then be null. `operator`: the method called, as the topology errors name it.
  */
 export function streamTableJoin<K, V, VT, VR>(
 	stream: KStreamImpl<K, V>,
 	kind: 'inner' | 'left',
+	operator: string,
 	table: KTableImpl<K, VT>,
 	joiner: ValueJoinerWithKey<K | null, V, VT | null, VR>,
 	options: Joined<K, V, VT> = {}
 ): KStream<K, VR> {
-	const operator = kind === 'inner' ? 'join()' : 'leftJoin()'
 	if (table.ctx !== stream.ctx) {
 		throw new TopologyError(`${operator} needs a table of the same app`)
 	}

@@ -136,29 +136,29 @@ A sink without a codec writes keys and values as they are: that works only for `
 
 ## Operation Catalog
 
-| Operation                                | On                     | Result                         | Stateful | Repartitions                    |
-| ---------------------------------------- | ---------------------- | ------------------------------ | -------- | ------------------------------- |
-| `filter`, `filterNot`                    | KStream                | KStream                        | no       | no                              |
-| `filter`, `filterNot`                    | KTable                 | KTable                         | optional | no                              |
-| `map`, `flatMap`, `selectKey`            | KStream                | KStream                        | no       | marks downstream                |
-| `mapValues`, `flatMapValues` (`WithKey`) | KStream                | KStream                        | no       | no                              |
-| `mapValues`, `mapValuesWithKey`          | KTable                 | KTable                         | optional | no                              |
-| `transformValues`                        | KTable                 | KTable                         | optional | no                              |
-| `peek`, `foreach`                        | KStream                | KStream / none                 | no       | no                              |
-| `merge`, `split`, `branch`               | KStream                | KStream(s)                     | no       | no                              |
-| `process`, `processValues`               | KStream                | KStream                        | optional | `process` marks downstream      |
-| `to`, `through`, `repartition`           | KStream                | none / KStream                 | no       | `repartition` always            |
-| `toTable`                                | KStream                | KTable                         | yes      | if keys changed                 |
-| `toStream`                               | KTable                 | KStream                        | no       | with a mapper, marks downstream |
-| `groupByKey`                             | KStream                | KGroupedStream                 | -        | if keys changed                 |
-| `groupBy`                                | KStream, KTable        | KGroupedStream / KGroupedTable | -        | always                          |
-| `count`, `reduce`, `aggregate`           | grouped streams/tables | KTable                         | yes      | -                               |
-| `windowedBy`                             | KGroupedStream         | windowed stream                | -        | -                               |
-| `join`, `leftJoin`, `outerJoin` (stream) | KStream                | KStream                        | yes      | re-keyed sides                  |
-| `join`, `leftJoin` (table)               | KStream                | KStream                        | yes      | a re-keyed stream               |
-| `join`, `leftJoin` (global table)        | KStream                | KStream                        | no*      | never                           |
-| `join`, `leftJoin`, `outerJoin`          | KTable                 | KTable                         | optional | never                           |
-| `suppress`                               | KTable                 | KTable                         | yes      | no                              |
+| Operation                                            | On                     | Result                         | Stateful | Repartitions                    |
+| ---------------------------------------------------- | ---------------------- | ------------------------------ | -------- | ------------------------------- |
+| `filter`, `filterNot`                                | KStream                | KStream                        | no       | no                              |
+| `filter`, `filterNot`                                | KTable                 | KTable                         | optional | no                              |
+| `map`, `flatMap`, `selectKey`                        | KStream                | KStream                        | no       | marks downstream                |
+| `mapValues`, `flatMapValues` (`WithKey`)             | KStream                | KStream                        | no       | no                              |
+| `mapValues`, `mapValuesWithKey`                      | KTable                 | KTable                         | optional | no                              |
+| `transformValues`                                    | KTable                 | KTable                         | optional | no                              |
+| `peek`, `foreach`                                    | KStream                | KStream / none                 | no       | no                              |
+| `merge`, `split`, `branch`                           | KStream                | KStream(s)                     | no       | no                              |
+| `process`, `processValues`                           | KStream                | KStream                        | optional | `process` marks downstream      |
+| `to`, `through`, `repartition`                       | KStream                | none / KStream                 | no       | `repartition` always            |
+| `toTable`                                            | KStream                | KTable                         | yes      | if keys changed                 |
+| `toStream`                                           | KTable                 | KStream                        | no       | with a mapper, marks downstream |
+| `groupByKey`                                         | KStream                | KGroupedStream                 | -        | if keys changed                 |
+| `groupBy`                                            | KStream, KTable        | KGroupedStream / KGroupedTable | -        | always                          |
+| `count`, `reduce`, `aggregate`                       | grouped streams/tables | KTable                         | yes      | -                               |
+| `windowedBy`                                         | KGroupedStream         | windowed stream                | -        | -                               |
+| `join`, `leftJoin`, `outerJoin` (`WithKey`) (stream) | KStream                | KStream                        | yes      | re-keyed sides                  |
+| `join`, `leftJoin` (`WithKey`) (table)               | KStream                | KStream                        | yes      | a re-keyed stream               |
+| `join`, `leftJoin` (`WithKey`) (global table)        | KStream                | KStream                        | no*      | never                           |
+| `join`, `leftJoin`, `outerJoin`                      | KTable                 | KTable                         | optional | never                           |
+| `suppress`                                           | KTable                 | KTable                         | yes      | no                              |
 
 \* The global table itself is state every instance holds; the join keeps no state of its own.
 

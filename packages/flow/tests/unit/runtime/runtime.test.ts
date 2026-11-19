@@ -695,6 +695,34 @@ describe('exactly-once: the producer is initialized before any restore (KS Recor
 		await h.stop()
 	})
 
+	it('close() during the backoff of a timed-out initialization stops the retries: no attempt after it, no timer left', async () => {
+		const h = new Harness(counting, { processingGuarantee: 'exactly_once' })
+		const timedOut = new TimeoutError("InitProducerId of transactional id 'app-p' did not complete", 60_000)
+		// Counted at the producer: an attempt made after the close carries an aborted signal, which no step answers.
+		let attempts = 0
+		h.io.scriptProducer = producer => {
+			producer.steps.initTransactions.always(timedOut)
+			const init = producer.initTransactions.bind(producer)
+			producer.initTransactions = options => {
+				attempts++
+				return init(options)
+			}
+		}
+		const starting = h.start().catch(() => {})
+		await h.joined()
+		await h.consumer.rebalance('in:0')
+		await settle()
+		expect(attempts).toBe(1)
+
+		// Within the first backoff (1 s).
+		await h.stop()
+		await starting
+		h.io.clock.advance(10_000)
+		await settle()
+		expect(attempts).toBe(1)
+		expect(h.io.clock.pendingTimers).toBe(0)
+	})
+
 	it('initializations timing out for longer than taskTimeoutMs fail with a TaskMigratedError that says so', async () => {
 		const h = new Harness(counting, { processingGuarantee: 'exactly_once', taskTimeoutMs: 5000 })
 		const timedOut = new TimeoutError("InitProducerId of transactional id 'app-p' did not complete", 60_000)

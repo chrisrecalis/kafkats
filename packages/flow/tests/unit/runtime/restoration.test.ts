@@ -13,6 +13,7 @@ import { RestorationPool, type RestoringTask } from '@/runtime/restoration.js'
 import { TaskIdRegistry } from '@/runtime/task-id.js'
 import { TaskManager } from '@/runtime/task-manager.js'
 import type { KeyValueStore, StateStore } from '@/state.js'
+import { clearStore } from '@/state/bulk.js'
 import { Checkpoints } from '@/state/checkpoints.js'
 import { InMemoryKeyValueStore, inMemory } from '@/state/memory.js'
 import { StateDirectory } from '@/state/state-directory.js'
@@ -52,6 +53,9 @@ class PoolHarness {
 	readonly consumers: FakeRestoreConsumer[] = []
 	/** Applied to every restore consumer created. */
 	wrap: (consumer: FakeRestoreConsumer) => RestoreConsumerPort = consumer => consumer
+	/** How the pool clears a store before a rebuild (in production: StateDirectory.clear). */
+	clear: (task: RestoringTask, store: RegisteredStore, signal: AbortSignal) => Promise<void> = (_, store, signal) =>
+		clearStore(store.raw as KeyValueStore<unknown, unknown>, signal)
 	readonly pool: RestorationPool
 
 	constructor(options: Partial<ResolvedRestorationOptions> = {}) {
@@ -68,6 +72,7 @@ class PoolHarness {
 			options: { ...OPTIONS, ...options },
 			applicationId: APP,
 			commitIntervalMs: Number.POSITIVE_INFINITY,
+			clear: (task, store, signal) => this.clear(task, store, signal),
 			logger: this.logger,
 		})
 	}
@@ -282,6 +287,28 @@ describe('RestorationPool (4.7.1)', () => {
 		expect(h.consumers).toHaveLength(1)
 	})
 
+	it("a rebuild clears each store through deps.clear (the state directory's marked clear), then replays", async () => {
+		const h = new PoolHarness()
+		h.write(`${APP}-s-changelog`, 0, ['a', '1'])
+		h.write(`${APP}-t-changelog`, 0, ['b', '2'])
+		const t0 = await task(0, kvBuilder('s'), kvBuilder('t'))
+		for (const { raw } of t0.stores) await (raw as KeyValueStore<string, string>).put('stale', 'x')
+		// 's' has a trusted checkpoint and is only caught up; 't' has none and is rebuilt.
+		await h.checkpoints.set(`${APP}-s-changelog`, 0, 0n)
+		const clears: string[] = []
+		const clear = h.clear
+		h.clear = async (task, store, signal) => {
+			clears.push(`${task.id.key} ${store.builder.name}`)
+			await clear(task, store, signal)
+		}
+
+		await h.pool.restore(t0, new AbortController().signal)
+
+		expect(clears).toEqual(['0_0 t'])
+		expect(await entries(t0.stores[0]!.raw)).toEqual(['"a"="1"', '"stale"="x"'])
+		expect(await entries(t0.stores[1]!.raw)).toEqual(['"b"="2"'])
+	})
+
 	it('a task without stores to restore (unlogged, skipRestoration) resolves at once without any call', async () => {
 		const h = new PoolHarness({ maxConcurrentTasks: 1 })
 		const t0 = await task(0, kvBuilder('unlogged', false), kvBuilder('skipped', { skipRestoration: true }))
@@ -395,12 +422,15 @@ function taskManager(h: PoolHarness) {
 	const exclusive = new SerialExclusive()
 	const failures: { error: unknown; site: FailureSite }[] = []
 	const stop = new AbortController()
+	const stateDirectory = new StateDirectory(APP, inMemory(), h.checkpoints, logger)
+	// As the run wires it: the rebuild's clear is the state directory's.
+	h.clear = (task, store, signal) => stateDirectory.clear(task.id, store.builder.name, task.id.partition, signal)
 	const manager = new TaskManager({
 		topology: builder.build(),
 		counts: new Map([['input', 1]]),
 		ids: new TaskIdRegistry(),
 		config,
-		stateDirectory: new StateDirectory(APP, inMemory(), h.checkpoints, logger),
+		stateDirectory,
 		checkpoints: h.checkpoints,
 		globalStore: name => {
 			throw new Error(`no global store '${name}'`)

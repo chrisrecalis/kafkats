@@ -711,6 +711,9 @@ describe('table filter, filterNot and mapValues', () => {
 		expect(() => t.mapValues(v => v.length, { materialized: { storeName: 'lengths' } })).toThrow(
 			'mapValues() needs a value codec'
 		)
+		expect(() => t.mapValuesWithKey((_k, v) => v.length, { materialized: { storeName: 'lengths' } })).toThrow(
+			'mapValuesWithKey() needs a value codec'
+		)
 	})
 
 	it('without old values from its parent, a filter forwards a tombstone for every update it rejects (KS)', async () => {

@@ -55,9 +55,14 @@ export async function writeChanges<K, V>(
  * Remove every entry from a store. Yields to the event loop as it goes (a store with millions of entries must not hold
  * up timers and network callbacks), and rejects with an AbortError once `signal` aborts, at the next yield while the
  * keys are collected and before a round of removals: the caller must have invalidated the store's checkpoint, since
- * the store is then partly cleared.
+ * the store is then partly cleared. `beforeRemoving` is awaited once before the first removal, only when the store
+ * holds entries.
  */
-export async function clearStore<K, V>(store: KeyValueStore<K, V>, signal?: AbortSignal): Promise<void> {
+export async function clearStore<K, V>(
+	store: KeyValueStore<K, V>,
+	signal?: AbortSignal,
+	beforeRemoving?: () => Promise<void>
+): Promise<void> {
 	// Collected before anything is removed: a store need not support removal while it is iterated.
 	const keys: K[] = []
 	for await (const [key] of store.all()) {
@@ -70,6 +75,7 @@ export async function clearStore<K, V>(store: KeyValueStore<K, V>, signal?: Abor
 			}
 		}
 	}
+	if (keys.length > 0) await beforeRemoving?.()
 	for (let start = 0; start < keys.length; start += WIPE_ROUND) {
 		await yieldIfDue()
 		if (signal?.aborted) {

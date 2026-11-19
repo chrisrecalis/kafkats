@@ -211,5 +211,10 @@ describe('stream-global table join wiring (6.19)', () => {
 
 		const foreign = flow({ applicationId: 'other', client }).globalTable('regions', S)
 		expect(() => events.leftJoin(foreign, joiner)).toThrow('leftJoin() needs a global table of the same app')
+		// A key-aware join's errors name the method called.
+		const keyed = (key: string | null, value: string, name: string | null) => `${key}:${value}=${name}`
+		expect(() => events.joinWithKey(foreign, (_key, value) => value, keyed)).toThrow(
+			'joinWithKey() needs a global table of the same app'
+		)
 	})
 })

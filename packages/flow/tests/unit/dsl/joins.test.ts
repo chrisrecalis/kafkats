@@ -473,6 +473,19 @@ describe('stream-table joins', () => {
 		])
 	})
 
+	it('the topology errors of a key-aware join name the method called', () => {
+		const driver = new TestDriver()
+		const table = driver.table('t', S)
+		const rekeyed = driver.input('s', S).selectKey((_k, v) => v!)
+		const keyed = (k: string | null, v: string, tv: string | null) => `${k}:${v}+${tv}`
+		expect(() => rekeyed.joinWithKey(table, keyed)).toThrow('joinWithKey() needs a key codec')
+		expect(() => rekeyed.leftJoinWithKey(table, keyed)).toThrow('leftJoinWithKey() needs a key codec')
+		const foreign = flow({ applicationId: 'other', client }).table('t', S)
+		expect(() => driver.input('u', S).leftJoinWithKey(foreign, keyed)).toThrow(
+			'leftJoinWithKey() needs a table of the same app'
+		)
+	})
+
 	it('a table of another app is a TopologyError', () => {
 		const driver = new TestDriver()
 		const foreign = flow({ applicationId: 'other', client }).table('t', S)

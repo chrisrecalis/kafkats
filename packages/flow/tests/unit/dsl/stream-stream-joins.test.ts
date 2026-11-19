@@ -387,12 +387,21 @@ describe.each(GUARANTEES)('stream-stream join results (%s)', (_guarantee, config
 })
 
 describe('stream-stream joins', () => {
-	it('the WithKey joins pass the key first: to matches of either side, closed unmatched records and KIP-962 results', async () => {
+	it('the WithKey joins pass the key first: to matches of either side, unmatched records (closed or late) and KIP-962 results', async () => {
 		const keyed = (k: string | null, a: string | null, b: string | null) => `${k}:${a}+${b}`
 		const expected = {
 			joinWithKey: ['k:L+R', 'k:L+S'],
-			leftJoinWithKey: ['k:L+R', 'k:L+S', 'null:N+null', 'a:A+null'],
-			outerJoinWithKey: ['k:L+R', 'k:L+S', 'null:N+null', 'null:null+M', 'b:null+B', 'a:A+null'],
+			leftJoinWithKey: ['k:L+R', 'k:L+S', 'null:N+null', 'a:A+null', 'q:Q+null'],
+			outerJoinWithKey: [
+				'k:L+R',
+				'k:L+S',
+				'null:N+null',
+				'null:null+M',
+				'b:null+B',
+				'a:A+null',
+				'q:Q+null',
+				'p:null+P',
+			],
 		}
 		for (const kind of ['joinWithKey', 'leftJoinWithKey', 'outerJoinWithKey'] as const) {
 			const driver = new TestDriver()
@@ -417,7 +426,31 @@ describe('stream-stream joins', () => {
 				await ctx.send('r', Buffer.from('M'), { timestamp: 300 })
 				// Closes the windows of A and B.
 				await send(ctx, 'l', 'z', 'Z', 1000)
+				// Out of order: their windows ended before the stream time, so they are joined with null at once.
+				await send(ctx, 'l', 'q', 'Q', 500)
+				await send(ctx, 'r', 'p', 'P', 500)
 				expect(values(ctx)).toEqual(expected[kind])
+			})
+		}
+		// The deprecated JoinWindows.of keeps no outer-join store: every unmatched record is joined with null at once.
+		for (const kind of ['leftJoinWithKey', 'outerJoinWithKey'] as const) {
+			const driver = new TestDriver()
+			const l = driver.input('l', S)
+			const r = driver.input('r', S)
+			const windows = JoinWindows.of(100)
+			const joined =
+				kind === 'leftJoinWithKey'
+					? l.leftJoinWithKey(r, keyed, windows)
+					: l.outerJoinWithKey(r, keyed, windows)
+			joined.to('out', S)
+			await driver.run(async ctx => {
+				await send(ctx, 'r', 'k', 'R', 100)
+				await send(ctx, 'l', 'k', 'L', 150)
+				await send(ctx, 'l', 'a', 'A', 200)
+				await send(ctx, 'r', 'b', 'B', 200)
+				expect(values(ctx)).toEqual(
+					kind === 'leftJoinWithKey' ? ['k:L+R', 'a:A+null'] : ['k:null+R', 'k:L+R', 'a:A+null', 'b:null+B']
+				)
 			})
 		}
 		// join() never passes the key, whatever the joiner declares.
@@ -557,6 +590,27 @@ describe('stream-stream joins', () => {
 		const topology = internals(app).build()
 		expect(topology.internalTopics.size).toBe(0)
 		expect(topology.subtopologies.flatMap(s => s.stores)).toEqual([])
+	})
+
+	it('the topology errors of a key-aware join name the method called', () => {
+		const app = flow({ applicationId: 'app', client })
+		const l = app.stream('l', S)
+		const r = app.stream('r', S)
+		const rekeyed = l.selectKey((_k, v) => v!)
+		const foreign = flow({ applicationId: 'other', client }).stream<string, string>('x')
+		const windows = JoinWindows.ofTimeDifferenceWithNoGrace(100)
+		const keyed = (k: string | null, a: string | null, b: string | null) => `${k}:${a}+${b}`
+
+		expect(() => rekeyed.joinWithKey(r, keyed, windows)).toThrow('joinWithKey() needs a key codec')
+		expect(() => rekeyed.leftJoinWithKey(r, keyed, windows)).toThrow('leftJoinWithKey() needs a key codec')
+		expect(() => rekeyed.outerJoinWithKey(r, keyed, windows)).toThrow('outerJoinWithKey() needs a key codec')
+		expect(() => l.joinWithKey(foreign, keyed, windows)).toThrow('joinWithKey() needs a stream of the same app')
+		expect(() => l.outerJoinWithKey(r, keyed, undefined as never)).toThrow(
+			'outerJoinWithKey() with a stream needs JoinWindows'
+		)
+		// The value-only methods keep their own names.
+		expect(() => rekeyed.leftJoin(r, joiner, windows)).toThrow('leftJoin() needs a key codec')
+		expect(() => rekeyed.outerJoin(r, joiner, windows)).toThrow('outerJoin() needs a key codec')
 	})
 
 	it('repartitions a re-keyed side before joining; a named join names its topics, nodes and stores', async () => {

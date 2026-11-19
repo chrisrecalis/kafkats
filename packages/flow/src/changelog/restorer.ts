@@ -29,6 +29,12 @@ export type { ReplayOptions as RestoreOptions } from '@/changelog/replay.js'
 export interface RestoreTarget extends ReplayTarget {
 	/** The raw store (below the write buffer and the logging layer, runtime§6.36). Targets may share one store. */
 	readonly store: KeyValueStore<unknown, unknown>
+	/**
+	 * Clears the store before a rebuild, after its checkpoint was invalidated, until `signal` aborts (default: deletes
+	 * every entry). The runtime's clear is marked in progress until it is done, so that one cut short is finished
+	 * whatever the store's changelog settings are at the next start (StateDirectory.clear).
+	 */
+	readonly clear?: (signal: AbortSignal) => Promise<void>
 }
 
 export interface RestoreResult {
@@ -72,8 +78,9 @@ export async function restoreChangelogs(
 	const rebuilt = plans.filter(p => p.rebuild)
 	// Invalidated first: a rebuild cut short must never be taken for the state its old checkpoint described (CR3).
 	await Promise.all(rebuilt.map(({ target }) => checkpoints.invalidate(target.topic, target.partition)))
-	for (const store of new Set(rebuilt.map(({ target }) => target.store))) {
-		await clearStore(store, signal)
+	// Targets sharing a store clear it once.
+	for (const [store, clear] of new Map(rebuilt.map(({ target }) => [target.store, target.clear]))) {
+		await (clear === undefined ? clearStore(store, signal) : clear(signal))
 	}
 	if (signal.aborted) {
 		throw abortError(signal)

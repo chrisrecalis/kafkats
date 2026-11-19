@@ -23,6 +23,8 @@ interface Instance extends Opened {
 	idleSince: number
 	/** A clear began and did not finish (a lease or close stopped it, or it failed): the store must not be used as is. */
 	partlyCleared: boolean
+	/** Its clear may be marked in progress in the checkpoints (durable ones): ended by the next clear that finishes. */
+	marked: boolean
 }
 
 /** A store partition of the topology whose durable state an earlier start may have left behind. */
@@ -75,10 +77,11 @@ const instanceId = (store: string, partition: number): string => `${store}\u0000
  * Clearing a store takes a delete per entry, seconds for millions of them, so nothing waits for it: a lease made while
  * a prune clears the instance stops the clear and gets it partly cleared, with its checkpoint invalidated; the task's
  * restore pipeline finishes the clear (finishClears(), outside the scheduler's exclusive section) before the restore
- * rebuilds it. close() stops the clears before it closes the provider. What survives a clear that a close or a crash
- * stopped is durable: the invalidated checkpoint of a logged store has its next restore rebuild it, and the clear of a
- * store nothing restores is marked in progress in the checkpoint store until it is done, so that the next start's lease
- * gets it partly cleared and its owner finishes the clear.
+ * rebuilds it. close() stops the clears before it closes the provider. With durable checkpoints, every clear (a
+ * prune's, its owner's, a restore's rebuild: clear()) is marked in progress in the checkpoint store from before its
+ * first delete until it is done, so that the next start's lease gets a store whose clear a close or a crash stopped
+ * partly cleared, and its owner finishes the clear. The mark, not the invalidated checkpoint, records it: the store's changelog settings may differ
+ * at the next start, and an invalidated checkpoint has a restore rebuild the store only while it is logged and restored.
  */
 export class StateDirectory {
 	private readonly instances = new Map<string, Instance>()
@@ -140,17 +143,11 @@ export class StateDirectory {
 	 * flush here: the clear is the restore's, which a stop interrupts).
 	 */
 	async release(owner: TaskId, store: string, partition: number, options?: { invalidate?: boolean }): Promise<void> {
-		const id = instanceId(store, partition)
-		const instance = this.instances.get(id)
-		if (instance === undefined || this.leases.get(id) !== owner) {
-			throw new IllegalStateError(
-				`Task ${owner.key} holds no lease of state store '${store}' of partition ${partition}`
-			)
-		}
+		const instance = this.leased(owner, store, partition)
 		try {
 			if (options?.invalidate) await this.invalidate(instance)
 		} finally {
-			this.endLease(id)
+			this.endLease(instance.id)
 		}
 	}
 
@@ -246,6 +243,19 @@ export class StateDirectory {
 	}
 
 	/**
+	 * Clears the store `owner` leased for its restore's rebuild (its checkpoint invalidated first by the restore), marked
+	 * in progress until it is done like every clear. Rejects with an AbortError once `signal` aborts or close() stops it
+	 * (after the write in flight): the store stays partly cleared, for finishClears() to finish.
+	 */
+	async clear(owner: TaskId, store: string, partition: number, signal: AbortSignal): Promise<void> {
+		const instance = this.leased(owner, store, partition)
+		const finished = await this.track(instance.id, stop =>
+			this.clearMarked(instance, AbortSignal.any([stop, signal]))
+		)
+		if (!finished) throw abortError(signal)
+	}
+
+	/**
 	 * The store of a global table (`<applicationId>.<store>`, one for all partitions), created and initialized on first
 	 * use. Not leased: the global state manager is its only writer.
 	 */
@@ -262,8 +272,8 @@ export class StateDirectory {
 	/**
 	 * Stops the wipes in progress (after their writes in flight), forgets every instance and lease and closes the
 	 * provider (a failure is logged). The next start re-creates them. A store left partly cleared is finished by its next
-	 * owner: a logged store's checkpoint is invalidated, so its restore rebuilds it; a store nothing restores has its
-	 * clear marked in progress, so its next lease gets it partly cleared (or a prune of the next start clears it).
+	 * owner: its clear is marked in progress (durable checkpoints), so its next lease gets it partly cleared (or a prune
+	 * of the next start clears it).
 	 */
 	async close(): Promise<void> {
 		const wipes = [...this.wipes.values()]
@@ -283,17 +293,28 @@ export class StateDirectory {
 		}
 	}
 
+	/** The instance `owner` leased; IllegalStateError when it holds no lease of it. */
+	private leased(owner: TaskId, store: string, partition: number): Instance {
+		const id = instanceId(store, partition)
+		const instance = this.instances.get(id)
+		if (instance === undefined || this.leases.get(id) !== owner) {
+			throw new IllegalStateError(
+				`Task ${owner.key} holds no lease of state store '${store}' of partition ${partition}`
+			)
+		}
+		return instance
+	}
+
 	/**
 	 * The instance of a store partition this start has not opened yet: partly cleared when a clear an earlier start began
-	 * did not finish (its marker, for a store nothing restores; a logged one's invalidated checkpoint has its restore
-	 * rebuild it).
+	 * did not finish (its marker), whatever the store's changelog settings were then and are now.
 	 */
 	private async reopen(id: string, builder: StoreBuilder, partition: number): Promise<Instance> {
 		const partlyCleared =
-			marksClears(builder, this.checkpoints) &&
-			(await this.checkpoints.clearing(...this.marker(builder, partition)))
+			this.checkpoints.durable && (await this.checkpoints.clearing(...this.marker(builder.name, partition)))
 		const instance = this.create(id, builder, partition)
 		instance.partlyCleared = partlyCleared
+		instance.marked = partlyCleared
 		return instance
 	}
 
@@ -305,6 +326,7 @@ export class StateDirectory {
 			store: builder.create(this.provider, this.providerName(builder.name, partition)),
 			idleSince,
 			partlyCleared: false,
+			marked: false,
 		}
 		this.instances.set(id, instance)
 		return instance
@@ -363,25 +385,38 @@ export class StateDirectory {
 		await wipe?.settled
 	}
 
-	/**
-	 * Invalidates the checkpoint (and marks the clear of a store nothing restores in progress), then clears the store
-	 * until `signal` aborts: partly cleared until it is done.
-	 */
+	/** Invalidates the checkpoint, then clears the store until `signal` aborts: partly cleared until it is done. */
 	private async wipe(instance: Instance, signal: AbortSignal): Promise<void> {
-		const marked = marksClears(instance.builder, this.checkpoints)
-		const marker = this.marker(instance.builder, instance.partition)
 		instance.partlyCleared = true
 		await this.invalidate(instance)
-		if (marked) await this.checkpoints.beginClear(...marker)
+		await this.clearMarked(instance, signal)
+	}
+
+	/**
+	 * Clears the store until `signal` aborts: partly cleared until it is done. With durable checkpoints, the clear is
+	 * marked in progress before its first delete (a write and a flush; a store without entries has nothing to mark), and
+	 * the marker, also one an earlier clear left in progress, is ended once it is done.
+	 */
+	private async clearMarked(instance: Instance, signal: AbortSignal): Promise<void> {
+		const marker = this.marker(instance.builder.name, instance.partition)
+		const mark = async (): Promise<void> => {
+			if (!this.checkpoints.durable) return
+			instance.marked = true
+			await this.checkpoints.beginClear(...marker)
+		}
+		instance.partlyCleared = true
 		await this.init(instance)
-		await clearStore(instance.store as KeyValueStore<unknown, unknown>, signal)
-		if (marked) await this.checkpoints.endClear(...marker)
+		await clearStore(instance.store as KeyValueStore<unknown, unknown>, signal, mark)
+		if (instance.marked) {
+			await this.checkpoints.endClear(...marker)
+			instance.marked = false
+		}
 		instance.partlyCleared = false
 	}
 
 	/** Where the checkpoints mark a clear of the store's partition: `<applicationId>.<store>` and the partition. */
-	private marker(builder: StoreBuilder, partition: number): [store: string, partition: number] {
-		return [`${this.applicationId}.${builder.name}`, partition]
+	private marker(store: string, partition: number): [store: string, partition: number] {
+		return [`${this.applicationId}.${store}`, partition]
 	}
 
 	/** Invalidates the checkpoint an earlier start left, if it would be trusted (a write and a flush otherwise saved). */
@@ -396,12 +431,4 @@ export class StateDirectory {
 /** Whether the restore of a lease rebuilds the store from its changelog when its checkpoint is invalid. */
 function rebuiltByRestore(builder: StoreBuilder): boolean {
 	return builder.logging.enabled && !builder.logging.skipRestoration
-}
-
-/**
- * Whether a clear of the store is marked in the checkpoints: only a store nothing restores needs it (an invalidated
- * checkpoint has the restore rebuild the others), and only a durable mark outlives the start that began the clear.
- */
-function marksClears(builder: StoreBuilder, checkpoints: Checkpoints): boolean {
-	return checkpoints.durable && !rebuiltByRestore(builder)
 }

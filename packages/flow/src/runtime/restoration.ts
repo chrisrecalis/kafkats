@@ -23,6 +23,11 @@ export interface RestorationPoolDeps {
 	readonly applicationId: string
 	/** Restore progress is checkpointed at most this often (the app's commit interval). */
 	readonly commitIntervalMs: number
+	/**
+	 * Clears a store of the task before its rebuild, until `signal` aborts (StateDirectory.clear: marked in progress
+	 * until it is done).
+	 */
+	readonly clear: (task: RestoringTask, store: RegisteredStore, signal: AbortSignal) => Promise<void>
 	readonly logger: Logger
 }
 
@@ -54,7 +59,7 @@ export class RestorationPool implements TaskRestorer {
 			return
 		}
 		await this.slot(signal)
-		const { io, checkpoints, options, applicationId, commitIntervalMs, logger } = this.deps
+		const { io, checkpoints, options, applicationId, commitIntervalMs, clear, logger } = this.deps
 		try {
 			await restoreChangelogs(
 				{
@@ -62,7 +67,10 @@ export class RestorationPool implements TaskRestorer {
 						io.restoreConsumers(`${applicationId}-restore-${task.id.key}-${++restoreConsumers}`),
 					admin: io.admin,
 				},
-				restoring.map(({ store, changelog }) => target(store, changelog)),
+				restoring.map(({ store, changelog }) => ({
+					...target(store, changelog),
+					clear: (signal: AbortSignal) => clear(task, store, signal),
+				})),
 				checkpoints,
 				{ ...options, commitIntervalMs, signal, logger: logger.child({ task: task.id.key }) }
 			)

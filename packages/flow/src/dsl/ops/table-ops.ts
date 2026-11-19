@@ -31,14 +31,18 @@ export function filterNot<K, V>(
 	return filtered(table, predicate, true, options)
 }
 
-/** mapValues() and mapValuesWithKey(): the mapper as a function of the key and the value. */
+/**
+ * mapValues() and mapValuesWithKey() (`operator`, the method called, as the topology errors name it): the mapper as a
+ * function of the key and the value.
+ */
 export function mapValues<K, V, VR>(
 	table: KTableImpl<K, V>,
+	operator: string,
 	mapper: ValueMapperWithKey<K, V, VR | null>,
 	options: TableOptions<K, VR> = {}
 ): KTable<K, VR> {
 	const format = derivedFormat(table.format, options.materialized, false)
-	const storeName = materializedStore(table.ctx, options.materialized, format, 'mapValues()')
+	const storeName = materializedStore(table.ctx, options.materialized, format, operator)
 	const node = new KTableMapValues(table.table, mapper, { storeName })
 	return derived(table, NodePrefix.TABLE_MAP_VALUES, options.name, node, format, storeName)
 }

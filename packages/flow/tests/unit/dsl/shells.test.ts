@@ -118,31 +118,40 @@ describe('DSL shells delegate every method to its operator builder', () => {
 		expect(streamStreamJoin.streamStreamJoin).toHaveBeenCalledWith(
 			stream,
 			'inner',
+			'join()',
 			other,
 			expect.any(Function),
 			windows,
 			options
 		)
-		expect(joinerOf(streamStreamJoin.streamStreamJoin, 3)('k', 1, 2)).toBe(3)
+		expect(joinerOf(streamStreamJoin.streamStreamJoin, 4)('k', 1, 2)).toBe(3)
 		api.leftJoin(other, left, { within: windows })
-		expect(streamStreamJoin.streamStreamJoin).toHaveBeenCalledWith(stream, 'left', other, expect.any(Function), {
-			within: windows,
-		})
-		expect(joinerOf(streamStreamJoin.streamStreamJoin, 3)('k', 1, null)).toBe(1)
+		expect(streamStreamJoin.streamStreamJoin).toHaveBeenCalledWith(
+			stream,
+			'left',
+			'leftJoin()',
+			other,
+			expect.any(Function),
+			{ within: windows }
+		)
+		expect(joinerOf(streamStreamJoin.streamStreamJoin, 4)('k', 1, null)).toBe(1)
 		api.outerJoin(other, outer, windows)
 		expect(streamStreamJoin.streamStreamJoin).toHaveBeenCalledWith(
 			stream,
 			'outer',
+			'outerJoin()',
 			other,
 			expect.any(Function),
 			windows
 		)
-		expect(joinerOf(streamStreamJoin.streamStreamJoin, 3)('k', null, 2)).toBe(2)
+		expect(joinerOf(streamStreamJoin.streamStreamJoin, 4)('k', null, 2)).toBe(2)
+		// The WithKey forms are named as such in the topology errors of the builders.
 		const keyedInner = (key: string, value: number, otherValue: number) => `${key}${value}${otherValue}`
 		api.joinWithKey(other, keyedInner, windows, options)
 		expect(streamStreamJoin.streamStreamJoin).toHaveBeenCalledWith(
 			stream,
 			'inner',
+			'joinWithKey()',
 			other,
 			keyedInner,
 			windows,
@@ -151,11 +160,19 @@ describe('DSL shells delegate every method to its operator builder', () => {
 		const keyedStreams = (key: string | null, value: number | null, otherValue: number | null) =>
 			`${key}${value}${otherValue}`
 		api.leftJoinWithKey(other, keyedStreams, windows)
-		expect(streamStreamJoin.streamStreamJoin).toHaveBeenCalledWith(stream, 'left', other, keyedStreams, windows)
+		expect(streamStreamJoin.streamStreamJoin).toHaveBeenCalledWith(
+			stream,
+			'left',
+			'leftJoinWithKey()',
+			other,
+			keyedStreams,
+			windows
+		)
 		api.outerJoinWithKey(other, keyedStreams, windows)
 		expect(streamStreamJoin.streamStreamJoin).toHaveBeenCalledWith(
 			stream,
 			'outer',
+			'outerJoinWithKey()',
 			other,
 			keyedStreams,
 			windows,
@@ -166,43 +183,76 @@ describe('DSL shells delegate every method to its operator builder', () => {
 		expect(streamTableJoin.streamTableJoin).toHaveBeenCalledWith(
 			stream,
 			'inner',
+			'join()',
 			table,
 			expect.any(Function),
 			options
 		)
-		expect(joinerOf(streamTableJoin.streamTableJoin, 3)('k', 1, 2)).toBe(3)
+		expect(joinerOf(streamTableJoin.streamTableJoin, 4)('k', 1, 2)).toBe(3)
 		api.leftJoin(table, left)
 		expect(streamTableJoin.streamTableJoin).toHaveBeenCalledWith(
 			stream,
 			'left',
+			'leftJoin()',
 			table,
 			expect.any(Function),
 			undefined
 		)
 		const keyed = (key: string | null, value: number, otherValue: number | null) => `${key}${value}${otherValue}`
 		api.joinWithKey(table, keyed, options)
-		expect(streamTableJoin.streamTableJoin).toHaveBeenCalledWith(stream, 'inner', table, keyed, options)
+		expect(streamTableJoin.streamTableJoin).toHaveBeenCalledWith(
+			stream,
+			'inner',
+			'joinWithKey()',
+			table,
+			keyed,
+			options
+		)
 		api.leftJoinWithKey(table, keyed)
-		expect(streamTableJoin.streamTableJoin).toHaveBeenCalledWith(stream, 'left', table, keyed, undefined)
+		expect(streamTableJoin.streamTableJoin).toHaveBeenCalledWith(
+			stream,
+			'left',
+			'leftJoinWithKey()',
+			table,
+			keyed,
+			undefined
+		)
 
 		api.join(global, selector, inner, options)
 		expect(globalJoin.globalJoin).toHaveBeenCalledWith(
 			stream,
 			'inner',
+			'join()',
 			global,
 			selector,
 			expect.any(Function),
 			options
 		)
-		expect(joinerOf(globalJoin.globalJoin, 4)('k', 1, 2)).toBe(3)
+		expect(joinerOf(globalJoin.globalJoin, 5)('k', 1, 2)).toBe(3)
 		api.joinWithKey(global, selector, keyed, options)
-		expect(globalJoin.globalJoin).toHaveBeenCalledWith(stream, 'inner', global, selector, keyed, options)
+		expect(globalJoin.globalJoin).toHaveBeenCalledWith(
+			stream,
+			'inner',
+			'joinWithKey()',
+			global,
+			selector,
+			keyed,
+			options
+		)
 		api.leftJoinWithKey(global, selector, keyed)
-		expect(globalJoin.globalJoin).toHaveBeenCalledWith(stream, 'left', global, selector, keyed, undefined)
+		expect(globalJoin.globalJoin).toHaveBeenCalledWith(
+			stream,
+			'left',
+			'leftJoinWithKey()',
+			global,
+			selector,
+			keyed,
+			undefined
+		)
 		// The deprecated form looks up the record key.
 		api.leftJoin(global as unknown as GlobalKTable<string, number>, left)
-		expect(joinerOf(globalJoin.globalJoin, 3)('k', 1)).toBe('k')
-		expect(joinerOf(globalJoin.globalJoin, 4)('k', 1, 2)).toBe(3)
+		expect(joinerOf(globalJoin.globalJoin, 4)('k', 1)).toBe('k')
+		expect(joinerOf(globalJoin.globalJoin, 5)('k', 1, 2)).toBe(3)
 	})
 
 	it('KTable operators', () => {
@@ -212,8 +262,8 @@ describe('DSL shells delegate every method to its operator builder', () => {
 		const cases: [() => unknown, unknown, unknown[]][] = [
 			[() => table.filter(fn, options), tableOps.filter, [fn, options]],
 			[() => table.filterNot(fn, options), tableOps.filterNot, [fn, options]],
-			[() => table.mapValues(fn, options), tableOps.mapValues, [expect.any(Function), options]],
-			[() => table.mapValuesWithKey(fn, options), tableOps.mapValues, [fn, options]],
+			[() => table.mapValues(fn, options), tableOps.mapValues, ['mapValues()', expect.any(Function), options]],
+			[() => table.mapValuesWithKey(fn, options), tableOps.mapValues, ['mapValuesWithKey()', fn, options]],
 			[() => table.transformValues(supplier, options), processOps.transformValues, [supplier, options]],
 			[() => table.toStream(options), stateless.toStream, [options, undefined]],
 			[() => table.toStream(fn, options), stateless.toStream, [fn, options]],

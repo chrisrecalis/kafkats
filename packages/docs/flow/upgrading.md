@@ -72,7 +72,7 @@ See [Configuration](/flow/configuration) for every option.
 ## Failures
 
 - Errors of your code and fatal Kafka errors go through Kafka Streams-style handlers: `deserializationExceptionHandler`, `processingExceptionHandler`, `productionExceptionHandler` (`'fail'` by default) and `uncaughtExceptionHandler` (`'shutdown'` by default, state `ERROR`). See [Error Handling](/flow/error-handling).
-- `SourceTopicNotFoundError` names what reads the missing topic, `readBy` (`{ subtopology }` or `{ globalStore }`), instead of `storeName`, which named an arbitrary store of the topology or none.
+- `start()` rejects with `SourceTopicNotFoundError`, after looking for the topic for 5 seconds, when any topic the topology or a global table reads is missing, also the input of a stateless subtopology or of a store without changelog; 0.13 raised it only for a topic that set the partition count of a store's changelog. `readBy` (`{ subtopology }` or `{ globalStore }`, the subtopology as numbered in `describe()`) replaces `storeName`, which named that store.
 - Infrastructure failures always recover: a send that failed after the producer's retries (at-least-once) revives the affected tasks in place, commit timeouts are retried at the next interval, and fencing, lost partitions and failed commits make the instance rejoin the group after a backoff.
 
 ## Testing
@@ -95,4 +95,4 @@ See [Configuration](/flow/configuration) for every option.
 
 ## New
 
-The [Processor API](/flow/processor-api), [`suppress()`](/flow/suppress), `emit: 'on-window-close'`, `split()`, `repartition()`, `Stores` and `addStateStore()`, `{ name }` on every operator, [`describe()`](/flow/topology#describe), the exception handlers, timestamp extractors, `getError()`, `taskTimeoutMs`, `maxTaskIdleMs`, `bufferedRecordsPerPartition`, `repartitionPurgeIntervalMs`, `stateCleanupDelayMs`, `mapValuesWithKey()` and `flatMapValuesWithKey()`, `joinWithKey()` and `leftJoinWithKey()`, `InternalTopicNotFoundError`, and the `kafkats:flow:process` tracing channel. See [Differences from Kafka Streams](/flow/kafka-streams) for where flow deliberately differs.
+The [Processor API](/flow/processor-api), [`suppress()`](/flow/suppress), `emit: 'on-window-close'`, `split()`, `repartition()`, `Stores` and `addStateStore()`, `{ name }` on every operator, [`describe()`](/flow/topology#describe), the exception handlers, timestamp extractors, `getError()`, `taskTimeoutMs`, `maxTaskIdleMs`, `bufferedRecordsPerPartition`, `repartitionPurgeIntervalMs`, `stateCleanupDelayMs`, `mapValuesWithKey()` and `flatMapValuesWithKey()`, `joinWithKey()`, `leftJoinWithKey()` and `outerJoinWithKey()` (also for stream-stream joins), `InternalTopicNotFoundError`, and the `kafkats:flow:process` tracing channel. See [Differences from Kafka Streams](/flow/kafka-streams) for where flow deliberately differs.
