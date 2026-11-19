@@ -339,39 +339,90 @@ describe('Producer.beginTransaction()', () => {
 			)
 		}
 
-		it('a send after the re-initialization timed out is rejected; the next transaction initializes', async () => {
-			let ready = false
+		/** Epoch and outcome of every EndTxn the coordinator received. */
+		const endTxns = () => mocks.txnCoordinator.endTxn.mock.calls.map(([r]) => [r.producerEpoch, r.committed])
+		/** The coordinator answers EndTxn only at `epoch()`, its current epoch of the producer id (KIP-360). */
+		const endTxnAtEpoch = (epoch: () => number) =>
+			mocks.txnCoordinator.endTxn.mockImplementation(async request => ({
+				throttleTimeMs: 0,
+				errorCode: request.producerEpoch === epoch() ? ErrorCode.None : ErrorCode.ProducerFenced,
+			}))
+
+		it('fenced by a successor: the transaction sends nothing more, and its abort at the fenced epoch is fatal (Java)', async () => {
+			// The successor bumped the epoch: the coordinator rejects the re-initialization and the abort at epoch 0.
 			mocks.txnCoordinator.initProducerId
 				.mockResolvedValueOnce(identity(1n, 0))
-				.mockImplementation(async () =>
-					ready ? identity(1n, 2) : { ...identity(-1n, -1), errorCode: ErrorCode.ConcurrentTransactions }
-				)
+				.mockResolvedValue({ ...identity(-1n, -1), errorCode: ErrorCode.ProducerFenced })
+			endTxnAtEpoch(() => 2)
 			mocks.leader.produce.mockResolvedValueOnce(fencedProduce(0))
-			const producer = makeProducer({ maxBlockMs: 50, retryBackoffMs: 5, maxRetryBackoffMs: 5 })
+			const producer = makeProducer()
 			const tx = await producer.beginTransaction()
 			await expect(tx.send(TOPIC, { value, partition: 0 })).rejects.toThrow(ProducerFencedError)
-			// The re-initialization the fence started gives up after maxBlockMs.
-			await tick(150)
-			const inits = mocks.txnCoordinator.initProducerId.mock.calls.length
-			expect(producer.transactionState).toBe('in_transaction')
+			await vi.waitFor(() => expect(mocks.txnCoordinator.initProducerId).toHaveBeenCalledTimes(2))
 
-			ready = true
 			const rejected: unknown = await tx.send(TOPIC, { value, partition: 0 }).catch((error: unknown) => error)
 			expect(rejected).toBeInstanceOf(TransactionAbortedError)
 			expect((rejected as TransactionAbortedError).cause).toBeInstanceOf(ProducerFencedError)
 			await expect(
 				tx.sendOffsets({ groupId: 'g1', offsets: [{ topic: TOPIC, partition: 0, offset: 1n }] })
 			).rejects.toThrow(TransactionAbortedError)
+			expect(mocks.txnCoordinator.addOffsetsToTxn).not.toHaveBeenCalled()
+			await expect(tx.commit()).rejects.toThrow(TransactionAbortedError)
+
+			expect(endTxns()).toEqual([[0, false]])
+			expect(producer.transactionState).toBe('error')
+			await expect(producer.beginTransaction()).rejects.toThrow(InvalidTxnStateError)
+			expect(mocks.txnCoordinator.initProducerId).toHaveBeenCalledTimes(2)
+			expect(await produced()).toEqual(['pid 1 epoch 0 transactional'])
+		})
+
+		it('a send after a re-initialization that timed out is rejected; the abort and the next transaction go on', async () => {
+			// An out-of-order sequence does not fence, and the re-initialization never reaches the loading coordinator:
+			// epoch 0 stays current, so the coordinator accepts the abort at it.
+			let coordinatorEpoch = 0
+			let loading = true
+			mocks.txnCoordinator.initProducerId.mockResolvedValueOnce(identity(1n, 0)).mockImplementation(async () => {
+				if (loading) return { ...identity(-1n, -1), errorCode: ErrorCode.CoordinatorLoadInProgress }
+				coordinatorEpoch += 1
+				return identity(1n, coordinatorEpoch)
+			})
+			endTxnAtEpoch(() => coordinatorEpoch)
+			mocks.leader.produce.mockResolvedValueOnce(
+				buildProduceResponse([
+					{ name: TOPIC, partitions: [{ partitionIndex: 0, errorCode: ErrorCode.OutOfOrderSequenceNumber }] },
+				])
+			)
+			const producer = makeProducer({ maxBlockMs: 50, retryBackoffMs: 5, maxRetryBackoffMs: 5 })
+			const tx = await producer.beginTransaction()
+			const outOfOrder: unknown = await tx.send(TOPIC, { value, partition: 0 }).catch((error: unknown) => error)
+			expect(outOfOrder).toMatchObject({ errorCode: ErrorCode.OutOfOrderSequenceNumber })
+			// The re-initialization the fence started gives up after maxBlockMs.
+			await tick(150)
+			const inits = mocks.txnCoordinator.initProducerId.mock.calls.length
+			expect(producer.transactionState).toBe('in_transaction')
+
+			loading = false
+			const rejected: unknown = await tx.send(TOPIC, { value, partition: 0 }).catch((error: unknown) => error)
+			expect(rejected).toBeInstanceOf(TransactionAbortedError)
+			expect((rejected as TransactionAbortedError).cause).toBe(outOfOrder)
+			await expect(
+				tx.sendOffsets({ groupId: 'g1', offsets: [{ topic: TOPIC, partition: 0, offset: 1n }] })
+			).rejects.toThrow(TransactionAbortedError)
 			expect(mocks.txnCoordinator.initProducerId).toHaveBeenCalledTimes(inits)
 			expect(mocks.txnCoordinator.addOffsetsToTxn).not.toHaveBeenCalled()
 			await expect(tx.commit()).rejects.toThrow(TransactionAbortedError)
+			expect(endTxns()).toEqual([[0, false]])
 
 			// Only a begin initializes it again; its transaction is the new epoch's.
 			const next = await producer.beginTransaction()
 			await next.send(TOPIC, { value, partition: 0 })
 			await next.commit()
-			expect(await produced()).toEqual(['pid 1 epoch 0 transactional', 'pid 1 epoch 2 transactional'])
-			expect(mocks.txnCoordinator.addPartitionsToTxn.mock.calls.map(([r]) => r.producerEpoch)).toEqual([0, 2])
+			expect(await produced()).toEqual(['pid 1 epoch 0 transactional', 'pid 1 epoch 1 transactional'])
+			expect(mocks.txnCoordinator.addPartitionsToTxn.mock.calls.map(([r]) => r.producerEpoch)).toEqual([0, 1])
+			expect(endTxns()).toEqual([
+				[0, false],
+				[1, true],
+			])
 		})
 
 		it('a send while the re-initialization runs is rejected at once, not sent under the new epoch', async () => {
@@ -443,6 +494,75 @@ describe('Producer.beginTransaction()', () => {
 			await expect(second).rejects.toThrow(TransactionAbortedError)
 			await tick()
 			expect(await produced()).toEqual(['pid 1 epoch 0 transactional'])
+		})
+
+		/**
+		 * A transaction whose first send's produce is held until the fence: answered PRODUCER_FENCED, the
+		 * re-initialization then getting epoch 2. `holdNextLookup()`, called by the retriable (`loading`) answer of a
+		 * coordinator request, holds the coordinator lookup of its retry until `fenceAndReinitialize()` is done.
+		 */
+		async function fencedDuringRetry(partitionCount: number) {
+			mocks = createTransactionalMocks(TOPIC, { partitionCount })
+			mocks.txnCoordinator.initProducerId
+				.mockResolvedValueOnce(identity(1n, 0))
+				.mockResolvedValue(identity(1n, 2))
+			let fence!: () => void
+			mocks.leader.produce.mockImplementationOnce(
+				() => new Promise(resolve => (fence = () => resolve(fencedProduce(0))))
+			)
+			const producer = makeProducer()
+			const tx = await producer.beginTransaction()
+			const first = tx.send(TOPIC, { value, partition: 0 })
+			first.catch(() => {})
+			await vi.waitFor(() => expect(mocks.leader.produce).toHaveBeenCalledTimes(1))
+
+			let release!: () => void
+			let held = false
+			const lookup = mocks.cluster.getCoordinator.getMockImplementation()!
+			const holdNextLookup = () =>
+				mocks.cluster.getCoordinator.mockImplementationOnce(async (...args) => {
+					held = true
+					await new Promise<void>(resolve => (release = resolve))
+					return lookup(...args)
+				})
+			const loading = { throttleTimeMs: 0, errorCode: ErrorCode.CoordinatorLoadInProgress }
+			const fenceAndReinitialize = async () => {
+				await vi.waitFor(() => expect(held).toBe(true))
+				fence()
+				await expect(first).rejects.toThrow(ProducerFencedError)
+				await vi.waitFor(() => expect(producer.transactionState).toBe('idle'))
+				release()
+			}
+			return { producer, tx, holdNextLookup, loading, fenceAndReinitialize }
+		}
+
+		it('a partition registration retried across the fence never goes out under the new epoch', async () => {
+			const { tx, holdNextLookup, loading, fenceAndReinitialize } = await fencedDuringRetry(2)
+			mocks.txnCoordinator.addPartitionsToTxn.mockImplementationOnce(async () => {
+				holdNextLookup()
+				return { ...loading, results: [] }
+			})
+			const second = tx.send(TOPIC, { value, partition: 1 })
+			second.catch(() => {})
+
+			await fenceAndReinitialize()
+			await expect(second).rejects.toThrow(TransactionAbortedError)
+			expect(mocks.txnCoordinator.addPartitionsToTxn.mock.calls.map(([r]) => r.producerEpoch)).toEqual([0, 0])
+			expect(await produced()).toEqual(['pid 1 epoch 0 transactional'])
+		})
+
+		it('offsets registered by a request retried across the fence never go out under the new epoch', async () => {
+			const { tx, holdNextLookup, loading, fenceAndReinitialize } = await fencedDuringRetry(1)
+			mocks.txnCoordinator.addOffsetsToTxn.mockImplementationOnce(async () => {
+				holdNextLookup()
+				return loading
+			})
+			const offsets = tx.sendOffsets({ groupId: 'g1', offsets: [{ topic: TOPIC, partition: 0, offset: 1n }] })
+			offsets.catch(() => {})
+
+			await fenceAndReinitialize()
+			await expect(offsets).rejects.toThrow(TransactionAbortedError)
+			expect(mocks.txnCoordinator.addOffsetsToTxn.mock.calls.map(([r]) => r.producerEpoch)).toEqual([0])
 		})
 	})
 

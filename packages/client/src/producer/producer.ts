@@ -6,6 +6,7 @@ import { EventEmitter } from 'node:events'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import type { Cluster } from '@/client/cluster.js'
 import type { Broker } from '@/client/broker.js'
+import type { InitProducerIdResponse } from '@/protocol/messages/responses/init-producer-id.js'
 import { SHUTDOWN_DEADLINE_MS, withTimeout } from '@/utils/timeout.js'
 import type { ProduceRequest } from '@/protocol/messages/requests/produce.js'
 import { ErrorCode, isRetriableError } from '@/protocol/messages/error-codes.js'
@@ -114,6 +115,9 @@ type ProduceAttemptOutcome = {
 	retryBatches: PreparedProduceBatch[]
 	stop: boolean
 }
+
+/** How one coordinator lookup and InitProducerId ended: the broker's answer, or why there is none. */
+type InitAttemptOutcome = { response: InitProducerIdResponse } | { error: unknown }
 
 /** The transaction a handle stands for, while it is this producer's open transaction. */
 type OpenTransaction = {
@@ -255,6 +259,12 @@ export class Producer extends EventEmitter<ProducerEvents> {
 	private reservedSequences = new Map<string, number>() // "topic:partition" -> reserved count
 	private idempotentState: IdempotentState = 'idle'
 	private initPromise: Promise<void> | null = null
+	/**
+	 * The coordinator lookup and InitProducerId that an initialization's maxBlockMs cut short: the next initialization
+	 * awaits it before it sends another (Java keeps the pending InitProducerId result), so that an answer the broker
+	 * gives late never bumps the epoch behind a newer InitProducerId of this producer, which would fence it.
+	 */
+	private pendingInitAttempt: Promise<InitAttemptOutcome> | null = null
 	/** Why the initialization put the idempotent producer in the error state. */
 	private initFailure: Error | undefined
 
@@ -1892,7 +1902,8 @@ export class Producer extends EventEmitter<ProducerEvents> {
 
 	/**
 	 * Send within a transaction - adds partition to transaction first. `assertEpoch` (the transaction's) runs right
-	 * before every request and append, so that nothing goes out once its producer was fenced.
+	 * before every request and append, so that nothing goes out once its producer was fenced; an append without an await
+	 * before it is covered by the check of the send's start.
 	 */
 	private async transactionalSend<V, K>(
 		topicDef: TopicDefinition<V, K>,
@@ -1903,12 +1914,11 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		const msgArray = Array.isArray(messages) ? messages : [messages]
 
 		// No send waiting before this one: resolve the partitions now, and if they are all part of
-		// the transaction already, append right away.
+		// the transaction already, append right away (synchronously after the send's start checked the epoch).
 		const partitionCount = this.partitionCountToAppendNow(topicDef.topic)
 		const resolvedNow =
 			partitionCount === undefined ? undefined : this.resolveMessagePartitions(topicDef, msgArray, partitionCount)
 		if (resolvedNow && this.partitionsNotInTransaction(topicDef.topic, resolvedNow).length === 0) {
-			assertEpoch()
 			return settleSend(this.enqueueMessages(topicDef, resolvedNow, partitionCount!), isSingle)
 		}
 
@@ -2524,45 +2534,40 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		// briefly-unreachable coordinator. Non-retriable protocol errors fail fast (Java: a fatal
 		// TransactionManager error). A disconnect stops it at once: a producer given up must not bump
 		// the epoch of its transactional id after its successor with the same id initialized.
+		// maxBlockMs bounds the whole of it, the requests in flight and the backoffs included, like
+		// Java's initTransactions(); an attempt it cuts short stays pending for the next initialization.
 		const deadlineAt = Date.now() + this.config.maxBlockMs
+		const timeLeft = () => deadlineAt - Date.now()
 		const stop = this.closing.signal
 		const backoff = new ReconnectionStrategy({
 			initialDelayMs: this.config.retryBackoffMs,
 			maxDelayMs: this.config.maxRetryBackoffMs,
 			maxAttempts: Number.MAX_SAFE_INTEGER,
 		})
-		let lastError: Error = new Error('no attempt completed')
+		let lastError: Error = new Error('no attempt answered in time')
 		const retryAfter = async (error: Error): Promise<void> => {
 			lastError = error
 			const delay = backoff.nextDelay()
 			backoff.recordFailure()
-			await sleepMs(delay, { signal: stop }).catch(() => {})
+			await sleepMs(Math.min(delay, Math.max(0, timeLeft())), { signal: stop }).catch(() => {})
 		}
 
-		while (Date.now() < deadlineAt) {
+		while (timeLeft() > 0) {
 			if (stop.aborted) {
 				this.idempotentState = 'idle'
 				throw toError(stop.reason)
 			}
-			let response: Awaited<ReturnType<Broker['initProducerId']>>
+			const attempt = (this.pendingInitAttempt ??= this.initAttempt())
+			let outcome: InitAttemptOutcome
 			try {
-				let broker: Broker
-
-				if (this.config.transactionalId) {
-					// Transactional: must use transaction coordinator
-					broker = await this.cluster.getCoordinator('TRANSACTION', this.config.transactionalId)
-				} else {
-					// Non-transactional: any broker works
-					broker = await (this.cluster as unknown as { getAnyBroker: () => Promise<Broker> }).getAnyBroker()
-				}
-
-				response = await broker.initProducerId({
-					transactionalId: this.config.transactionalId,
-					transactionTimeoutMs: this.config.transactionalId ? this.config.transactionTimeoutMs : 0,
-					producerId: this.producerId !== -1n ? this.producerId : undefined,
-					producerEpoch: this.producerEpoch !== -1 ? this.producerEpoch : undefined,
-				})
-			} catch (error) {
+				outcome = await withTimeout(attempt, timeLeft(), 'InitProducerId')
+			} catch {
+				// The deadline: the attempt stays pending, for the next initialization to await first.
+				break
+			}
+			this.pendingInitAttempt = null
+			if ('error' in outcome) {
+				const { error } = outcome
 				// A broker's non-retriable answer to FindCoordinator (an authorization failure): fatal.
 				if (error instanceof KafkaProtocolError && !error.retriable) {
 					this.failInitialization(error)
@@ -2574,9 +2579,9 @@ export class Producer extends EventEmitter<ProducerEvents> {
 				await retryAfter(toError(error))
 				continue
 			}
+			const { response } = outcome
 
-			// Protocol-level error handling — outside the try so a non-retriable code escapes the
-			// loop instead of being re-caught and treated as a transport failure.
+			// Protocol-level error handling: a retriable code is retried, any other one fails fast.
 			if (response.errorCode !== ErrorCode.None) {
 				const errorCode = response.errorCode
 
@@ -2628,6 +2633,26 @@ export class Producer extends EventEmitter<ProducerEvents> {
 		)
 		timeout.cause = lastError
 		throw timeout
+	}
+
+	/** One coordinator lookup and InitProducerId with the producer's current identity; never rejects. */
+	private async initAttempt(): Promise<InitAttemptOutcome> {
+		try {
+			const broker = this.config.transactionalId
+				? // Transactional: must use transaction coordinator
+					await this.cluster.getCoordinator('TRANSACTION', this.config.transactionalId)
+				: // Non-transactional: any broker works
+					await (this.cluster as unknown as { getAnyBroker: () => Promise<Broker> }).getAnyBroker()
+			const response = await broker.initProducerId({
+				transactionalId: this.config.transactionalId,
+				transactionTimeoutMs: this.config.transactionalId ? this.config.transactionTimeoutMs : 0,
+				producerId: this.producerId !== -1n ? this.producerId : undefined,
+				producerEpoch: this.producerEpoch !== -1 ? this.producerEpoch : undefined,
+			})
+			return { response }
+		} catch (error) {
+			return { error }
+		}
 	}
 
 	/** A non-retriable initialization failure: the producer stays in the error state, which rethrows it. */

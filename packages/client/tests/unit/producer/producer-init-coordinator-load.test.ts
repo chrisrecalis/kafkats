@@ -199,4 +199,92 @@ describe('Producer InitProducerId retries CoordinatorLoadInProgress', () => {
 		await new Promise(resolve => setTimeout(resolve, 50))
 		expect(txnCoordinator.initProducerId).toHaveBeenCalledTimes(calls)
 	})
+
+	// Without the bound, each of these waits for an answer that never comes: fail them fast.
+	describe('maxBlockMs bounds the whole initialization, like Java initTransactions()', { timeout: 5000 }, () => {
+		const ok = { throttleTimeMs: 0, errorCode: ErrorCode.None, producerId: 9n, producerEpoch: 1 }
+		const transactional = (options: { maxBlockMs: number; retryBackoffMs?: number }) =>
+			new Producer(mockCluster, {
+				lingerMs: 0,
+				retryBackoffMs: options.retryBackoffMs ?? 5,
+				maxRetryBackoffMs: options.retryBackoffMs ?? 5,
+				maxBlockMs: options.maxBlockMs,
+				transactionalId: 'tx-1',
+			})
+		/** How long `promise` takes to settle, and its rejection. */
+		const timed = async (promise: Promise<unknown>) => {
+			const started = Date.now()
+			const error = await promise.then(
+				() => undefined,
+				(error: unknown) => error
+			)
+			return { error, elapsedMs: Date.now() - started }
+		}
+
+		it('an InitProducerId in flight at the deadline: a TimeoutError then, and the next initialization awaits it instead of sending another', async () => {
+			let answer!: (response: typeof ok) => void
+			txnCoordinator.initProducerId.mockImplementationOnce(
+				() => new Promise<typeof ok>(resolve => (answer = resolve))
+			)
+			const producer = transactional({ maxBlockMs: 100 })
+
+			const first = await timed(producer.beginTransaction())
+			expect(first.error).toBeInstanceOf(TimeoutError)
+			expect(first.elapsedMs).toBeLessThan(1000)
+
+			// Another InitProducerId would bump the epoch again once the broker processes the one in flight, which
+			// fences a request that carries the epoch of before. The next begin waits for the answer of the first.
+			const second = producer.beginTransaction()
+			await new Promise(resolve => setTimeout(resolve, 20))
+			expect(txnCoordinator.initProducerId).toHaveBeenCalledTimes(1)
+			answer(ok)
+			const transaction = await second
+			await transaction.sendOffsets({
+				groupId: 'g1',
+				offsets: [{ topic: 'test-topic', partition: 0, offset: 1n }],
+			})
+			await transaction.commit()
+			expect(txnCoordinator.initProducerId).toHaveBeenCalledTimes(1)
+			expect(txnCoordinator.endTxn).toHaveBeenCalledWith(
+				expect.objectContaining({ producerId: 9n, producerEpoch: 1 })
+			)
+			await producer.disconnect({ timeoutMs: 100 })
+		})
+
+		it('an attempt in flight that fails after the deadline is retried by the next initialization', async () => {
+			let fail!: (error: Error) => void
+			txnCoordinator.initProducerId
+				.mockImplementationOnce(() => new Promise<typeof ok>((_, reject) => (fail = reject)))
+				.mockResolvedValue(ok)
+			const producer = transactional({ maxBlockMs: 100 })
+
+			expect((await timed(producer.beginTransaction())).error).toBeInstanceOf(TimeoutError)
+			const second = producer.beginTransaction()
+			fail(new Error('Request timeout'))
+			await second
+			expect(txnCoordinator.initProducerId).toHaveBeenCalledTimes(2)
+			await producer.disconnect({ timeoutMs: 100 })
+		})
+
+		it('a coordinator lookup that does not answer', async () => {
+			mockCluster.getCoordinator.mockImplementationOnce(() => new Promise(() => {}))
+			const producer = transactional({ maxBlockMs: 100 })
+
+			const { error, elapsedMs } = await timed(producer.beginTransaction())
+			expect(error).toBeInstanceOf(TimeoutError)
+			expect(elapsedMs).toBeLessThan(1000)
+			expect(txnCoordinator.initProducerId).not.toHaveBeenCalled()
+			await producer.disconnect({ timeoutMs: 100 })
+		})
+
+		it('a retry backoff longer than the time left', async () => {
+			txnCoordinator.initProducerId.mockResolvedValue({ ...ok, errorCode: ErrorCode.ConcurrentTransactions })
+			const producer = transactional({ maxBlockMs: 100, retryBackoffMs: 5000 })
+
+			const { error, elapsedMs } = await timed(producer.beginTransaction())
+			expect(error).toBeInstanceOf(TimeoutError)
+			expect(elapsedMs).toBeLessThan(1000)
+			await producer.disconnect({ timeoutMs: 100 })
+		})
+	})
 })
