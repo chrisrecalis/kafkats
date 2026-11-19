@@ -1,193 +1,135 @@
-import { ErrorCode, KafkaError, type KafkaClient, type Logger } from '@kafkats/client'
-import { ChangelogRestorer } from '@/changelog.js'
-import type { KeyValueStore } from '@/state.js'
-import { clearStore } from '@/state/bulk.js'
-import type { FlowConfig } from '@/types.js'
-import type { Checkpoints } from '@/runtime/checkpoints.js'
-import { toError } from '@/runtime/errors.js'
-import type { AppStatus } from '@/runtime/status.js'
-import type { StoreRegistry } from '@/runtime/store-registry.js'
+/**
+ * Restoration of tasks (4.7.1, D8): one restore job per task that is not RUNNING, with its own restore consumer over
+ * every changelog partition of the task (restoreChangelogs). At most `maxConcurrentTasks` jobs run at once; the others
+ * wait in FIFO order.
+ */
+import { OffsetOutOfRangeError, type Logger } from '@kafkats/client'
+import { TaskCorruptedError } from '@/api/errors.js'
+import { restoreChangelogs, restoreTarget, type RestoreTarget } from '@/changelog/restorer.js'
+import { windowedKeyCodec } from '@/changelog/writer.js'
+import type { ResolvedRestorationOptions } from '@/runtime/config.js'
+import type { RuntimeIO } from '@/runtime/io.js'
+import type { TaskRestorer } from '@/runtime/restore-pipelines.js'
+import { abortError } from '@/runtime/signals.js'
+import type { StreamTask } from '@/runtime/task.js'
+import type { KeyValueStore, WindowedKey } from '@/state.js'
+import type { Checkpoints } from '@/state/checkpoints.js'
+import type { RegisteredStore } from '@/state/state-manager.js'
 
-/** How long after a revocation unowned in-memory state partitions are kept before being dropped. */
-const UNOWNED_STATE_PRUNE_DELAY_MS = 30_000
+export interface RestorationPoolDeps {
+	readonly io: Pick<RuntimeIO, 'restoreConsumers' | 'admin'>
+	readonly checkpoints: Checkpoints
+	readonly options: ResolvedRestorationOptions
+	readonly applicationId: string
+	/** Restore progress is checkpointed at most this often (the app's commit interval). */
+	readonly commitIntervalMs: number
+	/**
+	 * Clears a store of the task before its rebuild, until `signal` aborts (StateDirectory.clear: marked in progress
+	 * until it is done).
+	 */
+	readonly clear: (task: RestoringTask, store: RegisteredStore, signal: AbortSignal) => Promise<void>
+	readonly logger: Logger
+}
 
-export type TopicPartition = { topic: string; partition: number }
+/** What a restore job needs of a task. */
+export type RestoringTask = Pick<StreamTask, 'id' | 'stores'>
 
-export type RestorationDeps = {
-	client: KafkaClient
-	config: FlowConfig
-	stores: StoreRegistry
-	checkpoints: Checkpoints
-	status: AppStatus
-	logger: Logger
-	/** Whether a worker of this instance currently owns state partition `partition` fed by `sourceTopics`. */
-	isStatePartitionOwned: (sourceTopics: Set<string>, partition: number) => boolean
+/** Restore consumers created by this process: `n` of their group ids `<applicationId>-restore-<taskId>-<n>` (DL14). */
+let restoreConsumers = 0
+
+export class RestorationPool implements TaskRestorer {
+	private running = 0
+	/** Jobs waiting for a slot, in FIFO order. */
+	private readonly waiting: (() => void)[] = []
+
+	constructor(private readonly deps: RestorationPoolDeps) {}
+
+	/**
+	 * Restores the task's logged stores that restore (raw stores, runtime§6.36). An aborted job rejects with an
+	 * AbortError: a queued one at once, a running one once its store write in flight is done and its progress is
+	 * checkpointed. A changelog that lost records the restore needed (C7) is a TaskCorruptedError: the task is revived
+	 * and rebuilds its stores (4.7.5).
+	 */
+	async restore(task: RestoringTask, signal: AbortSignal): Promise<void> {
+		const restoring = task.stores.flatMap(store => {
+			const { changelog } = store
+			return changelog === undefined || changelog.skipRestoration ? [] : [{ store, changelog }]
+		})
+		if (restoring.length === 0) {
+			return
+		}
+		await this.slot(signal)
+		const { io, checkpoints, options, applicationId, commitIntervalMs, clear, logger } = this.deps
+		try {
+			await restoreChangelogs(
+				{
+					consumer: () =>
+						io.restoreConsumers(`${applicationId}-restore-${task.id.key}-${++restoreConsumers}`),
+					admin: io.admin,
+				},
+				restoring.map(({ store, changelog }) => ({
+					...target(store, changelog),
+					clear: (signal: AbortSignal) => clear(task, store, signal),
+				})),
+				checkpoints,
+				{ ...options, commitIntervalMs, signal, logger: logger.child({ task: task.id.key }) }
+			)
+		} catch (error) {
+			if (error instanceof OffsetOutOfRangeError) {
+				throw new TaskCorruptedError(
+					`Task ${task.id.key} cannot restore its state: ${error.message}`,
+					[task.id],
+					{ cause: error }
+				)
+			}
+			throw error
+		} finally {
+			this.release()
+		}
+	}
+
+	/** Resolves once the job may run; rejects at once when `signal` aborts while it waits. */
+	private slot(signal: AbortSignal): Promise<void> {
+		if (signal.aborted) {
+			return Promise.reject(abortError(signal))
+		}
+		if (this.running < this.deps.options.maxConcurrentTasks) {
+			this.running++
+			return Promise.resolve()
+		}
+		return new Promise((resolve, reject) => {
+			const start = () => {
+				signal.removeEventListener('abort', onAbort)
+				this.running++
+				resolve()
+			}
+			const onAbort = () => {
+				this.waiting.splice(this.waiting.indexOf(start), 1)
+				reject(abortError(signal))
+			}
+			signal.addEventListener('abort', onAbort, { once: true })
+			this.waiting.push(start)
+		})
+	}
+
+	private release(): void {
+		this.running--
+		this.waiting.shift()?.()
+	}
 }
 
 /**
- * Restores state stores from their changelogs and releases state of partitions no longer owned.
- *
- * All work on state partitions (restore, release, prune) runs through one serialized queue, so a
- * partition is never restored and dropped concurrently.
+ * The restore target of a logged store: its raw store, written with the codecs of its changelog writer (window and
+ * session stores: windowed keys).
  */
-export class Restoration {
-	private queue: Promise<void> = Promise.resolve()
-	private pruneTimer: ReturnType<typeof setTimeout> | null = null
-
-	constructor(private readonly deps: RestorationDeps) {}
-
-	/** App-scoped stores hold state for all partitions; rebuild them fully before processing. */
-	async restoreAppScopedStores(): Promise<void> {
-		await Promise.all(
-			[...this.deps.stores.definitions]
-				.filter(def => def.scope === 'app' && def.changelog && !def.changelog.skipRestoration)
-				.map(async def => {
-					const spec = def.changelog!
-					const stack = await def.partitions.forPartition(0)
-					const restorer = new ChangelogRestorer(
-						spec.topicName,
-						spec.keyCodec,
-						spec.valueCodec,
-						stack.raw as unknown as KeyValueStore<unknown, unknown>
-					)
-					await this.runRestorer(restorer, undefined)
-				})
-		)
+function target(
+	{ builder, raw }: RegisteredStore,
+	changelog: { readonly topic: string; readonly partition: number }
+): RestoreTarget {
+	const codecs = { key: builder.keyCodec, value: builder.valueCodec }
+	if (builder.kind === 'key-value') {
+		return restoreTarget(changelog, raw as KeyValueStore<unknown, unknown>, codecs)
 	}
-
-	/**
-	 * Restore the state partitions that back newly assigned source partitions.
-	 * Restorations are serialized so a partition is never restored twice concurrently.
-	 */
-	enqueue(partitions: TopicPartition[]): Promise<void> {
-		const task = this.queue.then(() => this.restorePartitions(partitions))
-		this.queue = task.catch(err => {
-			// A restore failure during startup fails start() (see drain).
-			this.deps.status.failStartup(toError(err))
-		})
-		return task
-	}
-
-	/** Wait until every queued restoration (including ones queued meanwhile) is done. */
-	async drain(): Promise<void> {
-		let seen: Promise<void> | null = null
-		while (seen !== this.queue) {
-			seen = this.queue
-			await seen
-			this.deps.status.assertNotClosing()
-		}
-	}
-
-	/** Settles once all queued work is done; never rejects. */
-	settled(): Promise<void> {
-		return this.queue.catch(() => {})
-	}
-
-	/**
-	 * Partitions were revoked or lost: schedule the cleanup of state this instance no longer owns.
-	 *
-	 * The local copy is kept for now, because the partition often comes straight back (every
-	 * rebalance revokes before it re-assigns) and can then be caught up from its checkpoint instead
-	 * of being rebuilt from the start of the changelog.
-	 *
-	 * Writes buffered by an open transaction are deliberately left alone: they belong to that
-	 * transaction, which applies them when it commits and drops them when it aborts. Dropping them
-	 * here would let the transaction commit in Kafka without its update reaching the local store.
-	 */
-	release(released: TopicPartition[]): void {
-		if (released.length === 0) return
-		this.schedulePrune()
-	}
-
-	/** Cancel the pending prune (on shutdown). */
-	cancelPrune(): void {
-		if (this.pruneTimer) {
-			clearTimeout(this.pruneTimer)
-			this.pruneTimer = null
-		}
-	}
-
-	private async restorePartitions(assigned: TopicPartition[]): Promise<void> {
-		if (!this.deps.status.clusterAvailable || assigned.length === 0) return
-
-		await Promise.all(
-			[...this.deps.stores.definitions]
-				.filter(def => def.scope === 'partition' && def.changelog && !def.changelog.skipRestoration)
-				.map(async def => {
-					const spec = def.changelog!
-					const partitions = [
-						...new Set(assigned.filter(tp => def.sourceTopics.has(tp.topic)).map(tp => tp.partition)),
-					]
-					if (partitions.length === 0) return
-
-					const restorer = new ChangelogRestorer(
-						spec.topicName,
-						spec.keyCodec,
-						spec.valueCodec,
-						async partition => {
-							// Restoration writes committed state straight to the provider's store, below
-							// the transactional buffer.
-							const stack = await def.partitions.forPartition(partition)
-							return stack.raw as unknown as KeyValueStore<unknown, unknown>
-						}
-					)
-					await this.runRestorer(restorer, partitions)
-				})
-		)
-	}
-
-	private async runRestorer(
-		restorer: ChangelogRestorer<unknown, unknown>,
-		partitions: number[] | undefined
-	): Promise<void> {
-		try {
-			await restorer.restore(
-				this.deps.client,
-				this.deps.config.changelog?.restoration,
-				partitions,
-				this.deps.checkpoints.store
-			)
-		} catch (err) {
-			// A changelog topic that doesn't exist yet has nothing to restore (first startup with
-			// autoCreate disabled); anything else must fail loudly rather than run on partial state.
-			const error = err as Error & { code?: string }
-			if (error.code === 'UNKNOWN_TOPIC_OR_PARTITION') return
-			if (error instanceof KafkaError && error.errorCode === ErrorCode.UnknownTopicOrPartition) return
-			throw err
-		}
-	}
-
-	/**
-	 * Once assignments have settled, drop the in-memory state of partitions this instance no longer
-	 * owns. Another instance is advancing that state now, so the local copy would only go stale and
-	 * hold memory. Durable state (with durable checkpoints) is kept on disk for a later return.
-	 */
-	private schedulePrune(): void {
-		if (this.deps.checkpoints.durable) return
-		if (this.pruneTimer) clearTimeout(this.pruneTimer)
-		this.pruneTimer = setTimeout(() => {
-			this.pruneTimer = null
-			const { status, stores, checkpoints } = this.deps
-			if (status.closing) return
-			const task = this.queue.then(async () => {
-				for (const def of stores.definitions) {
-					if (def.scope !== 'partition') continue
-					for (const partition of def.partitions.materializedPartitions()) {
-						if (status.closing || this.deps.isStatePartitionOwned(def.sourceTopics, partition)) continue
-						const stack = await def.partitions.forPartition(partition)
-						stack.buffer.discardBuffer()
-						await clearStore(stack.raw as unknown as KeyValueStore<unknown, unknown>)
-						def.partitions.forget(partition)
-						if (def.changelog) {
-							checkpoints.forgetInProcess(def.changelog.topicName, partition)
-						}
-					}
-				}
-			})
-			this.queue = task.catch(err => {
-				this.deps.logger.warn('failed to prune state of unowned partitions', { error: toError(err).message })
-			})
-		}, UNOWNED_STATE_PRUNE_DELAY_MS)
-		this.pruneTimer.unref?.()
-	}
+	const store = raw as KeyValueStore<WindowedKey<unknown>, unknown>
+	return restoreTarget(changelog, store, { ...codecs, key: windowedKeyCodec(builder.keyCodec) })
 }

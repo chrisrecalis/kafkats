@@ -29,15 +29,37 @@ export interface SessionStoreOptions<K, V> extends KeyValueStoreOptions<K, V> {
 }
 
 /**
- * A key-value state store for maintaining local state in stream processing.
+ * Base of every state store. Stores are used by stateful operations like aggregations, joins and
+ * deduplication; each store has a unique name within the application.
  *
- * State stores are used by stateful operations like aggregations, joins, and
- * deduplication. Each store has a unique name within the application.
+ * Iteration order: `range()` iterates in ascending serialized-key order; `fetch()` and `findSessions()`
+ * iterate in `(start, end)` order for one key; the order of `all()`, `fetchAll()` and `fetchRange()` is
+ * unspecified.
  */
-export interface KeyValueStore<K, V> {
+export interface StateStore {
 	/** Unique name of this store */
 	readonly name: string
 
+	/**
+	 * Initialize the store. Called before first use.
+	 */
+	init(): Promise<void>
+
+	/**
+	 * Flush any pending writes to durable storage.
+	 */
+	flush(): Promise<void>
+
+	/**
+	 * Close the store and release resources.
+	 */
+	close(): Promise<void>
+}
+
+/**
+ * A key-value state store for maintaining local state in stream processing.
+ */
+export interface KeyValueStore<K, V> extends StateStore {
 	/**
 	 * Get the value for a key.
 	 * @returns The value, or undefined if not found
@@ -66,24 +88,9 @@ export interface KeyValueStore<K, V> {
 	range(from: K, to: K): AsyncIterable<[K, V]>
 
 	/**
-	 * Get approximate number of entries in the store.
+	 * Get approximate number of entries in the store (0 iff the store is empty).
 	 */
 	approximateNumEntries(): Promise<number>
-
-	/**
-	 * Initialize the store. Called before first use.
-	 */
-	init(): Promise<void>
-
-	/**
-	 * Flush any pending writes to durable storage.
-	 */
-	flush(): Promise<void>
-
-	/**
-	 * Close the store and release resources.
-	 */
-	close(): Promise<void>
 }
 
 /**
@@ -127,7 +134,7 @@ export interface WindowStore<K, V> extends KeyValueStore<WindowedKey<K>, V> {
 	fetchRange(keyFrom: K, keyTo: K, timeFrom: number, timeTo: number): AsyncIterable<[WindowedKey<K>, V]>
 
 	/**
-	 * Remove expired windows based on retention period.
+	 * Remove the windows that end before `currentTime - retentionMs` (the store's retention).
 	 * @param currentTime Current timestamp in milliseconds
 	 * @returns Number of expired entries removed
 	 */
@@ -141,12 +148,14 @@ export interface WindowStore<K, V> extends KeyValueStore<WindowedKey<K>, V> {
  */
 export interface SessionStore<K, V> extends KeyValueStore<WindowedKey<K>, V> {
 	/**
-	 * Find all sessions for a key that overlap with the given time range.
+	 * The sessions of a key that end at or after `earliestSessionEnd` and start at or before `latestSessionStart`
+	 * (Kafka Streams' `findSessions(key, earliestSessionEndTime, latestSessionStartTime)`): those that overlap the
+	 * range `[earliestSessionEnd, latestSessionStart]`, not only those inside it.
 	 * @param key The key to search
-	 * @param earliestStart Earliest session start time (inclusive)
-	 * @param latestEnd Latest session end time (inclusive)
+	 * @param earliestSessionEnd Earliest session end time (inclusive)
+	 * @param latestSessionStart Latest session start time (inclusive)
 	 */
-	findSessions(key: K, earliestStart: number, latestEnd: number): AsyncIterable<[WindowedKey<K>, V]>
+	findSessions(key: K, earliestSessionEnd: number, latestSessionStart: number): AsyncIterable<[WindowedKey<K>, V]>
 
 	/**
 	 * Remove all sessions for a key.
@@ -154,20 +163,38 @@ export interface SessionStore<K, V> extends KeyValueStore<WindowedKey<K>, V> {
 	remove(key: K): Promise<void>
 
 	/**
-	 * Remove sessions whose end time is older than the cutoff (i.e. inactive
-	 * for at least the configured retention). Returns the list of removed
-	 * session keys so callers (e.g. ChangelogBackedSessionStore) can emit
-	 * tombstones to keep the durable log in sync. Without expiry, closed
-	 * sessions persist forever and the store grows unboundedly.
+	 * Remove the sessions that end before `currentTime - retentionMs` (inactive
+	 * for at least the configured retention); returns their keys. Without
+	 * expiry, closed sessions persist forever and the store grows unboundedly.
 	 */
 	expireOldSessions(currentTime: number): Promise<WindowedKey<K>[]>
 }
+
+/** A value with the timestamp of the record that last updated it. */
+export interface ValueAndTimestamp<V> {
+	readonly value: V
+	readonly timestamp: number
+}
+
+/** Key-value store whose values carry a timestamp (DSL tables and aggregations). */
+export interface TimestampedKeyValueStore<K, V> extends KeyValueStore<K, ValueAndTimestamp<V>> {}
+
+/** Window store whose values carry a timestamp (time-window aggregations). */
+export interface TimestampedWindowStore<K, V> extends WindowStore<K, ValueAndTimestamp<V>> {}
+
+/** What processors may do with a global table's store: read it. */
+export type ReadOnlyTimestampedKeyValueStore<K, V> = Pick<
+	TimestampedKeyValueStore<K, V>,
+	'name' | 'get' | 'range' | 'all' | 'approximateNumEntries'
+>
 
 /**
  * Durable store for tracking changelog restore/write progress.
  *
  * Implementations should be colocated with state storage so offsets are not
- * reused across incompatible local state directories.
+ * reused across incompatible local state directories. Flow also records other
+ * progress of a store here, under names that are not topic names (the clear
+ * of a store in progress): store any string as `topic`.
  */
 export interface ChangelogCheckpointStore {
 	/**
@@ -179,7 +206,9 @@ export interface ChangelogCheckpointStore {
 	/**
 	 * Set the next offset to restore from for a changelog topic-partition.
 	 *
-	 * The offset should be the "next" offset (i.e. last-applied offset + 1).
+	 * The offset should be the "next" offset (i.e. last-applied offset + 1). It may be `-1n`, the sentinel
+	 * that invalidates a checkpoint (always below the earliest offset, so never trusted); implementations
+	 * store it like any other value.
 	 */
 	set(topic: string, partition: number, offset: bigint): Promise<void>
 

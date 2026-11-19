@@ -16,7 +16,7 @@ kafkats is a pure-protocol Kafka client and streams library for TypeScript. Unli
 | --------------------------------------------- | -------------------------------------------- |
 | [@kafkats/client](/client/)                   | Core Kafka client with producer and consumer |
 | [@kafkats/flow](/flow/)                       | Kafka Streams-like DSL for stream processing |
-| [@kafkats/flow-codec-zod](/flow-codec-zod/)   | Zod schema validation codecs                 |
+| [@kafkats/codec-zod](/flow-codec-zod/)        | Zod schema validation codecs                 |
 | [@kafkats/flow-state-lmdb](/flow-state-lmdb/) | LMDB-backed persistent state stores          |
 
 ## Next Steps

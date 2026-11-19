@@ -1,342 +1,165 @@
-# Stream Operations
+# Operations and Options
 
-Complete reference of all KStream and KTable operations.
+Kafka Streams configures operators with builder objects (`Consumed`, `Produced`, `Grouped`, `Materialized`, `Named`, `Branched`, ...). Flow takes the same settings as plain options objects, the last argument of each operator.
 
 ## Options Reference
 
-Many operations accept an `options` object. These are the common ones:
+### NamedOptions
 
-### Consumed (for `app.stream(...)`, `app.table(...)`)
-
-| Option        | Type                               | Description                                |
-| ------------- | ---------------------------------- | ------------------------------------------ |
-| `key`         | `Codec<K>`                         | Decode keys                                |
-| `value`       | `Codec<V>`                         | Decode values                              |
-| `offsetReset` | `'earliest' \| 'latest' \| 'none'` | What to do when no committed offset exists |
-
-### Produced (for `to(...)`, `through(...)`)
-
-| Option        | Type                                                                   | Description                             |
-| ------------- | ---------------------------------------------------------------------- | --------------------------------------- |
-| `key`         | `Codec<K>`                                                             | Encode keys                             |
-| `value`       | `Codec<V>`                                                             | Encode values                           |
-| `partitioner` | `(key: K \| null, value: V \| null, partitionCount: number) => number` | Choose a partition for produced records |
-
-Without `key`/`value`, the codecs the stream carries are used. `mapValues()`, `flatMapValues()` and `map()` drop the value codec, and `map()` and `selectKey()` drop the key codec.
-
-Records written with `to()` or `through()` keep the timestamp of the input record.
-
-### Grouped (for `groupBy(...)`, `groupByKey(...)`)
-
-| Option  | Type       | Description                                                                               |
-| ------- | ---------- | ----------------------------------------------------------------------------------------- |
-| `key`   | `Codec<K>` | Key codec for grouping / repartitioning (required for `groupBy()`)                        |
-| `value` | `Codec<V>` | Value codec for grouping / repartitioning                                                 |
-| `name`  | `string`   | Name of the internal repartition topic, `<applicationId>-<name>-repartition`. Recommended |
-
-### Materialized (for `toTable(...)` and stateful ops)
-
-| Option      | Type                         | Description                                                  |
-| ----------- | ---------------------------- | ------------------------------------------------------------ |
-| `storeName` | `string`                     | Store name (and changelog topic name prefix)                 |
-| `key`       | `Codec<K>`                   | Key codec for the state store                                |
-| `value`     | `Codec<V>`                   | Value codec for the state store (required for `aggregate()`) |
-| `changelog` | `boolean \| ChangelogConfig` | Changelog for the store (default: enabled)                   |
-
-### Joined (for `join(...)`, `leftJoin(...)`, `outerJoin(...)`)
-
-| Option       | Type                                              | Description                                                             |
-| ------------ | ------------------------------------------------- | ----------------------------------------------------------------------- |
-| `key`        | `Codec<K>`                                        | Key codec                                                               |
-| `value`      | `Codec<V1>`                                       | Left-side value codec                                                   |
-| `otherValue` | `Codec<V2>`                                       | Right-side value codec                                                  |
-| `within`     | `TimeWindows \| SessionWindows \| SlidingWindows` | Join window (required for stream-stream joins; `SlidingWindows` throws) |
-| `changelog`  | `boolean \| ChangelogConfig`                      | Changelog for the join window stores (default: enabled)                 |
-
-## Stateless Operations
-
-These operations don't require state storage:
-
-### map
-
-Transform key and value:
+Every operator takes `{ name }`. It names the operator's node and, where the operator has them, its stores and topics (an operator that registers several derives them as `<name>-<suffix>`, as Kafka Streams does).
 
 ```typescript
-stream.map((key, value) => [newKey, newValue] as const)
+stream.filter((key, v) => v !== null, { name: 'drop-tombstones' })
 ```
 
-### mapValues
+Names are 1 to 249 ASCII letters, digits, `.`, `_` and `-` (they end up in topic names), and unique in the app: an illegal or duplicate name throws `TopologyError`. Without names, node, store and topic names are generated from counters in the order of the DSL calls, so adding an operator can rename what comes after it. See [Topology and Naming](/flow/topology#naming).
 
-Transform only value:
+### Consumed
+
+For `app.stream()`, `app.table()` and `app.globalTable()`:
+
+| Option               | Description                                                                                                                        |
+| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `key`, `value`       | Codecs. Without one, the source reads raw `Buffer`s.                                                                               |
+| `timestampExtractor` | The timestamp of each record. Default: `FlowConfig.defaultTimestampExtractor`.                                                     |
+| `offsetReset`        | `'earliest'`, `'latest'` or `'none'` for partitions without a committed offset. Default: `consumer.autoOffsetReset ?? 'earliest'`. |
+| `name`               | The source node (for a table: `<name>-source`, and `<name>` for the table node).                                                   |
+
+`app.table()` and `app.globalTable()` also take `materialized` (a [`Materialized`](#materialized)).
+
+### Produced
+
+For `to()` and the deprecated `through()`:
+
+| Option         | Description                                                                                                       |
+| -------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `key`, `value` | Codecs. Default: the stream's.                                                                                    |
+| `partitioner`  | `(key, value, partitionCount) => number \| undefined`; `undefined` leaves the record to the default partitioning. |
+| `name`         | The sink node.                                                                                                    |
+
+### Grouped
+
+For `groupBy()` and `groupByKey()` on streams and `groupBy()` on tables:
+
+| Option         | Description                                                                                                                                         |
+| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `key`, `value` | Codecs of the grouped records (written to the repartition topic). `KTable.groupBy()` requires `key`.                                                |
+| `name`         | The repartition topic `<applicationId>-<name>-repartition`, shared by every aggregation of the grouping, and the key-selecting node of `groupBy()`. |
+
+### Materialized
+
+How a table is stored. Used by `app.table()`, `toTable()`, and in `materialized` of table operations:
+
+| Option         | Description                                                                                                                                             |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `storeName`    | The store, its changelog `<applicationId>-<storeName>-changelog` and its persisted state. Name stores whose state must survive changes of the topology. |
+| `key`, `value` | Codecs of the store.                                                                                                                                    |
+| `changelog`    | `true` (default), `false`, or a `ChangelogConfig`. See [Changelog topics](/flow/state-stores#changelog-topics).                                         |
+| `retention`    | Windowed aggregations: how long windows are kept. See [Retention](/flow/windowing#retention).                                                           |
+
+### AggregateOptions and WindowedAggregateOptions
+
+`count()`, `reduce()` and `aggregate()` take a `Materialized` and a `name`. Windowed aggregations also take `emit`: `'on-update'` (default) forwards every update of a window, `'on-window-close'` only its final result once the window closed. See [Emit on window close](/flow/windowing#emit-on-window-close).
 
 ```typescript
-stream.mapValues(value => transformedValue)
+grouped.count({ name: 'count-clicks', storeName: 'clicks-per-user' })
+grouped.windowedBy(TimeWindows.ofSizeWithNoGrace('1m')).count({ emit: 'on-window-close' })
 ```
 
-### selectKey
+### TableOptions
 
-Change the key:
+For `KTable.filter()`, `filterNot()`, `mapValues()`, `mapValuesWithKey()` and table joins: `{ name, materialized }`. With `materialized.storeName` the result table is materialized. `transformValues()` also takes `stores`.
+
+### StreamJoined
+
+For stream-stream joins (the fourth argument, after the `JoinWindows`):
+
+| Option                       | Description                                                                                                   |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `key`, `value`, `otherValue` | Codecs of the key and of both sides' values (required where the streams do not know them).                    |
+| `storeName`                  | Base name of the join stores: `<storeName>-this-join-store`, `<storeName>-other-join-store`. Default: `name`. |
+| `changelog`                  | Changelog backing of the join stores.                                                                         |
+| `name`                       | Names the join's nodes and the repartition topics of re-keyed sides (`<name>-left`, `<name>-right`).          |
+
+### Joined
+
+For stream-table joins: `key`, `value`, `otherValue` codecs and `name` (the join node, and the repartition topic of a re-keyed stream). The stream-stream join overloads taking `Joined` with `within` are deprecated; see [Joins](/flow/joins#deprecated-forms).
+
+### Repartitioned
+
+For `repartition()`: `name`, `key` and `value` codecs, `numberOfPartitions`, `partitioner`. See [repartition](/flow/streams#repartition).
+
+### SuppressOptions
+
+For `KTable.suppress()`: `{ until: 'window-close' }` or `{ until: 'time-limit', timeLimit }`, with `maxRecords`, `maxBytes`, `whenFull` and `name`. See [Suppression](/flow/suppress).
+
+### SplitOptions and BranchOptions
+
+For `split({ name })` and `branch(predicate, { name, chain })`. See [Splitting a stream](/flow/streams#splitting-a-stream).
+
+### ProcessOptions and TransformValuesOptions
+
+For `process()`, `processValues()` and `KTable.transformValues()`: `name` and `stores`, the state stores the processor uses. See the [Processor API](/flow/processor-api).
+
+## Durations
+
+Windows, grace periods, retention and suppress time limits take a `WindowDuration`: milliseconds, or a number with a unit.
 
 ```typescript
-stream.selectKey((value, key) => value.userId)
+TimeWindows.ofSizeAndGrace('5m', '30s')
+TimeWindows.ofSizeAndGrace(300_000, 30_000) // the same
+// units: 'ms', 's', 'm', 'h', 'd'; fractions allowed: '1.5s'
 ```
 
-`selectKey()` and `map()` mark the stream as re-keyed. If it is followed by `groupByKey()`, a join or `toTable()`, it is [repartitioned](/flow/streams#repartitioning) through an internal topic, which needs key and value codecs.
+A duration must come out as a whole, non-negative number of milliseconds (`JoinWindows.before()` and `after()` may be negative), otherwise the factory throws `TopologyError`.
 
-### filter
+## How Codecs Are Resolved
 
-Keep matching records:
+Flow tracks the codecs it knows for a stream or table at each point of the topology:
 
-```typescript
-stream.filter((key, value) => condition)
-```
+- A source knows the codecs it was given (else it reads raw `Buffer`s).
+- An operator that changes keys (`map`, `selectKey`, `flatMap`, `process`, `groupBy`, `toStream(mapper)`) forgets the key codec; one that changes values (`mapValues`, `flatMapValues`, `processValues`, joins, `map`) forgets the value codec. Operators that change neither keep both.
+- An aggregation's result has the codecs of its store: the key codec of the grouping, and its value codec (`count()`: int64; `reduce()`: the value codec; `aggregate()`: `value`, required when the aggregate type differs from the value type).
+- Windowed aggregations key their results with a windowed codec of the base key's codec; see [Windowed keys](/flow/windowing#windowed-keys).
 
-### flatMapValues
-
-One-to-many value transformation:
-
-```typescript
-stream.flatMapValues(value => [v1, v2, v3])
-```
-
-### peek
-
-Side effects without transformation:
-
-```typescript
-stream.peek((key, value) => {
-	console.log(key, value)
-})
-```
-
-## Grouping Operations
-
-### groupByKey
-
-Group by existing key:
-
-```typescript
-const grouped = stream.groupByKey()
-```
-
-### groupBy
-
-Group by computed key:
-
-```typescript
-// The new key needs a codec. Records are repartitioned through an internal topic
-const grouped = stream.groupBy((key, value) => value.category, {
-	key: string(),
-	name: 'by-category', // stable topic name: <applicationId>-by-category-repartition
-})
-```
-
-## Aggregation Operations
-
-Available on KGroupedStream and KGroupedTable:
-
-### count
-
-Count records per key:
-
-```typescript
-grouped.count()
-// Returns KTable<K, number>
-```
-
-### reduce
-
-Reduce to single value (the aggregate has the value type; `KGroupedTable.reduce()` also takes a subtractor):
-
-```typescript
-grouped.reduce((agg, value) => agg + value)
-```
-
-### aggregate
-
-Custom aggregation (`KGroupedTable.aggregate()` also takes a subtractor):
-
-```typescript
-grouped.aggregate(
-	() => ({ sum: 0, count: 0 }), // initializer
-	(key, value, agg) => ({
-		// aggregator
-		sum: agg.sum + value.amount,
-		count: agg.count + 1,
-	}),
-	{ value: json<{ sum: number; count: number }>() } // codec for the aggregate (required)
-)
-```
-
-## Windowed Operations
-
-### windowedBy
-
-Apply time window to grouped stream:
-
-```typescript
-import { TimeWindows } from '@kafkats/flow'
-
-grouped.windowedBy(TimeWindows.of('5m'))
-// Returns WindowedKGroupedStream
-```
-
-Session windows also use `windowedBy()`:
-
-```typescript
-import { SessionWindows } from '@kafkats/flow'
-
-grouped.windowedBy(SessionWindows.withInactivityGap('30m'))
-```
-
-## Join Operations
-
-The inputs of a join must be [co-partitioned](/flow/state-stores#co-partitioning), otherwise `start()` throws `CoPartitioningError`. A [global table](/flow/tables#global-tables) can be joined from a stream without that requirement.
-
-### join (inner)
-
-Inner join - both sides must have matching key:
-
-```typescript
-import { TimeWindows } from '@kafkats/flow'
-
-// Stream-stream join
-stream1.join(stream2, (v1, v2) => combined, {
-	within: TimeWindows.of('5m'),
-})
-
-// Stream-table join
-stream.join(table, (streamValue, tableValue) => combined)
-
-// Table-table join
-table1.join(table2, (v1, v2) => combined)
-```
-
-### leftJoin
-
-Left join - keep all left records:
-
-```typescript
-stream.leftJoin(table, (streamValue, tableValue) => ({
-	...streamValue,
-	extra: tableValue?.field ?? 'default',
-}))
-```
-
-### outerJoin
-
-Outer join - keep all records from both:
-
-```typescript
-stream1.outerJoin(
-	stream2,
-	(v1, v2) => ({
-		left: v1,
-		right: v2,
-	}),
-	{ within: TimeWindows.of('5m') }
-)
-```
-
-## Branching Operations
-
-### branch
-
-Split into multiple streams:
-
-```typescript
-const [premium, standard] = stream.branch(
-	(key, value) => value.tier === 'premium',
-	(key, value) => value.tier === 'standard'
-)
-```
-
-### merge
-
-Combine streams:
-
-```typescript
-const merged = stream1.merge(stream2).merge(stream3)
-```
-
-## Output Operations
-
-### to
-
-Terminal - write to topic:
-
-```typescript
-stream.to('output-topic')
-
-// With options
-const customPartitioner = (key, _value, partitionCount) => {
-	if (key === null) return 0
-	return String(key).length % partitionCount
-}
-
-stream.to('output-topic', { partitioner: customPartitioner })
-```
-
-### through
-
-Write to a topic and continue from what is read back from it. It is a real repartition point, and the topic must already exist:
+An operator option always wins. An operator that has to encode something (a repartition topic, a store) and finds no codec throws `TopologyError` naming itself and the missing codec, from the DSL call that adds it:
 
 ```typescript
 stream
-  .through(intermediateTopic)
-  .filter(...)
-  .to(finalTopic)
-```
-
-## Conversion Operations
-
-### toTable
-
-Convert stream to table:
-
-```typescript
-const table = stream.toTable()
-```
-
-### toStream
-
-Convert table to stream:
-
-```typescript
-const stream = table.toStream()
-```
-
-## Chaining Operations
-
-Operations can be chained fluently:
-
-```typescript
-app.stream(inputTopic)
-	.filter((_, v) => v.valid)
-	.mapValues(v => transform(v))
-	.selectKey(v => v.userId)
-	.groupByKey({ key: string(), value: json<Valid>(), name: 'valid-by-user' })
-	.windowedBy(TimeWindows.of('1h'))
+	.selectKey((key, order) => order!.customerId)
+	// the key changed: groupByKey() must repartition, and needs the new key's codec
+	.groupByKey({ key: string() })
 	.count()
-	.toStream()
-	.map(
-		(windowedKey, count) =>
-			[windowedKey.key, { userId: windowedKey.key, count, window: windowedKey.window }] as const
-	)
-	.to('user-counts', { key: string(), value: json() })
 ```
 
-## Operation Categories
+A sink without a codec writes keys and values as they are: that works only for `Buffer`s (and `null`); anything else is a serialization error, which goes to the [production exception handler](/flow/error-handling#production-exceptions).
 
-| Category    | Operations                               | State Required                               |
-| ----------- | ---------------------------------------- | -------------------------------------------- |
-| Transform   | map, mapValues, selectKey, flatMapValues | No                                           |
-| Filter      | filter                                   | No                                           |
-| Side Effect | peek                                     | No                                           |
-| Group       | groupByKey, groupBy                      | Repartition topic after a re-key / `groupBy` |
-| Aggregate   | count, reduce, aggregate                 | Yes                                          |
-| Window      | windowedBy                               | Yes                                          |
-| Join        | join, leftJoin, outerJoin                | Yes                                          |
-| Branch      | branch, merge                            | No                                           |
-| Output      | to, through                              | No                                           |
-| Convert     | toTable, toStream                        | Maybe                                        |
+## Operation Catalog
+
+| Operation                                            | On                     | Result                         | Stateful | Repartitions                    |
+| ---------------------------------------------------- | ---------------------- | ------------------------------ | -------- | ------------------------------- |
+| `filter`, `filterNot`                                | KStream                | KStream                        | no       | no                              |
+| `filter`, `filterNot`                                | KTable                 | KTable                         | optional | no                              |
+| `map`, `flatMap`, `selectKey`                        | KStream                | KStream                        | no       | marks downstream                |
+| `mapValues`, `flatMapValues` (`WithKey`)             | KStream                | KStream                        | no       | no                              |
+| `mapValues`, `mapValuesWithKey`                      | KTable                 | KTable                         | optional | no                              |
+| `transformValues`                                    | KTable                 | KTable                         | optional | no                              |
+| `peek`, `foreach`                                    | KStream                | KStream / none                 | no       | no                              |
+| `merge`, `split`, `branch`                           | KStream                | KStream(s)                     | no       | no                              |
+| `process`, `processValues`                           | KStream                | KStream                        | optional | `process` marks downstream      |
+| `to`, `through`, `repartition`                       | KStream                | none / KStream                 | no       | `repartition` always            |
+| `toTable`                                            | KStream                | KTable                         | yes      | if keys changed                 |
+| `toStream`                                           | KTable                 | KStream                        | no       | with a mapper, marks downstream |
+| `groupByKey`                                         | KStream                | KGroupedStream                 | -        | if keys changed                 |
+| `groupBy`                                            | KStream, KTable        | KGroupedStream / KGroupedTable | -        | always                          |
+| `count`, `reduce`, `aggregate`                       | grouped streams/tables | KTable                         | yes      | -                               |
+| `windowedBy`                                         | KGroupedStream         | windowed stream                | -        | -                               |
+| `join`, `leftJoin`, `outerJoin` (`WithKey`) (stream) | KStream                | KStream                        | yes      | re-keyed sides                  |
+| `join`, `leftJoin` (`WithKey`) (table)               | KStream                | KStream                        | yes      | a re-keyed stream               |
+| `join`, `leftJoin` (`WithKey`) (global table)        | KStream                | KStream                        | no*      | never                           |
+| `join`, `leftJoin`, `outerJoin`                      | KTable                 | KTable                         | optional | never                           |
+| `suppress`                                           | KTable                 | KTable                         | yes      | no                              |
+
+\* The global table itself is state every instance holds; the join keeps no state of its own.
+
+"Marks downstream": the operator may change keys, so the next key-based operation (`groupByKey`, a join with a stream or table, `toTable`) repartitions first. See [Repartitioning](/flow/streams#repartitioning).

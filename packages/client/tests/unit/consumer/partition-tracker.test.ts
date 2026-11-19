@@ -259,6 +259,51 @@ describe('PartitionTracker', () => {
 		})
 	})
 
+	describe('release (partitions lost with the session)', () => {
+		const p0 = { topic: 'topic1', partition: 0 }
+		const p1 = { topic: 'topic1', partition: 1 }
+
+		test('lets a revoke waiting for the handler of a lost partition return before the handler does', async () => {
+			tracker.assign([p0])
+			tracker.startProcessing('topic1', 0)
+			let revoked = false
+			const revoke = tracker.revoke([p0]).then(() => {
+				revoked = true
+			})
+			await Promise.resolve()
+			expect(revoked).toBe(false)
+
+			tracker.release([p0])
+
+			await revoke
+			expect(revoked).toBe(true)
+		})
+
+		test('forgets the partition and its handler at once, and keeps the others', () => {
+			tracker.assign([p0, p1])
+			tracker.startProcessing('topic1', 0)
+
+			tracker.release([p0])
+
+			expect(tracker.isAssigned('topic1', 0)).toBe(false)
+			expect(tracker.startProcessing('topic1', 0)).toBe(false)
+			expect(tracker.hasInFlightProcessing).toBe(false)
+			expect(tracker.isAssigned('topic1', 1)).toBe(true)
+			expect(tracker.getState()).toEqual({ assigned: ['topic1:1'], inFlight: [], revoking: [] })
+		})
+
+		test('ignores the end of the lost handler', () => {
+			tracker.assign([p0])
+			tracker.startProcessing('topic1', 0)
+			tracker.release([p0])
+
+			tracker.endProcessing('topic1', 0)
+
+			expect(tracker.getState()).toEqual({ assigned: [], inFlight: [], revoking: [] })
+			expect(tracker.hasInFlightProcessing).toBe(false)
+		})
+	})
+
 	describe('getState', () => {
 		test('should return current state for diagnostics', () => {
 			tracker.assign([

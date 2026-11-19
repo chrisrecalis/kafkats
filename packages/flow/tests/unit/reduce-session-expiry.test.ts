@@ -1,134 +1,117 @@
 import { describe, expect, it, vi } from 'vitest'
+import type { ChangelogWriter } from '@/changelog/writer.js'
+import { codec } from '@/codec.js'
+import { aggregateWith, reduceWith } from '@/operators/kstream-aggregate.js'
+import type { KTableNode } from '@/operators/ktable-node.js'
+import { sessionAggregateWith, sessionReduceWith, SessionWindowAggregate } from '@/operators/session-aggregate.js'
+import { TimeWindowAggregate } from '@/operators/window-aggregate.js'
+import type { ProcessorSupplier } from '@/processor/api.js'
+import type { StateStore, WindowedKey } from '@/state.js'
+import { ChangelogBackedSessionStore } from '@/state/logging.js'
+import { InMemorySessionStore } from '@/state/memory.js'
+import { clockedSessionStore, clockedWindowStore } from './support/clocked-stores.js'
+import { ProcessorHarness, processorDef, sourceDef } from './support/processor-harness.js'
 
-import { WindowedReduceNode, SessionReduceNode, SessionAggregateNode } from '../../src/processors/aggregation.js'
-import type { SessionStore, WindowStore, WindowedKey } from '../../src/state.js'
-import { InMemorySessionStore } from '../../src/state/memory.js'
-import { ChangelogBackedSessionStore } from '../../src/state/changelog.js'
-import type { ChangelogWriter } from '../../src/changelog.js'
+const stringCodec = codec.string()
+const numberCodec = codec.json<number>()
+const BASE = 1_000_000_000_000
+const GAP_MS = 1000
+/** With the gap, sessions close 24 s after their end. */
+const GRACE_MS = 23_000
+const TUMBLING = { sizeMs: 1000, advanceMs: 1000, graceMs: 0 }
+const SESSIONS = { gapMs: GAP_MS, graceMs: GRACE_MS }
 
-const stringCodec = {
-	encode: (s: string) => Buffer.from(s, 'utf-8'),
-	decode: (b: Buffer) => b.toString('utf-8'),
+const windowStore = () => clockedWindowStore('s', 1000, 1000)
+const sessionStore = () => clockedSessionStore('s', GAP_MS + GRACE_MS)
+
+/**
+ * Runs the processor of `node` over store `s` in the processor harness, its task seeded with `metadata`; returns a
+ * function processing a record of key 'a', and the task's metadata.
+ */
+async function run(node: KTableNode<unknown, unknown>, store: StateStore, metadata?: Record<string, number>) {
+	const supplier = node.supplier as ProcessorSupplier<never, never, unknown, unknown>
+	const harness = await ProcessorHarness.start(
+		[sourceDef('source', ['in']), processorDef('agg', ['source'], supplier, ['s'])],
+		{ stores: [store], metadata }
+	)
+	const process = (timestamp: number) => harness.process('in', { key: 'a', value: 1, timestamp })
+	return { process, metadata: harness.metadata }
 }
-const numberCodec = {
-	encode: (n: number) => {
-		const b = Buffer.alloc(8)
-		b.writeDoubleLE(n, 0)
-		return b
-	},
-	decode: (b: Buffer) => b.readDoubleLE(0),
-}
+
+const add = (a: number, b: number | null) => a + (b ?? 0)
 
 describe('windowed/session reduce + session aggregate retention', () => {
-	function makeStubWindowStore<K, V>() {
-		const expireSpy = vi.fn().mockResolvedValue(0)
-		const data = new Map<string, V>()
-		const store = {
-			name: 's',
-			get: vi.fn(async (k: WindowedKey<K>) => data.get(JSON.stringify(k)) ?? undefined),
-			put: vi.fn(async (k: WindowedKey<K>, v: V) => {
-				data.set(JSON.stringify(k), v)
-			}),
-			delete: vi.fn(),
-			all: vi.fn(() => (async function* () {})()),
-			range: vi.fn(),
-			fetch: vi.fn(),
-			fetchAll: vi.fn(),
-			fetchRange: vi.fn(),
-			expireOldWindows: expireSpy,
-			approximateNumEntries: vi.fn().mockResolvedValue(0),
-			init: vi.fn(),
-			flush: vi.fn(),
-			close: vi.fn(),
-		} as unknown as WindowStore<K, V>
-		return { store, expireSpy }
-	}
+	it('a time-window reduce expires its store once its clock moved past the cleanup interval', async () => {
+		const { store } = windowStore()
+		const expire = vi.spyOn(store, 'expire')
+		const { process } = await run(new TimeWindowAggregate('s', TUMBLING, reduceWith(add), false), store)
 
-	function makeStubSessionStore<K, V>() {
-		const expireSpy = vi.fn().mockResolvedValue(0)
-		const store = {
-			name: 's',
-			get: vi.fn().mockResolvedValue(undefined),
-			put: vi.fn(),
-			delete: vi.fn(),
-			all: vi.fn(() => (async function* () {})()),
-			range: vi.fn(),
-			findSessions: async function* () {
-				/* no overlapping sessions */
-			},
-			remove: vi.fn(),
-			expireOldSessions: expireSpy,
-			approximateNumEntries: vi.fn().mockResolvedValue(0),
-			init: vi.fn(),
-			flush: vi.fn(),
-			close: vi.fn(),
-		} as unknown as SessionStore<K, V>
-		return { store, expireSpy }
-	}
-
-	it('WindowedReduceNode triggers expireOldWindows after the cleanup interval of stream time', async () => {
-		const { store, expireSpy } = makeStubWindowStore<string, number>()
-		const node = new WindowedReduceNode<string, number>('s', { store }, (a, b) => a + b, 1000)
-
-		// First record at t=baseTime advances streamTime past the 60s cleanup threshold from initial 0.
-		const baseTime = 1_000_000_000_000
-		await node.process({
-			key: 'a',
-			value: 1,
-			timestamp: BigInt(baseTime),
-			topic: 't',
-			partition: 0,
-			offset: 0n,
-			headers: {},
-		})
-
-		expect(expireSpy).toHaveBeenCalledTimes(1)
-		expect(expireSpy.mock.calls[0]![0]).toBe(baseTime)
+		// The first record moves stream time past the 60 s cleanup threshold from 0.
+		await process(BASE)
+		expect(expire).toHaveBeenCalledTimes(1)
 	})
 
-	it('SessionReduceNode triggers expireOldSessions after the cleanup interval of stream time', async () => {
-		const { store, expireSpy } = makeStubSessionStore<string, number>()
-		const node = new SessionReduceNode<string, number>('s', { store }, (a, b) => a + b, 1000)
+	it('a session reduce expires its store once its clock moved past the cleanup interval', async () => {
+		const { store } = sessionStore()
+		const expire = vi.spyOn(store, 'expire')
+		const { process } = await run(new SessionWindowAggregate('s', SESSIONS, sessionReduceWith(add), false), store)
 
-		const baseTime = 1_000_000_000_000
-		await node.process({
-			key: 'a',
-			value: 1,
-			timestamp: BigInt(baseTime),
-			topic: 't',
-			partition: 0,
-			offset: 0n,
-			headers: {},
-		})
-
-		expect(expireSpy).toHaveBeenCalledTimes(1)
-		expect(expireSpy.mock.calls[0]![0]).toBe(baseTime)
+		await process(BASE)
+		expect(expire).toHaveBeenCalledTimes(1)
 	})
 
-	it('SessionAggregateNode triggers expireOldSessions after the cleanup interval of stream time', async () => {
-		const { store, expireSpy } = makeStubSessionStore<string, number>()
-		const node = new SessionAggregateNode<string, number, number>(
-			's',
-			{ store },
+	it('a session aggregate expires its store once its clock moved past the cleanup interval', async () => {
+		const { store } = sessionStore()
+		const expire = vi.spyOn(store, 'expire')
+		const merge = sessionAggregateWith<string, number, number>(
 			() => 0,
 			(_k, v, agg) => agg + v,
-			(a, b) => a + b,
-			1000
+			(_k, a, b) => a + b
 		)
+		const { process } = await run(new SessionWindowAggregate('s', SESSIONS, merge, false), store)
 
-		const baseTime = 1_000_000_000_000
-		await node.process({
-			key: 'a',
-			value: 1,
-			timestamp: BigInt(baseTime),
-			topic: 't',
-			partition: 0,
-			offset: 0n,
-			headers: {},
-		})
+		await process(BASE)
+		expect(expire).toHaveBeenCalledTimes(1)
+	})
 
-		expect(expireSpy).toHaveBeenCalledTimes(1)
-		expect(expireSpy.mock.calls[0]![0]).toBe(baseTime)
+	it('does NOT trigger expiry when stream time has not advanced past the threshold', async () => {
+		const { store } = windowStore()
+		const expire = vi.spyOn(store, 'expire')
+		const aggregation = aggregateWith<string, number, number>(
+			() => 0,
+			(_k, v, agg) => agg + v
+		)
+		const { process } = await run(new TimeWindowAggregate('s', TUMBLING, aggregation, false), store)
+
+		await process(BASE)
+		expect(expire).toHaveBeenCalledTimes(1)
+		// 100 ms later: well under the 60 s threshold.
+		await process(BASE + 100)
+		expect(expire).toHaveBeenCalledTimes(1)
+	})
+
+	it('B14: a session clock (record timestamps, under the store name) is seeded from the commit metadata, without a store scan', async () => {
+		const { inner, store } = sessionStore()
+		const scan = vi.spyOn(inner, 'all')
+		const expire = vi.spyOn(store, 'expire')
+		const node = new SessionWindowAggregate('s', SESSIONS, sessionReduceWith(add), false)
+		const { process, metadata } = await run(node, store, { s: BASE })
+
+		await process(BASE - 24_001) // joins no session and ends before the seeded clock - grace - gap: dropped
+		await process(BASE - 10_000) // still open: a new session
+		expect(metadata.get('s')).toBe(BASE)
+		// The first expiry runs by the seeded clock, already on the dropped record.
+		expect(expire).toHaveBeenCalledTimes(1)
+		await process(BASE + 500)
+		expect(metadata.get('s')).toBe(BASE + 500)
+
+		const sessions: unknown[] = []
+		for await (const [session] of inner.findSessions('a', 0, Number.MAX_SAFE_INTEGER)) sessions.push(session)
+		expect(sessions).toEqual([
+			{ key: 'a', windowStart: BASE - 10_000, windowEnd: BASE - 10_000 },
+			{ key: 'a', windowStart: BASE + 500, windowEnd: BASE + 500 },
+		])
+		expect(scan).not.toHaveBeenCalled()
 	})
 
 	it('InMemorySessionStore.expireOldSessions actually removes data and returns the keys', async () => {
@@ -152,7 +135,7 @@ describe('windowed/session reduce + session aggregate retention', () => {
 		expect(await store.approximateNumEntries()).toBe(2)
 	})
 
-	it('ChangelogBackedSessionStore.expireOldSessions emits a tombstone for each expired key', async () => {
+	it('ChangelogBackedSessionStore.expireOldSessions expires locally, without tombstones (KF17)', async () => {
 		const inner = new InMemorySessionStore<string, number>('s', {
 			keyCodec: stringCodec,
 			valueCodec: numberCodec,
@@ -162,16 +145,7 @@ describe('windowed/session reduce + session aggregate retention', () => {
 		await inner.put({ key: 'a', windowStart: 0, windowEnd: 1_000 }, 1)
 		await inner.put({ key: 'a', windowStart: 50_000, windowEnd: 60_000 }, 2)
 
-		const writes: Array<{ tombstone: boolean; key: WindowedKey<string> }> = []
-		const writer = {
-			write: vi.fn(async (key: WindowedKey<string>) => {
-				writes.push({ tombstone: false, key })
-			}),
-			writeTombstone: vi.fn(async (key: WindowedKey<string>) => {
-				writes.push({ tombstone: true, key })
-			}),
-		}
-
+		const writer = { write: vi.fn(), writeTombstone: vi.fn() }
 		const wrapped = new ChangelogBackedSessionStore(
 			inner,
 			writer as unknown as ChangelogWriter<WindowedKey<string>, number>
@@ -179,38 +153,8 @@ describe('windowed/session reduce + session aggregate retention', () => {
 		const expired = await wrapped.expireOldSessions(100_000)
 
 		expect(expired.length).toBe(1)
-		expect(writer.writeTombstone).toHaveBeenCalledTimes(1)
-		expect(writes.filter(w => w.tombstone).map(w => w.key)).toEqual([
-			{ key: 'a', windowStart: 0, windowEnd: 1_000 },
-		])
-	})
-
-	it('does NOT trigger expiry when stream time has not advanced past the threshold', async () => {
-		const { store, expireSpy } = makeStubWindowStore<string, number>()
-		const node = new WindowedReduceNode<string, number>('s', { store }, (a, b) => a + b, 1000)
-
-		await node.process({
-			key: 'a',
-			value: 1,
-			timestamp: 1_000_000_000_000n,
-			topic: 't',
-			partition: 0,
-			offset: 0n,
-			headers: {},
-		})
-		expect(expireSpy).toHaveBeenCalledTimes(1)
-
-		// 100ms later — well under the 60s threshold.
-		await node.process({
-			key: 'a',
-			value: 1,
-			timestamp: 1_000_000_000_100n,
-			topic: 't',
-			partition: 0,
-			offset: 1n,
-			headers: {},
-		})
-
-		expect(expireSpy).toHaveBeenCalledTimes(1)
+		expect(await inner.approximateNumEntries()).toBe(1)
+		expect(writer.write).not.toHaveBeenCalled()
+		expect(writer.writeTombstone).not.toHaveBeenCalled()
 	})
 })

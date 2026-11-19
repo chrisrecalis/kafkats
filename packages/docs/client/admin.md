@@ -170,6 +170,36 @@ for (const result of results) {
 Topic deletion is irreversible. All data in the topic will be lost.
 :::
 
+### Deleting Records
+
+Delete the records of partitions before given offsets, moving each partition's log start offset (low watermark) forward. Stream processors use it to purge repartition topics once their records are consumed and committed:
+
+```typescript
+const results = await admin.deleteRecords(
+	[
+		{ topic: 'events', partition: 0, offset: 5000n }, // delete offsets 0..4999
+		{ topic: 'events', partition: 1, offset: -1n }, // delete up to the high watermark
+	],
+	{ timeoutMs: 10_000 }
+)
+
+for (const { topic, partition, lowWatermark, error } of results) {
+	if (error) {
+		console.log(`${topic}-${partition}: ${error.message}`)
+	} else {
+		console.log(`${topic}-${partition} now starts at ${lowWatermark}`)
+	}
+}
+```
+
+- Partitions are sent to their leaders, one request per leader. A moved leader, an unknown topic or partition, other retriable broker answers and connection failures are retried with backoff (100 ms doubling to 1 s), looking the leaders up again, until `timeoutMs` (default: the admin's `requestTimeoutMs`) is spent. The remaining budget is also the brokers' time to reach the replicas.
+- Failures are returned per partition, not thrown: the broker's answer as a `KafkaProtocolError` (for example `OffsetOutOfRange` for an offset beyond the high watermark), or a `TimeoutError` (with the last failure as `cause`) for a partition still pending at the deadline.
+- Results come in the order the partitions were first listed; a partition listed twice is deleted up to its last offset. Aborting `signal` rejects the call with the signal's reason.
+
+::: warning
+Deleted records are gone for every consumer. A consumer whose position falls below the new log start offset applies its `autoOffsetReset` policy (see [Offset Reset](/client/consumer#offset-reset)).
+:::
+
 ## Consumer Group Operations
 
 ### Listing Consumer Groups

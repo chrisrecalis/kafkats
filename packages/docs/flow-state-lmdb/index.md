@@ -23,7 +23,7 @@ This package includes native bindings. Ensure you have build tools installed.
 ## Quick Example
 
 ```typescript
-import { flow } from '@kafkats/flow'
+import { flow, string } from '@kafkats/flow'
 import { lmdb } from '@kafkats/flow-state-lmdb'
 
 const app = flow({
@@ -35,11 +35,11 @@ const app = flow({
 })
 
 // Aggregations now persist to disk
-app.stream(clicks)
+app.stream('clicks', { key: string(), value: string() })
 	.groupByKey()
 	.count() // Stored in LMDB
 	.toStream()
-	.to(countsTopic)
+	.to('click-counts')
 
 await app.start()
 ```

@@ -1,19 +1,18 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 
+import { KafkaProtocolError } from '@/client/errors.js'
 import { Producer } from '@/producer/producer.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
-import { createMockBroker, createMockCluster, type MockBroker } from './_helpers.js'
+import { createTransactionalMocks } from './_helpers.js'
 
 const TOPIC = 'test-topic'
+const value = Buffer.from('v')
 
-describe('Producer.addPartitionsToTransaction top-level error handling', () => {
-	let mockCluster: ReturnType<typeof createMockCluster>
-	let txnCoordinator: MockBroker
+describe('Producer: AddPartitionsToTxn of a transactional send', () => {
+	let mocks: ReturnType<typeof createTransactionalMocks>
 
 	beforeEach(() => {
-		mockCluster = createMockCluster()
-		txnCoordinator = createMockBroker(1)
-		mockCluster.getCoordinator.mockResolvedValue(txnCoordinator)
+		mocks = createTransactionalMocks(TOPIC)
 	})
 
 	afterEach(() => {
@@ -21,123 +20,125 @@ describe('Producer.addPartitionsToTransaction top-level error handling', () => {
 	})
 
 	function makeProducer() {
-		return new Producer(mockCluster, {
-			lingerMs: 0,
-			retries: 2,
-			retryBackoffMs: 1,
-			transactionalId: 'tx-1',
-		})
+		return new Producer(mocks.cluster, { lingerMs: 0, retries: 2, retryBackoffMs: 1, transactionalId: 'tx-1' })
 	}
 
-	it('throws on a top-level error and does not mark the partitions as added', async () => {
-		txnCoordinator.addPartitionsToTxn.mockResolvedValue({
+	it('rejects the send on a top-level error, does not add the partition, and produces nothing', async () => {
+		mocks.txnCoordinator.addPartitionsToTxn.mockResolvedValueOnce({
 			throttleTimeMs: 0,
 			errorCode: ErrorCode.InvalidTxnState,
 			// Broker rejected the whole request at the top level; no per-partition results.
 			results: [],
 		})
+		const tx = await makeProducer().beginTransaction()
 
-		const producer = makeProducer()
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		const p = producer as any
-
-		await expect(p.addPartitionsToTransaction(TOPIC, [0])).rejects.toThrow()
-		expect(p.partitionsInTransaction.has(`${TOPIC}:0`)).toBe(false)
+		await expect(tx.send(TOPIC, { value, partition: 0 })).rejects.toThrow(/AddPartitionsToTxn failed/)
+		expect(mocks.leader.produce).not.toHaveBeenCalled()
+		// Not part of the transaction: the next send of the partition registers it.
+		await tx.send(TOPIC, { value, partition: 0 })
+		expect(mocks.txnCoordinator.addPartitionsToTxn).toHaveBeenCalledTimes(2)
+		await tx.abort()
 	})
 
 	it('invalidates the transaction coordinator on a top-level coordinator error', async () => {
-		txnCoordinator.addPartitionsToTxn.mockResolvedValue({
+		mocks.txnCoordinator.addPartitionsToTxn.mockResolvedValueOnce({
 			throttleTimeMs: 0,
 			errorCode: ErrorCode.NotCoordinator,
 			results: [],
 		})
+		const tx = await makeProducer().beginTransaction()
 
-		const producer = makeProducer()
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		const p = producer as any
-
-		await expect(p.addPartitionsToTransaction(TOPIC, [0])).rejects.toThrow()
-		expect(mockCluster.invalidateCoordinator).toHaveBeenCalledWith('TRANSACTION', 'tx-1')
+		await tx.send(TOPIC, { value, partition: 0 })
+		expect(mocks.cluster.invalidateCoordinator).toHaveBeenCalledWith('TRANSACTION', 'tx-1')
+		expect(mocks.txnCoordinator.addPartitionsToTxn).toHaveBeenCalledTimes(2)
+		await tx.commit()
 	})
 
-	it('marks partitions added when the request fully succeeds', async () => {
-		txnCoordinator.addPartitionsToTxn.mockResolvedValue({
+	it('rejects the send with the coordinator error once every attempt was answered with it, producing nothing', async () => {
+		mocks.txnCoordinator.addPartitionsToTxn.mockResolvedValue({
 			throttleTimeMs: 0,
-			errorCode: ErrorCode.None,
-			results: [{ name: TOPIC, resultsByPartition: [{ partitionIndex: 0, errorCode: ErrorCode.None }] }],
+			errorCode: ErrorCode.NotCoordinator,
+			results: [],
 		})
+		const tx = await makeProducer().beginTransaction()
 
-		const producer = makeProducer()
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		const p = producer as any
+		const error = await tx.send(TOPIC, { value, partition: 0 }).catch((cause: unknown) => cause)
 
-		await p.addPartitionsToTransaction(TOPIC, [0])
-		expect(p.partitionsInTransaction.has(`${TOPIC}:0`)).toBe(true)
+		expect(error).toBeInstanceOf(KafkaProtocolError)
+		expect(error).toMatchObject({ errorCode: ErrorCode.NotCoordinator })
+		// retries: 2, so three attempts, each sent to a coordinator looked up again.
+		expect(mocks.txnCoordinator.addPartitionsToTxn).toHaveBeenCalledTimes(3)
+		expect(mocks.cluster.invalidateCoordinator).toHaveBeenCalledTimes(3)
+		expect(mocks.cluster.invalidateCoordinator).toHaveBeenCalledWith('TRANSACTION', 'tx-1')
+		expect(mocks.leader.produce).not.toHaveBeenCalled()
+		await tx.abort()
+	})
+
+	it('adds the partition once the request fully succeeded: later sends of it register nothing', async () => {
+		const tx = await makeProducer().beginTransaction()
+
+		await tx.send(TOPIC, { value, partition: 0 })
+		await tx.send(TOPIC, { value, partition: 0 })
+		expect(mocks.txnCoordinator.addPartitionsToTxn).toHaveBeenCalledTimes(1)
+		await tx.commit()
 	})
 })
 
 describe('Producer: concurrent transactional sends register a partition once', () => {
-	let mockCluster: ReturnType<typeof createMockCluster>
-	let txnCoordinator: MockBroker
+	let mocks: ReturnType<typeof createTransactionalMocks>
 
 	beforeEach(() => {
-		mockCluster = createMockCluster()
-		txnCoordinator = createMockBroker(1)
-		mockCluster.getCoordinator.mockResolvedValue(txnCoordinator)
+		mocks = createTransactionalMocks(TOPIC)
 	})
 
 	afterEach(() => {
 		vi.restoreAllMocks()
 	})
 
-	/** A transactional producer whose actual produce step is stubbed out. */
-	function makeProducer() {
-		const producer = new Producer(mockCluster, { retries: 1, retryBackoffMs: 1, transactionalId: 'tx-1' })
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		const p = producer as any
-		vi.spyOn(p, 'getPartitionCount').mockResolvedValue(1)
-		vi.spyOn(p, 'append').mockResolvedValue([
-			Promise.resolve({ topic: TOPIC, partition: 0, offset: 0n, timestamp: 0n }),
-		])
-		return p
-	}
-
-	const send = (p: { transactionalSend: (topic: unknown, message: unknown) => Promise<unknown> }) =>
-		p.transactionalSend({ topic: TOPIC }, { value: Buffer.from('v'), partition: 0 })
+	const makeProducer = () =>
+		new Producer(mocks.cluster, { lingerMs: 0, retries: 1, retryBackoffMs: 1, transactionalId: 'tx-1' })
 
 	it('issues a single AddPartitionsToTxn for sends started before it returns', async () => {
-		txnCoordinator.addPartitionsToTxn.mockImplementation(async () => {
+		const events: string[] = []
+		const register = mocks.txnCoordinator.addPartitionsToTxn.getMockImplementation()!
+		mocks.txnCoordinator.addPartitionsToTxn.mockImplementation(async request => {
 			await new Promise(resolve => setTimeout(resolve, 10))
-			return {
-				throttleTimeMs: 0,
-				errorCode: ErrorCode.None,
-				results: [{ name: TOPIC, resultsByPartition: [{ partitionIndex: 0, errorCode: ErrorCode.None }] }],
-			}
+			events.push('AddPartitionsToTxn answered')
+			return register(request)
 		})
-		const p = makeProducer()
+		const produce = mocks.leader.produce.getMockImplementation()!
+		mocks.leader.produce.mockImplementation(async request => {
+			events.push('Produce')
+			return produce(request)
+		})
+		const tx = await makeProducer().beginTransaction()
 
-		await Promise.all(Array.from({ length: 50 }, () => send(p)))
+		await Promise.all(Array.from({ length: 50 }, () => tx.send(TOPIC, { value, partition: 0 })))
 
-		expect(txnCoordinator.addPartitionsToTxn).toHaveBeenCalledTimes(1)
+		expect(mocks.txnCoordinator.addPartitionsToTxn).toHaveBeenCalledTimes(1)
 		// None of the sends produced before the partition was part of the transaction.
-		expect(p.partitionsInTransaction.has(`${TOPIC}:0`)).toBe(true)
-		expect(p.append).toHaveBeenCalledTimes(50)
+		expect(events[0]).toBe('AddPartitionsToTxn answered')
+		expect(events.length).toBeGreaterThan(1)
+		await tx.commit()
 	})
 
 	it('fails a send whose registration fails, without producing anything', async () => {
-		txnCoordinator.addPartitionsToTxn.mockImplementation(async () => {
+		mocks.txnCoordinator.addPartitionsToTxn.mockImplementation(async () => {
 			await new Promise(resolve => setTimeout(resolve, 10))
 			return { throttleTimeMs: 0, errorCode: ErrorCode.InvalidTxnState, results: [] }
 		})
-		const p = makeProducer()
+		const tx = await makeProducer().beginTransaction()
 
-		const outcomes = await Promise.allSettled(Array.from({ length: 20 }, () => send(p)))
+		const outcomes = await Promise.allSettled(
+			Array.from({ length: 20 }, () => tx.send(TOPIC, { value, partition: 0 }))
+		)
 
 		expect(outcomes.every(o => o.status === 'rejected')).toBe(true)
 		// Nothing was produced to a partition the transaction does not contain.
-		expect(p.append).not.toHaveBeenCalled()
+		expect(mocks.leader.produce).not.toHaveBeenCalled()
 
 		// Each send that still needs the partition asks again, one at a time.
-		expect(txnCoordinator.addPartitionsToTxn).toHaveBeenCalledTimes(20)
+		expect(mocks.txnCoordinator.addPartitionsToTxn).toHaveBeenCalledTimes(20)
+		await tx.abort()
 	})
 })

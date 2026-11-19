@@ -5,27 +5,18 @@ The classic word count example using @kafkats/flow.
 ## Code
 
 ```typescript
-import { flow, topic, TimeWindows } from '@kafkats/flow'
-import { string, json } from '@kafkats/client'
+import { flow, topic, string, json, TimeWindows } from '@kafkats/flow'
 
 // Input: lines of text
-const lines = topic('lines', {
-	key: string(),
-	value: string(),
-})
+const lines = topic('lines', { key: string(), value: string() })
 
-// Output: word counts
+// Output: word counts per minute
 interface WordCount {
 	word: string
 	count: number
 	windowStart: number
 	windowEnd: number
 }
-
-const wordCounts = topic('word-counts', {
-	key: string(),
-	value: json<WordCount>(),
-})
 
 async function main() {
 	const app = flow({
@@ -36,44 +27,45 @@ async function main() {
 	app.stream(lines)
 		// Split lines into words
 		.flatMapValues(line =>
-			line
+			(line ?? '')
 				.toLowerCase()
 				.split(/\s+/)
 				.filter(word => word.length > 0)
 		)
 
 		// Rekey by word
-		.selectKey((_, word) => word)
+		.selectKey((_, word) => word!)
 
-		// Group by word (re-keyed streams are repartitioned, which needs codecs)
+		// Group by word: the re-keyed stream is repartitioned through word-count-words-repartition
 		.groupByKey({ key: string(), value: string(), name: 'words' })
 
-		// Count in 1-minute windows
-		.windowedBy(TimeWindows.of('1m'))
-		.count()
+		// Count in 1-minute windows (no late records accepted)
+		.windowedBy(TimeWindows.ofSizeWithNoGrace('1m'))
+		.count({ storeName: 'word-counts' })
 
 		// Convert to output format
 		.toStream()
-		.map((windowedKey, count) => ({
-			key: windowedKey.key,
-			value: {
-				word: windowedKey.key,
-				count,
-				windowStart: windowedKey.window.start,
-				windowEnd: windowedKey.window.end,
-			},
-		}))
+		.map(
+			(windowed, count) =>
+				[
+					windowed!.key,
+					{
+						word: windowed!.key,
+						count: count ?? 0,
+						windowStart: windowed!.window.start,
+						windowEnd: windowed!.window.end,
+					},
+				] as const
+		)
 
 		// Write results
-		.to(wordCounts)
+		.to('word-counts', { key: string(), value: json<WordCount>() })
 
 	// Handle shutdown
-	process.on('SIGTERM', async () => {
-		await app.close()
-	})
+	process.on('SIGTERM', () => void app.close())
 
-	console.log('Word count processor started')
 	await app.start()
+	console.log('Word count processor started')
 }
 
 main().catch(console.error)
@@ -84,7 +76,7 @@ main().catch(console.error)
 1. **Read** lines of text from input topic
 2. **FlatMapValues** - Split each line into words
 3. **SelectKey** - Rekey by the word itself
-4. **GroupByKey** - Group all occurrences of each word
+4. **GroupByKey** - Group all occurrences of each word (through a repartition topic, so that each word is counted in one task)
 5. **WindowedBy** - Apply 1-minute time windows
 6. **Count** - Count occurrences per word per window
 7. **Map** - Transform to output format
@@ -147,7 +139,7 @@ await producer.disconnect()
 kafka-console-consumer --topic word-counts --from-beginning
 ```
 
-Expected output:
+Expected output (every update of a window is forwarded; the order across words may differ):
 
 ```json
 {"word":"hello","count":1,"windowStart":1703001200000,"windowEnd":1703001260000}
@@ -170,12 +162,12 @@ Count all time:
 
 ```typescript
 app.stream(lines)
-	.flatMapValues(line => line.toLowerCase().split(/\s+/))
-	.selectKey((_, word) => word)
+	.flatMapValues(line => (line ?? '').toLowerCase().split(/\s+/))
+	.selectKey((_, word) => word!)
 	.groupByKey({ key: string(), value: string(), name: 'words' })
 	.count() // No windowing
 	.toStream()
-	.to(wordCounts)
+	.to('word-totals') // string keys, counts as 8-byte big-endian integers
 ```
 
 ### Top N Words
@@ -197,7 +189,7 @@ Filter common words:
 const stopWords = new Set(['the', 'a', 'an', 'is', 'are', 'was', 'were'])
 
 app.stream(lines).flatMapValues(line =>
-	line
+	(line ?? '')
 		.toLowerCase()
 		.split(/\s+/)
 		.filter(word => word.length > 0 && !stopWords.has(word))

@@ -16,6 +16,8 @@ export const ATTR = {
 	errorType: 'error.type',
 	/** Not part of the conventions: the broker a request went to. */
 	brokerId: 'kafkats.broker.id',
+	/** Not part of the conventions: the `@kafkats/flow` task that processed a record (`<subtopology>_<partition>`). */
+	taskId: 'kafkats.flow.task.id',
 } as const
 
 export const SYSTEM_KAFKA = 'kafka'

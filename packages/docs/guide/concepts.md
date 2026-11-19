@@ -136,13 +136,13 @@ Consumers can control whether they see uncommitted transactional data:
 A **KStream** represents an unbounded stream of records. Each record is an independent event.
 
 ```typescript
-import { flow } from '@kafkats/flow'
+import { flow, string, json } from '@kafkats/flow'
 
-const app = flow({ applicationId: 'my-app', ... })
-app.stream('events')
-  .filter((key, value) => value.type === 'click')
-  .mapValues(value => ({ ...value, processed: true }))
-  .to('processed-events')
+const app = flow({ applicationId: 'my-app', client: { clientId: 'my-app', brokers: ['localhost:9092'] } })
+app.stream('events', { key: string(), value: json<{ type: string }>() })
+	.filter((key, value) => value?.type === 'click')
+	.mapValues(value => ({ ...value!, processed: true }))
+	.to('processed-events')
 ```
 
 ### KTable
@@ -150,9 +150,10 @@ app.stream('events')
 A **KTable** represents a changelog stream, where each key has a latest value. It's like a continuously-updated table.
 
 ```typescript
-app.table('users') // Latest value for each user ID
+app.table('users', { key: string(), value: json<{ name: string }>() }) // Latest value for each user ID
 	.mapValues(user => user.name)
-	.to('user-names')
+	.toStream()
+	.to('user-names', { value: string() })
 ```
 
 ### Windowing
@@ -162,9 +163,9 @@ app.table('users') // Latest value for each user ID
 ```typescript
 import { TimeWindows } from '@kafkats/flow'
 
-app.stream('clicks')
+app.stream('clicks', { key: string(), value: string() })
 	.groupByKey()
-	.windowedBy(TimeWindows.of('5m')) // 5-minute windows
+	.windowedBy(TimeWindows.ofSizeWithNoGrace('5m')) // 5-minute windows
 	.count()
 ```
 

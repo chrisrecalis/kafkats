@@ -10,7 +10,7 @@
 import type { Cluster } from '@/client/cluster.js'
 import type { Broker } from '@/client/broker.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
-import { KafkaProtocolError } from '@/client/errors.js'
+import { KafkaProtocolError, OffsetOutOfRangeError } from '@/client/errors.js'
 import {
 	decodeRecordBatchFrom,
 	decodeRecordBatchFromSync,
@@ -24,6 +24,7 @@ import type {
 	TopicPartitionOffset,
 	AutoOffsetReset,
 	IsolationLevel,
+	OffsetResetPolicy,
 	PartitionBatch,
 	ConsumerPartitionMetrics,
 } from './types.js'
@@ -72,6 +73,14 @@ function recordBytes(record: DecodedRecord): number {
 	return (record.key?.length ?? 0) + (record.value?.length ?? 0) + 64
 }
 
+/** The smallest of `offset` and the defined `others`. */
+function earliest(offset: bigint, ...others: Array<bigint | undefined>): bigint {
+	for (const other of others) {
+		if (other !== undefined && other < offset) offset = other
+	}
+	return offset
+}
+
 /**
  * Completed fetch from a single partition
  * Similar to Java client's CompletedFetch
@@ -95,11 +104,19 @@ interface BufferedFetch {
 	nextRecord: number
 }
 
-/** Per-partition aggregate of buffered-but-undelivered bytes, for priority scheduling. */
+/** Per-partition aggregate of the records buffered for a partition and not yet drained. */
 interface BufferedPartitionStats {
 	topic: string
 	partition: number
 	bytes: number
+	records: number
+	/** Offset of the earliest of those records. */
+	firstOffset: bigint
+}
+
+/** Offset of the first record of a buffered fetch that is not drained yet (one is left while it is queued). */
+function firstRemainingOffset(fetch: BufferedFetch): bigint {
+	return fetch.records[fetch.nextRecord]!.offset
 }
 
 /** Anything with set-like `has(topic:partition)`; a Set or a Map keyed by partition works. */
@@ -213,16 +230,40 @@ class FetchBuffer {
 		return Array.from(drained.values())
 	}
 
-	/** Aggregate buffered bytes per partition, in queue (first-seen) order. */
+	/** Aggregate buffered records per partition, in queue (first-seen) order. */
 	snapshot(): BufferedPartitionStats[] {
 		const stats = new Map<string, BufferedPartitionStats>()
 		for (const fetch of this.queue) {
 			const key = tpKey(fetch.topic, fetch.partition)
+			const records = fetch.records.length - fetch.nextRecord
+			const firstOffset = firstRemainingOffset(fetch)
 			const existing = stats.get(key)
-			if (existing) existing.bytes += fetch.byteSize
-			else stats.set(key, { topic: fetch.topic, partition: fetch.partition, bytes: fetch.byteSize })
+			if (existing) {
+				existing.bytes += fetch.byteSize
+				existing.records += records
+				existing.firstOffset = earliest(existing.firstOffset, firstOffset)
+			} else {
+				stats.set(key, {
+					topic: fetch.topic,
+					partition: fetch.partition,
+					bytes: fetch.byteSize,
+					records,
+					firstOffset,
+				})
+			}
 		}
 		return Array.from(stats.values())
+	}
+
+	/** Offset of the earliest buffered record of a partition, if any is buffered. */
+	firstOffset(topic: string, partition: number): bigint | undefined {
+		let first: bigint | undefined
+		for (const fetch of this.queue) {
+			if (fetch.topic !== topic || fetch.partition !== partition) continue
+			const offset = firstRemainingOffset(fetch)
+			if (first === undefined || offset < first) first = offset
+		}
+		return first
 	}
 
 	hasDataFor(excludedPartitions?: PartitionKeys): boolean {
@@ -429,7 +470,10 @@ interface PartitionState {
 	topic: string
 	partition: number
 	offset: bigint
+	/** Paused by pausePartitions (or an out-of-range position under policy 'none'); cleared only by resume. */
 	paused: boolean
+	/** Added held: not fetched until releaseHeld, independently of `paused`. */
+	held: boolean
 	/** How far the partition could be read as of the last fetch response. */
 	endOffset?: bigint
 	/** Whether records were fetched for it since it was assigned or last sought. */
@@ -440,6 +484,24 @@ interface PartitionState {
 	// partition epoch changed is dropped, so a seek that lands mid-flight is not
 	// clobbered by the stale response advancing the offset.
 	fetchEpoch: number
+}
+
+function newPartitionState(tp: TopicPartition & { offset: bigint }, held: boolean): PartitionState {
+	return {
+		topic: tp.topic,
+		partition: tp.partition,
+		offset: tp.offset,
+		paused: false,
+		held,
+		abortController: new AbortController(),
+		cachedLeader: null,
+		fetchEpoch: 0,
+	}
+}
+
+/** Whether the fetch loop may fetch the partition: neither paused nor held. */
+function isFetchable(state: PartitionState): boolean {
+	return !state.paused && !state.held
 }
 
 /**
@@ -467,6 +529,30 @@ export interface FetchManagerConfig {
 	 * with backoff regardless.
 	 */
 	onError?: (error: Error) => void
+	/**
+	 * Called when the fetch position of a partition is out of range and its reset policy is 'none'. The
+	 * partition is paused first, as by pausePartitions; seek it before resuming it. Returns whether the
+	 * application handles it (an emit's result: whether anyone listens); when it does not, or without this
+	 * callback, the next poll() throws OffsetOutOfRangeError (Java's poll() throws it).
+	 */
+	onOffsetOutOfRange?: (position: TopicPartitionOffset) => boolean
+	/** Called after an out-of-range fetch position was reset by the partition's 'earliest' or 'latest' policy. */
+	onOffsetReset?: (reset: {
+		topic: string
+		partition: number
+		from: bigint
+		to: bigint
+		reason: 'out-of-range'
+	}) => void
+	/**
+	 * The caller's queue of drained batches it has not delivered yet (a batch is delivered once its handler is
+	 * invoked). poll() appends the batches it drains to it in the same synchronous step that takes them out of the
+	 * buffer, so until delivered a record is always in one of the two; the caller removes a batch when it delivers
+	 * or drops it. A pause rewinds the fetch position to the earliest of them and voids them (isBatchAssigned turns
+	 * false, and the caller drops them); nextOffset, currentLag and partitionMetrics count them as not delivered.
+	 * Without it, a pause leaves drained batches deliverable and nextOffset can be past their records.
+	 */
+	undelivered?: PartitionBatch[]
 	priority?: PriorityStrategy
 }
 
@@ -516,13 +602,13 @@ export class FetchManager {
 	private readonly cluster: Cluster
 	private readonly config: FetchManagerConfig
 	private readonly partitionStates: Map<string, PartitionState> = new Map()
-	// Per-partition assignment epoch, bumped whenever a partition is removed. Survives
-	// remove/re-add cycles (eager rebalance), so a batch drained before the rebalance can
-	// be told apart from one fetched under the new assignment of the same partition.
+	// Per-partition assignment epoch, bumped whenever a partition is removed or sought, and when a pause
+	// voids batches drained before it. Survives remove/re-add cycles (eager rebalance), so a batch drained
+	// before the rebalance can be told apart from one fetched under the new assignment of the same partition.
 	private readonly assignmentEpochs: Map<string, number> = new Map()
 	private readonly logger: Logger
-	private readonly autoOffsetReset?: AutoOffsetReset
-	private readonly offsetManager?: OffsetManager
+	private readonly autoOffsetReset: OffsetResetPolicy
+	private readonly offsetManager: OffsetManager
 	private abortController: AbortController | null = null
 	private running = false
 
@@ -549,10 +635,14 @@ export class FetchManager {
 	// `active` map, so the background fetch loop sees current busy state when it schedules fetches.
 	private lastExcluded?: PartitionKeys
 
+	/**
+	 * @param autoOffsetReset - Where a partition whose fetch position is out of range restarts: a policy, or a
+	 * function giving each partition's policy. 'none' pauses the partition (see `onOffsetOutOfRange`).
+	 */
 	constructor(
 		cluster: Cluster,
 		offsetManager: OffsetManager,
-		autoOffsetReset: AutoOffsetReset,
+		autoOffsetReset: OffsetResetPolicy,
 		config: Partial<FetchManagerConfig>,
 		logger?: Logger
 	) {
@@ -586,29 +676,24 @@ export class FetchManager {
 		}
 
 		for (const tp of partitions) {
-			const key = tpKey(tp.topic, tp.partition)
-			const state: PartitionState = {
-				topic: tp.topic,
-				partition: tp.partition,
-				offset: tp.offset,
-				paused: false,
-				abortController: new AbortController(),
-				cachedLeader: null,
-				fetchEpoch: 0,
-			}
-			this.partitionStates.set(key, state)
+			this.partitionStates.set(tpKey(tp.topic, tp.partition), newPartitionState(tp, false))
 		}
 	}
 
 	/**
-	 * Add partitions incrementally (used for cooperative rebalance)
+	 * Add partitions incrementally (used for cooperative rebalance). Partitions that are already assigned
+	 * keep their state.
+	 *
+	 * @param options.held - Add them held: they are not fetched until {@link releaseHeld}, so a caller can
+	 * pause or seek them before their first fetch.
 	 */
-	addPartitions(partitions: Array<TopicPartition & { offset: bigint }>): void {
+	addPartitions(partitions: Array<TopicPartition & { offset: bigint }>, options: { held?: boolean } = {}): void {
 		if (partitions.length === 0) return
 
 		this.logger.debug('adding partitions', {
 			count: partitions.length,
 			partitions: formatPartitions(partitions),
+			held: options.held === true,
 		})
 
 		for (const tp of partitions) {
@@ -618,17 +703,15 @@ export class FetchManager {
 				this.logger.debug('partition already exists, skipping', { topic: tp.topic, partition: tp.partition })
 				continue
 			}
+			this.partitionStates.set(key, newPartitionState(tp, options.held === true))
+		}
+	}
 
-			const state: PartitionState = {
-				topic: tp.topic,
-				partition: tp.partition,
-				offset: tp.offset,
-				paused: false,
-				abortController: new AbortController(),
-				cachedLeader: null,
-				fetchEpoch: 0,
-			}
-			this.partitionStates.set(key, state)
+	/** Let held partitions be fetched. Those also paused stay paused until resumed. */
+	releaseHeld(partitions: TopicPartition[]): void {
+		for (const tp of partitions) {
+			const state = this.partitionStates.get(tpKey(tp.topic, tp.partition))
+			if (state) state.held = false
 		}
 	}
 
@@ -663,8 +746,9 @@ export class FetchManager {
 	}
 
 	/**
-	 * Pause partitions (stop fetching but keep state)
-	 * Also clears any buffered records for the paused partitions
+	 * Pause partitions: stop fetching them, and withhold every record of them not delivered yet. Their buffered
+	 * records and the caller's undelivered batches of them (see `undelivered`) are dropped, those batches are
+	 * voided, and the fetch position rewinds to the earliest dropped record, so resuming delivers it again.
 	 */
 	pausePartitions(partitions: TopicPartition[]): void {
 		if (partitions.length === 0) return
@@ -674,33 +758,34 @@ export class FetchManager {
 			partitions: formatPartitions(partitions),
 		})
 
-		// Clear buffered records for paused partitions so they are not delivered. They were never
-		// delivered but the fetch offset already advanced past them, so rewind to the earliest
-		// buffered offset â otherwise those records are lost (never delivered, never re-fetched).
-		const earliest = this.fetchBuffer?.removePartitionsReturningEarliest(partitions) ?? new Map<string, bigint>()
+		// The fetch position is already past these records, so rewinding to the earliest of them is what
+		// keeps them from being lost (never delivered, never re-fetched).
+		const buffered = this.fetchBuffer?.removePartitionsReturningEarliest(partitions) ?? new Map<string, bigint>()
+		const undelivered = this.undeliveredFrom()
 
 		for (const tp of partitions) {
 			const key = tpKey(tp.topic, tp.partition)
 			const state = this.partitionStates.get(key)
-			if (state) {
-				state.paused = true
-				// Not fetched while paused: what is known of the partition's end goes stale.
-				state.endOffset = undefined
-				const earliestBuffered = earliest.get(key)
-				if (earliestBuffered !== undefined && earliestBuffered < state.offset) {
-					state.offset = earliestBuffered
-					// Fence any in-flight fetch issued at the old (higher) position. The pause flag
-					// alone is cleared on resume, so without bumping the epoch a stale fetch that
-					// resolves after resume would buffer at the old offset and advance past the
-					// rewound records, losing them. The very bug this rewind prevents.
-					state.fetchEpoch++
-				}
+			if (!state) continue
+			state.paused = true
+			// Not fetched while paused: what is known of the partition's end goes stale.
+			state.endOffset = undefined
+			// The caller's batches of it must not be delivered either: their records are fetched again.
+			if (undelivered.has(key)) this.bumpAssignmentEpoch(key)
+			const rewindTo = earliest(state.offset, buffered.get(key), undelivered.get(key))
+			if (rewindTo < state.offset) {
+				state.offset = rewindTo
+				// Fence any in-flight fetch issued at the old (higher) position. The pause flag
+				// alone is cleared on resume, so without bumping the epoch a stale fetch that
+				// resolves after resume would buffer at the old offset and advance past the
+				// rewound records, losing them. The very bug this rewind prevents.
+				state.fetchEpoch++
 			}
 		}
 	}
 
 	/**
-	 * Resume paused partitions
+	 * Resume paused partitions. Only the pause is lifted: a held partition stays held until releaseHeld.
 	 */
 	resumePartitions(partitions: TopicPartition[]): void {
 		if (partitions.length === 0) return
@@ -719,21 +804,47 @@ export class FetchManager {
 		}
 	}
 
-	/** The offset the next fetch of an assigned partition starts at, if the partition is assigned. */
 	/** Whether records of an assigned partition were fetched since it was assigned or last sought. */
 	hasFetched(topic: string, partition: number): boolean {
 		return this.partitionStates.get(tpKey(topic, partition))?.fetched === true
 	}
 
+	/** The offset the next fetch of an assigned partition starts at, if the partition is assigned. */
 	getFetchPosition(topic: string, partition: number): bigint | undefined {
 		return this.partitionStates.get(tpKey(topic, partition))?.offset
+	}
+
+	/**
+	 * The offset of the next record of an assigned partition to be delivered: the earliest record fetched but
+	 * not delivered yet (buffered, or in one of the caller's undelivered batches), else the fetch position,
+	 * which moves past control records and aborted transactions. Undefined if the partition is not assigned.
+	 */
+	nextOffset(topic: string, partition: number): bigint | undefined {
+		const key = tpKey(topic, partition)
+		const state = this.partitionStates.get(key)
+		if (!state) return undefined
+		return earliest(state.offset, this.fetchBuffer?.firstOffset(topic, partition), this.undeliveredFrom().get(key))
+	}
+
+	/**
+	 * How many records of an assigned partition are readable but not delivered yet: `endOffset - nextOffset`,
+	 * at least 0, with `endOffset` (the last stable offset under read_committed, else the high watermark) from
+	 * the partition's last fetch response. Undefined before that response, and while the partition is paused
+	 * or held (its end is not followed then).
+	 */
+	currentLag(topic: string, partition: number): bigint | undefined {
+		const state = this.partitionStates.get(tpKey(topic, partition))
+		if (state?.endOffset === undefined || !isFetchable(state)) return undefined
+		const lag = state.endOffset - this.nextOffset(topic, partition)!
+		return lag > 0n ? lag : 0n
 	}
 
 	/**
 	 * Seek to a specific offset for a partition
 	 *
 	 * Updates the fetch position for the partition to the given offset.
-	 * The next fetch request will request records starting from this offset.
+	 * The next fetch request will request records starting from this offset. Records of the partition not
+	 * delivered yet are dropped: its buffered records, and the caller's batches of it, which are voided.
 	 *
 	 * @param topic - Topic name
 	 * @param partition - Partition index
@@ -750,10 +861,11 @@ export class FetchManager {
 				newOffset: String(offset),
 			})
 			state.offset = offset
-			// Fence any in-flight fetch issued at the old position, and drop buffered
-			// records from before the seek, so neither clobbers the new position.
+			// Fence any in-flight fetch issued at the old position, and drop buffered records and
+			// drained batches from before the seek, so none of them clobbers the new position.
 			state.fetched = false
 			state.fetchEpoch++
+			this.bumpAssignmentEpoch(key)
 			this.fetchBuffer?.removePartitions([{ topic, partition }])
 		} else {
 			this.logger.warn('seek attempted on unassigned partition', { topic, partition })
@@ -784,7 +896,7 @@ export class FetchManager {
 	}
 
 	/**
-	 * Current assignment epoch for a partition (0 if it was never removed)
+	 * Current assignment epoch for a partition (0 if it was never removed, sought or paused over drained batches)
 	 */
 	getAssignmentEpoch(topic: string, partition: number): number {
 		return this.assignmentEpochs.get(tpKey(topic, partition)) ?? 0
@@ -792,10 +904,10 @@ export class FetchManager {
 
 	/**
 	 * Check whether a drained batch is still deliverable: its partition must be assigned
-	 * AND its assignment epoch must match the current one. A mismatch means the partition
-	 * was removed (and possibly re-added by an eager rebalance) after the batch was
-	 * buffered — delivering it would duplicate records re-fetched from the committed
-	 * offset under the new assignment.
+	 * AND its assignment epoch must match the current one. A mismatch means the batch was
+	 * voided after it was buffered: the partition was removed (and possibly re-added by an
+	 * eager rebalance), sought, or paused, and its records are fetched again from the
+	 * partition's new position; delivering the batch would skip or duplicate them.
 	 */
 	isBatchAssigned(batch: PartitionBatch): boolean {
 		if (!this.partitionStates.has(tpKey(batch.topic, batch.partition))) {
@@ -807,40 +919,25 @@ export class FetchManager {
 		)
 	}
 
+	/** First offset of the earliest of the caller's undelivered batches, per partition, for deliverable batches. */
+	private undeliveredFrom(): Map<string, bigint> {
+		const firstOffsets = new Map<string, bigint>()
+		for (const batch of this.config.undelivered ?? []) {
+			const first = batch.records[0]?.offset
+			if (first === undefined || !this.isBatchAssigned(batch)) continue
+			const key = tpKey(batch.topic, batch.partition)
+			firstOffsets.set(key, earliest(first, firstOffsets.get(key)))
+		}
+		return firstOffsets
+	}
+
 	/**
 	 * Handle fetch error for a partition
 	 */
 	private async handleFetchError(state: PartitionState, errorCode: ErrorCode): Promise<void> {
 		switch (errorCode) {
 			case ErrorCode.OffsetOutOfRange:
-				if (this.offsetManager && this.autoOffsetReset) {
-					if (this.autoOffsetReset === 'none') {
-						this.pendingError = new Error(
-							`Offset out of range for ${state.topic}-${state.partition} at offset ${state.offset}`
-						)
-						break
-					}
-					// Records buffered from the now-invalid position precede (or are unrelated
-					// to) the reset offset; delivering them would violate the reset. Discard them
-					// BEFORE the listOffsets round-trip below â otherwise a concurrent poll() could
-					// drain the stale records while we await, or a transient lookup failure could
-					// skip the clear entirely.
-					this.fetchBuffer?.removePartitions([{ topic: state.topic, partition: state.partition }])
-
-					// Capture the epoch across the (awaited) offset lookup: if a seek lands while we
-					// resolve the reset offset, the seek takes precedence and we must not overwrite
-					// its position with the reset.
-					{
-						const epochBeforeReset = state.fetchEpoch
-						const resetOffset =
-							this.autoOffsetReset === 'earliest'
-								? await this.offsetManager.getEarliestOffset(state.topic, state.partition)
-								: await this.offsetManager.getLatestOffset(state.topic, state.partition)
-						if (state.fetchEpoch === epochBeforeReset) {
-							state.offset = resetOffset
-						}
-					}
-				}
+				await this.handleOffsetOutOfRange(state)
 				break
 
 			case ErrorCode.NotLeaderOrFollower:
@@ -867,6 +964,53 @@ export class FetchManager {
 					errorCode,
 				})
 		}
+	}
+
+	/**
+	 * The fetch position of a partition is out of range (retention deleted it, or the log was truncated below
+	 * it). The partition's reset policy decides: 'earliest' and 'latest' move the position there and report the
+	 * reset; 'none' pauses the partition and reports it, so the application decides where it goes on (nobody
+	 * listening: the run ends with OffsetOutOfRangeError).
+	 */
+	private async handleOffsetOutOfRange(state: PartitionState): Promise<void> {
+		const { topic, partition, offset } = state
+		let policy: AutoOffsetReset
+		try {
+			policy =
+				typeof this.autoOffsetReset === 'function'
+					? this.autoOffsetReset(topic, partition)
+					: this.autoOffsetReset
+		} catch (error) {
+			// A policy function that throws is an application error: the next poll() ends the run with it.
+			this.pendingError = error instanceof Error ? error : new Error(String(error))
+			return
+		}
+		this.logger.warn('fetch offset out of range', { topic, partition, offset: String(offset), policy })
+
+		if (policy === 'none') {
+			this.pausePartitions([{ topic, partition }])
+			if (!this.config.onOffsetOutOfRange?.({ topic, partition, offset })) {
+				this.pendingError = new OffsetOutOfRangeError(topic, partition, offset)
+			}
+			return
+		}
+
+		// Records buffered from the now-invalid position precede (or are unrelated to) the reset offset;
+		// delivering them would violate the reset. Discard them BEFORE the listOffsets round-trip below,
+		// otherwise a concurrent poll() could drain them while we await, or a transient lookup failure could
+		// skip the clear entirely.
+		this.fetchBuffer?.removePartitions([{ topic, partition }])
+
+		// A seek that lands while the reset offset is resolved takes precedence over the reset, and a
+		// partition revoked meanwhile is not reset at all.
+		const epochBeforeReset = state.fetchEpoch
+		const resetOffset =
+			policy === 'earliest'
+				? await this.offsetManager.getEarliestOffset(topic, partition)
+				: await this.offsetManager.getLatestOffset(topic, partition)
+		if (state.fetchEpoch !== epochBeforeReset || state.abortController.signal.aborted) return
+		state.offset = resetOffset
+		this.config.onOffsetReset?.({ topic, partition, from: offset, to: resetOffset, reason: 'out-of-range' })
 	}
 
 	/**
@@ -953,10 +1097,10 @@ export class FetchManager {
 					continue
 				}
 
-				// Get ready (non-paused) partitions - reuse array
+				// Get ready (neither paused nor held) partitions - reuse array
 				readyPartitions.length = 0
 				for (const state of this.partitionStates.values()) {
-					if (!state.paused) {
+					if (isFetchable(state)) {
 						readyPartitions.push(state)
 					}
 				}
@@ -1183,7 +1327,7 @@ export class FetchManager {
 				if (
 					!state ||
 					state.abortController.signal.aborted ||
-					state.paused ||
+					!isFetchable(state) ||
 					state.fetchEpoch !== issuedEpochByKey.get(key)
 				)
 					continue
@@ -1211,7 +1355,7 @@ export class FetchManager {
 					// decodeRecords may have awaited; re-fence (revoked, paused, or seeked mid-decode).
 					if (
 						state.abortController.signal.aborted ||
-						state.paused ||
+						!isFetchable(state) ||
 						state.fetchEpoch !== issuedEpochByKey.get(key)
 					)
 						continue
@@ -1254,7 +1398,8 @@ export class FetchManager {
 	 * The background loop is started lazily on first call.
 	 *
 	 * Returns records grouped by topic/partition. Internal offsets are advanced
-	 * so subsequent polls return new records.
+	 * so subsequent polls return new records. With `undelivered` configured, the
+	 * batches are in that queue already when poll() returns them: take them from there.
 	 */
 	async poll(excludedPartitions?: PartitionKeys): Promise<PartitionBatch[]> {
 		// Surface a fatal fetch error (e.g. CORRUPT_MESSAGE) recorded by the background loop.
@@ -1303,32 +1448,41 @@ export class FetchManager {
 		throw error
 	}
 
-	/** Position, readable end, buffered bytes and pause state of every assigned partition. */
+	/** Position, next delivery offset, readable end, buffered records and pause state of every assigned partition. */
 	partitionMetrics(): ConsumerPartitionMetrics[] {
-		const buffered = new Map(
-			this.fetchBuffer?.snapshot().map(stat => [tpKey(stat.topic, stat.partition), stat.bytes])
-		)
-		return Array.from(this.partitionStates, ([key, state]) => ({
-			topic: state.topic,
-			partition: state.partition,
-			position: state.offset,
-			endOffset: state.endOffset,
-			bufferedBytes: buffered.get(key) ?? 0,
-			paused: state.paused,
-		}))
+		const buffered = new Map(this.fetchBuffer?.snapshot().map(stat => [tpKey(stat.topic, stat.partition), stat]))
+		const undelivered = this.undeliveredFrom()
+		return Array.from(this.partitionStates, ([key, state]) => {
+			const stat = buffered.get(key)
+			return {
+				topic: state.topic,
+				partition: state.partition,
+				position: state.offset,
+				nextOffset: earliest(state.offset, stat?.firstOffset, undelivered.get(key)),
+				endOffset: state.endOffset,
+				bufferedBytes: stat?.bytes ?? 0,
+				bufferedRecords: stat?.records ?? 0,
+				paused: state.paused,
+			}
+		})
 	}
 
 	/**
-	 * Drain buffer and return completed fetches directly
+	 * Drain buffer and return completed fetches directly. They go into the caller's `undelivered` queue in the same
+	 * step: poll() resolves them to the caller only later, and in between nothing else would hold them.
 	 */
 	private drainBuffer(excludedPartitions?: PartitionKeys): PartitionBatch[] {
 		const fetchBuffer = this.fetchBuffer
 		if (!fetchBuffer) return []
-		const { maxBytesPerPartition, priority } = this.config
-		if (!priority) return fetchBuffer.drain(maxBytesPerPartition, excludedPartitions)
-		this.lastExcluded = excludedPartitions
-		const decision = priority.schedule(this.buildSchedulerState(fetchBuffer, excludedPartitions))
-		return fetchBuffer.drain(maxBytesPerPartition, excludedPartitions, decision.drain)
+		const { maxBytesPerPartition, priority, undelivered } = this.config
+		let plan: ScheduleDecision['drain'] | undefined
+		if (priority) {
+			this.lastExcluded = excludedPartitions
+			plan = priority.schedule(this.buildSchedulerState(fetchBuffer, excludedPartitions)).drain
+		}
+		const batches = fetchBuffer.drain(maxBytesPerPartition, excludedPartitions, plan)
+		undelivered?.push(...batches)
+		return batches
 	}
 
 	/** Buffered partitions first (in buffer order), then idle assigned partitions with zero buffered. */
@@ -1346,10 +1500,10 @@ export class FetchManager {
 		}
 		for (const key of buffered.keys()) {
 			const state = this.partitionStates.get(key)
-			if (state && !state.paused) partitions.push(describe(state, key))
+			if (state && isFetchable(state)) partitions.push(describe(state, key))
 		}
 		for (const [key, state] of this.partitionStates) {
-			if (!state.paused && !buffered.has(key)) partitions.push(describe(state, key))
+			if (isFetchable(state) && !buffered.has(key)) partitions.push(describe(state, key))
 		}
 		return {
 			partitions,

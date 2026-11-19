@@ -5,7 +5,7 @@ Real-world examples demonstrating streaming topologies with `@kafkats/flow`.
 ## Prerequisites
 
 - Docker & Docker Compose
-- Node.js 18+
+- Node.js 22 or later
 - pnpm
 
 ## Quick Start
@@ -114,7 +114,7 @@ web-events (input)
     |
     +--[left join user-profiles]-->
     |     |
-    |     +--[branch by tier]-->  premium-events
+    |     +--[split by tier]-->  premium-events
     |     |                       free-events
     |     |
     |     +--[session windows 30s]-->  user-sessions
@@ -142,7 +142,7 @@ web-events (input)
 | `stream()`                   | Define input stream source         |
 | `table()`                    | Define changelog table for lookups |
 | `leftJoin()`                 | Enrich events with user data       |
-| `branch()`                   | Route events by user tier          |
+| `split()` and `branch()`     | Route events by user tier          |
 | `groupByKey()`               | Group by user for sessions         |
 | `groupBy()`                  | Group by page for metrics          |
 | `windowedBy(SessionWindows)` | Detect user sessions               |

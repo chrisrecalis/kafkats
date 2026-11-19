@@ -3,7 +3,7 @@
 ## Basic Usage
 
 ```typescript
-import { zodCodec } from '@kafkats/flow-codec-zod'
+import { zodCodec } from '@kafkats/codec-zod'
 import { z } from 'zod'
 
 // Simple schema
@@ -21,7 +21,7 @@ const codec = zodCodec(MessageSchema)
 ```typescript
 import { flow, topic } from '@kafkats/flow'
 import { string } from '@kafkats/client'
-import { zodCodec } from '@kafkats/flow-codec-zod'
+import { zodCodec } from '@kafkats/codec-zod'
 import { z } from 'zod'
 
 const OrderSchema = z.object({
@@ -50,9 +50,9 @@ const app = flow({
 
 // Types are fully inferred
 app.stream(orders)
-	.filter((_, order) => order.status === 'pending')
-	.mapValues(order => ({ ...order, status: 'confirmed' as const }))
-	.to(confirmedOrdersTopic)
+	.filter((_, order) => order?.status === 'pending')
+	.mapValues(order => ({ ...order!, status: 'confirmed' as const }))
+	.to('confirmed-orders', { key: string(), value: zodCodec(OrderSchema) })
 ```
 
 ## With Client Producer/Consumer

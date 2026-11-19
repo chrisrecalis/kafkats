@@ -1,6 +1,6 @@
 # Codecs
 
-Codecs handle serialization and deserialization. They're provided by `@kafkats/client` (and re-exported by `@kafkats/flow`) and used throughout both client and flow packages.
+Codecs turn keys and values into bytes and back. They are provided by `@kafkats/client` and re-exported by `@kafkats/flow`, so `import { string, json, buffer, codec } from '@kafkats/flow'` works as well.
 
 ## Built-in Codecs
 
@@ -91,8 +91,8 @@ const orders = topic('orders', {
 })
 
 app.stream(orders)
-	.filter((key, order) => order.total > 100)
-	.to('large-orders')
+	.filter((key, order) => order !== null && order.total > 100)
+	.to('large-orders') // the stream still knows both codecs
 ```
 
 ### In TestDriver
@@ -112,13 +112,12 @@ driver.input('orders', {
 ### In State Stores
 
 ```typescript
-import { string, json } from '@kafkats/client'
+import { Stores, string, json } from '@kafkats/flow'
 
-const store = provider.createKeyValueStore('my-store', {
-	keyCodec: string(),
-	valueCodec: json<MyValue>(),
-})
+const sessions = Stores.keyValueStore({ name: 'sessions', key: string(), value: json<Session>() })
 ```
+
+Stores of the DSL take their codecs from the operator (`Materialized.key` / `value`) or from the stream.
 
 ## Protocol Buffers
 
@@ -177,18 +176,9 @@ const userCodec = zodCodec(UserSchema)
 // Validates on decode (encode serializes the value as JSON without validating)
 ```
 
-## Nullable Values
+## Null Keys and Values
 
-Handle null values in your codec:
-
-```typescript
-import type { Codec } from '@kafkats/client'
-
-const nullableStringCodec: Codec<string | null> = {
-	encode: value => (value === null ? Buffer.alloc(0) : Buffer.from(value)),
-	decode: buf => (buf.length === 0 ? null : buf.toString()),
-}
-```
+Codecs never see `null`: a record without a key, or with a null value (a tombstone), is `null` in the stream, and a `null` key or value is written as a missing key or a tombstone. A codec only encodes and decodes actual values.
 
 ## Composite Codecs
 
@@ -216,3 +206,32 @@ const kvCodec: Codec<KeyValue> = {
 	}),
 }
 ```
+
+## Codecs Flow Picks
+
+Operators find the codecs they need in their options first, then in what the stream still knows (see [How codecs are resolved](/flow/operations#how-codecs-are-resolved)). A few results have codecs of their own:
+
+| Result                                  | Codec                                                                                       |
+| --------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `count()` values                        | 8-byte big-endian integers (Kafka Streams' `Serdes.Long`); `value` in the options to change |
+| Keys of time and sliding window results | `WindowedCodecs.timeWindowed(keyCodec, windowSize)`: `[key][start int64 BE]`                |
+| Keys of session window results          | `WindowedCodecs.sessionWindowed(keyCodec)`: `[key][end int64 BE][start int64 BE]`           |
+
+To read counts written by another flow or Kafka Streams application:
+
+```typescript
+import type { Codec } from '@kafkats/flow'
+
+const int64: Codec<number> = {
+	encode: n => {
+		const buf = Buffer.alloc(8)
+		buf.writeBigInt64BE(BigInt(n))
+		return buf
+	},
+	decode: buf => Number(buf.readBigInt64BE()),
+}
+
+app.stream('clicks-per-user', { key: string(), value: int64 })
+```
+
+See [Windowed keys](/flow/windowing#windowed-keys) for the windowed formats.

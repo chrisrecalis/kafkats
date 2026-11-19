@@ -1,280 +1,249 @@
 # Windowing
 
-Windowing groups stream records by time for aggregations. kafkats/flow supports time windows (tumbling and hopping) and session windows. Sliding windows are not implemented yet.
+Windowed aggregations group the records of each key by time. Flow has Kafka Streams' four kinds of windows, with the same factories, grace periods, retention rules, late-record rules and result formats.
+
+| Windows          | Shape                                    | Typical use                        |
+| ---------------- | ---------------------------------------- | ---------------------------------- |
+| `TimeWindows`    | Fixed size; tumbling or hopping          | Counts per minute, hourly metrics  |
+| `SessionWindows` | Activity separated by gaps of inactivity | User sessions                      |
+| `SlidingWindows` | Fixed size, sliding with the records     | "N events within 10 minutes"       |
+| `JoinWindows`    | A time range around each record          | [Stream-stream joins](/flow/joins) |
+
+```typescript
+import { TimeWindows } from '@kafkats/flow'
+
+const perMinute = clicks.groupByKey().windowedBy(TimeWindows.ofSizeWithNoGrace('1m')).count()
+```
 
 ## Time Windows
 
-Fixed-size, non-overlapping time buckets:
+Windows `[start, start + size)` whose starts are multiples of the advance.
 
 ```typescript
-import { flow, topic, TimeWindows } from '@kafkats/flow'
-import { string, json } from '@kafkats/client'
+// Tumbling: 5-minute windows, no late records accepted
+TimeWindows.ofSizeWithNoGrace('5m')
 
-// 5-minute tumbling windows
-app.stream(clicks).groupByKey().windowedBy(TimeWindows.of('5m')).count()
+// Tumbling, accepting records up to 30 seconds after the window ended
+TimeWindows.ofSizeAndGrace('5m', '30s')
+
+// Hopping: 5-minute windows starting every minute (each record is in 5 windows)
+TimeWindows.ofSizeAndGrace('5m', '30s').advanceBy('1m')
 ```
 
-### Window Duration Syntax
-
-| Format    | Duration           |
-| --------- | ------------------ |
-| `'100ms'` | 100 milliseconds   |
-| `'5s'`    | 5 seconds          |
-| `'5m'`    | 5 minutes          |
-| `'1h'`    | 1 hour             |
-| `'1d'`    | 1 day              |
-| `300000`  | 300000 ms (number) |
-
-### Hopping Windows
-
-Overlapping windows with custom advance:
-
-```typescript
-// 5-minute windows, advancing every 1 minute
-TimeWindows.of('5m').advanceBy('1m')
-```
-
-```
-Window 1: [0:00 - 0:05)
-Window 2: [0:01 - 0:06)
-Window 3: [0:02 - 0:07)
-...
-```
+The size must be positive and the advance positive and at most the size; the factories throw `TopologyError` otherwise. Windows never start before 0.
 
 ## Session Windows
 
-Dynamic windows based on activity gaps:
+Sessions `[start, end]` of a key's records that are at most `gap` apart. A record that falls into the gap between two sessions merges them into one.
 
 ```typescript
 import { SessionWindows } from '@kafkats/flow'
 
-// Session closes after 30 minutes of inactivity
-app.stream(userActivity).groupByKey().windowedBy(SessionWindows.withInactivityGap('30m')).count()
+SessionWindows.ofInactivityGapWithNoGrace('30m')
+SessionWindows.ofInactivityGapAndGrace('30m', '5m')
 ```
 
-Sessions:
-
-- Start with first event for a key
-- Extend with each new event
-- Close after inactivity gap elapses
-
-When a record bridges several sessions, they are merged in time order. `reduce()` always calls the reducer as `(aggregate, value)`. `aggregate()` on session windows needs a `merger` option that combines the aggregates of two sessions when they merge: `aggregate(init, agg, { value, merger: (a, b) => ... })`.
+When a record extends a session or merges several, the sessions it replaces are retracted downstream (a record with a null value for each) before the new session is sent. Session `aggregate()` takes a merger that combines the aggregates of merged sessions; see [Aggregations](/flow/aggregations#windowed-aggregations).
 
 ## Sliding Windows
 
-::: warning
-`SlidingWindows` is not implemented yet. `windowedBy(SlidingWindows.of(...))` throws. Use hopping `TimeWindows` (`TimeWindows.of(size).advanceBy(advance)`) instead.
-:::
-
-Continuous, overlapping windows:
+Windows `[start, start + timeDifference]` (both ends inclusive) that slide with the records: a key gets a window wherever a record enters or leaves the slide, so every distinct set of records at most `timeDifference` apart is aggregated once.
 
 ```typescript
 import { SlidingWindows } from '@kafkats/flow'
 
-// Look back 5 minutes from each event
-app.stream(events).groupByKey().windowedBy(SlidingWindows.of('5m')).count()
+// Payments of a card within any 10 minutes
+payments.groupByKey().windowedBy(SlidingWindows.ofTimeDifferenceAndGrace('10m', '1m')).count()
 ```
 
-## Window Operations
+Sliding window aggregations drop records with a null value. An aggregator must return a new aggregate rather than modify the one it is given: an aggregate may be copied into a new window.
 
-Once windowed, use aggregation operations:
+## Durations
+
+Sizes, gaps, graces and advances are milliseconds or strings with a unit: `'500ms'`, `'30s'`, `'5m'`, `'1h'`, `'1d'`. See [Durations](/flow/operations#durations).
+
+## Timestamps
+
+Every record gets a timestamp when it is consumed, from the source's timestamp extractor (`Consumed.timestampExtractor`, else `FlowConfig.defaultTimestampExtractor`):
+
+| Extractor                                       | Behaviour                                                                                                |
+| ----------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `TimestampExtractors.failOnInvalid` (default)   | The record's timestamp; a negative one stops the app (`InvalidTimestampError`)                           |
+| `TimestampExtractors.logAndSkipOnInvalid`       | The record's timestamp; a record with a negative one is dropped                                          |
+| `TimestampExtractors.usePartitionTimeOnInvalid` | The record's timestamp; a negative one is replaced by the partition's time (fatal while that is unknown) |
+| `TimestampExtractors.wallClock`                 | The time the record is consumed (processing time)                                                        |
+
+A custom extractor receives the decoded record (`topic`, `partition`, `offset`, `key`, `value`, `timestamp`, `headers`) and the partition's time (the largest timestamp seen on the partition, `-1` while unknown):
 
 ```typescript
-const windowed = stream.groupByKey().windowedBy(TimeWindows.of('1h'))
-
-// Count per window
-windowed.count()
-
-// Combine values per window (the aggregate has the value type)
-windowed.reduce((latest, value) => (value.amount > latest.amount ? value : latest))
-
-// Custom aggregation (needs a value codec for the aggregate)
-windowed.aggregate(
-	() => ({ count: 0, total: 0 }),
-	(key, value, agg) => ({
-		count: agg.count + 1,
-		total: agg.total + value.amount,
-	}),
-	{ value: json<{ count: number; total: number }>() }
-)
+app.stream('orders', {
+	key: string(),
+	value: json<Order>(),
+	timestampExtractor: record => (record.value as Order | null)?.createdAt ?? record.timestamp,
+})
 ```
 
-## Stream Time and Late Records
+A negative result drops the record; a result that is not an integer, or an extractor that throws, is a fatal error (see the [uncaught exception handler](/flow/error-handling#uncaught-exceptions)). Downstream, records keep their timestamps; processors set new ones explicitly (`record.withTimestamp()`).
 
-Windows are driven by event time, not wall-clock time. **Stream time is tracked per source partition**: it is the highest record timestamp seen on that partition. Partitions progress independently, so a partition that is far ahead does not make in-order records on another partition late.
+## Stream Time
 
-Stream time is used to:
+Windows close by **stream time**, which only moves with the timestamps of the records, never with the wall clock:
 
-- **Drop late records**: a record is dropped when its window (or session) is already past retention, which is 24 times the window size (or session gap) behind stream time. A record for a window that is still retained is applied normally, and a late session record that can merge into a live session is kept.
-- **Expire old windows**: windows and sessions past retention are removed from the store.
+- Each input partition of a task has a partition time: the largest timestamp read from it.
+- A task processes its records in timestamp order across its input partitions (the smallest head first), and its stream time is the largest timestamp it processed.
+- Each windowed operator keeps its own clock: the largest timestamp of the records it saw. Its windows close by that clock.
 
-Windowed state is partitioned like all other state, see [Partitioned State](/flow/state-stores#partitioned-state).
+Processor clocks are committed with the offsets (in the offset commit metadata, as Kafka Streams does), and restored when a task starts again elsewhere, after a rebalance or after a failure. A record is therefore late, or not, regardless of restarts.
+
+A task with several input partitions (a join, a merge) waits for data on all of them before it picks the next record, so that records are processed in timestamp order (KIP-695): it waits for an empty partition while its lag is unknown or positive (records are on the broker), and for `maxTaskIdleMs` (default 0) once the partition is caught up; then it processes what it has. With `-1` it never waits.
+
+## Grace Periods and Late Records
+
+A window **closes** once its operator's stream time passed its end by the grace period. A record whose windows are all closed is **late** and dropped (and logged); stream time does not move back for it.
+
+| Windows          | A record at `ts` is dropped for a window when                                            |
+| ---------------- | ---------------------------------------------------------------------------------------- |
+| `TimeWindows`    | `window end <= streamTime - grace` (a hopping record may still update its newer windows) |
+| `SessionWindows` | the merged session ends before `streamTime - grace - gap`                                |
+| `SlidingWindows` | `ts + timeDifference < streamTime - grace` (the whole record)                            |
+| `JoinWindows`    | see [Stream-stream joins](/flow/joins#stream-stream-joins)                               |
+
+The grace period is a trade-off: a longer one accepts later records, keeps windows longer in the store, and delays final results.
+
+## Retention
+
+A windowed aggregation's store keeps a window for its retention, measured back from the newest window end it holds. The default, which is also the minimum, keeps what a record can still update:
+
+| Windows          | Default and minimum retention |
+| ---------------- | ----------------------------- |
+| `TimeWindows`    | size + grace                  |
+| `SessionWindows` | gap + grace                   |
+| `SlidingWindows` | 2 × time difference + grace   |
+
+`Materialized.retention` keeps windows longer (for lookups through joins, for example); a smaller value throws `TopologyError`:
+
+```typescript
+grouped.windowedBy(TimeWindows.ofSizeWithNoGrace('1m')).count({ storeName: 'counts', retention: '1h' })
+```
+
+Reads never return a window past its retention, whether or not it was deleted yet. Expired windows are deleted from the local store as the store's clock advances; the window changelog topics have `cleanup.policy=delete,compact` and a `retention.ms` of the store's retention plus one day, so the broker drops them too.
+
+## Emit on Window Close
+
+By default a windowed aggregation forwards every update of a window (`emit: 'on-update'`). With `emit: 'on-window-close'` it forwards only the **final result** of each window, once the window closed:
+
+```typescript
+clicks
+	.groupByKey()
+	.windowedBy(TimeWindows.ofSizeAndGrace('1h', '5m'))
+	.count({ emit: 'on-window-close' })
+	.toStream()
+	.to('hourly-clicks')
+```
+
+Closed windows are looked for after records are processed, at most once per second of wall clock for each aggregation of each task: a window closes when a later record moves stream time to its end plus grace (a session: its end plus gap and grace), or past that time for sliding windows and sessions, which include their end. Which windows were emitted is committed with the offsets, so each final result is sent once across restarts (under at-least-once a failure can send it again). This is Kafka Streams' `EmitStrategy.onWindowClose()`. [`suppress({ until: 'window-close' })`](/flow/suppress) gives the same results on any windowed table, through a buffer.
 
 ## Windowed Keys
 
-Windowed aggregations produce `Windowed<K>` keys:
+Windowed aggregations produce a `KTable<Windowed<K>, V>`:
 
 ```typescript
 interface Windowed<K> {
 	key: K
-	window: {
-		start: number // Window start timestamp (ms)
-		end: number // Window end timestamp (ms)
-	}
+	window: { start: number; end: number } // [start, end) for time windows; [start, end] for sessions and sliding windows
 }
 ```
 
-Access window boundaries in transformations:
+Written to a topic, windowed keys use Kafka Streams' formats, so Java applications can read them with `WindowedSerdes`:
+
+| Windows                  | Key bytes                             | Codec                                         |
+| ------------------------ | ------------------------------------- | --------------------------------------------- |
+| Time and sliding windows | `[key][start int64 BE]`               | `WindowedCodecs.timeWindowed(keyCodec, size)` |
+| Sessions                 | `[key][end int64 BE][start int64 BE]` | `WindowedCodecs.sessionWindowed(keyCodec)`    |
+
+The time-windowed format does not carry the end: decoding computes it from the size (for sliding windows, the time difference). The results of a windowed aggregation know their codec, so `toStream().to(topic)` writes them without options. To read such a topic in another app:
 
 ```typescript
-stream
-	.groupByKey()
-	.windowedBy(TimeWindows.of('5m'))
-	.count()
-	.toStream()
-	.map(
-		(windowedKey, count) =>
-			[
-				windowedKey.key,
-				{
-					key: windowedKey.key,
-					windowStart: new Date(windowedKey.window.start),
-					windowEnd: new Date(windowedKey.window.end),
-					count,
-				},
-			] as const
-	)
+import { WindowedCodecs, string, json } from '@kafkats/flow'
+
+// written by .aggregate(..., { value: json<number>() }) over TimeWindows of one hour
+app.stream('hourly-revenue', { key: WindowedCodecs.timeWindowed(string(), 3_600_000), value: json<number>() })
 ```
 
-## Grace Periods
+Windowed records are written to the partition of their **base key**, both by `to()` and through repartition topics, so they stay in the partition where the key's other data is: key-based operations on windowed results need no repartitioning.
 
-`TimeWindows` and `SessionWindows` have no configurable grace period. A late record is still applied as long as its window (or session) is retained, which is 24 times the window size (or session gap) behind stream time; see [Stream Time and Late Records](#stream-time-and-late-records).
+## Result Timestamps
 
-## Window Comparison
+| Aggregation     | Timestamp of a result                         |
+| --------------- | --------------------------------------------- |
+| Time windows    | The largest timestamp of the window's records |
+| Session windows | The session's end                             |
+| Sliding windows | The largest timestamp of the window's records |
 
-| Type            | Size    | Overlap    | Use Case                         |
-| --------------- | ------- | ---------- | -------------------------------- |
-| Time (Tumbling) | Fixed   | No         | Regular metrics, hourly counts   |
-| Time (Hopping)  | Fixed   | Yes        | Smoothed averages, sliding stats |
-| Session         | Dynamic | No         | User sessions, activity tracking |
-| Sliding         | Fixed   | Continuous | Not implemented yet              |
+## Null Values
 
-## Example: Hourly Metrics
+Records with a null key are dropped by every aggregation. Time and session window aggregations pass records with a null value to the aggregator or reducer, and `count()` counts them, as Kafka Streams does; their callbacks type the value `V | null`. A `reduce()` whose first value of a window is null keeps no window for it. Sliding window aggregations drop null values.
+
+## Deprecated Factories
+
+The factories of earlier versions still work, with Kafka Streams' legacy behaviour, and warn once per process:
+
+| Deprecated                                | Behaves as                                                     | Use instead                                                |
+| ----------------------------------------- | -------------------------------------------------------------- | ---------------------------------------------------------- |
+| `TimeWindows.of(size)`                    | grace `max(24h - size, 0)`: windows accept records a day late  | `ofSizeWithNoGrace(size)` / `ofSizeAndGrace(size, grace)`  |
+| `SessionWindows.withInactivityGap(gap)`   | grace `max(24h - gap, 0)`                                      | `ofInactivityGapWithNoGrace` / `ofInactivityGapAndGrace`   |
+| `SlidingWindows.of(d)`, `.gracePeriod(g)` | the same windows                                               | `ofTimeDifferenceWithNoGrace` / `ofTimeDifferenceAndGrace` |
+| `JoinWindows.of(d)`                       | grace `max(24h - 2d, 0)`, unmatched left/outer results eagerly | `ofTimeDifferenceWithNoGrace` / `ofTimeDifferenceAndGrace` |
+
+The long legacy grace keeps about a day of windows in the store, and delays final results by as much. Switch to the new factories to bound both.
+
+## Example: Hourly Revenue per Product
 
 ```typescript
-interface MetricEvent {
-	metricName: string
-	value: number
-	timestamp: number
+interface Sale {
+	productId: string
+	amount: number
 }
 
-interface HourlyMetric {
-	metricName: string
-	windowStart: Date
-	windowEnd: Date
-	sum: number
-	count: number
-	average: number
-}
-
-app.stream<string, MetricEvent>(metricsTopic)
-	.groupByKey()
-	.windowedBy(TimeWindows.of('1h'))
+app.stream('sales', { key: string(), value: json<Sale>() })
+	.groupBy((key, sale) => sale!.productId, { key: string(), name: 'sales-by-product' })
+	.windowedBy(TimeWindows.ofSizeAndGrace('1h', '10m'))
 	.aggregate(
-		() => ({ sum: 0, count: 0 }),
-		(key, value, agg) => ({
-			sum: agg.sum + value.value,
-			count: agg.count + 1,
-		}),
-		{ value: json<{ sum: number; count: number }>() }
+		() => 0,
+		(productId, sale, revenue) => revenue + (sale?.amount ?? 0),
+		{ storeName: 'hourly-revenue', value: json<number>(), emit: 'on-window-close' }
 	)
 	.toStream()
-	.map(
-		(windowedKey, agg) =>
-			[
-				windowedKey.key,
-				{
-					metricName: windowedKey.key,
-					windowStart: new Date(windowedKey.window.start),
-					windowEnd: new Date(windowedKey.window.end),
-					sum: agg.sum,
-					count: agg.count,
-					average: agg.sum / agg.count,
-				} as HourlyMetric,
-			] as const
-	)
-	.to('hourly-metrics', { key: string(), value: json<HourlyMetric>() })
+	.map((windowed, revenue) => [windowed!.key, { hour: windowed!.window.start, revenue }] as const)
+	.to('hourly-revenue', { key: string(), value: json() })
 ```
 
 ## Example: User Sessions
 
 ```typescript
-interface UserAction {
-	userId: string
-	action: string
-	timestamp: number
+interface Activity {
+	page: string
 }
 
-interface SessionSummary {
-	userId: string
-	sessionStart: Date
-	sessionEnd: Date
-	actionCount: number
-	actions: string[]
+interface Session {
+	pages: number
+	firstPage: string | null
 }
 
-app.stream<string, UserAction>(actionsTopic)
+app.stream('activity', { key: string(), value: json<Activity>() })
 	.groupByKey()
-	.windowedBy(SessionWindows.withInactivityGap('30m'))
+	.windowedBy(SessionWindows.ofInactivityGapAndGrace('30m', '1m'))
 	.aggregate(
-		() => ({ actions: [] as string[] }),
-		(key, action, agg) => ({
-			actions: [...agg.actions, action.action],
+		(): Session => ({ pages: 0, firstPage: null }),
+		(userId, activity, session) => ({
+			pages: session.pages + (activity === null ? 0 : 1),
+			firstPage: session.firstPage ?? activity?.page ?? null,
 		}),
-		{
-			value: json<{ actions: string[] }>(),
-			// Required for session windows: combines two sessions that merge
-			merger: (a, b) => ({ actions: [...a.actions, ...b.actions] }),
-		}
+		(userId, a, b) => ({ pages: a.pages + b.pages, firstPage: a.firstPage ?? b.firstPage }),
+		{ storeName: 'sessions', value: json<Session>() }
 	)
 	.toStream()
-	// A session that grows or merges replaces the old one, which is emitted with a null value
-	.filter((_, agg) => agg !== null)
-	.map(
-		(windowedKey, agg) =>
-			[
-				windowedKey.key,
-				{
-					userId: windowedKey.key,
-					sessionStart: new Date(windowedKey.window.start),
-					sessionEnd: new Date(windowedKey.window.end),
-					actionCount: agg.actions.length,
-					actions: agg.actions,
-				} as SessionSummary,
-			] as const
-	)
-	.to('user-sessions', { key: string(), value: json<SessionSummary>() })
-```
-
-## State Management
-
-Windowed operations require state stores. Configure via `stateStoreProvider`:
-
-```typescript
-import { inMemory } from '@kafkats/flow'
-import { lmdb } from '@kafkats/flow-state-lmdb'
-
-// In-memory (default)
-const app = flow({
-	applicationId: 'my-app',
-	client: { clientId: 'my-app', brokers: ['localhost:9092'] },
-	stateStoreProvider: inMemory(),
-})
-
-// Persistent (LMDB)
-const app = flow({
-	applicationId: 'my-app',
-	client: { clientId: 'my-app', brokers: ['localhost:9092'] },
-	stateStoreProvider: lmdb({ stateDir: './state' }),
-})
+	// merged-away sessions are retracted with null values
+	.filter((windowed, session) => session !== null)
+	.to('user-sessions')
 ```

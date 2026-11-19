@@ -206,12 +206,16 @@ export class OrderedSessionStore<K, V> extends OrderedStore<WindowedKey<K>, V> i
 		this.retentionMs = options.retentionMs
 	}
 
-	/** The sessions of `key` that overlap `[earliestStart, latestEnd]`. */
-	async *findSessions(key: K, earliestStart: number, latestEnd: number): AsyncIterable<[WindowedKey<K>, V]> {
+	/** The sessions of `key` that end at or after `earliestSessionEnd` and start at or before `latestSessionStart`. */
+	async *findSessions(
+		key: K,
+		earliestSessionEnd: number,
+		latestSessionStart: number
+	): AsyncIterable<[WindowedKey<K>, V]> {
 		const keyBytes = this.keyCodec.encode(key)
 		for await (const entry of this.scan(this.keys.of(keyBytes), stored => this.keys.isOf(stored, keyBytes))) {
 			const [session] = entry
-			if (session.windowStart <= latestEnd && session.windowEnd >= earliestStart) yield entry
+			if (session.windowStart <= latestSessionStart && session.windowEnd >= earliestSessionEnd) yield entry
 		}
 	}
 

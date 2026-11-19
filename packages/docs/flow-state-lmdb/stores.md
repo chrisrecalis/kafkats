@@ -6,15 +6,7 @@
 
 For simple key-value storage (tables, aggregations):
 
-```typescript
-interface KeyValueStore<K, V> {
-	get(key: K): Promise<V | undefined>
-	put(key: K, value: V): Promise<void>
-	delete(key: K): Promise<void>
-	all(): AsyncIterable<{ key: K; value: V }>
-	range(from: K, to: K): AsyncIterable<{ key: K; value: V }>
-}
-```
+Implements flow's `KeyValueStore` interface; see [Store Types](/flow/state-stores#store-types) for its methods.
 
 ### Use Cases
 
@@ -34,34 +26,12 @@ Keys are stored as-is using the key codec:
 
 For time-windowed state:
 
-```typescript
-interface WindowStore<K, V> {
-	get(key: K, windowStart: number): Promise<V | undefined>
-	put(key: K, value: V, windowStart: number): Promise<void>
-	fetch(
-		key: K,
-		from: number,
-		to: number
-	): AsyncIterable<{
-		windowStart: number
-		value: V
-	}>
-	fetchAll(
-		from: number,
-		to: number
-	): AsyncIterable<{
-		key: K
-		windowStart: number
-		value: V
-	}>
-}
-```
+Implements flow's `WindowStore` interface; see [Store Types](/flow/state-stores#store-types) for its methods.
 
 ### Use Cases
 
-- Tumbling window aggregations
-- Hopping window aggregations
-- Sliding window aggregations
+- Tumbling and hopping window aggregations
+- Window stores of your own processors (`Stores.windowStore()`)
 
 ### Key Format
 
@@ -81,26 +51,12 @@ This ordering enables:
 
 For session-windowed state:
 
-```typescript
-interface SessionStore<K, V> {
-	get(key: K, sessionStart: number, sessionEnd: number): Promise<V | undefined>
-	put(key: K, value: V, sessionStart: number, sessionEnd: number): Promise<void>
-	findSessions(
-		key: K,
-		from: number,
-		to: number
-	): AsyncIterable<{
-		sessionStart: number
-		sessionEnd: number
-		value: V
-	}>
-}
-```
+Implements flow's `SessionStore` interface; see [Store Types](/flow/state-stores#store-types) for its methods.
 
 ### Use Cases
 
 - Session window aggregations
-- Activity-based grouping
+- Sliding window aggregations and the buffers of stream-stream joins (flow keeps them in session-layout stores)
 
 ### Key Format
 
@@ -122,17 +78,13 @@ Stores are created automatically by the flow runtime:
 
 ```typescript
 // This creates an LMDBKeyValueStore internally
-const counts = stream.groupByKey().count({
-	materialized: { storeName: 'user-counts' },
-})
+const counts = stream.groupByKey().count({ storeName: 'user-counts' })
 
 // This creates an LMDBWindowStore internally
 const windowedCounts = stream
 	.groupByKey()
-	.windowedBy(TimeWindows.of('1h'))
-	.count({
-		materialized: { storeName: 'hourly-counts' },
-	})
+	.windowedBy(TimeWindows.ofSizeWithNoGrace('1h'))
+	.count({ storeName: 'hourly-counts' })
 ```
 
 ## Manual Store Access
@@ -150,6 +102,7 @@ const kvStore = provider.createKeyValueStore('my-kv', {
 	keyCodec: string(),
 	valueCodec: json<MyValue>(),
 })
+await kvStore.init()
 
 await kvStore.put('key1', { data: 'value1' })
 const value = await kvStore.get('key1')
@@ -158,11 +111,13 @@ const value = await kvStore.get('key1')
 const windowStore = provider.createWindowStore('my-windows', {
 	keyCodec: string(),
 	valueCodec: json<number>(),
-	windowSize: 3600000, // 1 hour in ms
+	windowSizeMs: 3_600_000, // 1 hour
+	retentionMs: 86_400_000, // 1 day
 })
+await windowStore.init()
 
-const windowStart = Math.floor(Date.now() / 3600000) * 3600000
-await windowStore.put('user1', 42, windowStart)
+const windowStart = Math.floor(Date.now() / 3_600_000) * 3_600_000
+await windowStore.put({ key: 'user1', windowStart, windowEnd: windowStart + 3_600_000 }, 42)
 
 // Cleanup
 await provider.close()

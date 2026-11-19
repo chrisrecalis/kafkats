@@ -5,7 +5,7 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { KafkaClient, Producer } from '@kafkats/client'
-import { codec, flow, SessionWindows, type FlowApp } from '../../src/index.js'
+import { codec, flow, SessionWindows, type FlowApp, type Windowed } from '../../src/index.js'
 import {
 	createTopics,
 	injectCommitFailures,
@@ -19,6 +19,8 @@ import {
 const str = codec.string()
 const num = codec.json<number>()
 const GAP = 1_000
+// Longer than the event-time span of all records (14 steps of < 3 s from one base): no record is late.
+const GRACE = 45_000
 const KEYS = 6
 
 type Ev = { key: string; ts: number; v: number }
@@ -66,10 +68,7 @@ describe('hardening: session windows under EOS', () => {
 		await admin.disconnect()
 	})
 
-	const keyOf = (_v: unknown, k: unknown) => {
-		const w = k as { key: string; window: { start: number; end: number } }
-		return `${w.key}@${w.window.start}-${w.window.end}`
-	}
+	const keyOf = (k: Windowed<string> | null) => `${k!.key}@${k!.window.start}-${k!.window.end}`
 
 	const build = (
 		applicationId: string,
@@ -88,22 +87,22 @@ describe('hardening: session windows under EOS', () => {
 		})
 		const grouped = () => app.stream(input, { key: str, value: num }).groupByKey()
 		grouped()
-			.windowedBy(SessionWindows.withInactivityGap(GAP))
+			.windowedBy(SessionWindows.ofInactivityGapAndGrace(GAP, GRACE))
 			.count({ storeName: 's-count', value: num })
 			.toStream()
 			.selectKey(keyOf)
 			.to(outs.count, { key: str, value: num })
 		grouped()
-			.windowedBy(SessionWindows.withInactivityGap(GAP))
-			.reduce((a, b) => a + b, { storeName: 's-reduce', value: num })
+			.windowedBy(SessionWindows.ofInactivityGapAndGrace(GAP, GRACE))
+			.reduce((a, b) => a + (b ?? 0), { storeName: 's-reduce', value: num })
 			.toStream()
 			.selectKey(keyOf)
 			.to(outs.reduce, { key: str, value: num })
 		grouped()
-			.windowedBy(SessionWindows.withInactivityGap(GAP))
+			.windowedBy(SessionWindows.ofInactivityGapAndGrace(GAP, GRACE))
 			.aggregate(
 				() => 0,
-				(_k, v, a) => a + v,
+				(_k, v, a) => a + (v ?? 0),
 				{ storeName: 's-agg', value: num, merger: (a: number, b: number) => a + b } as never
 			)
 			.toStream()
@@ -143,7 +142,7 @@ describe('hardening: session windows under EOS', () => {
 			for (let k = 0; k < KEYS; k++) {
 				let t = 0
 				for (let i = 0; i < 14; i++) {
-					// keep total event-time span < retention (24 x gap) so nothing is legitimately dropped as late
+					// keep the total event-time span below GRACE so nothing is legitimately dropped as late
 					t += rnd() < 0.3 ? 1_500 + Math.floor(rnd() * 1_500) : Math.floor(rnd() * 900)
 					events.push({ key: `k${k}`, ts: base + t, v: 1 + Math.floor(rnd() * 5) })
 				}

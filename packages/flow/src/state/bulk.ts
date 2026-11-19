@@ -1,4 +1,5 @@
 import type { Codec } from '@/codec.js'
+import { abortError, yieldIfDue } from '@/runtime/signals.js'
 import type { KeyValueStore } from '@/state.js'
 
 /**
@@ -50,14 +51,36 @@ export async function writeChanges<K, V>(
 	await Promise.all(Array.from(changes, write))
 }
 
-/** Remove every entry from a store. */
-export async function clearStore<K, V>(store: KeyValueStore<K, V>): Promise<void> {
+/**
+ * Remove every entry from a store. Yields to the event loop as it goes (a store with millions of entries must not hold
+ * up timers and network callbacks), and rejects with an AbortError once `signal` aborts, at the next yield while the
+ * keys are collected and before a round of removals: the caller must have invalidated the store's checkpoint, since
+ * the store is then partly cleared. `beforeRemoving` is awaited once before the first removal, only when the store
+ * holds entries.
+ */
+export async function clearStore<K, V>(
+	store: KeyValueStore<K, V>,
+	signal?: AbortSignal,
+	beforeRemoving?: () => Promise<void>
+): Promise<void> {
 	// Collected before anything is removed: a store need not support removal while it is iterated.
 	const keys: K[] = []
 	for await (const [key] of store.all()) {
 		keys.push(key)
+		const turn = yieldIfDue()
+		if (turn !== undefined) {
+			await turn
+			if (signal?.aborted) {
+				throw abortError(signal)
+			}
+		}
 	}
+	if (keys.length > 0) await beforeRemoving?.()
 	for (let start = 0; start < keys.length; start += WIPE_ROUND) {
+		await yieldIfDue()
+		if (signal?.aborted) {
+			throw abortError(signal)
+		}
 		await Promise.all(keys.slice(start, start + WIPE_ROUND).map(key => store.delete(key)))
 	}
 }

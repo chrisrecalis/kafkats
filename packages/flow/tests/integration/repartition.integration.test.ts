@@ -1,8 +1,9 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import type { KafkaClient, Producer } from '@kafkats/client'
-import { codec, flow, SessionWindows, TimeWindows, type FlowApp } from '../../src/index.js'
+import { murmur2, toPositive, type KafkaClient, type Producer } from '@kafkats/client'
+import { codec, flow, SessionWindows, TimeWindows, WindowedCodecs, type FlowApp } from '../../src/index.js'
 import {
 	createTopics,
+	eventTimeBase,
 	injectCommitFailures,
 	newClient,
 	readAllCommitted,
@@ -35,7 +36,8 @@ describe('repartitioning keeps event time, totals and topic identity', () => {
 			const applicationId = uniqueTopicName('r2-rp-app')
 			await createTopics(admin, [{ name: input, partitions: P }, { name: outWin }, { name: outPar }])
 			const hour = 3_600_000
-			const T0 = Math.floor(1_650_000_000_000 / hour) * hour + 5_000 // far in the past
+			// A day back: apart from the wall clock (the producer's own timestamps), within the broker's retention.
+			const T0 = eventTimeBase() - 24 * hour + 5_000
 			const N = 60
 
 			const build = (): FlowApp => {
@@ -55,10 +57,7 @@ describe('repartitioning keeps event time, totals and topic identity', () => {
 					.windowedBy(TimeWindows.of(hour))
 					.count({ storeName: 'win', value: numberCodec })
 					.toStream()
-					.selectKey(
-						(_v, k) =>
-							`${(k as unknown as { key: string }).key}@${(k as unknown as { window: { start: number } }).window.start}`
-					)
+					.selectKey(k => `${k!.key}@${k!.window.start}`)
 					.to(outWin, { key: stringCodec, value: numberCodec })
 				src.groupBy((_k, v) => `p${(v as number) % 2}`, { key: stringCodec, value: numberCodec })
 					.count({ storeName: 'par', key: stringCodec, value: numberCodec })
@@ -124,7 +123,7 @@ describe('repartitioning keeps event time, totals and topic identity', () => {
 		const output = uniqueTopicName('r2-ss-out')
 		const applicationId = uniqueTopicName('r2-ss-app')
 		await createTopics(admin, [{ name: input }, { name: output }])
-		const B = 1_700_000_000_000
+		const B = eventTimeBase() // near the wall clock: the broker's retention deletes older records
 		// session 1 = {0, 500, 900}, session 2 = {5000, 5400}, session 3 = {20000}; arrival order scrambled
 		const order = [900, 0, 5400, 500, 5000, 20_000]
 		const client = newClient('r2-ss-app')
@@ -144,10 +143,7 @@ describe('repartitioning keeps event time, totals and topic identity', () => {
 			.windowedBy(SessionWindows.withInactivityGap(1_000))
 			.count({ storeName: 'sess', value: numberCodec })
 			.toStream()
-			.selectKey(
-				(_v, k) =>
-					`a@${(k as unknown as { window: { start: number } }).window.start - B}-${(k as unknown as { window: { end: number } }).window.end - B}`
-			)
+			.selectKey(k => `a@${k!.window.start - B}-${k!.window.end - B}`)
 			.to(output, { key: stringCodec, value: numberCodec })
 		try {
 			await app.start()
@@ -167,4 +163,165 @@ describe('repartitioning keeps event time, totals and topic identity', () => {
 			await app.close().catch(() => {})
 		}
 	}, 80_000)
+
+	it('a stream re-keyed before a global-table join is repartitioned before it is aggregated', async () => {
+		const input = uniqueTopicName('r2-rp-gt-in')
+		const table = uniqueTopicName('r2-rp-gt-table')
+		const output = uniqueTopicName('r2-rp-gt-out')
+		await createTopics(admin, [{ name: input, partitions: 2 }, { name: table }, { name: output }])
+		await producer.send(table, { key: 'eu', value: Buffer.from('Europe') })
+
+		const app = flow({
+			applicationId: uniqueTopicName('r2-rp-gt-app'),
+			client: newClient('r2-rp-gt-app'),
+			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 50 },
+			producer: { lingerMs: 0 },
+		})
+		const regions = app.globalTable(table, { key: stringCodec, value: stringCodec })
+		app.stream(input, { key: stringCodec, value: stringCodec })
+			.selectKey((_k, region) => region!)
+			.join(regions, (_region, name) => name)
+			.groupByKey({ key: stringCodec, value: stringCodec })
+			.count({ storeName: 'per-region', key: stringCodec, value: numberCodec })
+			.toStream()
+			.to(output, { key: stringCodec, value: numberCodec })
+		try {
+			await app.start()
+			// The same new key arrives on two different source partitions.
+			await producer.send(input, { key: 'a', value: Buffer.from('eu'), partition: 0 })
+			await producer.send(input, { key: 'b', value: Buffer.from('eu'), partition: 1 })
+
+			let counts: number[] = []
+			for (const deadline = Date.now() + 20_000; counts.length < 2 && Date.now() < deadline;) {
+				await sleep(300)
+				counts = (await readAllCommitted(admin, output, 800)).map(m => numberCodec.decode(m.value!))
+			}
+			expect(counts).toEqual([1, 2])
+		} finally {
+			await app.close().catch(() => {})
+		}
+	}, 40_000)
+
+	it('the results of a windowed aggregation are joined with a table keyed by (key, window)', async () => {
+		const P = 4
+		const input = uniqueTopicName('r2-rp-win-in')
+		const labels = uniqueTopicName('r2-rp-win-labels')
+		const output = uniqueTopicName('r2-rp-win-out')
+		await createTopics(admin, [{ name: input, partitions: P }, { name: labels, partitions: P }, { name: output }])
+		type Window = { key: string; window: { start: number; end: number } }
+		const windowCodec = codec.json<Window>()
+		const size = 10_000
+		const start = eventTimeBase() // near the wall clock: the broker's retention deletes older records
+
+		// One label per window of each key, wherever the windowed key hashes to.
+		const keys = ['k0', 'k1', 'k2', 'k3', 'k4', 'k5']
+		await producer.send(
+			labels,
+			keys.map(key => ({
+				key: windowCodec.encode({ key, window: { start, end: start + size } }),
+				value: Buffer.from(`label-${key}`),
+			}))
+		)
+
+		const app = flow({
+			applicationId: uniqueTopicName('r2-rp-win-app'),
+			client: newClient('r2-rp-win-app'),
+			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 50 },
+			producer: { lingerMs: 0 },
+		})
+		const labelTable = app.table(labels, { key: windowCodec, value: stringCodec })
+		app.stream(input, { key: stringCodec, value: stringCodec })
+			.groupByKey()
+			.windowedBy(TimeWindows.of(size))
+			.count({ storeName: 'per-window', value: numberCodec })
+			.toStream()
+			// Windowed results stay in the partition of their base key; the labels are where the whole windowed key
+			// hashes to, so the results move there through a repartition with a plain key codec (BC10).
+			.repartition({ key: windowCodec, value: numberCodec })
+			.join(labelTable, (count, label) => `${label}=${count}`)
+			.to(output, { key: windowCodec, value: stringCodec })
+		try {
+			await app.start()
+			// Let the table load, then send every key into partition 0.
+			await sleep(2_000)
+			await producer.send(
+				input,
+				keys.map(key => ({ key, value: Buffer.from('x'), partition: 0, timestamp: new Date(start + 1) }))
+			)
+
+			let joined: string[] = []
+			for (const deadline = Date.now() + 20_000; joined.length < keys.length && Date.now() < deadline;) {
+				await sleep(300)
+				joined = (await readAllCommitted(admin, output, 800)).map(m => m.value!.toString())
+			}
+			expect(joined.sort()).toEqual(keys.map(key => `label-${key}=1`))
+		} finally {
+			await app.close().catch(() => {})
+		}
+	}, 60_000)
+
+	// BC10, KS `WindowedStreamPartitioner`: a sink writes a windowed key to the partition its base key hashes to (with the
+	// producer's default partitioner), not where the bytes of the whole windowed key hash to.
+	it('windowed results are written to the partition of their base key', async () => {
+		const input = uniqueTopicName('r2-rp-wsink-in')
+		const timeOut = uniqueTopicName('r2-rp-wsink-time')
+		const sessionOut = uniqueTopicName('r2-rp-wsink-session')
+		const OUT_PARTITIONS = 3
+		await createTopics(admin, [
+			{ name: input, partitions: 4 },
+			{ name: timeOut, partitions: OUT_PARTITIONS },
+			{ name: sessionOut, partitions: OUT_PARTITIONS },
+		])
+		const size = 10_000
+		const app = flow({
+			applicationId: uniqueTopicName('r2-rp-wsink-app'),
+			client: newClient('r2-rp-wsink-app'),
+			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 50 },
+			producer: { lingerMs: 0 },
+		})
+		const grouped = app.stream(input, { key: stringCodec, value: stringCodec }).groupByKey()
+		grouped
+			.windowedBy(TimeWindows.ofSizeWithNoGrace(size))
+			.count({ storeName: 'per-window', value: numberCodec })
+			.toStream()
+			.to(timeOut)
+		grouped
+			.windowedBy(SessionWindows.ofInactivityGapWithNoGrace(size))
+			.count({ storeName: 'per-session', value: numberCodec })
+			.toStream()
+			.to(sessionOut)
+		const keys = Array.from({ length: 12 }, (_, i) => `key-${i}`)
+		const start = eventTimeBase() // near the wall clock: the broker's retention deletes older records
+		try {
+			await app.start()
+			await producer.send(
+				input,
+				keys.map(key => ({ key, value: Buffer.from('x'), timestamp: new Date(start + 1) }))
+			)
+			const formats = [
+				{ topic: timeOut, key: WindowedCodecs.timeWindowed(stringCodec, size) },
+				{ topic: sessionOut, key: WindowedCodecs.sessionWindowed(stringCodec) },
+			]
+			for (const { topic, key } of formats) {
+				let rows: Awaited<ReturnType<typeof readAllCommitted>> = []
+				for (const deadline = Date.now() + 20_000; rows.length < keys.length && Date.now() < deadline;) {
+					await sleep(300)
+					rows = await readAllCommitted(admin, topic, 800)
+				}
+				const placed = rows.map(row => {
+					const windowed = key.decode(row.key!)
+					return { key: windowed.key, start: windowed.window.start, partition: row.partition }
+				})
+				const expected = keys.map(base => ({
+					key: base,
+					start: start + (topic === timeOut ? 0 : 1),
+					partition: toPositive(murmur2(Buffer.from(base))) % OUT_PARTITIONS,
+				}))
+				const byKey = (a: { key: string }, b: { key: string }) => a.key.localeCompare(b.key)
+				expect(placed.sort(byKey), topic).toEqual(expected.sort(byKey))
+			}
+		} finally {
+			await app.close().catch(() => {})
+		}
+	}, 60_000)
 })

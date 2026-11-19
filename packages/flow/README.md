@@ -4,14 +4,15 @@ Kafka Streams-like DSL for stream processing in TypeScript.
 
 ## Features
 
-- **Stream DSL** — map, filter, branch, flatMapValues, and more
-- **Tables** — KTable with changelog-backed state
-- **Aggregations** — groupByKey, count, aggregate, reduce
-- **Windowing** — Tumbling, hopping, and session windows
-- **Joins** — Stream-stream and stream-table joins
-- **State Stores** — Pluggable state with in-memory default, partitioned per source partition
-- **Fault tolerance** — At-least-once or exactly-once processing, changelog restoration, workers that restart after recoverable failures
-- **Testing** — Built-in TestDriver for unit testing topologies
+- **Stream DSL** — map, filter, flatMap, split/branch, merge, repartition, and more
+- **Tables** — KTable and GlobalKTable with changelog-backed state, value getters and `suppress()`
+- **Aggregations** — groupByKey, groupBy, count, aggregate, reduce
+- **Windowing** — tumbling, hopping, sliding and session windows with grace periods, emit on window close
+- **Joins** — stream-stream (with deferred left/outer results), stream-table, stream-global table and table-table joins
+- **Processor API** — `process()`, `processValues()`, custom state stores, stream-time and wall-clock punctuators
+- **State Stores** — pluggable state (in-memory by default; LMDB and RocksDB providers), one instance per task
+- **Fault tolerance** — Kafka Streams' task runtime and commit protocol, at-least-once or exactly-once, changelog restoration, recovery without restarting the process
+- **Testing** — built-in TestDriver for unit testing topologies
 
 ## Installation
 
@@ -30,18 +31,27 @@ const client = new KafkaClient({ clientId: 'my-app', brokers: ['localhost:9092']
 const app = flow({ applicationId: 'my-app', client })
 
 app.stream('input-topic', { value: string() })
-	.filter((key, value) => value.includes('important'))
-	.mapValues(value => value.toUpperCase())
+	.filter((key, value) => value !== null && value.includes('important'))
+	.mapValues(value => value?.toUpperCase() ?? null)
 	.to('output-topic', { value: string() })
 
 await app.start()
 ```
 
+Values (and keys) are `null` for tombstones, so stream callbacks receive `V | null`.
+
 ### Partitioning and failures
 
-State is kept per source partition, so topics that feed one stateful operation must have the same partition count (otherwise `start()` throws `CoPartitioningError`). Re-keyed streams are repartitioned through an internal topic before aggregations and joins; pass key and value codecs and a stable `name` in `groupBy(fn, { key, value, name })`.
+Flow runs Kafka Streams' task model: one task per input partition of each part of the topology, with its own state, stream time and offsets. Topics that feed one stateful operation must have the same partition count (otherwise `start()` throws `CoPartitioningError`). Re-keyed streams are repartitioned through an internal topic before aggregations and joins; pass key and value codecs and a stable `name` in `groupBy(fn, { key, value, name })`.
 
-A worker that hits a failure never continues past it. Recoverable failures restart the worker from the last committed offsets (disable with `restartOnError: false`); errors thrown by your code and fatal Kafka errors set `app.state()` to `'ERROR'`, and `app.getError()` returns the error. See the [fault tolerance guide](https://chrisrecalis.github.io/kafkats/flow/fault-tolerance).
+Failures are handled as in Kafka Streams, without restarting the process:
+
+- A task whose output or state cannot be trusted (a send that failed after the producer's retries under at-least-once, a changelog that lost records) is revived in place from its last commit.
+- Infrastructure failures (fencing, a failed commit, a lost connection) make the instance leave the group and join again after a backoff, resuming from the committed offsets.
+- A record that cannot be deserialized, processed or produced goes to its handler (`deserializationExceptionHandler`, `processingExceptionHandler`, `productionExceptionHandler`: `'fail'` by default, or `'continue'`).
+- Anything else is fatal and goes to `uncaughtExceptionHandler`: `'shutdown'` (the default) sets `app.state()` to `'ERROR'`, `'restart'` joins the group again.
+
+`app.getError()` returns the error. See the [fault tolerance guide](https://chrisrecalis.github.io/kafkats/flow/fault-tolerance); upgrading from 0.13 (the worker model and the options `numStreamThreads`, `runEach` and `stateDir` were removed): see the [upgrade guide](https://chrisrecalis.github.io/kafkats/flow/upgrading).
 
 ### Testing
 
@@ -53,7 +63,7 @@ const driver = new TestDriver()
 
 driver
 	.input('input-topic', { value: string() })
-	.mapValues(value => value.toUpperCase())
+	.mapValues(value => value?.toUpperCase() ?? null)
 	.to('output-topic', { value: string() })
 
 await driver.run(async ({ send, output }) => {

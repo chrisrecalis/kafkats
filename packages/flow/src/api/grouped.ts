@@ -1,0 +1,129 @@
+import type { KTable } from '@/api/ktable.js'
+import type { AggregateOptions, WindowedAggregateOptions } from '@/api/options.js'
+import type { Codec } from '@/codec.js'
+import type { SessionWindows, SlidingWindows, TimeWindows } from '@/dsl/windows.js'
+
+/** A key and the window it was aggregated in: `[start, end)` for time windows, `[start, end]` for sessions and sliding windows. */
+export interface Windowed<K> {
+	key: K
+	window: { start: number; end: number }
+}
+
+/**
+ * A stream grouped by key, ready to be aggregated. Its aggregations drop records with a null key; those not windowed
+ * and those of sliding windows drop records with a null value too, while those of time and session windows pass a
+ * null value to the aggregator or reducer, and count() counts it (Kafka Streams).
+ */
+export interface KGroupedStream<K, V> {
+	/** Counts are kept and sent as int64 big-endian (Kafka Streams' `Serdes.Long`) unless `options.value` is given. */
+	count(options?: AggregateOptions<K, number>): KTable<K, number>
+	reduce(reducer: (aggregate: V, value: V) => V, options?: AggregateOptions<K, V>): KTable<K, V>
+	/** Aggregates of the value type are kept with the value codec unless `options.value` is given. */
+	aggregate(
+		initializer: () => V,
+		aggregator: (key: K, value: V, aggregate: V) => V,
+		options?: AggregateOptions<K, V>
+	): KTable<K, V>
+	/** Aggregates of another type need their codec: `options.value`. */
+	aggregate<A>(
+		initializer: () => A,
+		aggregator: (key: K, value: V, aggregate: A) => A,
+		options: AggregateOptions<K, A> & { value: Codec<A> }
+	): KTable<K, A>
+	windowedBy(windows: TimeWindows): TimeWindowedKStream<K, V>
+	windowedBy(windows: SessionWindows): SessionWindowedKStream<K, V>
+	windowedBy(windows: SlidingWindows): SlidingWindowedKStream<K, V>
+}
+
+/** A table re-grouped by a new key: every update subtracts the old value and adds the new one. */
+export interface KGroupedTable<K, V> {
+	count(options?: AggregateOptions<K, number>): KTable<K, number>
+	reduce(
+		adder: (aggregate: V, value: V) => V,
+		subtractor: (aggregate: V, value: V) => V,
+		options?: AggregateOptions<K, V>
+	): KTable<K, V>
+	/** Aggregates always need their codec: `options.value`. */
+	aggregate<A>(
+		initializer: () => A,
+		adder: (key: K, value: V, aggregate: A) => A,
+		subtractor: (key: K, value: V, aggregate: A) => A,
+		options: AggregateOptions<K, A> & { value: Codec<A> }
+	): KTable<K, A>
+}
+
+/**
+ * A grouped stream aggregated per time window. A record with a null value reaches the reducer or aggregator, and
+ * count() counts it; a reduce() starting with one keeps no window for it (Kafka Streams).
+ */
+export interface TimeWindowedKStream<K, V> {
+	count(options?: WindowedAggregateOptions<K, number>): KTable<Windowed<K>, number>
+	reduce(
+		reducer: (aggregate: V, value: V | null) => V,
+		options?: WindowedAggregateOptions<K, V>
+	): KTable<Windowed<K>, V>
+	/** Aggregates of the value type are kept with the value codec unless `options.value` is given. */
+	aggregate(
+		initializer: () => V,
+		aggregator: (key: K, value: V | null, aggregate: V) => V,
+		options?: WindowedAggregateOptions<K, V>
+	): KTable<Windowed<K>, V>
+	/** Aggregates of another type need their codec: `options.value`. */
+	aggregate<A>(
+		initializer: () => A,
+		aggregator: (key: K, value: V | null, aggregate: A) => A,
+		options: WindowedAggregateOptions<K, A> & { value: Codec<A> }
+	): KTable<Windowed<K>, A>
+}
+
+/**
+ * A grouped stream aggregated per session: sessions that a record bridges are merged. A record with a null value
+ * reaches the reducer or aggregator, and count() counts it; a reduce() starting with one keeps no session for it
+ * (Kafka Streams).
+ */
+export interface SessionWindowedKStream<K, V> {
+	count(options?: WindowedAggregateOptions<K, number>): KTable<Windowed<K>, number>
+	/** The reducer also merges sessions. */
+	reduce(
+		reducer: (aggregate: V, value: V | null) => V,
+		options?: WindowedAggregateOptions<K, V>
+	): KTable<Windowed<K>, V>
+	/** Aggregates of the value type are kept with the value codec unless `options.value` is given. */
+	aggregate(
+		initializer: () => V,
+		aggregator: (key: K, value: V | null, aggregate: V) => V,
+		merger: (key: K, aggregate1: V, aggregate2: V) => V,
+		options?: WindowedAggregateOptions<K, V>
+	): KTable<Windowed<K>, V>
+	/** Aggregates of another type need their codec: `options.value`. */
+	aggregate<A>(
+		initializer: () => A,
+		aggregator: (key: K, value: V | null, aggregate: A) => A,
+		merger: (key: K, aggregate1: A, aggregate2: A) => A,
+		options: WindowedAggregateOptions<K, A> & { value: Codec<A> }
+	): KTable<Windowed<K>, A>
+	/** @deprecated Pass the merger as the third argument: `(key, aggregate1, aggregate2) => A`. */
+	aggregate<A>(
+		initializer: () => A,
+		aggregator: (key: K, value: V | null, aggregate: A) => A,
+		options: WindowedAggregateOptions<K, A> & { value: Codec<A>; merger: (aggregate1: A, aggregate2: A) => A }
+	): KTable<Windowed<K>, A>
+}
+
+/** A grouped stream aggregated per sliding window. Records with a null value are dropped (Kafka Streams). */
+export interface SlidingWindowedKStream<K, V> {
+	count(options?: WindowedAggregateOptions<K, number>): KTable<Windowed<K>, number>
+	reduce(reducer: (aggregate: V, value: V) => V, options?: WindowedAggregateOptions<K, V>): KTable<Windowed<K>, V>
+	/** Aggregates of the value type are kept with the value codec unless `options.value` is given. */
+	aggregate(
+		initializer: () => V,
+		aggregator: (key: K, value: V, aggregate: V) => V,
+		options?: WindowedAggregateOptions<K, V>
+	): KTable<Windowed<K>, V>
+	/** Aggregates of another type need their codec: `options.value`. */
+	aggregate<A>(
+		initializer: () => A,
+		aggregator: (key: K, value: V, aggregate: A) => A,
+		options: WindowedAggregateOptions<K, A> & { value: Codec<A> }
+	): KTable<Windowed<K>, A>
+}

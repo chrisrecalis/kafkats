@@ -1,4 +1,4 @@
-import type { Codec } from '@/codec.js'
+import type { ResolvedChangelogConfig } from '@/topology/nodes.js'
 
 /**
  * Configuration for changelog topics backing state stores.
@@ -11,7 +11,7 @@ export interface ChangelogConfig {
 	enabled?: boolean
 	/** Custom topic name. Default: {appId}-{storeName}-changelog */
 	topicName?: string
-	/** Replication factor. Default: broker default */
+	/** Replication factor. Default: FlowConfig.changelog.replicationFactor, else the broker's default. */
 	replicationFactor?: number
 	/** Custom topic configs. Merged with defaults */
 	topicConfigs?: Record<string, string>
@@ -42,31 +42,35 @@ export interface ChangelogRestorationOptions {
 	 */
 	checkIntervalMs?: number
 	/**
-	 * Override the consumer's Fetch maxWaitMs during restoration to make stop() responsive.
-	 * Default: unset (uses consumer defaults).
+	 * Override the consumer's Fetch maxWaitMs during restoration to make stop() responsive. Default, in
+	 * FlowConfig.changelog.restoration: FlowConfig.consumer.maxWaitMs, else 500. For ChangelogRestorer.restore(): the
+	 * client consumer's default.
 	 */
 	consumerMaxWaitMs?: number
+	/** How many tasks restore at once (one restore consumer each). Default: 4. */
+	maxConcurrentTasks?: number
+}
+
+/** Key-value changelogs: compacted, kept forever. */
+export const DEFAULT_CHANGELOG_CONFIGS: Record<string, string> = {
+	'cleanup.policy': 'compact',
+	'retention.ms': '-1',
+	'segment.bytes': '52428800',
 }
 
 /**
- * Spec for a changelog topic to be created.
+ * How much longer a window or session changelog keeps records than its store keeps windows: a day, the default of Kafka
+ * Streams' `windowstore.changelog.additional.retention.ms`. The broker deletes by its own clock, so the margin keeps
+ * windows the store still holds when stream time lags behind it.
  */
-export interface ChangelogTopicSpec {
-	storeName: string
-	topicName: string
-	replicationFactor?: number
-	configs: Record<string, string>
-	keyCodec: Codec<unknown>
-	valueCodec: Codec<unknown>
-	skipRestoration: boolean
-	/** Source topics that feed into this state store. Used to infer partition count. */
-	sourceTopics: Set<string>
-	/** If true, only validate existing topics, don't create new ones. */
-	validateOnly: boolean
-}
+export const WINDOWED_CHANGELOG_ADDITIONAL_RETENTION_MS = 86_400_000
 
-export const DEFAULT_CHANGELOG_CONFIGS: Record<string, string> = {
-	'cleanup.policy': 'compact',
+/**
+ * Repartition topics (Kafka Streams' RepartitionTopicConfig): never compacted, not expired by time; the records below
+ * the committed offset are purged instead.
+ */
+export const DEFAULT_REPARTITION_CONFIGS: Readonly<Record<string, string>> = {
+	'cleanup.policy': 'delete',
 	'retention.ms': '-1',
 	'segment.bytes': '52428800',
 }
@@ -88,4 +92,46 @@ export function resolveChangelogConfig(changelog: boolean | ChangelogConfig | un
 		return { enabled: true }
 	}
 	return { enabled: changelog.enabled !== false, ...changelog }
+}
+
+/** What the changelog of every store of an application is resolved against. */
+export interface ChangelogDefaults {
+	readonly applicationId: string
+	/**
+	 * `FlowConfig.changelog.topicConfigs`: applied over the defaults, below a store's own topic configs and, for a
+	 * window or session store, below its retention (resolveStoreChangelog()).
+	 */
+	readonly topicConfigs?: Readonly<Record<string, string>>
+}
+
+/**
+ * The changelog of a store: its topic and the configs it is created with (the defaults, then the application's, then
+ * the store's own). Window and session stores (those with a `retentionMs`) default to `delete,compact` with the store's
+ * retention plus a day (5.4), so the broker drops the records of expired windows instead of keeping every window
+ * forever; their expiry writes no tombstones (`state/logging.ts`). That retention is the store's own, set over the
+ * application's configs (KS `WindowedChangelogTopicConfig`): an application-wide `retention.ms`, meant for repartition
+ * topics, must not cut the changelog of a window below the store's retention; only the store's own configs replace it.
+ */
+export function resolveStoreChangelog(
+	defaults: ChangelogDefaults,
+	store: { readonly name: string; readonly retentionMs?: number },
+	option: boolean | ChangelogConfig | undefined
+): ResolvedChangelogConfig {
+	const config = resolveChangelogConfig(option)
+	if (!config.enabled) {
+		return { enabled: false }
+	}
+	const { retentionMs } = store
+	const policy: Record<string, string> = retentionMs === undefined ? {} : { 'cleanup.policy': 'delete,compact' }
+	const retention: Record<string, string> =
+		retentionMs === undefined
+			? {}
+			: { 'retention.ms': String(retentionMs + WINDOWED_CHANGELOG_ADDITIONAL_RETENTION_MS) }
+	return {
+		enabled: true,
+		topic: config.topicName ?? buildChangelogTopicName(defaults.applicationId, store.name),
+		configs: getDefaultTopicConfigs({ ...policy, ...defaults.topicConfigs, ...retention, ...config.topicConfigs }),
+		replicationFactor: config.replicationFactor,
+		skipRestoration: config.skipRestoration ?? false,
+	}
 }

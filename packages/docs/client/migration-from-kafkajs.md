@@ -427,6 +427,20 @@ consumer.resume([
 ])
 ```
 
+### Committing Offsets
+
+**KafkaJS:**
+
+```typescript
+await consumer.commitOffsets([{ topic: 'my-topic', partition: 0, offset: '100' }])
+```
+
+**@kafkats/client:**
+
+```typescript
+await consumer.commit([{ topic: 'my-topic', partition: 0, offset: 100n }])
+```
+
 ### Stopping the Consumer
 
 **KafkaJS:**
@@ -492,6 +506,19 @@ await producer.transaction(async tx => {
 })
 ```
 
+Code that commits or aborts in different places, like KafkaJS's transaction object, uses a handle:
+
+```typescript
+const tx = await producer.beginTransaction()
+try {
+	await tx.send('topic-a', [{ value: Buffer.from('msg') }])
+	await tx.commit()
+} catch (e) {
+	await tx.abort()
+	throw e
+}
+```
+
 ## Admin API
 
 ### KafkaJS
@@ -545,22 +572,23 @@ await admin.deleteGroups(['old-group'])
 
 ### Admin API Mapping
 
-| KafkaJS                        | @kafkats/client              | Notes                  |
-| ------------------------------ | ---------------------------- | ---------------------- |
-| `admin.connect()`              | N/A                          | No explicit connect    |
-| `admin.disconnect()`           | N/A                          | No explicit disconnect |
-| `admin.listTopics()`           | `admin.listTopics()`         | Same                   |
-| `admin.createTopics({topics})` | `admin.createTopics(topics)` | Direct array           |
-| `admin.deleteTopics({topics})` | `admin.deleteTopics(topics)` | Direct array           |
-| `admin.fetchTopicMetadata()`   | `admin.describeTopics()`     | Renamed                |
-| `admin.listGroups()`           | `admin.listGroups()`         | Same                   |
-| `admin.describeGroups()`       | `admin.describeGroups()`     | Same                   |
-| `admin.deleteGroups()`         | `admin.deleteGroups()`       | Same                   |
-| `admin.describeCluster()`      | `admin.describeCluster()`    | Same                   |
-| `admin.fetchTopicOffsets()`    | `admin.fetchTopicOffsets()`  | Similar                |
-| `admin.describeAcls()`         | `admin.describeAcls()`       | Same                   |
-| `admin.createAcls()`           | `admin.createAcls()`         | Same                   |
-| `admin.deleteAcls()`           | `admin.deleteAcls()`         | Same                   |
+| KafkaJS                        | @kafkats/client              | Notes                                           |
+| ------------------------------ | ---------------------------- | ----------------------------------------------- |
+| `admin.connect()`              | N/A                          | No explicit connect                             |
+| `admin.disconnect()`           | N/A                          | No explicit disconnect                          |
+| `admin.listTopics()`           | `admin.listTopics()`         | Same                                            |
+| `admin.createTopics({topics})` | `admin.createTopics(topics)` | Direct array                                    |
+| `admin.deleteTopics({topics})` | `admin.deleteTopics(topics)` | Direct array                                    |
+| `admin.fetchTopicMetadata()`   | `admin.describeTopics()`     | Renamed                                         |
+| `admin.listGroups()`           | `admin.listGroups()`         | Same                                            |
+| `admin.describeGroups()`       | `admin.describeGroups()`     | Same                                            |
+| `admin.deleteGroups()`         | `admin.deleteGroups()`       | Same                                            |
+| `admin.describeCluster()`      | `admin.describeCluster()`    | Same                                            |
+| `admin.fetchTopicOffsets()`    | `admin.fetchTopicOffsets()`  | Similar                                         |
+| `admin.deleteTopicRecords()`   | `admin.deleteRecords()`      | Partitions of any topics, per-partition results |
+| `admin.describeAcls()`         | `admin.describeAcls()`       | Same                                            |
+| `admin.createAcls()`           | `admin.createAcls()`         | Same                                            |
+| `admin.deleteAcls()`           | `admin.deleteAcls()`         | Same                                            |
 
 ## Compression
 
@@ -709,7 +737,6 @@ process.on('SIGINT', shutdown)
 
 ### Features in KafkaJS not yet in @kafkats/client
 
-- `consumer.commitOffsets()` for manual offset commits outside handlers
 - Admin partition reassignment (`alterPartitionReassignments`)
 - Advanced retry options (e.g., `multiplier`, `factor` for exponential backoff)
 

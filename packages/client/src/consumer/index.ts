@@ -34,6 +34,12 @@ export type {
 	AutoOffsetReset,
 	IsolationLevel,
 	PartitionAssignmentStrategy,
+	// Offsets and assignments
+	CommitOffset,
+	CommittedOffset,
+	AssignedPartition,
+	OffsetResetPolicy,
+	OffsetResetEvent,
 	// Internal types
 	TopicPartition,
 	TopicPartitionOffset,
@@ -83,6 +89,7 @@ export type { JoinResult } from './consumer-group.js'
 
 // Offset manager (for advanced use)
 export { OffsetManager } from './offset-manager.js'
+export type { OffsetRequestOptions } from './offset-manager.js'
 
 // Fetch manager (for advanced use)
 export { FetchManager } from './fetch-manager.js'

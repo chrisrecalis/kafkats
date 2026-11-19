@@ -40,18 +40,18 @@ const client = new KafkaClient({
 
 ### Options Reference
 
-| Option                      | Type                                     | Default  | Description                                      |
-| --------------------------- | ---------------------------------------- | -------- | ------------------------------------------------ |
-| `clientId`                  | `string`                                 | -        | Required. Client identifier shown in broker logs |
-| `brokers`                   | `string[]`                               | -        | Required. Bootstrap broker addresses             |
-| `requestTimeoutMs`          | `number`                                 | `30000`  | Request timeout (ms)                             |
-| `connectionTimeoutMs`       | `number`                                 | `10000`  | Connection timeout (ms)                          |
-| `metadataRefreshIntervalMs` | `number`                                 | `300000` | How often to refresh cluster metadata (ms)       |
-| `maxInFlightRequests`       | `number`                                 | `5`      | Max in-flight requests per broker connection     |
-| `tls`                       | `TlsConfig`                              | -        | TLS configuration (omit for plaintext)           |
-| `sasl`                      | `SaslConfig`                             | -        | SASL authentication configuration                |
-| `logger`                    | `Logger`                                 | -        | Custom logger implementation                     |
-| `logLevel`                  | `'debug' \| 'info' \| 'warn' \| 'error'` | `'info'` | Log level for the built-in logger                |
+| Option                      | Type                                                 | Default  | Description                                                                                      |
+| --------------------------- | ---------------------------------------------------- | -------- | ------------------------------------------------------------------------------------------------ |
+| `clientId`                  | `string`                                             | -        | Required. Client identifier shown in broker logs                                                 |
+| `brokers`                   | `string[]`                                           | -        | Required. Bootstrap broker addresses                                                             |
+| `requestTimeoutMs`          | `number`                                             | `30000`  | Request timeout (ms)                                                                             |
+| `connectionTimeoutMs`       | `number`                                             | `10000`  | Connection timeout (ms)                                                                          |
+| `metadataRefreshIntervalMs` | `number`                                             | `300000` | How often to refresh cluster metadata (ms)                                                       |
+| `maxInFlightRequests`       | `number`                                             | `5`      | Max in-flight requests per broker connection                                                     |
+| `tls`                       | `TlsConfig`                                          | -        | TLS configuration (omit for plaintext)                                                           |
+| `sasl`                      | `SaslConfig`                                         | -        | SASL authentication configuration                                                                |
+| `logger`                    | `Logger`                                             | -        | Custom logger implementation                                                                     |
+| `logLevel`                  | `'debug' \| 'info' \| 'warn' \| 'error' \| 'silent'` | -        | Log level of the built-in console logger. Without `logger` or `logLevel` the client logs nothing |
 
 ### SASL Reauthentication
 
@@ -74,22 +74,22 @@ const producer = client.producer({
 
 ### Options Reference
 
-| Option                 | Type                                              | Default     | Description                                                                                            |
-| ---------------------- | ------------------------------------------------- | ----------- | ------------------------------------------------------------------------------------------------------ |
-| `acks`                 | `'all' \| 'leader' \| 'none'`                     | `'all'`     | Acknowledgment mode                                                                                    |
-| `compression`          | `'none' \| 'gzip' \| 'snappy' \| 'lz4' \| 'zstd'` | `'none'`    | Compression type                                                                                       |
-| `lingerMs`             | `number`                                          | `5`         | Batch wait time (ms)                                                                                   |
-| `maxBatchBytes`        | `number`                                          | `16384`     | Max batch size (bytes)                                                                                 |
-| `retries`              | `number`                                          | `3`         | Retry attempts                                                                                         |
-| `retryBackoffMs`       | `number`                                          | `100`       | Initial retry backoff (ms)                                                                             |
-| `maxRetryBackoffMs`    | `number`                                          | `1000`      | Max retry backoff (ms)                                                                                 |
-| `partitioner`          | `'murmur2' \| 'round-robin' \| Function`          | `'murmur2'` | Partitioning strategy                                                                                  |
-| `requestTimeoutMs`     | `number`                                          | `30000`     | Request timeout (ms)                                                                                   |
-| `idempotent`           | `boolean`                                         | `false`     | Enable idempotent producer                                                                             |
-| `maxInFlight`          | `number`                                          | `5`         | Max in-flight requests                                                                                 |
-| `transactionalId`      | `string`                                          | -           | Enable transactions                                                                                    |
-| `transactionTimeoutMs` | `number`                                          | `60000`     | Transaction timeout (ms)                                                                               |
-| `maxBlockMs`           | `number`                                          | `60000`     | Max time to block acquiring a producer id during transactional/idempotent producer initialization (ms) |
+| Option                 | Type                                              | Default     | Description                                                                                                                                                                                                                                                                                               |
+| ---------------------- | ------------------------------------------------- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `acks`                 | `'all' \| 'leader' \| 'none'`                     | `'all'`     | Acknowledgment mode                                                                                                                                                                                                                                                                                       |
+| `compression`          | `'none' \| 'gzip' \| 'snappy' \| 'lz4' \| 'zstd'` | `'none'`    | Compression type                                                                                                                                                                                                                                                                                          |
+| `lingerMs`             | `number`                                          | `5`         | Batch wait time (ms)                                                                                                                                                                                                                                                                                      |
+| `maxBatchBytes`        | `number`                                          | `16384`     | Max batch size (bytes)                                                                                                                                                                                                                                                                                    |
+| `retries`              | `number`                                          | `3`         | Retry attempts                                                                                                                                                                                                                                                                                            |
+| `retryBackoffMs`       | `number`                                          | `100`       | Initial retry backoff (ms)                                                                                                                                                                                                                                                                                |
+| `maxRetryBackoffMs`    | `number`                                          | `1000`      | Max retry backoff (ms)                                                                                                                                                                                                                                                                                    |
+| `partitioner`          | `'murmur2' \| 'round-robin' \| Function`          | `'murmur2'` | Partitioning strategy                                                                                                                                                                                                                                                                                     |
+| `requestTimeoutMs`     | `number`                                          | `30000`     | Request timeout (ms)                                                                                                                                                                                                                                                                                      |
+| `idempotent`           | `boolean`                                         | `false`     | Enable idempotent producer                                                                                                                                                                                                                                                                                |
+| `maxInFlight`          | `number`                                          | `5`         | Max in-flight requests                                                                                                                                                                                                                                                                                    |
+| `transactionalId`      | `string`                                          | -           | Enable transactions                                                                                                                                                                                                                                                                                       |
+| `transactionTimeoutMs` | `number`                                          | `60000`     | Transaction timeout (ms)                                                                                                                                                                                                                                                                                  |
+| `maxBlockMs`           | `number`                                          | `60000`     | Max time to block acquiring a producer id during transactional/idempotent producer initialization (ms); past it the call fails with a `TimeoutError` and the next one tries again. Also bounds the epoch bump of a transaction's abort, which is not tried again: the producer enters the `'error'` state |
 
 ### Acknowledgment Modes
 
@@ -125,28 +125,37 @@ const consumer = client.consumer({
 
 ### Options Reference
 
-| Option                        | Type                                          | Default                | Description                                           |
-| ----------------------------- | --------------------------------------------- | ---------------------- | ----------------------------------------------------- |
-| `groupId`                     | `string`                                      | -                      | Required. Consumer group ID                           |
-| `groupInstanceId`             | `string`                                      | -                      | Static membership ID                                  |
-| `sessionTimeoutMs`            | `number`                                      | `30000`                | Session timeout (ms)                                  |
-| `rebalanceTimeoutMs`          | `number`                                      | `60000`                | Rebalance timeout (ms)                                |
-| `heartbeatIntervalMs`         | `number`                                      | `3000`                 | Heartbeat interval (ms)                               |
-| `maxBytesPerPartition`        | `number`                                      | `1048576`              | Max bytes per partition per fetch and per batch       |
-| `minBytes`                    | `number`                                      | `1`                    | Min bytes to fetch                                    |
-| `maxWaitMs`                   | `number`                                      | `5000`                 | Max fetch wait time (ms)                              |
-| `autoOffsetReset`             | `'earliest' \| 'latest' \| 'none'`            | `'latest'`             | Offset reset strategy                                 |
-| `isolationLevel`              | `'read_committed' \| 'read_uncommitted'`      | `'read_committed'`     | Transaction isolation                                 |
-| `partitionAssignmentStrategy` | `'cooperative-sticky' \| 'sticky' \| 'range'` | `'cooperative-sticky'` | Assignment strategy                                   |
-| `defaultApiTimeoutMs`         | `number`                                      | `60000`                | Max time to retry offset fetch/commit operations (ms) |
+| Option                        | Type                                                              | Default                | Description                                                                 |
+| ----------------------------- | ----------------------------------------------------------------- | ---------------------- | --------------------------------------------------------------------------- |
+| `groupId`                     | `string`                                                          | -                      | Required. Consumer group ID                                                 |
+| `groupInstanceId`             | `string`                                                          | -                      | Static membership ID                                                        |
+| `sessionTimeoutMs`            | `number`                                                          | `30000`                | Session timeout (ms)                                                        |
+| `rebalanceTimeoutMs`          | `number`                                                          | `60000`                | Rebalance timeout (ms)                                                      |
+| `heartbeatIntervalMs`         | `number`                                                          | `3000`                 | Heartbeat interval (ms)                                                     |
+| `maxBytesPerPartition`        | `number`                                                          | `1048576`              | Max bytes per partition per fetch and per batch                             |
+| `minBytes`                    | `number`                                                          | `1`                    | Min bytes to fetch                                                          |
+| `maxWaitMs`                   | `number`                                                          | `5000`                 | Max fetch wait time (ms)                                                    |
+| `autoOffsetReset`             | `'earliest' \| 'latest' \| 'none'` or `(topic, partition) => ...` | `'latest'`             | Offset reset policy, or a function giving each partition's                  |
+| `isolationLevel`              | `'read_committed' \| 'read_uncommitted'`                          | `'read_committed'`     | Transaction isolation                                                       |
+| `partitionAssignmentStrategy` | `'cooperative-sticky' \| 'sticky' \| 'range'`                     | `'cooperative-sticky'` | Assignment strategy                                                         |
+| `defaultApiTimeoutMs`         | `number`                                                          | `60000`                | Max time to retry offset fetch/commit operations (ms)                       |
+| `onBeforeRebalance`           | `() => Promise<void>`                                             | -                      | Awaited before each rebalance starts                                        |
+| `onPartitionsRevoked`         | `(partitions) => Promise<void>`                                   | -                      | Awaited before revoked partitions are committed and removed                 |
+| `onPartitionsAssigned`        | `(partitions) => Promise<void>`                                   | -                      | Awaited before assigned partitions are fetched                              |
+| `onPartitionsLost`            | `(partitions) => Promise<void>`                                   | -                      | Called when partitions are lost with the session; awaited before the rejoin |
 
 ### Offset Reset Strategies
 
-| Value        | Behavior                                    |
-| ------------ | ------------------------------------------- |
-| `'earliest'` | Start from beginning of topic               |
-| `'latest'`   | Start from end of topic (new messages only) |
-| `'none'`     | Throw error if no committed offset exists   |
+The policy applies to partitions without a committed offset and to positions out of range (records deleted). Pass a
+function `(topic, partition) => policy` to choose per partition.
+
+| Value        | Behavior                                                                                                                                                                                                           |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `'earliest'` | Start from beginning of topic                                                                                                                                                                                      |
+| `'latest'`   | Start from end of topic (new messages only); the last stable offset under `read_committed`                                                                                                                         |
+| `'none'`     | No committed offset: the run fails with `NoOffsetForPartitionError`. Out of range: the partition is paused and `offsetOutOfRange` is emitted (with no listener for it, the run fails with `OffsetOutOfRangeError`) |
+
+See [Rebalance Hooks](/client/consumer#rebalance-hooks) and [Offset Reset](/client/consumer#offset-reset).
 
 ### Isolation Levels
 

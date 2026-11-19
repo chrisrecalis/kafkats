@@ -1,4 +1,5 @@
 import type { EngineUnderTest } from './engine.js'
+import { checkpointSentinelSuite } from './checkpoint-sentinel.js'
 import { crashSuite } from './crash.js'
 import { memoryParitySuite } from './memory-parity.js'
 import { rangeSuite } from './range.js'
@@ -11,14 +12,16 @@ export type { EngineUnderTest } from './engine.js'
 
 /**
  * Everything a persistent state store provider has to get right, as vitest suites: store
- * ordering and bounds, agreement with the in-memory stores, restart cycles of a flow app and
- * recovery after SIGKILL. The suites that run a flow app are skipped without KAFKA_BROKERS.
+ * ordering and bounds, agreement with the in-memory stores, the checkpoint that invalidates a
+ * store, restart cycles of a flow app and recovery after SIGKILL. The suites that run a flow
+ * app are skipped without KAFKA_BROKERS.
  */
 export function describeStateStoreProvider(engine: EngineUnderTest): void {
 	rangeSuite(engine)
 	windowBoundsSuite(engine)
 	signedTimeOrderingSuite(engine)
 	memoryParitySuite(engine)
+	checkpointSentinelSuite(engine)
 	restartSuite(engine)
 	sharedDirSuite(engine)
 	crashSuite(engine)

@@ -7,11 +7,13 @@
  *   KAFKA_CHAOS_BROKERS=127.0.0.1:29092 KAFKA_CHAOS_CONTAINER=kafka-chaos \
  *     pnpm -C packages/client exec vitest run --config vitest.integration.config.ts tests/integration/chaos
  *
- * Without both env vars the whole file is skipped.
+ * Without both env vars the whole file is skipped. The tests run one after the other: they share the broker,
+ * so tests that restart or pause it must stay in this file.
  */
 import { execSync } from 'node:child_process'
 import { describe, expect, it } from 'vitest'
 
+import { InvalidTxnStateError, TimeoutError, TransactionAbortedError } from '@/client/errors.js'
 import { KafkaClient } from '@/client/index.js'
 import type { Logger } from '@/logger.js'
 
@@ -71,6 +73,35 @@ async function restartBroker(): Promise<void> {
 	await waitForBroker()
 }
 
+/**
+ * Run `fn` while the broker is paused (`docker pause`): its sockets stay open and take requests, but nothing is
+ * answered, so the client sees no error, only silence. Unpauses and waits for the broker afterwards.
+ */
+async function whilePaused(fn: () => Promise<void>): Promise<void> {
+	docker('pause')
+	try {
+		await fn()
+	} finally {
+		docker('unpause')
+		await waitForBroker()
+	}
+}
+
+/** How long `operation` took to settle, and what it rejected with. */
+async function timed(operation: () => Promise<unknown>): Promise<{ ms: number; error?: unknown }> {
+	const started = Date.now()
+	try {
+		await operation()
+		return { ms: Date.now() - started }
+	} catch (error) {
+		return { ms: Date.now() - started, error }
+	}
+}
+
+function openSockets(): number {
+	return process.getActiveResourcesInfo().filter(r => r === 'TCPSocketWrap').length
+}
+
 async function waitUntil(cond: () => boolean, timeoutMs: number, what: string): Promise<void> {
 	const deadline = Date.now() + timeoutMs
 	while (!cond()) {
@@ -91,6 +122,19 @@ async function createTopic(client: KafkaClient, name: string, partitions: number
 	throw new Error(`topic ${name} not ready`)
 }
 
+/** Create a single-partition topic with a short-lived client. */
+async function newTopic(prefix: string): Promise<string> {
+	const setup = makeClient(`${prefix}-setup`)
+	await setup.connect()
+	try {
+		const name = uniqueName(prefix)
+		await createTopic(setup, name, 1)
+		return name
+	} finally {
+		await setup.disconnect()
+	}
+}
+
 /** Produce `values` with a short-lived, independent client (retrying while the broker is not ready). */
 async function produceValues(topicName: string, values: string[]): Promise<void> {
 	const client = makeClient('chaos-feeder')
@@ -108,6 +152,46 @@ async function produceValues(topicName: string, values: string[]): Promise<void>
 
 function range(prefix: string, from: number, to: number): string[] {
 	return Array.from({ length: to - from }, (_, i) => `${prefix}${from + i}`)
+}
+
+/**
+ * Commit the marker `fenced-<id>` in `topicName` with a new producer for each transactional id (its InitProducerId
+ * fences the producer before it and aborts the transaction that one left open), then return every value a
+ * read_committed consumer sees in `topicName`.
+ */
+async function fenceAndReadCommitted(topicName: string, transactionalIds: string[]): Promise<string[]> {
+	const client = makeClient('chaos-fence')
+	await client.connect()
+	try {
+		for (const transactionalId of transactionalIds) {
+			const producer = client.producer({ transactionalId, lingerMs: 0 })
+			const tx = await producer.beginTransaction()
+			await tx.send(topicName, { value: Buffer.from(`fenced-${transactionalId}`) })
+			await tx.commit()
+			await producer.disconnect()
+		}
+
+		const reader = client.consumer({
+			groupId: uniqueName('chaos-fence-reader'),
+			autoOffsetReset: 'earliest',
+			isolationLevel: 'read_committed',
+			maxWaitMs: 100,
+		})
+		const values: string[] = []
+		const run = reader.runEach(topicName, async message => {
+			values.push(Buffer.from(message.value as Buffer).toString())
+		})
+		try {
+			await waitUntil(() => values.length >= transactionalIds.length, 30_000, 'the markers')
+			await sleep(1000) // anything else visible shows up by now
+		} finally {
+			reader.stop()
+			await run
+		}
+		return values
+	} finally {
+		await client.disconnect()
+	}
 }
 
 // Both an 'error'-event count and a logged-error-line count must stay far below what a hot spin produces
@@ -298,66 +382,163 @@ describe.skipIf(!enabled)('broker restart / unresponsive broker (chaos)', () => 
 		expect(outputs.sort()).toEqual(inputValues.map(v => `out-${v}`).sort())
 	}, 300_000)
 
-	it('consumer stop(), producer.disconnect() and client.disconnect() are bounded against an unresponsive broker', async () => {
-		const setup = makeClient('chaos-pause-setup')
-		await setup.connect()
-		const topicName = uniqueName('chaos-pause')
-		await createTopic(setup, topicName, 1)
-		await setup.disconnect()
+	// What a caller can count on when the broker stops answering (DL17): the consumer's own shutdown budget (5 s for
+	// the final commit or the LeaveGroup), the producer's `timeoutMs`, and the client's (1 s for requests in flight).
+	describe('shutdown against a paused broker', () => {
+		const consumerCases = [
+			{ pending: 'offsets to commit (the final commit is bounded)', options: { autoCommitIntervalMs: 600_000 } },
+			{ pending: 'nothing to commit (the LeaveGroup is bounded)', options: { commitOffsets: false } },
+		]
+		for (const { pending, options } of consumerCases) {
+			it(`consumer stop() takes under 6 s with ${pending}; producer.disconnect({ timeoutMs: 2000 }) under 2.5 s with a send in flight; client.disconnect() under 2 s`, async () => {
+				const topicName = await newTopic('chaos-pause')
+				const socketsBefore = openSockets()
 
-		const socketsBefore = process.getActiveResourcesInfo().filter(r => r === 'TCPSocketWrap').length
+				const client = makeClient('chaos-pause')
+				await client.connect()
+				const producer = client.producer({ lingerMs: 0 })
+				const consumer = client.consumer({
+					groupId: uniqueName('chaos-pause-group'),
+					autoOffsetReset: 'earliest',
+					maxWaitMs: 100,
+				})
+				consumer.on('error', () => {})
+				const seen = new Set<string>()
+				const run = consumer.runEach(
+					topicName,
+					async message => {
+						seen.add(Buffer.from(message.value as Buffer).toString())
+					},
+					options
+				)
+				try {
+					const values = range('p-', 0, 10)
+					await Promise.all(values.map(v => producer.send(topicName, [{ key: v, value: Buffer.from(v) }])))
+					await waitUntil(() => values.every(v => seen.has(v)), 30_000, 'records')
 
-		const client = makeClient('chaos-pause')
-		await client.connect()
-		const producer = client.producer({ lingerMs: 0 })
-		const consumer = client.consumer({
-			groupId: uniqueName('chaos-pause-group'),
-			autoOffsetReset: 'earliest',
-			maxWaitMs: 100,
-		})
-		consumer.on('error', () => {})
-		const seen = new Set<string>()
-		const run = consumer.runEach(
-			topicName,
-			async message => {
-				seen.add(Buffer.from(message.value as Buffer).toString())
-			},
-			// Long interval: the consumed offsets are still pending when stop() runs, so stop() has a
-			// final commit + LeaveGroup to do.
-			{ autoCommitIntervalMs: 600_000 }
-		)
+					await whilePaused(async () => {
+						const inFlight = producer.send(topicName, [{ value: Buffer.from('in flight') }]).then(
+							() => null,
+							(error: unknown) => error
+						)
+						await waitUntil(
+							() => producer.metrics().inFlightRequests > 0,
+							5000,
+							'a produce request in flight'
+						)
 
-		let paused = false
-		try {
-			const values = range('p-', 0, 10)
-			await Promise.all(values.map(v => producer.send(topicName, [{ key: v, value: Buffer.from(v) }])))
-			await waitUntil(() => values.every(v => seen.has(v)), 30_000, 'records')
+						const stop = await timed(async () => {
+							consumer.stop()
+							await run
+						})
+						const disconnect = await timed(() => producer.disconnect({ timeoutMs: 2000 }))
+						const clientDisconnect = await timed(() => client.disconnect())
 
-			docker('pause')
-			paused = true
-			// Queue a send that can never be acknowledged so disconnect() has something to flush.
-			const stuck = producer.send(topicName, [{ key: 'stuck', value: Buffer.from('stuck') }]).catch(() => {})
+						expect(stop.error).toBeUndefined()
+						expect(stop.ms).toBeLessThan(6000)
+						expect(disconnect.error).toBeUndefined()
+						expect(disconnect.ms).toBeLessThan(2500)
+						expect(await inFlight).toBeInstanceOf(Error)
+						expect(clientDisconnect.error).toBeUndefined()
+						expect(clientDisconnect.ms).toBeLessThan(2000)
+					})
+				} finally {
+					await client.disconnect()
+				}
 
-			const started = Date.now()
-			consumer.stop()
-			await run
-			const stopMs = Date.now() - started
-			await producer.disconnect()
-			await stuck
-			await client.disconnect()
-			const totalMs = Date.now() - started
-
-			expect(stopMs).toBeLessThan(10_000)
-			expect(totalMs).toBeLessThan(15_000)
-		} finally {
-			if (paused) docker('unpause')
-			await client.disconnect().catch(() => {})
+				await sleep(500)
+				expect(openSockets()).toBeLessThanOrEqual(socketsBefore)
+			}, 120_000)
 		}
 
-		await sleep(500)
-		expect(process.getActiveResourcesInfo().filter(r => r === 'TCPSocketWrap').length).toBeLessThanOrEqual(
-			socketsBefore
-		)
-		await waitForBroker()
-	}, 120_000)
+		it('a transactional producer disconnect({ timeoutMs: 2000 }) takes under 2.5 s with a transaction open and a send in flight; the transaction never shows', async () => {
+			const topicName = await newTopic('chaos-pause-txn')
+			const transactionalId = uniqueName('chaos-pause-txn')
+			const client = makeClient('chaos-pause-txn')
+			await client.connect()
+			const producer = client.producer({ transactionalId, lingerMs: 0 })
+			try {
+				const tx = await producer.beginTransaction()
+				await tx.send(topicName, { value: Buffer.from('acknowledged') })
+
+				await whilePaused(async () => {
+					const inFlight = tx.send(topicName, { value: Buffer.from('in flight') }).then(
+						() => null,
+						(error: unknown) => error
+					)
+					await waitUntil(() => producer.metrics().inFlightRequests > 0, 5000, 'a produce request in flight')
+
+					const disconnect = await timed(() => producer.disconnect({ timeoutMs: 2000 }))
+					const clientDisconnect = await timed(() => client.disconnect())
+
+					expect(disconnect.error).toBeUndefined()
+					expect(disconnect.ms).toBeLessThan(2500)
+					expect(await inFlight).toBeInstanceOf(Error)
+					await expect(tx.commit()).rejects.toBeInstanceOf(InvalidTxnStateError)
+					expect(clientDisconnect.error).toBeUndefined()
+					expect(clientDisconnect.ms).toBeLessThan(2000)
+				})
+			} finally {
+				await client.disconnect()
+			}
+
+			expect(await fenceAndReadCommitted(topicName, [transactionalId])).toEqual([`fenced-${transactionalId}`])
+		}, 120_000)
+
+		it('transaction handles: abort({ timeoutMs: 2000 }) and commit({ timeoutMs: 2000 }) settle within 2.5 s with a send in flight; the producers then refuse new transactions and still disconnect in time', async () => {
+			const topicName = await newTopic('chaos-pause-end')
+			const abortId = uniqueName('chaos-pause-abort')
+			const commitId = uniqueName('chaos-pause-commit')
+			const client = makeClient('chaos-pause-end')
+			await client.connect()
+			const aborting = client.producer({ transactionalId: abortId, lingerMs: 0 })
+			const committing = client.producer({ transactionalId: commitId, lingerMs: 0 })
+			try {
+				const toAbort = await aborting.beginTransaction()
+				const toCommit = await committing.beginTransaction()
+				await Promise.all(
+					[toAbort, toCommit].map(tx => tx.send(topicName, { value: Buffer.from('acknowledged') }))
+				)
+
+				await whilePaused(async () => {
+					// In flight while the transactions end, so the commit cannot get as far as EndTxn(commit).
+					const inFlight = [toAbort, toCommit].map(tx =>
+						tx.send(topicName, { value: Buffer.from('in flight') }).then(
+							() => null,
+							(error: unknown) => error
+						)
+					)
+					await waitUntil(
+						() => aborting.metrics().inFlightRequests > 0 && committing.metrics().inFlightRequests > 0,
+						5000,
+						'produce requests in flight'
+					)
+
+					const [abort, commit] = await Promise.all([
+						timed(() => toAbort.abort({ timeoutMs: 2000 })),
+						timed(() => toCommit.commit({ timeoutMs: 2000 })),
+					])
+
+					expect(abort.error).toBeInstanceOf(TimeoutError)
+					expect(abort.ms).toBeLessThan(2500)
+					expect(commit.error).toBeInstanceOf(TransactionAbortedError)
+					expect((commit.error as TransactionAbortedError).outcome).toBe('aborted')
+					expect(commit.ms).toBeLessThan(2500)
+					for (const producer of [aborting, committing]) {
+						expect(producer.transactionState).toBe('error')
+						await expect(producer.beginTransaction()).rejects.toBeInstanceOf(InvalidTxnStateError)
+						const disconnect = await timed(() => producer.disconnect({ timeoutMs: 2000 }))
+						expect(disconnect.error).toBeUndefined()
+						expect(disconnect.ms).toBeLessThan(2500)
+					}
+					for (const error of await Promise.all(inFlight)) expect(error).toBeInstanceOf(Error)
+				})
+			} finally {
+				await client.disconnect()
+			}
+
+			const visible = await fenceAndReadCommitted(topicName, [abortId, commitId])
+			expect(visible.sort()).toEqual([`fenced-${abortId}`, `fenced-${commitId}`].sort())
+		}, 120_000)
+	})
 })

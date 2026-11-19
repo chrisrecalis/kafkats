@@ -6,294 +6,152 @@
 pnpm add @kafkats/flow
 ```
 
-## Creating a Flow Application
+`@kafkats/flow` depends on `@kafkats/client` and re-exports its codecs (`string()`, `json()`, `buffer()`, `codec`). Node.js 22 or later.
+
+## Creating an Application
 
 ```typescript
-import { flow, topic } from '@kafkats/flow'
-import { string, json } from '@kafkats/client'
+import { flow } from '@kafkats/flow'
 
 const app = flow({
 	applicationId: 'my-stream-app',
-	client: {
-		clientId: 'my-stream-app',
-		brokers: ['localhost:9092'],
-	},
+	client: { clientId: 'my-stream-app', brokers: ['localhost:9092'] },
 })
 ```
 
-### Configuration Options
+`applicationId` names everything the application owns: it is the consumer group id, the prefix of its internal topics (`<applicationId>-<name>-changelog`, `<applicationId>-<name>-repartition`) and of its state, and the base of its exactly-once transactional id. Instances of one application share it; two different applications must not.
 
-| Option                | Type                                | Default           | Description                                                                                                   |
-| --------------------- | ----------------------------------- | ----------------- | ------------------------------------------------------------------------------------------------------------- |
-| `applicationId`       | `string`                            | -                 | Required. Also used as the consumer group id                                                                  |
-| `client`              | `KafkaClient \| KafkaClientConfig`  | -                 | Required. Pass an existing client or a config object                                                          |
-| `numStreamThreads`    | `number`                            | `1`               | Number of parallel stream threads (each has its own producer/consumer)                                        |
-| `processingGuarantee` | `'at_least_once' \| 'exactly_once'` | `'at_least_once'` | Enables transactional processing when `'exactly_once'`                                                        |
-| `commitIntervalMs`    | `number`                            | `100`             | How often work is committed: transactions under `exactly_once`, progress within a batch under `at_least_once` |
-| `stateDir`            | `string`                            | -                 | State directory (used by some store providers)                                                                |
-| `stateStoreProvider`  | `StateStoreProvider`                | in-memory         | State store backend (in-memory by default)                                                                    |
-| `restartOnError`      | `boolean`                           | `true`            | Restart a worker after a recoverable failure. See [Fault Tolerance](/flow/fault-tolerance)                    |
-| `startTimeoutMs`      | `number`                            | `120000`          | How long `start()` waits for each worker to join the consumer group                                           |
-| `changelog`           | `object`                            | -                 | Changelog topic settings: `replicationFactor`, `topicConfigs`, `autoCreate`, `restoration`                    |
-| `consumer`            | `Omit<ConsumerConfig, 'groupId'>`   | -                 | Consumer overrides (Flow sets `groupId` to `applicationId` and always uses the `range` assignor)              |
-| `producer`            | `ProducerConfig`                    | -                 | Producer overrides                                                                                            |
-| `consumerRun`         | `RunBatchOptions`                   | -                 | Consumer run-loop options (e.g. `partitionConcurrency`, `autoCommitIntervalMs`, `assignment`)                 |
+`client` is a `KafkaClient` you created, or the config of one (`brokers`, `clientId`, `tls`, `sasl`, ...; see [client configuration](/client/configuration)). A client the app creates is connected by `start()` and disconnected by `close()`; a client you pass stays yours.
 
-#### Client Config (KafkaClientConfig)
-
-If you pass a config object as `client`, it uses the same options as `new KafkaClient({...})` in `@kafkats/client`:
-
-| Option     | Type         | Notes                                               |
-| ---------- | ------------ | --------------------------------------------------- |
-| `brokers`  | `string[]`   | Required                                            |
-| `clientId` | `string`     | Required                                            |
-| `tls`      | `TlsConfig`  | Omit for plaintext; use `{ enabled: true }` for TLS |
-| `sasl`     | `SaslConfig` | SASL authentication                                 |
-
-## Processing Guarantees
-
-Flow supports two processing guarantees:
-
-### At-Least-Once (Default)
-
-No record is lost. After a crash or redelivery, some records are processed again, so their outputs and state updates may be applied again.
-
-```typescript
-const app = flow({
-	applicationId: 'my-app',
-	client: { clientId: 'my-app', brokers: ['localhost:9092'] },
-	processingGuarantee: 'at_least_once', // default
-})
-```
-
-Consumer offsets are committed periodically (controlled by `autoCommitIntervalMs` in `consumerRun` options).
-
-### Exactly-Once
-
-Messages are processed exactly once using Kafka transactions. Input offsets, output messages and changelog records are committed atomically.
-
-```typescript
-const app = flow({
-	applicationId: 'my-app',
-	client: { clientId: 'my-app', brokers: ['localhost:9092'] },
-	processingGuarantee: 'exactly_once',
-	commitIntervalMs: 100, // optional, default 100ms
-})
-```
-
-#### How Exactly-Once Works
-
-Flow implements exactly-once semantics using batch-based transaction commits, similar to Kafka Streams:
-
-1. **Batch Processing** - Multiple input messages are processed within a single transaction batch
-2. **Periodic Commits** - Transactions commit at regular intervals (controlled by `commitIntervalMs`)
-3. **Atomic Commits** - Each commit atomically writes output messages and changelog records and commits consumer offsets
-4. **Buffered State** - State store writes are held in memory during the transaction and applied to the local store only after the commit, so an aborted transaction or a crash never leaves uncommitted updates in a store
-5. **Replica-Safe IDs** - Flow gives each application instance an internal process UUID and derives each
-   producer's transactional ID as `<applicationId>-<processId>-w<thread>`
-
-The process UUID is generated when the `FlowApp` is created, so replicas can safely share the normal
-`applicationId` and `clientId` configuration. It is not currently persisted: after a process restart, Flow uses a
-new UUID. Exactly-once correctness is preserved, but a transaction left open by the previous process may remain
-open until its transaction timeout expires.
-
-If `producer.transactionalId` is configured explicitly, the caller is responsible for making it unique among
-simultaneously running application instances. Flow appends a worker suffix when `numStreamThreads` is greater
-than one.
-
-Transactions are also committed:
-
-- When the application shuts down via `close()`
-- When a consumer rebalance occurs (partitions are revoked)
-
-#### Commit Interval Tuning
-
-The `commitIntervalMs` setting controls the trade-off between latency and throughput:
-
-| Value            | Latency | Throughput | Use Case                 |
-| ---------------- | ------- | ---------- | ------------------------ |
-| Lower (50-100ms) | Lower   | Lower      | Real-time processing     |
-| Higher (500ms+)  | Higher  | Higher     | Batch-oriented workloads |
-
-::: tip
-The default of 100ms provides a good balance for most use cases. Kafka Streams uses a default of 30 seconds, but Flow uses a lower default for more responsive processing.
-:::
-
-#### Consumer Configuration
-
-When using exactly-once, downstream consumers must use `read_committed` isolation to only see committed messages:
-
-```typescript
-const consumer = client.consumer({
-	groupId: 'downstream-consumer',
-	isolationLevel: 'read_committed',
-})
-```
+`flow()` validates the config at once and throws `FlowConfigError` for an invalid value or an option that was removed. Every option is listed in [Configuration](/flow/configuration).
 
 ## Defining Topics
 
-Define typed topics for input and output:
+`topic()` gives a topic name its codecs, so they do not have to be repeated:
 
 ```typescript
-import { topic } from '@kafkats/flow'
-import { string, json } from '@kafkats/client'
-
-interface UserEvent {
-	userId: string
-	action: string
-	timestamp: number
-}
-
-const events = topic('user-events', {
-	key: string(),
-	value: json<UserEvent>(),
-})
-```
-
-## Building a Topology
-
-### Stream Processing
-
-```typescript
-// Create a stream from a topic
-app.stream(events)
-	.filter((key, value) => value.action === 'purchase')
-	.mapValues(value => ({ ...value, processed: true }))
-	.to('processed-events', { value: json<UserEvent & { processed: boolean }>() })
-```
-
-### Table Processing
-
-```typescript
-// Create a table (changelog) from a topic
-const usersTable = app.table(usersTopic)
-
-// Transform table values
-usersTable
-	.mapValues(user => ({ name: user.name, email: user.email }))
-	.toStream()
-	.to('user-profiles', { value: json() })
-```
-
-### Aggregations
-
-```typescript
-app.stream(events).groupByKey().count().toStream().to('user-event-counts')
-```
-
-## Starting and Stopping
-
-```typescript
-// Start the application
-await app.start()
-
-// Check state
-console.log(app.state()) // 'RUNNING'
-
-// Stop gracefully
-await app.close()
-```
-
-### Application States
-
-| State         | Description                                                                                 |
-| ------------- | ------------------------------------------------------------------------------------------- |
-| `CREATED`     | Application created, not started                                                            |
-| `RUNNING`     | Processing messages                                                                         |
-| `REBALANCING` | Consumer group rebalancing, or a worker restarting after a recoverable failure              |
-| `ERROR`       | A worker stopped on an error that is not retried, or `start()` failed. See `app.getError()` |
-| `STOPPED`     | Gracefully stopped                                                                          |
-
-Failures are handled differently depending on their kind. See [Fault Tolerance](/flow/fault-tolerance) for what is retried and what puts the app in `ERROR`.
-
-```typescript
-if (app.state() === 'ERROR') {
-	console.error(app.getError())
-}
-```
-
-### Partitions and State
-
-State is kept per source partition. Topics that feed the same stateful operation (merged streams, both sides of a join) must have the same number of partitions, otherwise `start()` throws `CoPartitioningError`. Streams that are re-keyed before an aggregation or join are repartitioned through an internal topic automatically. See [Co-partitioning](/flow/state-stores#co-partitioning) and [Repartitioning](/flow/streams#repartitioning).
-
-### Node.js Version
-
-Flow tracks the record being processed with `AsyncLocalStorage`. On Node.js 22 and earlier this adds a cost to every promise in the process; Node.js 24 removed it. Stateful topologies measured 40–50% more throughput on Node.js 22 with `--experimental-async-context-frame`, which is the default behaviour from Node.js 24 on.
-
-## Complete Example
-
-```typescript
-import { flow, topic, TimeWindows } from '@kafkats/flow'
-import { string, json } from '@kafkats/client'
+import { topic, string, json } from '@kafkats/flow'
 
 interface PageView {
 	userId: string
 	page: string
-	timestamp: number
 }
 
-interface PageViewCount {
+const pageViews = topic('page-views', { key: string(), value: json<PageView>() })
+```
+
+A source without codecs reads raw `Buffer`s. Codecs are covered in [Codecs](/flow/codecs).
+
+## Building a Topology
+
+```typescript
+// A stream: every record is an event
+app.stream(pageViews)
+	.filter((key, view) => view !== null && view.page !== '/health')
+	.mapValues(view => ({ ...view!, seenAt: Date.now() }))
+	.to('page-views-clean', { key: string(), value: json() })
+
+// A table: the latest value per key
+const users = app.table('users', { key: string(), value: json<{ name: string }>() })
+
+// An aggregation: a table of counts per key, written to a topic as it changes
+app.stream(pageViews).groupByKey().count().toStream().to('page-views-per-user')
+```
+
+Callbacks that receive the record, such as `filter()`'s predicate, take `(key, value)`. In a stream, keys and values may be `null` (a record without a key, a tombstone), so they see `K | null` and `V | null`. `mapValues()` and `flatMapValues()` take the value alone, as above (`mapValuesWithKey()` and `flatMapValuesWithKey()` take the key too), and joiners take the two values (see [Joins](/flow/joins)).
+
+`to()` writes with the codecs of its options, else the ones the stream knows; `count()` results are int64 numbers, so `page-views-per-user` above gets string keys and 8-byte big-endian counts. See [Operations](/flow/operations#how-codecs-are-resolved).
+
+## Starting and Stopping
+
+```typescript
+await app.start()
+console.log(app.state()) // 'RUNNING'
+
+process.on('SIGTERM', () => {
+	void app.close() // commits what was processed, then releases everything
+})
+```
+
+`start()` connects, creates the internal topics, loads the global tables, joins the group, and resolves once every task of the first assignment is restored and running. It rejects if anything fails before that, or if no assignment arrives within `startTimeoutMs` (default 120 s). A failed start releases what it started and can be retried.
+
+`close({ timeoutMs })` (default 20 s) commits what was processed, closes the tasks and leaves the group. It returns within its timeout even when the cluster is unreachable; work that could not be committed is redone by the next owner of the partitions.
+
+The topology is fixed by the first `start()` (or `describe()`): later DSL calls throw `TopologyError`.
+
+### Application States
+
+| State         | Meaning                                                                                          |
+| ------------- | ------------------------------------------------------------------------------------------------ |
+| `CREATED`     | Not started, or a start is in progress                                                           |
+| `RUNNING`     | Every assigned task is restored and processing                                                   |
+| `REBALANCING` | A rebalance, a restoration or a recovery after a failure is in progress                          |
+| `ERROR`       | `start()` failed, or a fatal error stopped the app (see `app.getError()`); `close()` releases it |
+| `STOPPED`     | Closed                                                                                           |
+
+`state()` works as a readiness probe: it is `RUNNING` only while every assigned task is running. `getError()` returns the fatal error while the state is `ERROR`, otherwise the most recent recoverable error, which does not change the state. See [Fault Tolerance](/flow/fault-tolerance) and [Error Handling](/flow/error-handling).
+
+## Processing Guarantees
+
+```typescript
+const app = flow({
+	applicationId: 'payments',
+	client: { clientId: 'payments', brokers: ['localhost:9092'] },
+	processingGuarantee: 'exactly_once', // default 'at_least_once'
+})
+```
+
+- **`at_least_once`** (default): nothing is lost; after a crash, the records since the last commit are processed again. Offsets are committed every `commitIntervalMs` (default 5000).
+- **`exactly_once`**: the outputs, changelog records and input offsets of all tasks commit in one Kafka transaction every `commitIntervalMs` (default 100). Consumers of the output topics must read with `isolationLevel: 'read_committed'`.
+
+See [Fault Tolerance](/flow/fault-tolerance#processing-guarantees) for how each one commits.
+
+## Partitions and State
+
+State is kept per task, that is per input partition. The topics feeding one stateful task (merged streams, both sides of a join, a stream and the table it looks up) must have the same partition count, otherwise `start()` throws `CoPartitioningError`. A stream whose keys changed (`selectKey()`, `map()`, `groupBy()`, ...) is repartitioned through an internal topic before a key-based operation. See [Repartitioning](/flow/streams#repartitioning) and [Topology and Naming](/flow/topology).
+
+## Complete Example
+
+```typescript
+import { flow, topic, string, json, TimeWindows } from '@kafkats/flow'
+
+interface PageView {
+	userId: string
 	page: string
-	count: number
-	windowStart: number
-	windowEnd: number
 }
 
-// Define topics
-const pageViews = topic('page-views', {
-	key: string(),
-	value: json<PageView>(),
-})
+const pageViews = topic('page-views', { key: string(), value: json<PageView>() })
 
-const pageViewCounts = topic('page-view-counts', {
-	key: string(),
-	value: json<PageViewCount>(),
-})
-
-// Create app
 const app = flow({
 	applicationId: 'page-view-counter',
 	client: { clientId: 'page-view-counter', brokers: ['localhost:9092'] },
 })
 
-// Build topology
 app.stream(pageViews)
-	// Rekey by page and group. Records are repartitioned through an internal topic
-	.groupBy((_, value) => value.page, { key: string(), name: 'page-views-by-page' })
-	// Window
-	.windowedBy(TimeWindows.of('1h'))
-	.count()
-	// Transform output
+	// Re-keyed by page: the records go through the repartition topic page-view-counter-by-page-repartition
+	.groupBy((_userId, view) => view!.page, { key: string(), name: 'by-page' })
+	// Hourly windows that accept records up to 5 minutes late
+	.windowedBy(TimeWindows.ofSizeAndGrace('1h', '5m'))
+	// Only the final count of each window, once it closed
+	.count({ storeName: 'views-per-page', emit: 'on-window-close' })
 	.toStream()
 	.map(
-		(windowedKey, count) =>
+		(windowed, count) =>
 			[
-				windowedKey.key,
-				{
-					page: windowedKey.key,
-					count,
-					windowStart: windowedKey.window.start,
-					windowEnd: windowedKey.window.end,
-				},
+				windowed!.key,
+				{ page: windowed!.key, windowStart: windowed!.window.start, windowEnd: windowed!.window.end, count },
 			] as const
 	)
-	// to() takes the topic name; the topic definition supplies the codecs
-	.to(pageViewCounts.name, pageViewCounts)
+	.to('page-view-counts', { key: string(), value: json() })
 
-// Handle shutdown
-process.on('SIGTERM', async () => {
-	await app.close()
-})
+process.on('SIGTERM', () => void app.close())
 
-// Start
 await app.start()
-console.log('Stream processing started')
 ```
 
 ## Next Steps
 
-- [KStream Operations](/flow/streams) - Stream transformations
-- [KTable Operations](/flow/tables) - Table transformations
-- [Aggregations](/flow/aggregations) - Counting and reducing
-- [Windowing](/flow/windowing) - Time-based processing
-- [Fault Tolerance](/flow/fault-tolerance) - Processing guarantees and failure handling
+- [Configuration](/flow/configuration): every option and its default
+- [KStream](/flow/streams) and [KTable](/flow/tables)
+- [Windowing](/flow/windowing) and [Aggregations](/flow/aggregations)
+- [Testing](/flow/testing): run a topology without Kafka

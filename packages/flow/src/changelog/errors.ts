@@ -20,18 +20,38 @@ export class ChangelogPartitionMismatchError extends Error {
 }
 
 /**
- * Error thrown when a source topic does not exist and partition count cannot be inferred.
+ * Error thrown by start() when a topic the topology reads does not exist (Kafka Streams' `MissingSourceTopicException`).
  */
 export class SourceTopicNotFoundError extends Error {
 	override readonly name = 'SourceTopicNotFoundError'
 
 	constructor(
 		public readonly topic: string,
-		public readonly storeName: string
+		/** What reads it: a subtopology (its number in `describe()`), or the store of a global table. */
+		public readonly readBy: { readonly subtopology: number } | { readonly globalStore: string }
+	) {
+		const reader =
+			'subtopology' in readBy ? `subtopology ${readBy.subtopology}` : `global store "${readBy.globalStore}"`
+		super(`Source topic "${topic}" of ${reader} does not exist. Create it first.`)
+	}
+}
+
+/**
+ * Error thrown by start() when a changelog or repartition topic of the topology does not exist and is not created
+ * (`changelog.autoCreate: false`).
+ */
+export class InternalTopicNotFoundError extends Error {
+	override readonly name = 'InternalTopicNotFoundError'
+
+	constructor(
+		public readonly topic: string,
+		public readonly kind: 'changelog' | 'repartition',
+		/** The partition count the topology needs it to have. */
+		public readonly partitions: number
 	) {
 		super(
-			`Source topic "${topic}" does not exist. Cannot determine partition count for ` +
-				`changelog topic of store "${storeName}". Create the source topic first.`
+			`Internal ${kind} topic "${topic}" does not exist and changelog.autoCreate is false. ` +
+				`Create it with ${partitions} partitions, or let the application create it.`
 		)
 	}
 }
@@ -50,6 +70,26 @@ export class CoPartitioningError extends Error {
 			`Topics [${[...partitionCounts].map(([topic, count]) => `${topic} (${count})`).join(', ')}] feed the same ` +
 				'stateful operation and must have the same number of partitions. ' +
 				'Repartition one side with through(), or use a globalTable() for lookups.'
+		)
+	}
+}
+
+/**
+ * Error thrown when a changelog record cannot be decoded with the store's codecs while restoring. The changelog was
+ * written with other codecs (a changed topology, or another application's topic): restarting cannot fix it.
+ */
+export class ChangelogDecodeError extends Error {
+	override readonly name = 'ChangelogDecodeError'
+
+	constructor(
+		public readonly changelogTopic: string,
+		public readonly partition: number,
+		options: { cause: unknown }
+	) {
+		super(
+			`A record of changelog topic "${changelogTopic}" partition ${partition} cannot be decoded with the codecs of ` +
+				'its store. Reset the application state if the store changed its key or value format.',
+			options
 		)
 	}
 }

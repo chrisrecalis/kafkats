@@ -83,6 +83,8 @@ export interface ProducerConfig {
 	 * - Transactional-ID zombie fencing applies per lane. For consume-transform-produce,
 	 *   pass `consumerGroupMetadata` to sendOffsets() (KIP-447) so zombie commits are
 	 *   fenced by consumer group generation regardless of which lane they ran on.
+	 * - Once a lane is fenced (or otherwise in the 'error' state), so is the pool: it begins
+	 *   no transaction any more, like a single producer in that state; replace it.
 	 * - Requires transactionalId. Only affects transaction().
 	 */
 	transactionConcurrency?: number
@@ -114,13 +116,24 @@ export interface ProducerConfig {
 	 * 1. **Broker-side**: Passed to InitProducerId; broker aborts transaction if
 	 *    not committed/aborted within this time
 	 * 2. **Client-side**: Used by transaction() to timeout the user callback
+	 *    (a beginTransaction() handle has none: its signal bounds it until commit() or abort() is
+	 *    called, and those take their own timeoutMs and signal)
 	 *
 	 * Keep these in sync to avoid surprises. Only used when transactionalId is set.
 	 */
 	transactionTimeoutMs?: number
 	/**
 	 * Maximum time in ms to block while initializing a transactional or idempotent producer,
-	 * retrying coordinator discovery and InitProducerId before failing (default: 60000).
+	 * retrying coordinator discovery and InitProducerId before failing with a `TimeoutError`
+	 * (default: 60000), requests in flight included. A timed-out initialization is tried again by
+	 * the next send or transaction, which first awaits an InitProducerId left unanswered (Java).
+	 * A coordinator lookup that answers once the initialization gave up (timed out, the signal of
+	 * the `beginTransaction()` waiting for it aborted, or the producer disconnected) sends no
+	 * InitProducerId: it would bump the epoch of the transactional id behind a producer that
+	 * replaced this one. One already sent may still be applied, like in the Java client.
+	 *
+	 * It also bounds the epoch bump of an abort (InitProducerId after a failed epoch). A bump that
+	 * times out is not tried again: the abort rejects and the producer is in the 'error' state.
 	 */
 	maxBlockMs?: number
 }
@@ -236,9 +249,6 @@ export type ProducerState = 'idle' | 'running' | 'stopping'
  */
 export type IdempotentState = 'idle' | 'initializing' | 'running' | 'fenced' | 'error'
 
-/**
- * Producer events
- */
 /** What is waiting inside a producer at one moment (see `Producer.metrics()`). */
 export interface ProducerMetrics {
 	/** Batches, records and bytes ready to send but waiting behind a request in flight for their partition. */
@@ -251,6 +261,9 @@ export interface ProducerMetrics {
 	unacknowledgedSends: number
 }
 
+/**
+ * Producer events
+ */
 export interface ProducerEvents {
 	error: [error: Error]
 	/**
@@ -277,9 +290,10 @@ export interface ProducerEvents {
 export type TransactionState = 'idle' | 'in_transaction' | 'committing' | 'aborting' | 'error'
 
 /**
- * Topic-partition offset for transactional offset commit
+ * An offset committed within a transaction (`sendOffsets`): `offset` is the next offset to read (the last processed
+ * offset + 1)
  */
-export interface TopicPartitionOffset {
+export interface TransactionOffset {
 	/** Topic name */
 	topic: string
 	/** Partition index */
@@ -288,7 +302,7 @@ export interface TopicPartitionOffset {
 	offset: bigint
 	/** Leader epoch (optional) */
 	leaderEpoch?: number
-	/** Metadata (optional) */
+	/** Stored with the offset and read back with it, e.g. by `consumer.committed()` (optional) */
 	metadata?: string
 }
 
@@ -310,7 +324,7 @@ export interface SendOffsetsParams {
 	/** Consumer group metadata (for full EOS with consumer) */
 	consumerGroupMetadata?: GroupMetadata
 	/** Offsets to commit */
-	offsets: TopicPartitionOffset[]
+	offsets: TransactionOffset[]
 }
 
 /**
@@ -318,6 +332,38 @@ export interface SendOffsetsParams {
  */
 export interface TransactionOptions {
 	/** Transaction timeout in ms (default: 60000) */
+	timeoutMs?: number
+}
+
+/**
+ * Bounds of an asynchronous producer call
+ */
+export interface ProducerCallOptions {
+	/** Reject with a `TimeoutError` once this many ms passed */
+	timeoutMs?: number
+	/** Aborting it rejects the call with the signal's reason */
+	signal?: AbortSignal
+}
+
+/**
+ * Options of `producer.beginTransaction()`
+ */
+export interface BeginTransactionOptions {
+	/**
+	 * Aborting it rejects a call still waiting to begin (also stopping the producer's initialization that call waits
+	 * for: no InitProducerId is sent after it, though one already sent may still be applied), and aborts the
+	 * transaction once it is open, until `commit()` or `abort()` is called on the handle; from then on it has no
+	 * effect, and those calls are bounded only by their own `timeoutMs` and `signal`. Without it, an open transaction
+	 * has no client-side timeout (the broker's `transactionTimeoutMs` applies).
+	 */
+	signal?: AbortSignal
+}
+
+/**
+ * Options of `producer.disconnect()`
+ */
+export interface DisconnectOptions {
+	/** Upper bound in ms for the flush and for ending an open transaction (default: 5000) */
 	timeoutMs?: number
 }
 
@@ -340,13 +386,26 @@ export interface ProducerTransaction {
 	/**
 	 * Commit consumer offsets as part of the transaction
 	 * (for consume-transform-produce patterns)
+	 *
+	 * With consumer group metadata (directly or from the context), the commit is fenced by the
+	 * member's generation (KIP-447): metadata with a negative generation or an empty member id
+	 * is rejected with `CommitFailedError` before anything is sent. The `{ groupId }` form is
+	 * not fenced.
+	 *
+	 * The offsets belong to this transaction only: a commit waits for a registration still in
+	 * progress (AddOffsetsToTxn) and commits its offsets with the transaction. Like a failed send,
+	 * a call of an open transaction that fails (also one not awaited, also for its arguments)
+	 * makes the commit abort. Once the transaction
+	 * aborts, a registration in progress sends nothing more and rejects with
+	 * `TransactionAbortedError`, also when its request is answered afterwards.
 	 */
 	sendOffsets(context: ConsumeContext): Promise<void>
-	sendOffsets(context: ConsumeContext, offsets: TopicPartitionOffset[]): Promise<void>
+	sendOffsets(context: ConsumeContext, offsets: TransactionOffset[]): Promise<void>
 	sendOffsets(params: SendOffsetsParams): Promise<void>
 
 	/**
-	 * Signal that is aborted when the transaction times out or is aborted
+	 * Signal that is aborted when the transaction times out or is aborted, with a
+	 * `TransactionAbortedError` as its reason
 	 *
 	 * Use this to cancel long-running operations when the transaction fails:
 	 * - Aborted on timeout (after `transactionTimeoutMs`)
@@ -367,4 +426,63 @@ export interface ProducerTransaction {
 	 * ```
 	 */
 	readonly signal: AbortSignal
+}
+
+/**
+ * An open transaction, from `producer.beginTransaction()`
+ *
+ * It holds the producer's turn until `commit()` or `abort()` ended it (or the signal given to
+ * `beginTransaction()` aborted it): other `beginTransaction()` and `transaction()` calls wait.
+ * Its `signal` is aborted when the transaction ends without committing.
+ */
+export interface TransactionHandle extends ProducerTransaction {
+	/**
+	 * Commit: flush the transaction's sends, wait for its offset registrations, commit its offsets
+	 * (TxnOffsetCommit), EndTxn(commit)
+	 *
+	 * Rejects with `TransactionAbortedError` when the transaction did not commit:
+	 * - `outcome: 'aborted'`: it was aborted, as `abort()` does (also when a send failed, or the
+	 *   producer's epoch did: then nothing can commit); or `timeoutMs` passed or `signal` aborted
+	 *   before EndTxn(commit) was sent, and then nothing more is sent: the broker's transaction
+	 *   timeout ends the transaction and the producer enters the 'error' state.
+	 * - `outcome: 'unknown'`: EndTxn(commit) was sent but not confirmed, so the broker may have
+	 *   committed. The producer enters the 'error' state.
+	 *
+	 * Rejects with `ProducerFencedError` once the producer is fenced (see `abort()`), else with
+	 * `InvalidTxnStateError` once the transaction is committing or ended.
+	 */
+	commit(options?: ProducerCallOptions): Promise<void>
+	/**
+	 * Abort: reject the queued sends, wait for those in flight, EndTxn(abort)
+	 *
+	 * Offset registrations, and sends whose records were not taken for sending yet, start no
+	 * request any more and reject with `TransactionAbortedError`, also when a registration already
+	 * sent is answered afterwards (what it added is not used); their records are dropped. A produce
+	 * request already sent, and its retries, is awaited (EndTxn follows it), and its send resolves
+	 * or rejects with the broker's answer, like in the Java client (the abort marker discards its
+	 * records). Nothing of the transaction reaches the next one. EndTxn is sent once the
+	 * coordinator may have begun the transaction, also when the answer to a registration was lost
+	 * (then a coordinator that never began it answers INVALID_TXN_STATE, and the abort resolves).
+	 *
+	 * When the producer's epoch failed during the transaction (an out-of-order sequence, a send
+	 * whose outcome its retries left unknown, InvalidProducerEpoch on a produce, or
+	 * INVALID_PRODUCER_ID_MAPPING from the coordinator: the transactional id expired), its sends
+	 * were rejected and nothing more went out; after EndTxn (skipped for INVALID_PRODUCER_ID_MAPPING,
+	 * which the coordinator answers EndTxn too), InitProducerId bumps the epoch (Java parity; once the
+	 * id expired, it gets a new producer id), and the producer runs the next transaction under the
+	 * new one (`disconnect()` skips the bump, also one in progress).
+	 *
+	 * If that does not finish (EndTxn or the bump fails, `timeoutMs` passes or `signal` aborts),
+	 * the producer enters the 'error' state and this rejects. A fenced producer (another one with
+	 * the same transactional id took over, or the broker aborted the transaction after
+	 * `transactionTimeoutMs`: answers PRODUCER_FENCED, or INVALID_PRODUCER_EPOCH from a
+	 * coordinator) is in the 'error' state for good, never initialized again: this sends nothing
+	 * (the broker aborted the transaction) and rejects with the `ProducerFencedError`, also once
+	 * the transaction ended, like every later call of the handle and every later begin; replace
+	 * the producer. Otherwise, on a transaction that already ended or is ending, it resolves once
+	 * that aborted it, and rejects with `InvalidTxnStateError` while committing, once committed, and
+	 * once it ended in the 'error' state: its abort did not finish, or its commit's outcome is
+	 * unknown (the broker may have committed it; Java refuses that abort too).
+	 */
+	abort(options?: ProducerCallOptions): Promise<void>
 }

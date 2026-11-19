@@ -2,8 +2,18 @@ import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 
 import { Cluster } from '@/client/cluster.js'
 import { Broker } from '@/client/broker.js'
-import { BrokerNotAvailableError, LeaderNotAvailableError, CoordinatorNotAvailableError } from '@/client/errors.js'
-import { ConnectionClosedError } from '@/network/errors.js'
+import {
+	BrokerNotAvailableError,
+	CoordinatorNotAvailableError,
+	LeaderNotAvailableError,
+	NoBrokersAvailableError,
+	UnsupportedVersionError,
+} from '@/client/errors.js'
+import { encodeSubscriptionMetadata } from '@/consumer/assignors/index.js'
+import { ConsumerGroup } from '@/consumer/consumer-group.js'
+import { OffsetManager } from '@/consumer/offset-manager.js'
+import { ConnectionClosedError, RequestTimeoutError } from '@/network/errors.js'
+import { ApiKey } from '@/protocol/messages/api-keys.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
 
 /**
@@ -33,6 +43,45 @@ function createMockBroker(nodeId: number, options: { isConnected?: boolean; fail
 		connect: ReturnType<typeof vi.fn>
 		metadata: ReturnType<typeof vi.fn>
 		findCoordinator: ReturnType<typeof vi.fn>
+	}
+}
+
+const brokersList = [{ nodeId: 1, host: 'localhost', port: 9092, rack: null }]
+
+/** Make `mockBroker` the cluster's only (connected) broker, node 1. */
+function wireBroker(cluster: Cluster, mockBroker: ReturnType<typeof createMockBroker>): void {
+	;(cluster as unknown as { bootstrapBrokers: Broker[] }).bootstrapBrokers = [mockBroker]
+	;(cluster as unknown as { brokers: Map<number, Broker> }).brokers = new Map([[1, mockBroker]])
+	;(cluster as unknown as { isConnected: boolean }).isConnected = true
+}
+
+function partitionMeta(partitionIndex: number, leaderId: number, leaderEpoch: number, errorCode = ErrorCode.None) {
+	return {
+		errorCode,
+		partitionIndex,
+		leaderId,
+		leaderEpoch,
+		replicaNodes: [1],
+		isrNodes: leaderId < 0 ? [] : [leaderId],
+		offlineReplicas: [],
+	}
+}
+
+/** A metadata response for one topic, `t`, with the given partitions. */
+function metadataResponse(partitions: ReturnType<typeof partitionMeta>[]) {
+	return {
+		clusterId: 'c',
+		controllerId: 1,
+		brokers: brokersList,
+		topics: [
+			{
+				errorCode: ErrorCode.None,
+				name: 't',
+				topicId: '00000000-0000-0000-0000-000000000000',
+				isInternal: false,
+				partitions,
+			},
+		],
 	}
 }
 
@@ -226,41 +275,105 @@ describe('Cluster', () => {
 			await expect(cluster.getLeaderForPartition('missing-topic', 0)).rejects.toThrow(LeaderNotAvailableError)
 		})
 
-		it('throws LeaderNotAvailableError when partition has no leader', async () => {
-			const cluster = new Cluster({
-				clientId: 'test-client',
-				brokers: ['bootstrap:9092'],
+		it('throws LeaderNotAvailableError when the partition still has no leader after a refresh', async () => {
+			const cluster = new Cluster({ clientId: 'c', brokers: ['bootstrap:9092'] })
+			const mockBroker = createMockBroker(1, { isConnected: true })
+			wireBroker(cluster, mockBroker)
+			mockBroker.metadata.mockResolvedValue(
+				metadataResponse([partitionMeta(0, -1, 4, ErrorCode.LeaderNotAvailable)])
+			)
+			await cluster.refreshMetadata()
+			mockBroker.metadata.mockClear()
+
+			await expect(cluster.getLeaderForPartition('t', 0)).rejects.toThrow(LeaderNotAvailableError)
+			expect(mockBroker.metadata).toHaveBeenCalledTimes(1)
+			expect(mockBroker.metadata).toHaveBeenCalledWith(expect.objectContaining({ topics: [{ name: 't' }] }))
+		})
+
+		it('refreshes the topic when the cached partition has no leader and returns the elected leader', async () => {
+			const cluster = new Cluster({ clientId: 'c', brokers: ['bootstrap:9092'] })
+			const mockBroker = createMockBroker(1, { isConnected: true })
+			wireBroker(cluster, mockBroker)
+			mockBroker.metadata.mockResolvedValueOnce(
+				metadataResponse([partitionMeta(0, -1, 4, ErrorCode.LeaderNotAvailable)])
+			)
+			await cluster.refreshMetadata()
+
+			// The election finished: the refresh names broker 1 as the leader.
+			mockBroker.metadata.mockResolvedValueOnce(metadataResponse([partitionMeta(0, 1, 5)]))
+
+			await expect(cluster.getLeaderForPartition('t', 0)).resolves.toBe(mockBroker)
+			expect(mockBroker.metadata).toHaveBeenCalledTimes(2)
+		})
+
+		it('does not refresh when the cached partition has a leader', async () => {
+			const cluster = new Cluster({ clientId: 'c', brokers: ['bootstrap:9092'] })
+			const mockBroker = createMockBroker(1, { isConnected: true })
+			wireBroker(cluster, mockBroker)
+			mockBroker.metadata.mockResolvedValueOnce(metadataResponse([partitionMeta(0, 1, 5)]))
+			await cluster.refreshMetadata()
+
+			await expect(cluster.getLeaderForPartition('t', 0)).resolves.toBe(mockBroker)
+			expect(mockBroker.metadata).toHaveBeenCalledTimes(1)
+		})
+
+		/** A cluster whose cached metadata names no leader for t-0, so that a lookup refreshes it. */
+		async function leaderlessCluster() {
+			const cluster = new Cluster({ clientId: 'c', brokers: ['bootstrap:9092'] })
+			const mockBroker = createMockBroker(1, { isConnected: true })
+			wireBroker(cluster, mockBroker)
+			mockBroker.metadata.mockResolvedValueOnce(
+				metadataResponse([partitionMeta(0, -1, 4, ErrorCode.LeaderNotAvailable)])
+			)
+			await cluster.refreshMetadata()
+			return { cluster, mockBroker }
+		}
+
+		it('throws the retriable LeaderNotAvailableError, caused by the failure, when the refresh reaches no broker', async () => {
+			const { cluster } = await leaderlessCluster()
+			// The broker went away: the refresh finds no broker to ask.
+			vi.spyOn(cluster, 'getAnyBroker').mockRejectedValueOnce(new NoBrokersAvailableError())
+
+			const error = await cluster.getLeaderForPartition('t', 0).catch((cause: unknown) => cause)
+
+			expect(error).toBeInstanceOf(LeaderNotAvailableError)
+			expect(error).toMatchObject({ topic: 't', partition: 0, retriable: true })
+			expect((error as LeaderNotAvailableError).cause).toBeInstanceOf(NoBrokersAvailableError)
+		})
+
+		it.each([
+			['a connection failure', new ConnectionClosedError('Connection closed')],
+			['a timeout', new RequestTimeoutError(1, 30_000)],
+		])('throws LeaderNotAvailableError when the refresh fails with %s', async (_, failure) => {
+			const { cluster, mockBroker } = await leaderlessCluster()
+			mockBroker.metadata.mockRejectedValueOnce(failure)
+
+			const error = await cluster.getLeaderForPartition('t', 0).catch((cause: unknown) => cause)
+
+			expect(error).toBeInstanceOf(LeaderNotAvailableError)
+			expect((error as LeaderNotAvailableError).cause).toBe(failure)
+		})
+
+		it('passes on a refresh failure that is not a connectivity failure', async () => {
+			const { cluster, mockBroker } = await leaderlessCluster()
+			const unsupported = new UnsupportedVersionError(ApiKey.Metadata, 12, { min: 0, max: 0 })
+			mockBroker.metadata.mockRejectedValueOnce(unsupported)
+
+			await expect(cluster.getLeaderForPartition('t', 0)).rejects.toBe(unsupported)
+		})
+
+		it('lets an offset lookup retry a leader lookup whose refresh reached no broker', async () => {
+			const { cluster, mockBroker } = await leaderlessCluster()
+			const listOffsets = vi.fn().mockResolvedValue({
+				topics: [{ name: 't', partitions: [{ partitionIndex: 0, errorCode: ErrorCode.None, offset: 42n }] }],
 			})
+			;(mockBroker as unknown as { listOffsets: typeof listOffsets }).listOffsets = listOffsets
+			// The first refresh reaches no broker; the next one finds broker 1 leading the partition.
+			vi.spyOn(cluster, 'getAnyBroker').mockRejectedValueOnce(new NoBrokersAvailableError())
+			mockBroker.metadata.mockResolvedValueOnce(metadataResponse([partitionMeta(0, 1, 5)]))
 
-			;(cluster as unknown as { metadata: unknown }).metadata = {
-				clusterId: 'test',
-				controllerId: 1,
-				brokers: new Map([[1, { nodeId: 1, host: 'localhost', port: 9092, rack: null }]]),
-				topics: new Map([
-					[
-						'test-topic',
-						{
-							name: 'test-topic',
-							partitions: new Map([
-								[
-									0,
-									{
-										partitionIndex: 0,
-										leaderId: -1,
-										replicaNodes: [],
-										isrNodes: [],
-										offlineReplicas: [],
-									},
-								], // No leader
-							]),
-						},
-					],
-				]),
-				updatedAt: Date.now(),
-			}
-			;(cluster as unknown as { isConnected: boolean }).isConnected = true
-
-			await expect(cluster.getLeaderForPartition('test-topic', 0)).rejects.toThrow(LeaderNotAvailableError)
+			await expect(new OffsetManager(cluster, 'g').getEarliestOffset('t', 0)).resolves.toBe(42n)
+			expect(listOffsets).toHaveBeenCalledTimes(1)
 		})
 	})
 
@@ -431,13 +544,6 @@ describe('Cluster', () => {
 	})
 
 	describe('metadata merge and leader epoch', () => {
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		function wireBroker(cluster: Cluster, mockBroker: any): void {
-			;(cluster as unknown as { bootstrapBrokers: Broker[] }).bootstrapBrokers = [mockBroker as Broker]
-			;(cluster as unknown as { brokers: Map<number, Broker> }).brokers = new Map([[1, mockBroker as Broker]])
-			;(cluster as unknown as { isConnected: boolean }).isConnected = true
-		}
-
 		function topicMeta(
 			name: string,
 			partition: number,
@@ -463,8 +569,6 @@ describe('Cluster', () => {
 				],
 			}
 		}
-
-		const brokersList = [{ nodeId: 1, host: 'localhost', port: 9092, rack: null }]
 
 		it('does not drop previously-known topics on a topic-scoped refresh', async () => {
 			const cluster = new Cluster({ clientId: 'c', brokers: ['bootstrap:9092'] })
@@ -564,6 +668,88 @@ describe('Cluster', () => {
 			expect(topic.topicId).toBe(idNew)
 			expect(topic.partitions.get(0)!.leaderId).toBe(2)
 			expect(topic.partitions.get(0)!.leaderEpoch).toBe(0)
+		})
+	})
+
+	describe('partitions with a partition-level error', () => {
+		// Partition 1 is between leaders, as during an election.
+		const electing = [
+			partitionMeta(0, 1, 3),
+			partitionMeta(1, -1, 4, ErrorCode.LeaderNotAvailable),
+			partitionMeta(2, 1, 3),
+		]
+
+		it('keeps the partition with leader -1, so the partition count is the real one', async () => {
+			const cluster = new Cluster({ clientId: 'c', brokers: ['bootstrap:9092'] })
+			const mockBroker = createMockBroker(1, { isConnected: true })
+			wireBroker(cluster, mockBroker)
+			mockBroker.metadata.mockResolvedValueOnce(metadataResponse(electing))
+
+			// First lookup of the topic in this process: nothing cached to fall back on.
+			const topic = (await cluster.refreshMetadata(['t'])).topics.get('t')!
+
+			expect(topic.partitions.size).toBe(3)
+			expect([...topic.partitions.keys()]).toEqual([0, 1, 2])
+			expect(topic.partitions.get(1)).toMatchObject({ partitionIndex: 1, leaderId: -1, leaderEpoch: 4 })
+		})
+
+		it('applies the leader epoch guard to a partition that comes back with an error', async () => {
+			const cluster = new Cluster({ clientId: 'c', brokers: ['bootstrap:9092'] })
+			const mockBroker = createMockBroker(1, { isConnected: true })
+			wireBroker(cluster, mockBroker)
+			const partition0 = () => cluster.getMetadata()!.topics.get('t')!.partitions.get(0)!
+
+			mockBroker.metadata.mockResolvedValueOnce(metadataResponse([partitionMeta(0, 1, 5)]))
+			await cluster.refreshMetadata()
+
+			// An older response (epoch 4) without a leader does not regress the known leader.
+			mockBroker.metadata.mockResolvedValueOnce(
+				metadataResponse([partitionMeta(0, -1, 4, ErrorCode.LeaderNotAvailable)])
+			)
+			await cluster.refreshMetadata()
+			expect(partition0()).toMatchObject({ leaderId: 1, leaderEpoch: 5 })
+
+			// The leader is gone at epoch 6: the partition stays, without a leader.
+			mockBroker.metadata.mockResolvedValueOnce(
+				metadataResponse([partitionMeta(0, -1, 6, ErrorCode.LeaderNotAvailable)])
+			)
+			await cluster.refreshMetadata()
+			expect(partition0()).toMatchObject({ leaderId: -1, leaderEpoch: 6 })
+
+			// A new leader is elected at epoch 7.
+			mockBroker.metadata.mockResolvedValueOnce(metadataResponse([partitionMeta(0, 1, 7)]))
+			await cluster.refreshMetadata()
+			expect(partition0()).toMatchObject({ leaderId: 1, leaderEpoch: 7 })
+		})
+
+		it('gives the range assignor every partition, including the one without a leader', async () => {
+			const cluster = new Cluster({ clientId: 'c', brokers: ['bootstrap:9092'] })
+			const mockBroker = createMockBroker(1, { isConnected: true })
+			wireBroker(cluster, mockBroker)
+			mockBroker.metadata.mockResolvedValueOnce(metadataResponse(electing))
+
+			const group = new ConsumerGroup(cluster, { groupId: 'g', partitionAssignmentStrategy: 'range' })
+			const leader = group as unknown as {
+				computeAssignments(
+					members: Array<{ memberId: string; groupInstanceId: string | null; metadata: Buffer }>,
+					protocolName: string | null
+				): Promise<void>
+				leaderAssignments: Map<string, { partitions: Array<{ topic: string; partitions: number[] }> }> | null
+			}
+			const subscription = encodeSubscriptionMetadata({ version: 0, topics: ['t'], userData: null })
+
+			await leader.computeAssignments(
+				[
+					{ memberId: 'a', groupInstanceId: null, metadata: subscription },
+					{ memberId: 'b', groupInstanceId: null, metadata: subscription },
+				],
+				'range'
+			)
+
+			const assigned = [...leader.leaderAssignments!.values()]
+				.flatMap(assignment => assignment.partitions.flatMap(tp => tp.partitions))
+				.sort((x, y) => x - y)
+			expect(assigned).toEqual([0, 1, 2])
 		})
 	})
 })

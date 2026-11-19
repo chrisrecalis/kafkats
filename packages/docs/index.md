@@ -58,7 +58,7 @@ import { withBase } from 'vitepress'
 </a>
 
 <a :href="withBase('/flow-codec-zod/')" class="package-card">
-  <h3>@kafkats/flow-codec-zod</h3>
+  <h3>@kafkats/codec-zod</h3>
   <p>Zod schema validation for type-safe message encoding and decoding.</p>
 </a>
 

@@ -1,9 +1,10 @@
 /**
  * Child worker for the crash tests (spawned, never run directly by vitest).
- * Env: R3_BROKERS, R3_APP, R3_IN, R3_OUT, R3_STATE, R3_MODE=count|window, R3_GUARANTEE, R3_RESTORE_DELAY_MS (slow restore),
+ * Env: R3_BROKERS, R3_APP, R3_IN, R3_OUT, R3_STATE, R3_MODE=count|window|session|join, R3_RIGHT (the right stream of
+ *      the join mode), R3_GUARANTEE, R3_RESTORE_DELAY_MS (slow restore),
  *      R3_PROVIDER_MODULE + R3_PROVIDER_FACTORY (the provider under test, see EngineUnderTest.module)
  */
-import { codec, flow, SessionWindows, TimeWindows } from '@kafkats/flow'
+import { codec, flow, JoinWindows, SessionWindows, TimeWindows } from '@kafkats/flow'
 import type { StateStoreProvider } from '@kafkats/flow'
 import { KafkaClient } from '@kafkats/client'
 
@@ -23,47 +24,44 @@ process.on('unhandledRejection', r => log('UNHANDLED_REJECTION', { message: (r a
 const t0 = Date.now()
 const client = new KafkaClient({ clientId: `r3-${process.pid}`, brokers: env('R3_BROKERS').split(',') })
 if (process.env.R3_TRACE) {
-	// Trace every producer transaction (no src changes): begin / sendOffsets / outcome.
+	// Trace every producer transaction (no src changes): begin / sends / sendOffsets / outcome.
+	const trace = (v: unknown) => JSON.stringify(v, (_k, x) => (typeof x === 'bigint' ? String(x) : x))
 	const original = client.producer.bind(client)
 	let n = 0
 	;(client as any).producer = (config: any) => {
 		const producer = original(config)
-		const tx0 = producer.transaction.bind(producer)
-		;(producer as any).transaction = async (fn: any, ...rest: any[]) => {
+		const begin = producer.beginTransaction.bind(producer)
+		;(producer as any).beginTransaction = async (...args: any[]) => {
+			const tx = await begin(...args)
 			const id = ++n
 			log('tx_begin', { id, t: Date.now() - t0 })
-			try {
-				const r = await tx0(
-					async (tx: any) => {
-						const so = tx.sendOffsets.bind(tx)
-						tx.sendOffsets = async (...a: any[]) => {
-							log('tx_sendOffsets', {
-								id,
-								t: Date.now() - t0,
-								offsets: JSON.stringify(a[1], (_k, v) => (typeof v === 'bigint' ? String(v) : v)),
-							})
-							return so(...a)
-						}
-						const send = tx.send.bind(tx)
-						tx.send = async (topic: string, ...a: any[]) => {
-							const res = await send(topic, ...a)
-							log('tx_send', {
-								id,
-								topic,
-								res: JSON.stringify(res, (_k, v) => (typeof v === 'bigint' ? String(v) : v)),
-							})
-							return res
-						}
-						return fn(tx)
-					},
-					...rest
-				)
-				log('tx_committed', { id, t: Date.now() - t0 })
-				return r
-			} catch (e) {
-				log('tx_failed', { id, t: Date.now() - t0, message: (e as Error).message })
-				throw e
+			const send = tx.send.bind(tx) as (...a: any[]) => Promise<unknown>
+			;(tx as any).send = async (topic: string, ...a: any[]) => {
+				const res = await send(topic, ...a)
+				log('tx_send', { id, topic, res: trace(res) })
+				return res
 			}
+			const sendOffsets = tx.sendOffsets.bind(tx) as (...a: any[]) => Promise<void>
+			;(tx as any).sendOffsets = async (...a: any[]) => {
+				log('tx_sendOffsets', { id, t: Date.now() - t0, offsets: trace(a[0]?.offsets ?? a[1]) })
+				return sendOffsets(...a)
+			}
+			const commit = tx.commit.bind(tx)
+			tx.commit = async options => {
+				try {
+					await commit(options)
+					log('tx_committed', { id, t: Date.now() - t0 })
+				} catch (e) {
+					log('tx_failed', { id, t: Date.now() - t0, message: (e as Error).message })
+					throw e
+				}
+			}
+			const abort = tx.abort.bind(tx)
+			tx.abort = async options => {
+				log('tx_abort', { id, t: Date.now() - t0 })
+				return abort(options)
+			}
+			return tx
 		}
 		return producer
 	}
@@ -73,6 +71,9 @@ const app = flow({
 	client,
 	processingGuarantee: env('R3_GUARANTEE') as 'at_least_once' | 'exactly_once',
 	commitIntervalMs: 100,
+	// KIP-695: a join task waits up to 2 s for an input partition that is caught up, so the right stream, written in
+	// full first, is joined in event-time order with the live input.
+	...(env('R3_MODE') === 'join' ? { maxTaskIdleMs: 2_000 } : {}),
 	consumer: { autoOffsetReset: 'earliest', maxWaitMs: 100, sessionTimeoutMs: 6000 },
 	producer: { lingerMs: 0, transactionTimeoutMs: 10000 },
 	stateStoreProvider: createProvider({ stateDir: env('R3_STATE') }),
@@ -80,28 +81,37 @@ const app = flow({
 		restoration: { idleTimeoutMs: 1000, initialIdleTimeoutMs: 5000, checkIntervalMs: 50, consumerMaxWaitMs: 50 },
 	},
 })
-const grouped = app.stream(env('R3_IN'), { key: str, value: str }).groupByKey()
-if (env('R3_MODE') === 'count') {
-	grouped.count({ storeName: 'counts', key: str, value: num }).toStream().to(env('R3_OUT'), { key: str, value: num })
+const input = app.stream(env('R3_IN'), { key: str, value: str })
+if (env('R3_MODE') === 'join') {
+	// Left join within 1 s, no grace: its join buffers and the outer-join store of unmatched records on the provider.
+	input
+		.leftJoin(
+			app.stream(env('R3_RIGHT'), { key: str, value: str }),
+			(left, right) => `${left}|${right ?? 'null'}`,
+			JoinWindows.ofTimeDifferenceWithNoGrace(1_000)
+		)
+		.to(env('R3_OUT'), { key: str, value: codec.json<string>() })
+} else if (env('R3_MODE') === 'count') {
+	input
+		.groupByKey()
+		.count({ storeName: 'counts', key: str, value: num })
+		.toStream()
+		.to(env('R3_OUT'), { key: str, value: num })
 } else if (env('R3_MODE') === 'session') {
-	grouped
+	input
+		.groupByKey()
 		.windowedBy(SessionWindows.withInactivityGap(1_000))
 		.count({ storeName: 'scounts', value: num })
 		.toStream()
-		.selectKey((_v, k) => {
-			const w = k as unknown as { key: string; window: { start: number; end: number } }
-			return `${w.key}@${w.window.start}-${w.window.end}`
-		})
+		.selectKey(k => `${k!.key}@${k!.window.start}-${k!.window.end}`)
 		.to(env('R3_OUT'), { key: str, value: num })
 } else {
-	grouped
+	input
+		.groupByKey()
 		.windowedBy(TimeWindows.of(1_000))
 		.count({ storeName: 'wcounts', value: num })
 		.toStream()
-		.selectKey((_v, k) => {
-			const w = k as unknown as { key: string; window: { start: number } }
-			return `${w.key}@${w.window.start}`
-		})
+		.selectKey(k => `${k!.key}@${k!.window.start}`)
 		.to(env('R3_OUT'), { key: str, value: num })
 }
 process.on('SIGTERM', () => {

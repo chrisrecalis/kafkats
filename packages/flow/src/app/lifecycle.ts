@@ -1,0 +1,152 @@
+/**
+ * The app's lifecycle (3.15, 4.2, 4.3.5, 4.10.3, 4.11): its StreamState, the error getError() reports, and the
+ * memoized start and close promises. What a start or a close does is the caller's (FlowRuntime).
+ *
+ * States: CREATED (until a start succeeds) -> RUNNING <-> REBALANCING (BC17: RUNNING only while every assigned task
+ * is RUNNING; REBALANCING during a rebalance, a restore or a recovery); ERROR after a fatal failure (sticky until
+ * close) or a failed start; STOPPED after close. getError(): the fatal error while there is one, else the most recent
+ * recoverable error (a failed start, a revival's or a recovery's cause, a checkpoint that failed to persist), which
+ * never changes state(). A new start clears both.
+ */
+import type { StreamState } from '@/api/app.js'
+import { IllegalStateError } from '@/api/errors.js'
+
+const toError = (error: unknown): Error => (error instanceof Error ? error : new Error(String(error)))
+
+export class AppLifecycle {
+	private current: StreamState = 'CREATED'
+	private fatal: Error | null = null
+	private recoverable: Error | null = null
+	private startPromise: Promise<void> | null = null
+	private closePromise: Promise<void> | null = null
+	private isStarted = false
+	/** A close() was asked for since the last start (the state it ends in is STOPPED). */
+	private isClosing = false
+	/** A close() has not finished yet. */
+	private closeInFlight = false
+	/** The runtime's last word: setRebalancing() more recent than setRunning(). Decides the state a start ends in. */
+	private rebalancing = false
+
+	get state(): StreamState {
+		return this.current
+	}
+
+	get error(): Error | null {
+		return this.fatal ?? this.recoverable
+	}
+
+	/** The last start succeeded and no close happened since. */
+	get started(): boolean {
+		return this.isStarted
+	}
+
+	/** A close() is in flight (it ends STOPPED), whatever the state already is. */
+	get closing(): boolean {
+		return this.closeInFlight
+	}
+
+	/**
+	 * Runs `start` unless a start is in flight or succeeded (both share its promise; so does start() while ERROR after
+	 * a fatal failure, until close()). A failed start leaves state ERROR (STOPPED if a close came meanwhile) and can be
+	 * retried. While a close() is in flight, start() rejects with IllegalStateError (Kafka Streams' PENDING_SHUTDOWN):
+	 * start again once it resolved.
+	 */
+	start(start: () => Promise<void>): Promise<void> {
+		if (this.closing) {
+			return Promise.reject(new IllegalStateError('the app is closing: start() it again once close() resolved'))
+		}
+		if (this.startPromise) {
+			return this.startPromise
+		}
+		this.current = 'CREATED'
+		this.fatal = null
+		this.recoverable = null
+		this.isClosing = false
+		this.closePromise = null
+		this.rebalancing = false
+		const promise = new Promise<void>(resolve => resolve(start())).then(
+			() => {
+				this.isStarted = true
+				if (this.current !== 'ERROR') {
+					// A recovery may have begun between the start's end and this callback.
+					this.current = this.rebalancing ? 'REBALANCING' : 'RUNNING'
+				}
+			},
+			(error: unknown) => {
+				this.recoverable = toError(error)
+				this.current = this.isClosing ? 'STOPPED' : 'ERROR'
+				if (this.startPromise === promise) {
+					this.startPromise = null
+				}
+				throw error
+			}
+		)
+		this.startPromise = promise
+		return promise
+	}
+
+	/**
+	 * Runs `close` once (later calls share its promise), then waits for a start still in flight; the state is STOPPED
+	 * afterwards even if `close` failed. Closing an app that never started only marks it STOPPED.
+	 */
+	close(close: () => Promise<void>): Promise<void> {
+		if (this.closePromise) {
+			return this.closePromise
+		}
+		if (this.current === 'STOPPED' || (this.current === 'CREATED' && this.startPromise === null)) {
+			this.current = 'STOPPED'
+			return Promise.resolve()
+		}
+		this.isClosing = true
+		this.closeInFlight = true
+		const inFlight = this.startPromise
+		this.closePromise = (async () => {
+			try {
+				await close()
+				await inFlight?.catch(() => {})
+			} finally {
+				this.current = 'STOPPED'
+				this.isStarted = false
+				this.startPromise = null
+				this.closeInFlight = false
+			}
+		})()
+		return this.closePromise
+	}
+
+	/** Every assigned task is RUNNING: REBALANCING -> RUNNING, once started, unless failed or closing. */
+	setRunning(): void {
+		this.rebalancing = false
+		if (this.isStarted && !this.isClosing && this.current === 'REBALANCING') {
+			this.current = 'RUNNING'
+		}
+	}
+
+	/** A rebalance, a restore or a recovery began: RUNNING -> REBALANCING, unless closing (it ends STOPPED). */
+	setRebalancing(): void {
+		this.rebalancing = true
+		if (!this.isClosing && this.current === 'RUNNING') {
+			this.current = 'REBALANCING'
+		}
+	}
+
+	/** A recoverable failure: reported by getError() unless a fatal one is; the state does not change. */
+	recordError(error: unknown): void {
+		this.recoverable = toError(error)
+	}
+
+	/**
+	 * A fatal failure after start: state ERROR (unless closing) and the error reported until close. The first fatal
+	 * failure wins: false if one was recorded already.
+	 */
+	halt(error: unknown): boolean {
+		if (this.fatal !== null) {
+			return false
+		}
+		this.fatal = toError(error)
+		if (!this.isClosing) {
+			this.current = 'ERROR'
+		}
+		return true
+	}
+}

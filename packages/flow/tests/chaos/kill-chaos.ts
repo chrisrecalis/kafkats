@@ -1,58 +1,73 @@
 /**
- * Scenarios A + B: SIGKILL chaos for stateless and count pipelines, ALO and EOS.
+ * Scenarios A + B: SIGKILL chaos for every worker mode, ALO and EOS.
  *
- * Prereq:  a broker at 127.0.0.1:29092 (override with CHAOS_BROKERS), e.g. a docker container `kafka-chaos`; no start script is checked in.
+ * Prereq: a broker at 127.0.0.1:29092 (override with CHAOS_BROKERS); `tests/chaos/brokers.sh single` starts one.
  * Run (from packages/flow):
- *   pnpm exec tsx tests/chaos/kill-chaos.ts --guarantee eos --mode count --instances 2 --threads 1 --kills 8
- * Flags: --guarantee alo|eos  --mode stateless|count|regroup  --instances 1|2  --threads N  --kills N
- *        --keys 12 --per-key 100  --batch 12 --delay-ms 250 (producer pacing)  --drain-ms 120000
+ *   pnpm exec tsx tests/chaos/kill-chaos.ts --guarantee eos --mode count --instances 2 --kills 8
+ * Flags: --guarantee alo|eos  --mode stateless|count|regroup|table-join|global-join|window|join  --instances N  --kills N
+ *        --partitions 4  --keys 12 --per-key 100  --batch 12 --delay-ms 250 (producer pacing)  --drain-ms 120000
+ *        --max-dupes N (ALO stateless/join: fail above N duplicates)  --max-count N (ALO count: fail above a count of N)
+ * One worker process runs one app (there is no --threads: every app has one scheduler; use --instances).
  * Set CHAOS_DUMP=/path/file.json to dump all output records + worker event logs for analysis.
- * Exit code 0 = PASS, 1 = FAIL. Prints evidence (missing/dup/gaps, unhandled rejections, worker error states).
+ * Exit code 0 = PASS, 1 = FAIL. Prints evidence (missing/dup/gaps, unhandled rejections, workers in ERROR).
  */
 import {
 	Worker,
 	workerEnv,
 	makeClient,
-	createTopics,
+	scenarioTopics,
 	genInput,
 	produceBatches,
+	produceRight,
+	tickStreamTime,
+	lastEventTime,
 	readAll,
-	uid,
 	sleep,
 	rnd,
-	summarizeStateless,
-	summarizeCount,
+	flags,
+	guaranteeOf,
+	modeOf,
+	json,
 	type Out,
 } from './common.js'
+import { TableFeed } from './table-feed.js'
+import { drained, passes, printFaults, summarize, workerFaults, type Summary } from './verdict.js'
 
-const arg = (n: string, d: string) => {
-	const i = process.argv.indexOf(`--${n}`)
-	return i >= 0 ? process.argv[i + 1]! : d
-}
-const guarantee = arg('guarantee', 'alo') === 'eos' ? 'exactly_once' : 'at_least_once'
-const mode = arg('mode', 'stateless') as 'stateless' | 'count' | 'regroup'
-const instances = Number(arg('instances', '1'))
-const threads = Number(arg('threads', '1'))
-const kills = Number(arg('kills', '7'))
-const keys = Number(arg('keys', '12'))
-const perKey = Number(arg('per-key', '100'))
-const batch = Number(arg('batch', '12'))
-const delayMs = Number(arg('delay-ms', '250'))
-const drainMs = Number(arg('drain-ms', '120000'))
+const opts = flags({
+	guarantee: 'alo',
+	mode: 'stateless',
+	instances: '1',
+	kills: '7',
+	partitions: '4',
+	keys: '12',
+	'per-key': '100',
+	batch: '12',
+	'delay-ms': '250',
+	'drain-ms': '120000',
+	'max-dupes': '',
+	'max-count': '',
+})
+const guarantee = guaranteeOf(opts.guarantee)
+const mode = modeOf(opts.mode)
+const instances = Number(opts.instances)
+const kills = Number(opts.kills)
+const partitions = Number(opts.partitions)
+const keys = Number(opts.keys)
+const perKey = Number(opts['per-key'])
+const drainMs = Number(opts['drain-ms'])
 const isolation = guarantee === 'exactly_once' ? 'read_committed' : 'read_uncommitted'
 
-const label = `${guarantee}/${mode}/inst=${instances}/thr=${threads}`
+const label = `${guarantee}/${mode}/inst=${instances}/p=${partitions}`
 const client = await makeClient()
-const input = uid('chaos-in')
-const output = uid('chaos-out')
-const appId = uid('chaos-app')
-await createTopics(client, [input, output], 4)
-const inputs = genInput(keys, perKey)
-console.log(`== ${label}: ${inputs.length} records, ${kills} kills; in=${input} out=${output}`)
+const topics = await scenarioTopics(client, mode, partitions)
+const inputs = genInput(keys, perKey, mode)
+console.log(`== ${label}: ${inputs.length} records, ${kills} kills; in=${topics.input} out=${topics.output}`)
 
-const producing = produceBatches(client, input, inputs, batch, delayMs)
+const feed = topics.table ? await TableFeed.start(client, topics.table, keys) : null
+await produceRight(client, topics, keys, perKey)
+const producing = produceBatches(client, topics.input, inputs, Number(opts.batch), Number(opts['delay-ms']))
 
-const env = workerEnv({ appId, input, output, mode, guarantee, threads })
+const env = workerEnv({ ...topics, mode, guarantee })
 const all: Worker[] = []
 const slots: Worker[] = []
 const spawnWorker = (slot: number) => {
@@ -80,69 +95,42 @@ for (let k = 0; k < kills; k++) {
 	spawnWorker(slot)
 }
 await producing
-console.log('  producer finished, waiting for drain...')
+await feed?.stop()
+console.log(`  producer finished${feed ? ` (table at version ${feed.version})` : ''}, waiting for drain...`)
 
+const sizes = { keys, perKey }
 const t0 = Date.now()
 let outs: Out[] = []
-let ok = false
-let sum: any
+let sum: Summary
 while (Date.now() - t0 < drainMs) {
-	outs = await readAll(client, output, isolation, { quietMs: 3000, maxMs: 20000 })
-	if (mode === 'stateless') {
-		sum = summarizeStateless(inputs, outs)
-		ok = sum.missing === 0
-	} else {
-		sum = summarizeCount(keys, perKey, outs, undefined, mode === 'regroup' ? 'nk' : 'k')
-		ok = sum.belowKeys === 0 && sum.lastBelowKeys === 0
-	}
-	if (ok) break
-	console.log(`  not drained yet (${Date.now() - t0}ms):`, JSON.stringify({ ...sum, problems: undefined }))
+	await tickStreamTime(client, topics, mode, partitions, lastEventTime(inputs))
+	outs = await readAll(client, topics.output, isolation, { quietMs: 3000, maxMs: 20000 })
+	sum = summarize(mode, inputs, outs, sizes)
+	if (drained(sum)) break
+	console.log(`  not drained yet (${Date.now() - t0}ms):`, json({ ...sum, problems: undefined }))
 }
 const drainTook = Date.now() - t0
 // let it settle, then final re-read (catches late dupes)
 await sleep(5000)
-outs = await readAll(client, output, isolation, { quietMs: 6000, maxMs: 40000 })
-sum =
-	mode === 'stateless'
-		? summarizeStateless(inputs, outs)
-		: summarizeCount(keys, perKey, outs, undefined, mode === 'regroup' ? 'nk' : 'k')
+outs = await readAll(client, topics.output, isolation, { quietMs: 6000, maxMs: 40000 })
+sum = summarize(mode, inputs, outs, sizes)
 
 if (process.env.CHAOS_DUMP) {
 	const { writeFileSync } = await import('node:fs')
 	writeFileSync(
 		process.env.CHAOS_DUMP,
-		JSON.stringify(
-			{ outs, workers: all.map(w => ({ label: w.label, lines: w.lines.filter(l => l.type !== 'status') })) },
-			(_, v) => (typeof v === 'bigint' ? v.toString() : v)
-		)
+		json({ outs, workers: all.map(w => ({ label: w.label, lines: w.lines.filter(l => l.type !== 'status') })) })
 	)
 }
-const unhandled = all.flatMap(w => w.lines.filter(l => /UNHANDLED|UNCAUGHT/.test(l.type)))
-const errStates = all.flatMap(w =>
-	w.lines
-		.filter(l => l.type === 'status' && (l.state === 'ERROR' || l.error))
-		.slice(0, 1)
-		.map(l => ({ w: l.label, state: l.state, error: l.error }))
-)
+const faults = workerFaults(all)
 const startFails = all.flatMap(w => w.lines.filter(l => l.type === 'start_failed'))
+const gate = aloGate(sum)
 
-let pass: boolean
-if (guarantee === 'exactly_once') {
-	pass = mode === 'stateless' ? sum.missing === 0 && sum.dupes === 0 && sum.unexpected === 0 : sum.exactKeys === keys
-} else {
-	pass = mode === 'stateless' ? sum.missing === 0 : sum.belowKeys === 0 && sum.lastBelowKeys === 0
-}
+const pass = passes(guarantee, sum) && faults.ok && gate.ok
 console.log(`RESULT ${label}: ${pass ? 'PASS' : 'FAIL'} (drain ${drainTook}ms)`)
-console.log(
-	'  summary:',
-	JSON.stringify(sum, (_, v) => (typeof v === 'bigint' ? v.toString() : v))
-)
-console.log(
-	'  unhandled rejections/exceptions:',
-	unhandled.length,
-	unhandled.slice(0, 3).map(u => u.message)
-)
-console.log('  worker ERROR states/errors:', JSON.stringify(errStates))
+console.log('  summary:', json(sum))
+if (gate.message) console.log(`  ALO duplicate gate: ${gate.message}`)
+printFaults(faults)
 console.log('  start failures:', JSON.stringify(startFails.map(s => s.message)))
 
 for (const w of slots) {
@@ -157,3 +145,15 @@ for (const w of slots) {
 }
 await client.disconnect()
 process.exit(pass ? 0 : 1)
+
+/** --max-dupes / --max-count: duplicates under at-least-once must stay within the recorded baseline (spec 9.4). */
+function aloGate(sum: Summary): { ok: boolean; message?: string } {
+	if ('exactKeys' in sum) {
+		if (!opts['max-count']) return { ok: true }
+		const max = Number(opts['max-count'])
+		return { ok: sum.maxCount <= max, message: `max count ${sum.maxCount} (limit ${max})` }
+	}
+	if (!opts['max-dupes']) return { ok: true }
+	const max = Number(opts['max-dupes'])
+	return { ok: sum.dupes <= max, message: `${sum.dupes} duplicates (limit ${max})` }
+}

@@ -1,32 +1,129 @@
-export const flowVersion = '0.1.0'
+import packageJson from '../package.json' with { type: 'json' }
+
+/** The version of this package. */
+export const flowVersion: string = packageJson.version
 
 // Core flow API
-export { flow, topic, TimeWindows, SessionWindows, SlidingWindows } from '@/flow.js'
+export { flow } from '@/app/flow.js'
+export { topic } from '@/topic.js'
+export { TimeWindows, SessionWindows, SlidingWindows, JoinWindows } from '@/dsl/windows.js'
 
 // Types
 export type {
 	FlowApp,
 	FlowConfig,
+	CloseOptions,
+	StreamState,
+	TopologyDescription,
+	SubtopologyDescription,
+	GlobalStoreDescription,
+	TopologyNodeDescription,
+} from '@/api/app.js'
+export type {
 	KStream,
-	KTable,
+	BranchedKStream,
+	KeyValue,
+	KeyValueMapper,
+	ValueMapper,
+	ValueMapperWithKey,
+	ValueJoiner,
+	ValueJoinerWithKey,
+} from '@/api/kstream.js'
+export type { KTable, GlobalKTable } from '@/api/ktable.js'
+export type {
 	KGroupedStream,
 	KGroupedTable,
-	WindowedKGroupedStream,
+	TimeWindowedKStream,
+	SessionWindowedKStream,
+	SlidingWindowedKStream,
 	Windowed,
-	KeyValue,
-	StreamState,
+} from '@/api/grouped.js'
+export type {
 	WindowDuration,
-	Topic,
+	NamedOptions,
 	Consumed,
 	Produced,
+	RecordPartitioner,
 	Grouped,
 	Materialized,
+	AggregateOptions,
+	EmitStrategy,
+	WindowedAggregateOptions,
+	TableOptions,
+	TransformValuesOptions,
+	ProcessOptions,
+	ConnectedStores,
+	StreamJoined,
 	Joined,
-} from '@/flow.js'
+	Repartitioned,
+	SuppressOptions,
+	SplitOptions,
+	BranchOptions,
+} from '@/api/options.js'
+export type { Topic } from '@/topic.js'
+export type { ResetPolicy, TopicNameExtractor, TopicNameExtractorContext } from '@/topology/nodes.js'
+
+// Errors and handlers
+export {
+	FlowConfigError,
+	TopologyError,
+	StreamsError,
+	IllegalStateError,
+	TaskMigratedError,
+	TaskCorruptedError,
+	FailedProcessingError,
+	InvalidTimestampError,
+	AssignmentError,
+	NoOffsetResetError,
+} from '@/api/errors.js'
+export type {
+	ErrorHandlerContext,
+	HandlerResponse,
+	DeserializationExceptionHandler,
+	ProcessingExceptionHandler,
+	ProductionExceptionHandler,
+	UncaughtExceptionResponse,
+	UncaughtExceptionHandler,
+} from '@/api/handlers.js'
+export type { CollectedRecord } from '@/processor/output.js'
+
+// Processor API
+export { Stores } from '@/state/store-builders.js'
+export type {
+	StoreDefinition,
+	StoreOptions,
+	WindowStoreDefinitionOptions,
+	SessionStoreDefinitionOptions,
+	StoresFactory,
+} from '@/api/stores.js'
+export { StreamRecord } from '@/processor/record.js'
+export type { FixedKeyRecord, RecordHeaders } from '@/processor/record.js'
+export type {
+	Processor,
+	ProcessorSupplier,
+	ProcessorContext,
+	FixedKeyProcessor,
+	FixedKeyProcessorSupplier,
+	FixedKeyProcessorContext,
+	ValueTransformerWithKey,
+	ValueTransformerWithKeySupplier,
+	ForwardingDisabledContext,
+	RecordMetadata,
+	TaskId,
+	Punctuator,
+	PunctuationType,
+	Cancellable,
+	MaybePromise,
+	ForwardResult,
+} from '@/processor/api.js'
+export { TimestampExtractors } from '@/processor/timestamps.js'
+export type { TimestampExtractor, ConsumedRecord } from '@/processor/timestamps.js'
 
 // Codecs
 export { codec, string, json, buffer } from '@/codec.js'
 export type { Codec } from '@/codec.js'
+export { WindowedCodecs } from '@/operators/windowed.js'
+export type { WindowedCodec } from '@/operators/windowed.js'
 
 // State stores
 export {
@@ -36,17 +133,18 @@ export {
 	InMemoryWindowStore,
 	InMemorySessionStore,
 } from '@/state/memory.js'
-export {
-	ChangelogBackedKeyValueStore,
-	ChangelogBackedWindowStore,
-	ChangelogBackedSessionStore,
-} from '@/state/changelog.js'
+export type { InMemoryProviderOptions } from '@/state/memory.js'
 export type {
 	StateStoreProvider,
 	ChangelogCheckpointStore,
+	StateStore,
 	KeyValueStore,
 	WindowStore,
 	SessionStore,
+	TimestampedKeyValueStore,
+	TimestampedWindowStore,
+	ReadOnlyTimestampedKeyValueStore,
+	ValueAndTimestamp,
 	KeyValueStoreOptions,
 	WindowStoreOptions,
 	SessionStoreOptions,
@@ -59,10 +157,15 @@ export {
 	getDefaultTopicConfigs,
 	resolveChangelogConfig,
 	DEFAULT_CHANGELOG_CONFIGS,
-	ChangelogWriter,
 	ChangelogRestorer,
+	ChangelogDecodeError,
 	ChangelogPartitionMismatchError,
 	CoPartitioningError,
+	InternalTopicNotFoundError,
 	SourceTopicNotFoundError,
 } from '@/changelog.js'
-export type { ChangelogConfig, ChangelogTopicSpec } from '@/changelog.js'
+export type { ChangelogConfig, ChangelogRestorationOptions } from '@/changelog.js'
+
+// Diagnostics: the records tasks process, on node:diagnostics_channel (`kafkats:flow:process`)
+export { flowDiagnostics } from '@/runtime/tracing.js'
+export type { FlowProcessDiagnostics, FlowProcessScope } from '@/runtime/tracing.js'

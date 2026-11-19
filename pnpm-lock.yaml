@@ -262,6 +262,9 @@ importers:
       '@kafkats/client':
         specifier: workspace:^
         version: link:../client
+      '@kafkats/flow':
+        specifier: workspace:^
+        version: link:../flow
       '@opentelemetry/api':
         specifier: ^1.9.0
         version: 1.10.0

@@ -1,285 +1,213 @@
 # KStream
 
-A KStream represents an unbounded stream of key-value records. Each record is an independent event.
+A `KStream` is an unbounded stream of key-value records. Each record is an independent event: two records with the same key are two events, not an update of one row (that is a [KTable](/flow/tables)).
+
+Keys and values of a stream may be `null`: a record without a key, or a tombstone. Callbacks that receive the record (`filter()`, `map()`, `selectKey()`, `peek()`, ...) take `(key, value)` and see `K | null` and `V | null`. `mapValues()` and `flatMapValues()` take the value alone (their key-aware forms are `mapValuesWithKey()` and `flatMapValuesWithKey()`), and [joiners](/flow/joins) take the two values.
 
 ## Creating a Stream
 
 ```typescript
-import { flow, topic } from '@kafkats/flow'
-import { string, json } from '@kafkats/client'
+import { topic, string, json } from '@kafkats/flow'
 
-const app = flow({
-	applicationId: 'my-app',
-	client: { clientId: 'my-app', brokers: ['localhost:9092'] },
-})
+const orders = topic('orders', { key: string(), value: json<Order>() })
 
-// From a topic
-const stream = app.stream(myTopic)
-
-// With explicit types
-const stream = app.stream<string, MyEvent>(myTopic)
+const stream = app.stream(orders)
+// or with a topic name and codecs:
+const same = app.stream('orders', { key: string(), value: json<Order>() })
 ```
 
-## Transformation Operations
+The second argument is a `Consumed`: codecs (`key`, `value`; missing ones read raw `Buffer`s), a `timestampExtractor`, an `offsetReset` policy for partitions without a committed offset, and a `name` for the source node. See [Operations](/flow/operations#consumed).
+
+## Stateless Operations
+
+### filter, filterNot
+
+```typescript
+stream.filter((key, order) => order !== null && order.amount > 100)
+stream.filterNot((key, order) => order?.status === 'test')
+```
 
 ### map
 
-Transform both key and value:
+Changes the key and the value. A key-based operation downstream [repartitions](#repartitioning) first.
 
 ```typescript
-// Return a [key, value] tuple
-stream.map((key, value) => [value.userId, { ...value, processed: true }] as const)
+stream.map((key, order) => [order!.customerId, order!.amount] as const)
 ```
 
-### mapValues
+### mapValues, mapValuesWithKey
 
-Transform only the value (preserves key):
+Changes the value and keeps the key, so no repartitioning is needed. `mapValues()` calls its mapper with the value alone (Kafka Streams' `ValueMapper`), whatever parameters the function declares, so `stream.mapValues(JSON.stringify)` stringifies the value; `mapValuesWithKey()` calls it with the key and the value (`ValueMapperWithKey`).
 
 ```typescript
-stream.mapValues(value => ({
-	...value,
-	timestamp: Date.now(),
-}))
+stream.mapValues(order => order!.amount)
+stream.mapValuesWithKey((key, order) => `${key}:${order?.amount}`)
+```
+
+### flatMap, flatMapValues, flatMapValuesWithKey
+
+Zero or more records per record. `flatMap` may change keys (and so requires repartitioning downstream); `flatMapValues` and `flatMapValuesWithKey` keep the record's key. Any iterable works.
+
+```typescript
+stream.flatMap((key, order) => order!.items.map(item => [item.sku, item] as const))
+stream.flatMapValues(order => order!.items)
+stream.flatMapValuesWithKey((key, order) => order!.items.map(item => `${key}:${item.sku}`))
 ```
 
 ### selectKey
 
-Change the key:
+Picks a new key from `(key, value)`. A key-based operation downstream repartitions first.
 
 ```typescript
-// The function receives (value, key)
-stream.selectKey(value => value.userId)
+stream.selectKey((key, order) => order!.customerId)
 ```
 
-`map()` and `selectKey()` can change which partition a key belongs to. If the re-keyed stream is followed by `groupByKey()`, a join or `toTable()`, Flow [repartitions](#repartitioning) it automatically.
+### peek, foreach
 
-### filter
-
-Keep only matching records:
+`peek` calls an action for every record and passes the record on; `foreach` is the terminal form.
 
 ```typescript
-stream.filter((key, value) => value.amount > 100)
+stream.peek((key, order) => console.log('order', key)).to('orders-seen')
+stream.foreach((key, order) => metrics.increment('orders'))
 ```
-
-### flatMapValues
-
-Emit multiple values per input:
-
-```typescript
-stream.flatMapValues(value => value.items)
-```
-
-## Side Effects
-
-### peek
-
-Perform side effects without modifying the stream:
-
-```typescript
-stream.peek((key, value) => {
-	console.log(`Processing: ${key}`)
-	metrics.increment('processed')
-})
-```
-
-## Branching
-
-### branch
-
-Split stream into multiple branches:
-
-```typescript
-const [highValue, lowValue] = stream.branch(
-	(key, value) => value.amount > 1000,
-	(key, value) => value.amount <= 1000
-)
-
-highValue.to(highValueTopic)
-lowValue.to(lowValueTopic)
-```
-
-## Merging
 
 ### merge
 
-Combine multiple streams:
+The records of two streams of the same app, as one stream:
 
 ```typescript
-const merged = stream1.merge(stream2)
-
-// Or merge multiple
-const merged = stream1.merge(stream2).merge(stream3).merge(stream4)
+const all = webOrders.merge(storeOrders)
 ```
 
-If a merged stream feeds a stateful operation, all merged topics must have the same partition count, otherwise `start()` throws `CoPartitioningError`. See [Co-partitioning](/flow/state-stores#co-partitioning).
+The result keeps the codecs both streams share (the same codec objects), and needs repartitioning if either side does.
+
+## Splitting a Stream
+
+`split()` routes each record to the first branch whose predicate matches it, else to the default branch if there is one (Kafka Streams' `BranchedKStream`):
+
+```typescript
+const branches = stream
+	.split({ name: 'orders-' })
+	.branch((key, order) => order!.amount >= 1000, { name: 'large' })
+	.branch((key, order) => order!.country !== 'US', { name: 'international' })
+	.defaultBranch({ name: 'other' })
+
+branches['orders-large']!.to('large-orders')
+branches['orders-international']!.to('international-orders')
+branches['orders-other']!.to('domestic-orders')
+```
+
+- The result maps `<split name><branch name>` to each branch. A branch without a name is named by its position (`1`, `2`, ...; the default branch `0`). Without a split name, the prefix is the generated name of the split node (`KSTREAM-BRANCH-<n>`), so name the split to look branches up.
+- `chain` builds on a branch in place; what it returns replaces the branch in the result, and a chain that returns nothing (one ending in `to()`) leaves the branch out:
+
+```typescript
+stream
+	.split({ name: 'route-' })
+	.branch((key, order) => order!.priority, { chain: s => s.to('priority-orders') })
+	.noDefaultBranch() // records no predicate matched are dropped
+```
+
+- Every branch must be added before `defaultBranch()` or `noDefaultBranch()`; adding one later throws `TopologyError`.
+
+`branch(...predicates)` is deprecated: it returns an array of streams, one per predicate, and drops records no predicate matches.
 
 ## Output
 
 ### to
 
-Write to a topic (terminal operation):
+Writes every record to a topic:
 
 ```typescript
-stream.to('output-topic')
-
-// With options
-stream.to('output-topic', {
-	partitioner: (key, _value, partitionCount) => {
-		if (key === null) return 0
-		return String(key).length % partitionCount
-	},
-})
+stream.to('processed-orders', { key: string(), value: json<Order>() })
 ```
 
-`to()` and `through()` take the topic name. Records are encoded with the `key` and `value` codecs from the options, or else with the codecs the stream carries. `mapValues()`, `flatMapValues()` and `map()` drop the value codec, and `map()` and `selectKey()` drop the key codec, so pass the codecs when writing such a stream; a record that is not a `Buffer` and has no codec fails to encode.
+The options are a `Produced`: codecs (the stream's codecs otherwise; a stream without one can write only `Buffer`s), a `partitioner`, and a `name` for the sink node. The record keeps its timestamp and headers.
 
-Records written with `to()` or `through()` keep the timestamp of the input record, so windowing and joins downstream see the original event time.
+The topic can be chosen per record with a topic name extractor, which receives the key, the value and the record's context (input `topic`, `partition`, `offset`, and the record's `timestamp` and `headers`):
 
-### through
+```typescript
+stream.to((key, order, context) => `orders-${order!.region}`, { key: string(), value: json<Order>() })
+```
 
-Write to a topic and continue from what is read back from it:
+An extractor that returns anything but a non-empty string fails the record (it goes to the [processing exception handler](/flow/error-handling#processing-exceptions)).
+
+A `partitioner` returns the partition of a record, or `undefined` for the producer's default partitioning of the encoded key. Records whose key codec is windowed (the results of windowed aggregations) go to the partition of their base key by default; see [Windowed keys](/flow/windowing#windowed-keys).
+
+### repartition
+
+Writes the stream to an internal topic and reads it back, even if keys did not change:
 
 ```typescript
 stream
-	.through(intermediateTopic)
-	.mapValues(value => transform(value))
-	.to(finalTopic, { value: json() })
-```
-
-`through()` is a real repartition point. Records are written to the topic, and the rest of the topology processes them from the partition they were written to. Use it to repartition with your own partitioner or partition count:
-
-```typescript
-orders
-	.through(ordersByUser, {
+	.selectKey((key, order) => order!.customerId)
+	.repartition({
+		name: 'orders-by-customer', // topic <applicationId>-orders-by-customer-repartition
 		key: string(),
 		value: json<Order>(),
-		partitioner: (key, _value, partitionCount) => String(key).length % partitionCount,
+		numberOfPartitions: 12,
 	})
-	.join(users, joiner)
 ```
 
-The topic must already exist, because Flow does not create it. When the group has no committed offset for it, it is read from the beginning, so records written before the first assignment are not skipped. If the stream was transformed with `map()` or `selectKey()`, pass the `key` and `value` codecs in the options.
+`Repartitioned` options: `name` (else `repartition-<n>` is generated), codecs (the stream's otherwise; both are required), `numberOfPartitions` (default: the largest partition count of the topics the stream comes from, or the count of the topics it is co-partitioned with downstream, which an explicit count must then equal), and a `partitioner`. Key-based operations after `repartition()` do not repartition again.
+
+### through (deprecated)
+
+`through(topic, produced)` writes to a topic you created and continues with what is read back from it. Use `repartition()`, or `to()` and `app.stream()`. A `through()` topic must exist; it is read from `'earliest'` without a committed offset, and unlike a repartition topic it keeps records with a null key.
 
 ## Grouping
 
-### groupByKey
-
-Group by existing key:
+Aggregations start from a grouped stream. See [Aggregations](/flow/aggregations).
 
 ```typescript
-const grouped = stream.groupByKey()
-// Returns KGroupedStream
+// By the current key: repartitions only if keys changed upstream
+stream.groupByKey()
+
+// By a new key: always repartitions; pass the new key's codec
+stream.groupBy((key, order) => order!.customerId, { key: string(), name: 'by-customer' })
 ```
 
-### groupBy
-
-Group by a new key. The new key needs a codec, and the records are [repartitioned](#repartitioning) so that all records of a key are processed in one partition:
-
-```typescript
-const grouped = stream.groupBy((key, value) => value.category, {
-	key: string(),
-	value: json<Order>(),
-	name: 'orders-by-category', // stable name for the repartition topic
-})
-```
+`Grouped` options: `key` and `value` codecs, and a `name` that names the repartition topic (`<applicationId>-<name>-repartition`), shared by every aggregation built from the grouping.
 
 ## Conversion
 
 ### toTable
 
-Convert stream to table:
+Reads the stream as a table: the latest value per key, a null (or undefined) value deleting the key. Records with a null key are dropped. The table is materialized in a store; pass a `Materialized` to name it or set its codecs.
 
 ```typescript
-const table = stream.toTable()
+const latestOrders = stream.toTable({ storeName: 'latest-orders' })
 ```
 
-A re-keyed stream is [repartitioned](#repartitioning) before it becomes a table.
+## Joins
+
+Streams join other streams within a window, tables on the current value of the key, and global tables on a key you select. See [Joins](/flow/joins).
+
+```typescript
+orders.join(payments, (order, payment) => ({ order, payment }), JoinWindows.ofTimeDifferenceWithNoGrace('10m'))
+orders.leftJoin(customers, (order, customer) => ({ ...order, customer }))
+orders.join(
+	products,
+	(key, order) => order.productId,
+	(order, product) => ({ ...order, product })
+)
+```
+
+## Custom Processing
+
+`process()` and `processValues()` run your own processors, with state stores and punctuators. See the [Processor API](/flow/processor-api).
 
 ## Repartitioning
 
-State is kept per partition, so all records of a key must be processed in the same partition. After `selectKey()` or `map()` that is no longer guaranteed. Flow therefore writes the stream through an internal topic and reads it back when a re-keyed stream is followed by:
+Operations that work per key (aggregations, joins with streams and tables, `toTable()`) need every record of a key in the same partition of their input. When the key of a stream may have changed since it was read (after `map()`, `flatMap()`, `selectKey()`, `process()`, `KTable.toStream(mapper)`, or a `groupBy()`), the operation first writes the stream to an internal repartition topic, partitioned by the new key, and reads it back.
 
-- `groupByKey()`
-- a join (`join()`, `leftJoin()`, `outerJoin()`)
-- `toTable()`
+| Changes keys (repartition downstream)                                   | Keeps the key                                                                                         |
+| ----------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `map`, `flatMap`, `selectKey`, `process`, `toStream(mapper)`, `groupBy` | `filter`, `filterNot`, `mapValues`, `flatMapValues`, `peek`, `split` branches, `processValues`, joins |
 
-`groupBy(fn, options)` always repartitions, because it changes the key itself.
+- The repartition topic is `<applicationId>-<name>-repartition`. Its name comes from the operator's `name` (`Grouped.name`, `Joined.name`, `Repartitioned.name`, ...), else from an aggregation's `storeName`, else a generated `repartition-<n>`. Name repartitioning operations: generated names depend on the order of the DSL calls, and a renamed topic is a new topic.
+- Repartitioning needs key and value codecs: the operator's options, else the codecs the stream still knows. An operation that needs one nobody gave throws `TopologyError` naming it.
+- Records with a null key are dropped at a repartition topic, unless a left or outer join is downstream of it (which joins them with null, as in Kafka Streams).
+- Repartition topics are created by `start()` (or validated with `changelog.autoCreate: false`) with Kafka Streams' configs (`cleanup.policy=delete`, `retention.ms=-1`), read from `'earliest'` without a committed offset, and purged up to the committed offsets every `repartitionPurgeIntervalMs`.
+- A named grouping repartitions once for all the aggregations built from it; an unnamed one once per aggregation, as in Kafka Streams. Joins with a [global table](/flow/joins#stream-globalktable-joins) never repartition.
 
-```typescript
-app.stream(events)
-	.selectKey(event => event.userId)
-	.groupByKey({ key: string(), value: json<Event>(), name: 'events-by-user' })
-	.count()
-```
-
-The internal topic is named `<applicationId>-<name>-repartition`. It is created at startup with the partition count of the upstream topic (the largest one, if several topics feed it). With `changelog.autoCreate: false` it must already exist, and an existing topic with a different partition count fails `start()` with `ChangelogPartitionMismatchError`. Newly assigned partitions of repartition topics are read from the beginning when the group has no committed offset.
-
-Repartitioning needs both key and value codecs. If they cannot be inferred from the stream, you get an error that says so, and you pass them via the options (`groupBy(fn, { key, value })`, `groupByKey({ key, value })`, or `key`/`value` on a join's options).
-
-::: tip Name your repartition topics
-Pass `name` in the `Grouped` options for `groupBy()` and `groupByKey()`. Without it, topics are numbered (`repartition-0`, `repartition-1`, ...) in the order the topology is built, so adding or reordering an operation renames the topics. Joins and `toTable()` cannot be named, so they always use numbered topics.
-:::
-
-## Example: Event Processing Pipeline
-
-```typescript
-interface RawEvent {
-	type: string
-	userId: string
-	data: unknown
-	timestamp: number
-}
-
-interface ProcessedEvent {
-	type: string
-	userId: string
-	data: unknown
-	processedAt: number
-	source: string
-}
-
-app.stream<string, RawEvent>(rawEvents)
-	// Filter valid events
-	.filter((_, event) => event.type !== 'heartbeat')
-
-	// Enrich
-	.mapValues(
-		event =>
-			({
-				...event,
-				processedAt: Date.now(),
-				source: 'stream-processor',
-			}) as ProcessedEvent
-	)
-
-	// Log
-	.peek((key, event) => {
-		logger.debug(`Processing event ${event.type} for user ${event.userId}`)
-	})
-
-	// Route by type
-	.branch(
-		(_, e) => e.type === 'purchase',
-		(_, e) => e.type === 'pageview',
-		() => true // default
-	)
-	.forEach((branch, index) => {
-		const topics = [purchasesTopic, pageviewsTopic, otherEventsTopic]
-		branch.to(topics[index], { value: json<ProcessedEvent>() })
-	})
-```
-
-## Type Parameters
-
-KStream operations preserve and transform types:
-
-```typescript
-// KStream<string, UserEvent>
-const stream = app.stream(userEvents)
-
-// KStream<string, { count: number }> - value type changed
-const mapped = stream.mapValues(e => ({ count: 1 }))
-
-// KStream<string, UserEvent> - key changed to userId
-const rekeyed = stream.selectKey(e => e.userId)
-```
+See [Topology and Naming](/flow/topology) for how repartition topics cut the topology into subtopologies.

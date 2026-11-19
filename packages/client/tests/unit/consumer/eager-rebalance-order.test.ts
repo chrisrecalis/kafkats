@@ -64,6 +64,7 @@ function buildProvider(protocol: 'eager' | 'cooperative', calls: string[]) {
 
 function buildCallbacks(calls: string[]): PartitionProviderCallbacks {
 	return {
+		onRebalancePending: vi.fn(),
 		onRebalance: vi.fn().mockResolvedValue(undefined),
 		onPartitionsAssigned: vi.fn().mockImplementation(async () => {
 			calls.push('assigned')
@@ -72,6 +73,8 @@ function buildCallbacks(calls: string[]): PartitionProviderCallbacks {
 			calls.push('revoked')
 		}),
 		onPartitionsLost: vi.fn(),
+		onRebalanceComplete: vi.fn(),
+		onOffsetReset: vi.fn(),
 		onError: vi.fn(),
 	}
 }
@@ -85,7 +88,7 @@ describe('GroupPartitionProvider eager rebalance ordering', () => {
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		;(provider as any).callbacks = callbacks
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		;(provider as any).rebalancePending = true
+		;(provider as any).rebalanceRequested = true
 
 		await provider.checkAndHandleRebalance()
 
@@ -110,7 +113,7 @@ describe('GroupPartitionProvider eager rebalance ordering', () => {
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		;(provider as any).callbacks = callbacks
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		;(provider as any).rebalancePending = true
+		;(provider as any).rebalanceRequested = true
 
 		await provider.checkAndHandleRebalance()
 

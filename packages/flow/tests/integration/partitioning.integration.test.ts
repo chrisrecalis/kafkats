@@ -101,18 +101,12 @@ function makeApp(
 	appId: string,
 	clientId: string,
 	build: (app: FlowApp) => void,
-	stateStoreProvider?: StateStoreProvider,
-	strategy?: 'range' | 'sticky' | 'cooperative-sticky'
+	stateStoreProvider?: StateStoreProvider
 ): FlowApp {
 	const app = flow({
 		applicationId: appId,
 		client: { clientId, brokers: requireKafkaBrokers() },
-		numStreamThreads: 1,
-		consumer: {
-			autoOffsetReset: 'earliest',
-			maxWaitMs: 100,
-			...(strategy ? { partitionAssignmentStrategy: strategy } : {}),
-		},
+		consumer: { autoOffsetReset: 'earliest', maxWaitMs: 100 },
 		changelog: { restoration: RESTORATION },
 		...(stateStoreProvider ? { stateStoreProvider } : {}),
 	})
@@ -270,7 +264,7 @@ describe('state/changelog partitioning', () => {
 				.windowedBy(TimeWindows.of(3_600_000))
 				.count({ storeName: 'wcounts', value: numberCodec })
 				.toStream()
-				.selectKey((_v, k) => (k as unknown as { key: string }).key)
+				.selectKey(k => k!.key)
 				.to(out, { key: stringCodec, value: numberCodec })
 
 		const collector = new MultiTopicCollector({
@@ -464,7 +458,7 @@ describe('state/changelog partitioning', () => {
 					.to(out, { key: stringCodec, value: stringCodec })
 			}
 			const mk = (id: string) =>
-				makeApp(appId, id, build, withCheckpoints ? new CheckpointingProvider() : undefined, 'range')
+				makeApp(appId, id, build, withCheckpoints ? new CheckpointingProvider() : undefined)
 			const A = `${appId}-A`
 			const B = `${appId}-B`
 			const appA = mk(A)
@@ -726,9 +720,9 @@ describe('state/changelog partitioning', () => {
 			groupId: `${appId}-collector`,
 			topics: [{ topic: out, keyCodec: stringCodec, valueCodec: numberCodec }],
 		})
-		const a1 = makeApp(appId, `${appId}-a1`, build, undefined, 'range')
-		const a2 = makeApp(appId, `${appId}-a2`, build, undefined, 'range')
-		const a3 = makeApp(appId, `${appId}-a3`, build, undefined, 'range')
+		const a1 = makeApp(appId, `${appId}-a1`, build)
+		const a2 = makeApp(appId, `${appId}-a2`, build)
+		const a3 = makeApp(appId, `${appId}-a3`, build)
 		try {
 			await collector.start()
 			await a1.start()

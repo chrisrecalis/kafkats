@@ -5,10 +5,20 @@ kafkats provides specific error types for different failure scenarios, making it
 ## Error Hierarchy
 
 ```
-KafkaError (base)
-├── KafkaProtocolError (protocol-level errors)
+KafkaError (base: errorCode, retriable)
+├── KafkaProtocolError (an error code the broker answered)
 ├── ConnectionError (network failures)
 ├── TimeoutError (request timeouts)
+├── GroupError (groupId)
+│   ├── RebalanceInProgressError
+│   ├── UnknownMemberIdError
+│   ├── IllegalGenerationError
+│   └── CommitFailedError
+├── OffsetOutOfRangeError
+├── NoOffsetForPartitionError
+├── ProducerFencedError
+├── InvalidTxnStateError
+├── TransactionAbortedError (outcome)
 └── Specific errors...
 ```
 
@@ -50,36 +60,28 @@ try {
 }
 ```
 
-### SendTimeoutError
+### Produce Rejections
 
-Producer send timed out:
-
-```typescript
-import { SendTimeoutError } from '@kafkats/client'
-
-try {
-	await producer.send('events', { value: 'data' })
-} catch (error) {
-	if (error instanceof SendTimeoutError) {
-		console.log('Send timed out after retries')
-		// Message may or may not have been delivered
-	}
-}
-```
-
-### RecordTooLargeError
-
-Message exceeds broker limits:
+A send that fails rejects with a `KafkaError`. When the broker rejected the records for good, it is a
+`KafkaProtocolError` carrying the broker's `errorCode` (`retriable: false`). When the producer stopped retrying, it is a
+`KafkaError` with `retriable: true` whose `cause` is the last failure; the records may or may not have been written.
+When the retries run out for records an idempotent (or transactional) producer had already sent, it fails its epoch
+instead: that send and every other send it had not settled yet reject with one `KafkaError` for the ambiguous outcome
+(also `retriable: true`), whose `cause` is the exhausted-retries `KafkaError` of the batch that had been sent; its last
+failure is `cause.cause`.
 
 ```typescript
-import { RecordTooLargeError } from '@kafkats/client'
+import { ErrorCode, KafkaError, KafkaProtocolError } from '@kafkats/client'
 
 try {
 	await producer.send('events', { value: hugePayload })
 } catch (error) {
-	if (error instanceof RecordTooLargeError) {
+	if (error instanceof KafkaProtocolError && error.errorCode === ErrorCode.MessageTooLarge) {
 		console.log('Message too large:', error.message)
 		// Split the message or increase broker limits
+	} else if (error instanceof KafkaError && error.retriable) {
+		console.log('Retries exhausted:', error.cause)
+		// Message may or may not have been delivered
 	}
 }
 ```
@@ -88,7 +90,8 @@ try {
 
 ### LeaderNotAvailableError
 
-Partition leader is unavailable:
+Partition leader is unavailable: the metadata names no leader for the partition, also after a refresh, or no broker
+could be reached to refresh it (`cause` is then the failure of the refresh). Retriable:
 
 ```typescript
 import { LeaderNotAvailableError } from '@kafkats/client'
@@ -134,6 +137,8 @@ import { RebalanceInProgressError } from '@kafkats/client'
 // Handled automatically - wait for rebalance to complete
 ```
 
+`consumer.commit()` rejects with it while the group rebalances: commit again once the rebalance is done, or commit in `onPartitionsRevoked`.
+
 ### UnknownMemberIdError
 
 Consumer was removed from group:
@@ -153,6 +158,51 @@ import { IllegalGenerationError } from '@kafkats/client'
 
 // Consumer will rejoin with new generation
 ```
+
+### CommitFailedError
+
+`consumer.commit()` was rejected because this member's generation is gone (the broker answered `IllegalGeneration`,
+`UnknownMemberId` or `FencedInstanceId`, available as `cause`). Nothing was committed and the consumer rejoins the
+group; the partitions may have moved to another member, which will process their records again from the last
+committed offsets. A commit that was still being retried when the consumer rejoined, or when a partition of it was
+revoked or lost, fails the same way (`cause`: `IllegalGeneration`) without being sent again. A transaction's
+`sendOffsets()` raises it too when given the metadata of a member that has not joined.
+
+```typescript
+import { CommitFailedError } from '@kafkats/client'
+
+try {
+	await consumer.commit(offsets)
+} catch (error) {
+	if (error instanceof CommitFailedError) {
+		// Do not retry: these offsets belong to a generation that is gone
+	}
+}
+```
+
+## Offset Reset Errors
+
+### NoOffsetForPartitionError
+
+`autoOffsetReset: 'none'` and an assigned partition has no committed offset: the run (`runEach()`, `runBatch()`,
+`stream()`) rejects with it. `topic` and `partition` name the partition.
+
+### OffsetOutOfRangeError
+
+A partition's fetch position is outside the offsets the broker holds (`topic`, `partition`, `offset`), and its reset
+policy is `'none'`. With an `offsetOutOfRange` listener the consumer does not throw it: it pauses the partition and
+emits the event (see [Offset Reset](/client/consumer#offset-reset)). With no listener, the run (`runEach()`,
+`runBatch()`, `stream()`) rejects with it.
+
+## Transaction Errors
+
+| Error                     | Raised when                                                                                                                                                                                                   |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TransactionAbortedError` | A transaction did not commit. `outcome: 'aborted'`: it did not; `'unknown'`: EndTxn(commit) was sent but not confirmed, the broker may have committed. `cause` is why.                                        |
+| `InvalidTxnStateError`    | A call does not fit the transaction's state: a handle used after it ended, or a transaction begun on a producer in the `'error'` state (a fenced producer raises `ProducerFencedError`).                      |
+| `ProducerFencedError`     | A newer producer with the same transactional ID (or the transaction timeout) took the producer's epoch: it rejects every later call; replace it. Also an idempotent producer's send answered PRODUCER_FENCED. |
+
+See [Transactions: Error Handling](/client/transactions#error-handling).
 
 ## Checking Retriability
 
@@ -194,7 +244,7 @@ try {
 	await producer.send(topic, messages)
 } catch (error) {
 	if (isKafkaError(error)) {
-		console.log('Kafka error:', error.code, error.message)
+		console.log('Kafka error:', error.errorCode, error.message)
 	} else {
 		console.log('Other error:', error)
 	}

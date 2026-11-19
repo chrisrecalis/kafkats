@@ -48,17 +48,20 @@ describe('failed rebalance stops the consumer', () => {
 
 		const failure = new Error('rebalance handler failed')
 		const callbacks: PartitionProviderCallbacks = {
+			onRebalancePending: vi.fn(),
 			onRebalance: vi.fn().mockRejectedValue(failure),
 			onPartitionsAssigned: vi.fn(),
 			onPartitionsRevoked: vi.fn(),
 			onPartitionsLost: vi.fn(),
+			onRebalanceComplete: vi.fn(),
+			onOffsetReset: vi.fn(),
 			onError: vi.fn(),
 		}
 
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		;(provider as any).callbacks = callbacks
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		;(provider as any).rebalancePending = true
+		;(provider as any).rebalanceRequested = true
 
 		// Pre-fix this resolved (only calling onError), so the fetch loop kept running on
 		// revoked partitions after the group had been left.

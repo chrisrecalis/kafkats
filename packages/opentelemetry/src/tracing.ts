@@ -27,12 +27,14 @@ const intoHeaders: TextMapSetter<Record<string, string>> = {
 	},
 }
 
-const fromHeaders: TextMapGetter<IncomingHeaders> = {
+/** Reads trace context from the headers of a consumed message. */
+export const fromHeaders: TextMapGetter<IncomingHeaders> = {
 	keys: headers => Object.keys(headers),
 	get: (headers, key) => headers[key]?.toString(),
 }
 
-function end(span: Span, error: unknown): void {
+/** Ends `span`, as failed when `error` is set. */
+export function endSpan(span: Span, error: unknown): void {
 	if (error !== undefined) {
 		span.recordException(error instanceof Error ? error : String(error))
 		span.setStatus({ code: SpanStatusCode.ERROR })
@@ -47,7 +49,7 @@ function end(span: Span, error: unknown): void {
  * nothing still costs as much to create as one that does. This follows the parent's decision, as
  * the SDK's default sampler does.
  */
-function notSampled(parent: Context): boolean {
+export function notSampled(parent: Context): boolean {
 	const origin = trace.getSpanContext(parent)
 	return origin !== undefined && (origin.traceFlags & TraceFlags.SAMPLED) === 0
 }
@@ -92,7 +94,7 @@ export function traceMessages(tracer: Tracer): () => void {
 				span.setAttribute(ATTR.partition, String(send.result.partition))
 				span.setAttribute(ATTR.offset, Number(send.result.offset))
 			}
-			end(span, error)
+			endSpan(span, error)
 		},
 	})
 
@@ -131,7 +133,7 @@ export function traceMessages(tracer: Tracer): () => void {
 			return span
 		},
 		finished(_, span, error) {
-			if (span) end(span, error)
+			if (span) endSpan(span, error)
 		},
 	})
 

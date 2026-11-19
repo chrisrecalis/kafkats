@@ -22,25 +22,96 @@ import type {
 	DescribeAclsResult,
 	CreateAclResult,
 	DeleteAclsFilterResult,
+	RecordsToDelete,
+	DeleteRecordsOptions,
+	DeleteRecordsResult,
 } from './types.js'
+import type { ClusterMetadata } from '@/client/types.js'
 import { createCreateTopicsRequest } from '@/protocol/messages/requests/create-topics.js'
 import { createDeleteTopicsRequest } from '@/protocol/messages/requests/delete-topics.js'
+import type {
+	DeleteRecordsRequest,
+	DeleteRecordsRequestPartition,
+} from '@/protocol/messages/requests/delete-records.js'
+import type { DeleteRecordsPartitionResponse } from '@/protocol/messages/responses/delete-records.js'
 import { createListGroupsRequest } from '@/protocol/messages/requests/list-groups.js'
 import { createDescribeGroupsRequest } from '@/protocol/messages/requests/describe-groups.js'
 import { createDeleteGroupsRequest } from '@/protocol/messages/requests/delete-groups.js'
 import { OFFSET_TIMESTAMP } from '@/protocol/messages/requests/list-offsets.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
-import { KafkaProtocolError, isKafkaError, shouldRefreshMetadata } from '@/client/errors.js'
+import {
+	KafkaError,
+	KafkaProtocolError,
+	LeaderNotAvailableError,
+	TimeoutError,
+	UnknownTopicOrPartitionError,
+	isConnectionFailure,
+	isKafkaError,
+	isRetriable,
+	shouldRefreshMetadata,
+} from '@/client/errors.js'
 import type { Logger } from '@/logger.js'
 import { noopLogger } from '@/logger.js'
+import { abortable, deadlineSignal } from '@/utils/abortable.js'
 import { sleep } from '@/utils/sleep.js'
+import { tpKey } from '@/utils/topic-partition.js'
 import { DEFAULT_REQUEST_TIMEOUT_MS } from '@/network/types.js'
+
+/** Backoff between attempts of deleteRecords: 100 ms, doubling up to 1 s. */
+const DELETE_RECORDS_RETRY_INITIAL_DELAY_MS = 100
+const DELETE_RECORDS_RETRY_MAX_DELAY_MS = 1_000
+
+/** Outcome of one deleteRecords attempt for one partition: its new low watermark, or why it failed. */
+type DeletionAttempt = { lowWatermark: bigint } | { error: unknown }
 
 /**
  * Map a coordinator lookup/request failure to an error code for per-group results
  */
 function errorCodeFor(error: unknown): ErrorCode {
 	return isKafkaError(error) ? error.errorCode : ErrorCode.UnknownServerError
+}
+
+/** Whether a later attempt may succeed where a deletion failed with `error`. */
+function isRetriableDeletion(error: unknown): boolean {
+	return isConnectionFailure(error) || isRetriable(error)
+}
+
+/** Whether the partition's leader must be looked up again before the next attempt. */
+function leaderMayHaveMoved(error: unknown): boolean {
+	return isConnectionFailure(error) || (isKafkaError(error) && shouldRefreshMetadata(error.errorCode))
+}
+
+/** `error` as a KafkaError; an error of another kind becomes the cause of one. */
+function asKafkaError(error: unknown): KafkaError {
+	if (isKafkaError(error)) {
+		return error
+	}
+	const wrapped = new KafkaError(error instanceof Error ? error.message : String(error))
+	wrapped.cause = error
+	return wrapped
+}
+
+/** One DeleteRecords request for `records` (all led by the same broker). */
+function deleteRecordsRequest(records: readonly RecordsToDelete[], timeoutMs: number): DeleteRecordsRequest {
+	const topics = new Map<string, DeleteRecordsRequestPartition[]>()
+	for (const { topic, partition, offset } of records) {
+		const partitions = topics.get(topic) ?? []
+		partitions.push({ partitionIndex: partition, offset })
+		topics.set(topic, partitions)
+	}
+	return { topics: [...topics].map(([name, partitions]) => ({ name, partitions })), timeoutMs }
+}
+
+/** The outcome of `record` given the broker's `answer` for it. */
+function deletionOutcome(record: RecordsToDelete, answer: DeleteRecordsPartitionResponse | undefined): DeletionAttempt {
+	const context = `DeleteRecords for ${record.topic}-${record.partition}`
+	if (!answer) {
+		return { error: new KafkaProtocolError(ErrorCode.UnknownServerError, `${context}: missing from the response`) }
+	}
+	if (answer.errorCode !== ErrorCode.None) {
+		return { error: new KafkaProtocolError(answer.errorCode, context) }
+	}
+	return { lowWatermark: answer.lowWatermark }
 }
 
 /**
@@ -347,6 +418,151 @@ export class Admin {
 
 		this.logger.debug('deleted topics', { count: results.length })
 		return results
+	}
+
+	/**
+	 * Delete the records of partitions before the given offsets, moving each partition's log start offset forward.
+	 *
+	 * Partitions are sent to their leaders, one request per leader. A moved leader, an unknown topic or partition,
+	 * other retriable broker answers and connection failures are retried with backoff (100 ms doubling to 1 s), the
+	 * leaders being looked up again where they may have moved, until `timeoutMs` is spent. Failures are returned per
+	 * partition, not thrown: the broker's answer as a `KafkaProtocolError` (e.g. `OffsetOutOfRange` for an offset
+	 * beyond the high watermark), or a `TimeoutError` (cause: the last failure) for a partition still pending at the
+	 * deadline. Aborting `options.signal` rejects the call with its reason.
+	 *
+	 * @param records - Partitions and offsets; a partition listed twice is deleted up to its last offset
+	 * @param options - Time budget and abort signal
+	 * @returns One result per partition, in the order the partitions were first listed
+	 */
+	async deleteRecords(
+		records: readonly RecordsToDelete[],
+		options: DeleteRecordsOptions = {}
+	): Promise<DeleteRecordsResult[]> {
+		const { signal } = options
+		signal?.throwIfAborted()
+		const timeoutMs = options.timeoutMs ?? this.config.requestTimeoutMs
+		const deadline = Date.now() + timeoutMs
+
+		const pending = new Map(records.map(record => [tpKey(record.topic, record.partition), record] as const))
+		const order = [...pending.keys()]
+		const results = new Map<string, DeleteRecordsResult>()
+		const lastErrors = new Map<string, unknown>()
+		this.logger.debug('deleting records', { partitions: pending.size, timeoutMs })
+
+		// Aborted at the deadline or by the caller's signal; the caller's is checked first when telling them apart.
+		const stop = deadlineSignal(timeoutMs, signal)
+		try {
+			let relocate = new Set<string>()
+			let delayMs = DELETE_RECORDS_RETRY_INITIAL_DELAY_MS
+			while (pending.size > 0) {
+				const attempt = this.attemptDeleteRecords(
+					[...pending.values()],
+					relocate,
+					Math.max(0, deadline - Date.now())
+				)
+				const outcomes = await abortable(attempt, stop.signal)
+				relocate = new Set()
+				for (const [key, outcome] of outcomes) {
+					const { topic, partition } = pending.get(key)!
+					if ('lowWatermark' in outcome) {
+						results.set(key, { topic, partition, lowWatermark: outcome.lowWatermark })
+						pending.delete(key)
+					} else if (isRetriableDeletion(outcome.error)) {
+						lastErrors.set(key, outcome.error)
+						if (leaderMayHaveMoved(outcome.error)) relocate.add(topic)
+					} else {
+						results.set(key, { topic, partition, error: asKafkaError(outcome.error) })
+						pending.delete(key)
+					}
+				}
+				if (pending.size > 0) {
+					this.logger.debug('retrying deleteRecords', { partitions: pending.size, delayMs })
+					await sleep(delayMs, { signal: stop.signal })
+					delayMs = Math.min(2 * delayMs, DELETE_RECORDS_RETRY_MAX_DELAY_MS)
+				}
+			}
+		} catch (error) {
+			signal?.throwIfAborted()
+			if (!stop.signal.aborted) throw error
+		} finally {
+			stop.clear()
+		}
+
+		for (const [key, { topic, partition }] of pending) {
+			const error = new TimeoutError(`DeleteRecords for ${topic}-${partition} did not complete`, timeoutMs)
+			if (lastErrors.has(key)) error.cause = lastErrors.get(key)
+			results.set(key, { topic, partition, error })
+		}
+		return order.map(key => results.get(key)!)
+	}
+
+	/**
+	 * One attempt of {@link deleteRecords}: one DeleteRecords request per leader, sent concurrently. The leaders of
+	 * the topics in `relocate`, and of partitions the metadata cache has none for, are looked up again first.
+	 * Never rejects: a failure becomes the outcome of the partitions it concerns.
+	 */
+	private async attemptDeleteRecords(
+		records: readonly RecordsToDelete[],
+		relocate: ReadonlySet<string>,
+		timeoutMs: number
+	): Promise<Map<string, DeletionAttempt>> {
+		const outcomes = new Map<string, DeletionAttempt>()
+		let metadata: ClusterMetadata | null
+		try {
+			metadata = await this.metadataWithLeaders(records, relocate)
+		} catch (error) {
+			for (const record of records) outcomes.set(tpKey(record.topic, record.partition), { error })
+			return outcomes
+		}
+
+		const byLeader = new Map<number, RecordsToDelete[]>()
+		for (const record of records) {
+			const { topic, partition } = record
+			const partitionMetadata = metadata?.topics.get(topic)?.partitions.get(partition)
+			if (!partitionMetadata) {
+				outcomes.set(tpKey(topic, partition), { error: new UnknownTopicOrPartitionError(topic, partition) })
+			} else if (partitionMetadata.leaderId < 0) {
+				outcomes.set(tpKey(topic, partition), { error: new LeaderNotAvailableError(topic, partition) })
+			} else {
+				const led = byLeader.get(partitionMetadata.leaderId) ?? []
+				led.push(record)
+				byLeader.set(partitionMetadata.leaderId, led)
+			}
+		}
+
+		await Promise.all(
+			[...byLeader].map(async ([leaderId, led]) => {
+				try {
+					const leader = await this.cluster.getBroker(leaderId)
+					const response = await leader.deleteRecords(deleteRecordsRequest(led, timeoutMs))
+					const answers = new Map(
+						response.topics.flatMap(t =>
+							t.partitions.map(p => [tpKey(t.name, p.partitionIndex), p] as const)
+						)
+					)
+					for (const record of led) {
+						const key = tpKey(record.topic, record.partition)
+						outcomes.set(key, deletionOutcome(record, answers.get(key)))
+					}
+				} catch (error) {
+					for (const record of led) outcomes.set(tpKey(record.topic, record.partition), { error })
+				}
+			})
+		)
+		return outcomes
+	}
+
+	/** The cluster metadata, refreshed first for `relocate` and for the topics of partitions it knows no leader of. */
+	private async metadataWithLeaders(
+		records: readonly RecordsToDelete[],
+		relocate: ReadonlySet<string>
+	): Promise<ClusterMetadata | null> {
+		const cached = this.cluster.getMetadata()
+		const topics = new Set(relocate)
+		for (const { topic, partition } of records) {
+			if ((cached?.topics.get(topic)?.partitions.get(partition)?.leaderId ?? -1) < 0) topics.add(topic)
+		}
+		return topics.size === 0 ? cached : this.cluster.refreshMetadata([...topics])
 	}
 
 	// ==================== Cluster Operations ====================

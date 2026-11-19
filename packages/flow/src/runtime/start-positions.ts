@@ -1,129 +1,99 @@
-import { ErrorCode, KafkaError, type KafkaClient, type Logger } from '@kafkats/client'
-import { toError } from '@/runtime/errors.js'
-import type { AppStatus } from '@/runtime/status.js'
-import type { TopicPartition } from '@/runtime/restoration.js'
-import type { Topology } from '@/runtime/topology.js'
-
 /**
- * Settles where newly assigned partitions without a committed offset start.
+ * Start positions of input partitions without a committed offset (4.7.4, runtime§6.40). The client put each one where
+ * its topic's reset policy says (repartition and through topics: 'earliest', KF16); a task's restore pipeline settles
+ * them once its stores are restored, outside exclusive (CR8) and before its partitions resume.
  *
- * Internal (repartition / through) topics are read from the beginning: with the consumer
- * default ('latest'), records written before this worker resolved its position would be lost.
- *
- * Source topics read from 'latest' keep the position they were first started at: it is pinned in
- * this process and committed to the group. Otherwise a restart (or getting the partition back)
- * before the first commit would re-resolve 'latest' and silently skip everything that had been
- * read but not committed.
+ * A partition read from 'latest' stays at the position this process first started it at (its pin) until an offset is
+ * committed: a rebalance or a recovery before the first commit would otherwise resolve the end of the log again and
+ * skip what arrived meanwhile. The pinned position is committed too (best effort), so that a restart of the process
+ * resumes from it as well. An 'earliest' position needs neither: resolving it again reads the same records.
  */
+import type { Logger, TopicPartition } from '@kafkats/client'
+import { encodeCommitMetadata, ProcessorMetadataImpl } from '@/processor/metadata.js'
+import { errorMessage } from '@/runtime/errors.js'
+import type { GroupConsumerPort, OffsetAndMetadata } from '@/runtime/io.js'
+import type { StartPositionSettler } from '@/runtime/restore-pipelines.js'
+import { tpKey } from '@/runtime/task-id.js'
+import type { StreamTask } from '@/runtime/task.js'
+import type { ResetPolicy } from '@/topology/nodes.js'
+
+/** The commit metadata of a start position: no partition time, no processor metadata (it seeds nothing, 4.8.5). */
+const START_METADATA = encodeCommitMetadata(-1, new ProcessorMetadataImpl())
+
+export interface StartPositionsDeps {
+	/** The reset policy of an input topic (the source's, else the app default; repartition and through: 'earliest'). */
+	readonly policy: (topic: string) => ResetPolicy
+	readonly logger: Logger
+}
+
+type Consumer = Pick<GroupConsumerPort, 'seek' | 'commit'>
+
+/** One per start (runtime§6.59): the pins outlive group memberships, not the start. */
 export class StartPositions {
-	/**
-	 * Where this process started reading source partitions that had no committed offset under the
-	 * 'latest' reset policy. Until the first commit lands, a worker restart or rebalance resumes
-	 * from here instead of jumping to the (new) end of the topic and skipping records.
-	 * Shared by all workers: a partition can move between workers of this process.
-	 */
-	private readonly initialPositions = new Map<string, bigint>()
+	/** Per `topic:partition`: where this process first started a 'latest' partition that had no commit. */
+	private readonly pins = new Map<string, bigint>()
 
-	constructor(
-		private readonly client: KafkaClient,
-		private readonly groupId: string,
-		private readonly topology: Topology,
-		private readonly status: AppStatus,
-		private readonly logger: Logger
-	) {}
+	constructor(private readonly deps: StartPositionsDeps) {}
+
+	/** The settler of one run: it seeks and commits through that run's consumer. */
+	settler(consumer: Consumer): StartPositionSettler {
+		return { settle: (task, signal) => this.settle(task, consumer, signal) }
+	}
 
 	/**
-	 * Settle where newly assigned partitions without a committed offset start.
-	 * `startPositions` holds where the consumer resolved them; `consumer.seek` is called for each
-	 * one whose position must move, and `consumer.commitStartPosition` to make start positions durable.
+	 * The start positions of the task's partitions without a commit, which become their last committed offsets (CR13).
+	 * A 'latest' partition goes back to its pin (the seek drops what the consumer fetched from elsewhere, C5), and its
+	 * position is committed; a commit that fails or outlasts `signal` is logged, and the pin keeps the position here.
 	 */
 	async settle(
-		partitions: TopicPartition[],
-		startPositions: Map<string, bigint>,
-		consumer: {
-			seek(topic: string, partition: number, offset: bigint): void
-			commitStartPosition(partitions: TopicPartition[]): Promise<void>
-		}
-	): Promise<void> {
-		const topology = this.topology
-		const policy = topology.resolveOffsetReset() ?? 'latest'
-		// With 'earliest' (and 'none') the start position of a source partition is already stable.
-		const relevant = partitions.filter(tp => topology.isInternalTopic(tp.topic) || policy === 'latest')
-		if (relevant.length === 0 || !this.status.clusterAvailable) return
-
-		const admin = this.client.admin()
-		const commits: Promise<void>[] = []
-		for (const [topic, uncommitted] of await this.uncommittedPartitions(relevant)) {
-			if (topology.isInternalTopic(topic)) {
-				const earliest = await admin.fetchTopicOffsets(topic, uncommitted, 'earliest')
-				for (const partition of uncommitted) consumer.seek(topic, partition, earliest.get(partition) ?? 0n)
+		task: Pick<StreamTask, 'inputPartitions' | 'starts'>,
+		consumer: Consumer,
+		signal: AbortSignal
+	): Promise<ReadonlyMap<string, bigint>> {
+		signal.throwIfAborted()
+		const positions = new Map<string, bigint>()
+		const pinned: OffsetAndMetadata[] = []
+		for (const tp of task.inputPartitions) {
+			const key = tpKey(tp)
+			const start = task.starts.get(key)
+			if (start === undefined) {
 				continue
 			}
-			// Source topic read from 'latest': the first position this process started the partition
-			// at stays its start position until an offset is committed.
-			for (const partition of uncommitted) {
-				const key = `${topic}:${partition}`
-				const pinned = this.initialPositions.get(key)
-				const resolved = startPositions.get(key)
-				if (pinned === undefined) {
-					if (resolved !== undefined) this.initialPositions.set(key, resolved)
-				} else if (pinned !== resolved) {
-					consumer.seek(topic, partition, pinned)
-				}
+			if (start.committed !== null) {
+				// Committed: the group knows where the partition stands, the pin is done.
+				this.pins.delete(key)
+				continue
 			}
-			// Commit that position, so a restart (of this or another instance) before the first
-			// commit resumes from it as well instead of resolving 'latest' again and skipping
-			// what was read in between. Best effort: the in-process pin above still holds.
-			commits.push(
-				consumer.commitStartPosition(uncommitted.map(partition => ({ topic, partition }))).catch(err => {
-					this.logger.warn('could not commit the start position', { topic, error: toError(err).message })
+			if (this.deps.policy(tp.topic) !== 'latest') {
+				positions.set(key, start.resolved)
+				continue
+			}
+			const position = this.pin(tp, start.resolved, consumer)
+			positions.set(key, position)
+			pinned.push({ topic: tp.topic, partition: tp.partition, offset: position, metadata: START_METADATA })
+		}
+		if (pinned.length > 0) {
+			await consumer.commit(pinned, { signal }).catch((error: unknown) => {
+				this.deps.logger.warn('committing start positions failed: they are kept in this process only', {
+					partitions: pinned.map(tpKey),
+					error: errorMessage(error),
 				})
-			)
+			})
 		}
-		// Awaited before the partitions resume: a start position committed after processing has
-		// begun could overwrite a newer offset.
-		await Promise.all(commits)
+		return positions
 	}
 
-	/** The given partitions for which the group has no committed offset, by topic. */
-	private async uncommittedPartitions(partitions: TopicPartition[]): Promise<Map<string, number[]>> {
-		const groupId = this.groupId
-		const topics = [...new Set(partitions.map(tp => tp.topic))].map(name => ({
-			name,
-			partitions: partitions.filter(tp => tp.topic === name).map(tp => ({ partitionIndex: tp.partition })),
-		}))
-
-		// Offsets of an in-flight transaction (another instance committing) are reported as
-		// unstable; wait for them rather than guessing.
-		const deadline = Date.now() + 30_000
-		for (;;) {
-			try {
-				const coordinator = await this.client.cluster.getCoordinator('GROUP', groupId)
-				const response = await coordinator.offsetFetch({ groupId, topics, requireStable: true })
-				const all = response.topics.flatMap(t => t.partitions)
-				const code =
-					response.errorCode !== ErrorCode.None
-						? response.errorCode
-						: all.find(p => p.errorCode !== ErrorCode.None)?.errorCode
-				if (code !== undefined) throw new KafkaError(`OffsetFetch failed for group ${groupId}`, code)
-
-				const uncommitted = new Map<string, number[]>()
-				for (const topic of response.topics) {
-					const missing = topic.partitions.filter(p => p.committedOffset < 0n).map(p => p.partitionIndex)
-					if (missing.length > 0) uncommitted.set(topic.name, missing)
-				}
-				return uncommitted
-			} catch (err) {
-				const retriable = err instanceof KafkaError && err.retriable
-				if (!retriable || Date.now() > deadline || this.status.closing) throw err
-				this.client.cluster.invalidateCoordinator('GROUP', groupId)
-				await this.status.sleepUnlessClosing(200)
-			}
+	/** The pin of the partition: the first position it got here; the consumer moves back to it if it resolved another. */
+	private pin(tp: TopicPartition, resolved: bigint, consumer: Consumer): bigint {
+		const key = tpKey(tp)
+		const pin = this.pins.get(key)
+		if (pin === undefined) {
+			this.pins.set(key, resolved)
+			return resolved
 		}
-	}
-
-	/** Forget all pinned positions (on shutdown). */
-	clear(): void {
-		this.initialPositions.clear()
+		if (pin !== resolved) {
+			consumer.seek(tp, pin)
+		}
+		return pin
 	}
 }

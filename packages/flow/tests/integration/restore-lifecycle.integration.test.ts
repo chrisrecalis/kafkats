@@ -3,9 +3,10 @@
  * (start/close/restart) against a real broker.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import type { KafkaClient, Producer } from '@kafkats/client'
+import type { Consumer, KafkaClient, Producer } from '@kafkats/client'
 import {
 	ChangelogRestorer,
+	FailedProcessingError,
 	InMemoryKeyValueStore,
 	InMemoryStateStoreProvider,
 	buildChangelogTopicName,
@@ -86,6 +87,9 @@ const RESTORE_FAST = {
 	consumerMaxWaitMs: 100,
 }
 
+/** A changelog value of a count store, which is timestamped (BC14): `[int64BE timestamp][count]`. */
+const storedCount = (count: number): Buffer => Buffer.concat([Buffer.alloc(8), numberCodec.encode(count)])
+
 async function newKvStore(name: string) {
 	const store = new InMemoryKeyValueStore<string, number>(name, { keyCodec: stringCodec, valueCodec: numberCodec })
 	await store.init()
@@ -117,7 +121,7 @@ describe('changelog restorer', () => {
 		const changelog = buildChangelogTopicName(appId, 'counts')
 		await createTopics(client, [{ name: input }, { name: changelog }])
 		for (let i = 1; i <= 5; i++) {
-			await producer.send(changelog, { key: `k${i}`, value: numberCodec.encode(i) })
+			await producer.send(changelog, { key: `k${i}`, value: storedCount(i) })
 		}
 
 		const provider = new SlowProvider(new MemoryCheckpointStore())
@@ -126,7 +130,6 @@ describe('changelog restorer', () => {
 		const app = flow({
 			applicationId: appId,
 			client,
-			numStreamThreads: 1,
 			consumer: { maxWaitMs: 100 },
 			stateStoreProvider: provider,
 			changelog: { restoration: RESTORE_FAST },
@@ -138,7 +141,7 @@ describe('changelog restorer', () => {
 		try {
 			await withTimeout('start', app.start(), 25_000)
 			const inner = [...provider.inners].find(([name]) => name.endsWith('.counts.p0'))![1]
-			for (let i = 1; i <= 5; i++) expect(await inner.get(`k${i}`)).toBe(i)
+			for (let i = 1; i <= 5; i++) expect(await inner.get(`k${i}`)).toEqual({ value: i, timestamp: 0 })
 		} finally {
 			await app.close().catch(() => {})
 		}
@@ -178,7 +181,7 @@ describe('changelog restorer', () => {
 		try {
 			for (let s = 0; s < storeCount; s++) {
 				await tx.transaction(async t => {
-					await t.send(buildChangelogTopicName(appId, `s${s}`), { key: 'a', value: numberCodec.encode(1) })
+					await t.send(buildChangelogTopicName(appId, `s${s}`), { key: 'a', value: storedCount(1) })
 				})
 			}
 		} finally {
@@ -187,7 +190,6 @@ describe('changelog restorer', () => {
 		const app = flow({
 			applicationId: appId,
 			client,
-			numStreamThreads: 1,
 			consumer: { maxWaitMs: 100 },
 			changelog: { restoration: { consumerMaxWaitMs: 100 } },
 		})
@@ -350,7 +352,6 @@ describe('restart cycles with a persistent store and checkpoint store', () => {
 					const app = flow({
 						applicationId: appId,
 						client,
-						numStreamThreads: 1,
 						processingGuarantee: guarantee,
 						commitIntervalMs: 100,
 						consumer: { maxWaitMs: 100 },
@@ -399,7 +400,7 @@ describe('processing failures', () => {
 		})
 		await collector.start()
 		const build = (throwOn: number | null) => {
-			const app = flow({ applicationId: appId, client, numStreamThreads: 1, consumer: { maxWaitMs: 100 } })
+			const app = flow({ applicationId: appId, client, consumer: { maxWaitMs: 100 } })
 			app.stream(input, { key: stringCodec, value: numberCodec })
 				.mapValues(v => {
 					if (v === throwOn) throw new Error('boom')
@@ -414,7 +415,9 @@ describe('processing failures', () => {
 			for (const v of [1, 2, 3]) await producer.send(input, { key: 'a', value: numberCodec.encode(v) })
 			await collector.waitFor<string, number>(out, m => m.value === 1, 10_000)
 			await waitUntil('app1 ERROR', () => app1.state() === 'ERROR', 10_000)
-			expect(app1.getError()?.message).toContain('boom')
+			// The processing exception handler's 'fail' (the default) wraps the error (4.6.4).
+			expect(app1.getError()).toBeInstanceOf(FailedProcessingError)
+			expect(app1.getError()?.cause).toEqual(new Error('boom'))
 			await app1.close()
 			const app2 = build(null)
 			await app2.start()
@@ -442,9 +445,8 @@ describe('processing failures', () => {
 			const app = flow({
 				applicationId: appId,
 				client,
-				numStreamThreads: 1,
 				consumer: { maxWaitMs: 100 },
-				consumerRun: { autoCommitIntervalMs: 200 },
+				commitIntervalMs: 200,
 			})
 			app.stream(input, { key: stringCodec, value: numberCodec })
 				.mapValues(v => v)
@@ -490,7 +492,6 @@ describe('processing failures', () => {
 		const app = flow({
 			applicationId: appId,
 			client,
-			numStreamThreads: 1,
 			consumer: { maxWaitMs: 100 },
 			stateStoreProvider: provider,
 		})
@@ -614,7 +615,7 @@ describe('app lifecycle', () => {
 			topics: [{ topic: out, keyCodec: stringCodec, valueCodec: numberCodec }],
 		})
 		await collector.start()
-		const app = flow({ applicationId: appId, client, numStreamThreads: 1, consumer: { maxWaitMs: 100 } })
+		const app = flow({ applicationId: appId, client, consumer: { maxWaitMs: 100 } })
 		app.stream(input, { key: stringCodec, value: numberCodec })
 			.groupByKey()
 			.count({ storeName: 'counts', key: stringCodec, value: numberCodec })
@@ -646,7 +647,6 @@ describe('app lifecycle', () => {
 		const app = flow({
 			applicationId: appId,
 			client: { brokers: requireKafkaBrokers(), clientId: 'restore-close-restoring' },
-			numStreamThreads: 1,
 			consumer: { maxWaitMs: 100 },
 			stateStoreProvider: provider,
 			changelog: { restoration: { idleTimeoutMs: 30_000, initialIdleTimeoutMs: 30_000, consumerMaxWaitMs: 100 } },
@@ -676,7 +676,6 @@ describe('app lifecycle', () => {
 			const app = flow({
 				applicationId: appId,
 				client,
-				numStreamThreads: 1,
 				consumer: { maxWaitMs: 100, groupInstanceId: 'restore-fenced-static' },
 			})
 			app.stream(input, { key: stringCodec, value: numberCodec }).mapValues(v => v)
@@ -717,15 +716,24 @@ describe('app lifecycle', () => {
 			topics: [{ topic: out, keyCodec: stringCodec, valueCodec: numberCodec }],
 		})
 		await collector.start()
-		const app = flow({ applicationId: appId, client, numStreamThreads: 1, consumer: { maxWaitMs: 100 } })
+		// The app's group consumer, from a client whose consumer() keeps what it created.
+		const appClient = newClient('restore-transient-app')
+		const groupConsumers: Consumer[] = []
+		const createConsumer = appClient.consumer.bind(appClient)
+		appClient.consumer = config => {
+			const consumer = createConsumer(config)
+			if (config.groupId === appId) groupConsumers.push(consumer)
+			return consumer
+		}
+		const app = flow({ applicationId: appId, client: appClient, consumer: { maxWaitMs: 100 } })
 		app.stream(input, { key: stringCodec, value: numberCodec })
 			.mapValues(v => v)
 			.to(out, { key: stringCodec, value: numberCodec })
 		try {
 			await app.start()
 			// The client emits 'error' for non-fatal conditions too (e.g. auto-commit failures).
-			// eslint-disable-next-line @typescript-eslint/no-explicit-any
-			;(app as any).workers.active[0].context.consumer.emit('error', new Error('transient commit failure'))
+			expect(groupConsumers).toHaveLength(1)
+			groupConsumers[0]!.emit('error', new Error('transient commit failure'))
 			await producer.send(input, { key: 'a', value: numberCodec.encode(7) })
 			await collector.waitFor<string, number>(out, m => m.value === 7, 10_000) // still processing
 			await sleep(300)
@@ -733,16 +741,16 @@ describe('app lifecycle', () => {
 		} finally {
 			await app.close().catch(() => {})
 			await collector.stop()
+			await appClient.disconnect()
 		}
 	}, 30_000)
 
-	it('start() failing while workers are starting (consumer cannot join) cleans up its sockets', async () => {
+	it('start() failing while joining the group (consumer cannot join) cleans up its sockets', async () => {
 		const input = uniqueTopicName('restore-joinfail-in')
 		await createTopics(client, [{ name: input }])
 		const app = flow({
 			applicationId: `restore-joinfail-${Date.now()}`,
 			client: { brokers: requireKafkaBrokers(), clientId: 'restore-joinfail' },
-			numStreamThreads: 1,
 			// Invalid session timeout (below broker group.min.session.timeout.ms) => join fails
 			consumer: { maxWaitMs: 100, sessionTimeoutMs: 1 },
 		})
@@ -770,7 +778,6 @@ describe('changelog topic creation', () => {
 				const app = flow({
 					applicationId: appId,
 					client: { brokers: requireKafkaBrokers(), clientId: 'restore-race' },
-					numStreamThreads: 1,
 					consumer: { maxWaitMs: 100 },
 				})
 				app.stream(input, { key: stringCodec, value: numberCodec })

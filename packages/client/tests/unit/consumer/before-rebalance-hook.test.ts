@@ -51,19 +51,22 @@ describe('GroupPartitionProvider.checkAndHandleRebalance awaits onRebalance', ()
 		})
 
 		const callbacks: PartitionProviderCallbacks = {
+			onRebalancePending: vi.fn(),
 			onRebalance: vi.fn(async () => {
 				await hookDone
 			}),
 			onPartitionsAssigned: vi.fn().mockResolvedValue(undefined),
 			onPartitionsRevoked: vi.fn().mockResolvedValue(undefined),
 			onPartitionsLost: vi.fn(),
+			onRebalanceComplete: vi.fn(),
+			onOffsetReset: vi.fn(),
 			onError: vi.fn(),
 		}
 
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		;(provider as any).callbacks = callbacks
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		;(provider as any).rebalancePending = true
+		;(provider as any).rebalanceRequested = true
 
 		const checkPromise = provider.checkAndHandleRebalance()
 
@@ -84,17 +87,20 @@ describe('GroupPartitionProvider.checkAndHandleRebalance awaits onRebalance', ()
 
 		const failure = new Error('eos commit failed')
 		const callbacks: PartitionProviderCallbacks = {
+			onRebalancePending: vi.fn(),
 			onRebalance: vi.fn().mockRejectedValue(failure),
 			onPartitionsAssigned: vi.fn(),
 			onPartitionsRevoked: vi.fn(),
 			onPartitionsLost: vi.fn(),
+			onRebalanceComplete: vi.fn(),
+			onOffsetReset: vi.fn(),
 			onError: vi.fn(),
 		}
 
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		;(provider as any).callbacks = callbacks
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		;(provider as any).rebalancePending = true
+		;(provider as any).rebalanceRequested = true
 
 		// The failure is fatal: it must reject so the poll loop driving
 		// checkAndHandleRebalance exits instead of fetching after LeaveGroup.

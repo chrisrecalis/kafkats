@@ -258,6 +258,42 @@ describe('Broker', () => {
 			expect(broker.getApiVersion(ApiKey.Metadata)).toBeGreaterThanOrEqual(0)
 		})
 
+		it('is not connected while ApiVersions is in flight; concurrent connects share the negotiation', async () => {
+			const controlConnection = createMockConnection()
+			const fetchConnection = createMockConnection()
+			const broker = new Broker({ host: 'localhost', port: 9092, nodeId: 1, clientId: 'test-client' })
+			;(broker as unknown as { connection: typeof controlConnection }).connection = controlConnection
+			;(broker as unknown as { fetchConnection: typeof fetchConnection }).fetchConnection = fetchConnection
+
+			let answer!: (response: Buffer) => void
+			controlConnection.setSendHandler(apiKey => {
+				if (apiKey === ApiKey.ApiVersions) {
+					return new Promise<Buffer>(resolve => (answer = resolve))
+				}
+				throw new Error(`Unexpected API key: ${apiKey}`)
+			})
+
+			const first = broker.connect()
+			await vi.waitFor(() => expect(controlConnection.send).toHaveBeenCalled())
+			// The sockets are open, but the versions are unknown: a caller that took this broker for connected (the
+			// cluster's broker cache) would fail with UnsupportedVersionError (API 2 version 0 not supported).
+			expect(controlConnection.isConnected && fetchConnection.isConnected).toBe(true)
+			expect(broker.isConnected).toBe(false)
+			const second = broker.connect()
+
+			answer(
+				buildApiVersionsResponse([
+					{ apiKey: ApiKey.ApiVersions, minVersion: 0, maxVersion: 3 },
+					{ apiKey: ApiKey.ListOffsets, minVersion: 0, maxVersion: 8 },
+				])
+			)
+			await Promise.all([first, second])
+
+			expect(broker.isConnected).toBe(true)
+			expect(broker.getApiVersion(ApiKey.ListOffsets)).toBeGreaterThan(0)
+			expect(controlConnection.send).toHaveBeenCalledTimes(1)
+		})
+
 		it('throws KafkaProtocolError when ApiVersions returns error', async () => {
 			const controlConnection = createMockConnection()
 			const fetchConnection = createMockConnection()

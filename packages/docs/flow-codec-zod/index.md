@@ -1,4 +1,4 @@
-# @kafkats/flow-codec-zod
+# @kafkats/codec-zod
 
 Zod schema validation codecs for @kafkats/client and @kafkats/flow.
 
@@ -12,7 +12,7 @@ Zod schema validation codecs for @kafkats/client and @kafkats/flow.
 ## Installation
 
 ```bash
-pnpm add @kafkats/flow-codec-zod zod
+pnpm add @kafkats/codec-zod zod
 ```
 
 ## Quick Example
@@ -20,7 +20,7 @@ pnpm add @kafkats/flow-codec-zod zod
 ```typescript
 import { flow, topic } from '@kafkats/flow'
 import { string } from '@kafkats/client'
-import { zodCodec } from '@kafkats/flow-codec-zod'
+import { zodCodec } from '@kafkats/codec-zod'
 import { z } from 'zod'
 
 // Define schema
@@ -48,17 +48,15 @@ type User = z.infer<typeof UserSchema>
 
 The codec:
 
-1. **On encode**: Validates the value, then JSON stringifies
-2. **On decode**: JSON parses, then validates the result
+1. **On encode**: JSON stringifies the value as it is, without validating it (the value being produced is already typed)
+2. **On decode**: JSON parses, then validates the result with `schema.parse`
 
 ```typescript
-// This will throw on invalid data
-userCodec.encode({ id: 'not-a-uuid', email: 'invalid', age: -5, role: 'unknown' })
-// ZodError: invalid_string at id, invalid_string at email, ...
+// Encoding does not validate
+const bytes = userCodec.encode({ id: 'not-a-uuid', email: 'invalid', age: -5, role: 'unknown' } as User)
 
-// Valid data works
-userCodec.encode({ id: '123e4567-e89b-12d3-a456-426614174000', email: 'a@b.com', age: 25, role: 'user' })
-// Buffer containing JSON
+// Decoding does: this throws a ZodError (invalid id, email, age and role)
+userCodec.decode(bytes)
 ```
 
 ## Next Steps

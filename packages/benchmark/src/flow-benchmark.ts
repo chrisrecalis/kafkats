@@ -18,7 +18,6 @@ import { uniqueName } from './utils.js'
  *
  *   KAFKA_BROKERS=localhost:9092 pnpm -C packages/benchmark bench:flow
  *   ... bench:flow -- --records 200000 --scenario count,restore --guarantee exactly_once --runs 3
- *   ... bench:flow -- --scenario stateless --threads 2
  *   ... bench:flow -- --scenario count,session-count --provider lmdb   (or rocksdb)
  */
 
@@ -28,7 +27,6 @@ interface Options {
 	records: number
 	keys: number
 	partitions: number
-	threads: number
 	valueBytes: number
 	runs: number
 	scenarios: string[]
@@ -99,7 +97,8 @@ const SCENARIOS: Scenario[] = [
 				app
 					.stream(t.input, { key: str, value: event })
 					.groupByKey()
-					.windowedBy(TimeWindows.of('1m'))
+					// A grace of an hour: no record of a run is ever late, so every record reaches the sink.
+					.windowedBy(TimeWindows.ofSizeAndGrace('1m', '1h'))
 					.count({ storeName: 'windowed-counts', value: num })
 					.toStream()
 					.map(
@@ -119,7 +118,7 @@ const SCENARIOS: Scenario[] = [
 				app
 					.stream(t.input, { key: str, value: event })
 					.groupByKey()
-					.windowedBy(SessionWindows.withInactivityGap('1m'))
+					.windowedBy(SessionWindows.ofInactivityGapAndGrace('1m', '1h'))
 					.count({ storeName: 'session-counts', value: num })
 					.toStream()
 					// Merging a record into a session retracts the previous session (a null value).
@@ -195,7 +194,6 @@ function parseArgs(argv: string[]): Options {
 		records: Number(arg('records') ?? 200_000),
 		keys: Number(arg('keys') ?? 1_000),
 		partitions: Number(arg('partitions') ?? 4),
-		threads: Number(arg('threads') ?? 1),
 		valueBytes: Number(arg('value-bytes') ?? 100),
 		runs: Number(arg('runs') ?? 3),
 		scenarios: arg('scenario')?.split(',') ?? [...SCENARIOS.map(s => s.name), 'restore'],
@@ -263,7 +261,6 @@ function createApp(brokers: string[], applicationId: string, guarantee: Guarante
 		applicationId,
 		client: { brokers, clientId: 'flow-bench', logLevel: 'silent' },
 		processingGuarantee: guarantee,
-		numStreamThreads: options.threads,
 		consumer: { autoOffsetReset: 'earliest' },
 		...(stateDir
 			? { stateStoreProvider: options.provider === 'rocksdb' ? rocksdb({ stateDir }) : lmdb({ stateDir }) }
@@ -271,10 +268,25 @@ function createApp(brokers: string[], applicationId: string, guarantee: Guarante
 	})
 }
 
+/**
+ * Deletes the topics of a run and the internal topics of its application: a full benchmark writes gigabytes, and a
+ * broker's startup metadata grows with every topic left behind.
+ */
+async function tearDown(brokers: string[], topics: Topics, applicationId: string): Promise<void> {
+	const client = new KafkaClient({ brokers, clientId: 'flow-bench-setup', logLevel: 'silent' })
+	await client.connect()
+	const admin = client.admin()
+	const internal = (await admin.listTopics()).filter(name => name.startsWith(`${applicationId}-`))
+	await admin.deleteTopics([...Object.values(topics), ...internal])
+	await client.disconnect()
+}
+
 async function runOnce(brokers: string[], scenario: Scenario, guarantee: Guarantee, options: Options): Promise<number> {
 	const topics = await setUp(brokers, scenario, options)
-	const app = createApp(brokers, uniqueName(`flow-bench-${scenario.name}`), guarantee, options)
-	return processAll(app, scenario, topics, options)
+	const applicationId = uniqueName(`flow-bench-${scenario.name}`)
+	const rate = await processAll(createApp(brokers, applicationId, guarantee, options), scenario, topics, options)
+	await tearDown(brokers, topics, applicationId)
+	return rate
 }
 
 /** Starts `app` and resolves with records/s once every input record has passed through it; closes it. */
@@ -323,6 +335,7 @@ async function restoreOnce(brokers: string[], guarantee: Guarantee, options: Opt
 		admin.admin().fetchTopicOffsets(changelog, partitions, 'latest'),
 	])
 	await admin.disconnect()
+	await tearDown(brokers, topics, applicationId)
 	// Includes the transaction markers of an exactly_once changelog (one per commit, a small share).
 	let records = 0
 	for (const p of partitions) records += Number(latest.get(p)! - earliest.get(p)!)
@@ -336,7 +349,6 @@ async function main(): Promise<void> {
 
 	console.log(
 		`flow benchmark: ${options.records} records, ${options.keys} keys, ${options.partitions} partitions, ` +
-			`${options.threads} stream thread(s), ` +
 			`~${options.valueBytes} byte values, ${options.provider} state, best of ${options.runs} runs\n`
 	)
 	const rows: Array<{ scenario: string; guarantee: string; 'records/s': string; runs: string }> = []

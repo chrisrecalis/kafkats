@@ -5,6 +5,7 @@ import {
 	createTopics,
 	injectCommitFailures,
 	newClient,
+	readAllCommitted,
 	requireKafkaBrokers,
 	sleep,
 	uniqueTopicName,
@@ -82,7 +83,6 @@ describe('EOS failure paths', () => {
 	const eosCfg = (applicationId: string, extra: Record<string, unknown> = {}) => ({
 		applicationId,
 		client,
-		numStreamThreads: 1,
 		processingGuarantee: 'exactly_once' as const,
 		commitIntervalMs: 300,
 		consumer: {
@@ -369,9 +369,8 @@ describe('EOS failure paths', () => {
 			const admin = client.admin()
 			const leo = await admin.fetchTopicOffsets(cl, [0, 1, 2], 'latest')
 			const lso = await admin.fetchTopicOffsets(cl, [0, 1, 2], 'latest', { isolationLevel: 'read_committed' })
-			const rows = await readCommitted(client, cl, { minCount: 30, timeoutMs: 10_000, idleMs: 800 }).catch(
-				() => []
-			)
+			// Changelog values are timestamped counts (BC14): only their offsets matter here.
+			const rows = await readAllCommitted(client, cl, 800)
 			const lastData = new Map<number, bigint>()
 			for (const r of rows) {
 				const prev = lastData.get(r.partition)
@@ -499,7 +498,7 @@ describe('EOS failure paths', () => {
 		}
 	)
 
-	it('failed commit inside onBeforeRebalance must not lose the aborted batch', { timeout: 90_000 }, async () => {
+	it('failed commit inside the revocation hook must not lose the aborted batch', { timeout: 90_000 }, async () => {
 		const input = uniqueTopicName('eos-t7-in')
 		const output = uniqueTopicName('eos-t7-out')
 		await createTopics(client, [
@@ -522,7 +521,14 @@ describe('EOS failure paths', () => {
 			sendOffsetsFailure
 		)
 		const build = (c: KafkaClient) => {
-			const app = flow(eosCfg(appId, { client: c, commitIntervalMs: 20_000 }))
+			// A transaction stays open for a commit interval, so it may not time out sooner (FlowConfigError).
+			const app = flow(
+				eosCfg(appId, {
+					client: c,
+					commitIntervalMs: 20_000,
+					producer: { lingerMs: 0, retries: 10, transactionTimeoutMs: 30_000 },
+				})
+			)
 			app.stream(input, { key: stringCodec, value: numberCodec })
 				.mapValues(v => v)
 				.to(output, { key: stringCodec, value: numberCodec })
@@ -538,7 +544,7 @@ describe('EOS failure paths', () => {
 			)
 			await sleep(1_500) // processed, txn still open (20s commit interval)
 			arm = true
-			await b.start() // rebalance => A's onBeforeRebalance commit fails
+			await b.start() // rebalance => A's revocation commit fails
 			expect(failures).toBeGreaterThan(0)
 			await producer.send(
 				input,

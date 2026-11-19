@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import type { KafkaClient, Producer } from '@kafkats/client'
-import { codec, flow, type FlowApp } from '../../src/index.js'
+import { ErrorCode, KafkaError, type KafkaClient, type Producer } from '@kafkats/client'
+import { codec, FailedProcessingError, flow, type FlowApp } from '../../src/index.js'
 import {
 	createTopics,
 	injectCommitFailures,
@@ -14,7 +14,7 @@ import {
 const stringCodec = codec.string()
 const numberCodec = codec.json<number>()
 
-describe('global tables and worker lifecycle', () => {
+describe('global tables and app lifecycle', () => {
 	let admin: KafkaClient
 	let producer: Producer
 	beforeAll(async () => {
@@ -98,7 +98,7 @@ describe('global tables and worker lifecycle', () => {
 		}
 	}, 80_000)
 
-	it('global table: a row that cannot be decoded after startup stops the app instead of serving a stale table', async () => {
+	it('global table: a row that cannot be decoded after startup stops the app and its stream processing', async () => {
 		const table = uniqueTopicName('r2-gt-bad-table')
 		const events = uniqueTopicName('r2-gt-bad-events')
 		const output = uniqueTopicName('r2-gt-bad-out')
@@ -115,21 +115,130 @@ describe('global tables and worker lifecycle', () => {
 		app.stream(events, { key: stringCodec, value: stringCodec })
 			.join(rows, (event, row) => `${event}+${row}`)
 			.to(output, { key: stringCodec, value: stringCodec })
+		const joined = async (): Promise<string[]> =>
+			(await readAllCommitted(admin, output, 800)).map(message => message.value!.toString())
 		try {
 			await app.start()
-			await producer.send(table, { key: 'k', value: Buffer.from('not json') })
+			await producer.send(events, { key: 'k', value: Buffer.from('before') })
+			for (const deadline = Date.now() + 10_000; (await joined()).length < 1 && Date.now() < deadline;) {
+				await sleep(200)
+			}
+			expect(await joined()).toEqual(['before+1'])
 
+			await producer.send(table, { key: 'k', value: Buffer.from('not json') })
 			for (const deadline = Date.now() + 10_000; app.state() !== 'ERROR' && Date.now() < deadline;) {
 				await sleep(100)
 			}
 			expect(app.state()).toBe('ERROR')
-			expect(app.getError()).toBeInstanceOf(SyntaxError)
+			// The deserialization handler's 'fail' (the default) wraps the codec's error (4.6.3).
+			expect(app.getError()).toBeInstanceOf(FailedProcessingError)
+			expect(app.getError()?.cause).toBeInstanceOf(SyntaxError)
+
+			// The table no longer advances, so nothing more may be joined against it.
+			await producer.send(events, { key: 'k', value: Buffer.from('after') })
+			await sleep(3_000)
+			expect(await joined()).toEqual(['before+1'])
 		} finally {
 			await app.close().catch(() => {})
 		}
 	}, 40_000)
 
-	it('close() while a worker is in restart backoff returns promptly and leaves no extra handles', async () => {
+	it('global table: a row that cannot be decoded in the last batch of the initial load fails start()', async () => {
+		const table = uniqueTopicName('r2-gt-bad-load-table')
+		const events = uniqueTopicName('r2-gt-bad-load-events')
+		const output = uniqueTopicName('r2-gt-bad-load-out')
+		await createTopics(admin, [{ name: table }, { name: events }, { name: output }])
+		await producer.send(table, [
+			{ key: 'a', value: Buffer.from('1') },
+			{ key: 'b', value: Buffer.from('not json') },
+		])
+
+		const app = flow({
+			applicationId: uniqueTopicName('r2-gt-bad-load-app'),
+			client: newClient('r2-gt-bad-load-app'),
+			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 50 },
+			producer: { lingerMs: 0 },
+		})
+		const rows = app.globalTable(table, { key: stringCodec, value: numberCodec })
+		app.stream(events, { key: stringCodec, value: stringCodec })
+			.join(rows, (event, row) => `${event}+${row}`)
+			.to(output, { key: stringCodec, value: stringCodec })
+		try {
+			await expect(app.start()).rejects.toBeInstanceOf(FailedProcessingError)
+			expect(app.getError()?.cause).toBeInstanceOf(SyntaxError)
+			expect(app.state()).toBe('ERROR')
+		} finally {
+			await app.close().catch(() => {})
+		}
+	}, 40_000)
+
+	it('a fatal error while restoring a task assigned anew puts the app in ERROR instead of restarting forever', async () => {
+		const input = uniqueTopicName('r2-fatal-restore-in')
+		const output = uniqueTopicName('r2-fatal-restore-out')
+		const applicationId = uniqueTopicName('r2-fatal-restore-app')
+		await createTopics(admin, [{ name: input, partitions: 2 }, { name: output }])
+		// Once armed, every restore consumer of the first instance (groupId `<appId>-restore-<taskId>-<n>`, DL14)
+		// fails with an error that no restart can fix.
+		const denied = new KafkaError('not authorized to read the changelog', ErrorCode.TopicAuthorizationFailed)
+		let armed = false
+		let restores = 0
+		const firstClient = newClient('r2-fatal-restore-app')
+		const createConsumer = firstClient.consumer.bind(firstClient)
+		firstClient.consumer = config => {
+			const consumer = createConsumer(config)
+			if (armed && config.groupId.startsWith(`${applicationId}-restore-`)) {
+				restores += 1
+				consumer.runBatch = () => Promise.reject(denied)
+			}
+			return consumer
+		}
+		const build = (client: KafkaClient): FlowApp => {
+			const app = flow({
+				applicationId,
+				client,
+				consumer: { autoOffsetReset: 'earliest', maxWaitMs: 50, sessionTimeoutMs: 6_000 },
+				producer: { lingerMs: 0 },
+			})
+			app.stream(input, { key: stringCodec, value: stringCodec })
+				.groupByKey()
+				.count({ storeName: 'counts', key: stringCodec, value: numberCodec })
+				.toStream()
+				.to(output, { key: stringCodec, value: numberCodec })
+			return app
+		}
+		const first = build(firstClient)
+		const second = build(newClient('r2-fatal-restore-app'))
+		try {
+			await first.start()
+			// The second instance joins and takes one of the two tasks; both count a record per partition, so the
+			// changelog of the second instance's task moves past what the first one has of it.
+			await second.start()
+			await producer.send(input, [
+				{ key: 'a', value: Buffer.from('x'), partition: 0 },
+				{ key: 'b', value: Buffer.from('x'), partition: 1 },
+			])
+			for (const deadline = Date.now() + 20_000; Date.now() < deadline;) {
+				if ((await readAllCommitted(admin, output, 500)).length >= 2) break
+			}
+			expect(await readAllCommitted(admin, output, 500)).toHaveLength(2)
+
+			// The second instance leaves: the first one gets its task anew and must restore it.
+			armed = true
+			await second.close()
+			for (const deadline = Date.now() + 20_000; first.state() !== 'ERROR' && Date.now() < deadline;) {
+				await sleep(100)
+			}
+			expect(restores).toBe(1)
+			expect(first.state()).toBe('ERROR')
+			expect(first.getError()).toBe(denied)
+		} finally {
+			await first.close().catch(() => {})
+			await second.close().catch(() => {})
+			await firstClient.disconnect().catch(() => {})
+		}
+	}, 60_000)
+
+	it('close() during the recovery backoff returns promptly and leaves no extra handles', async () => {
 		const input = uniqueTopicName('r2-lc-in')
 		const output = uniqueTopicName('r2-lc-out')
 		await createTopics(admin, [{ name: input }, { name: output }])
@@ -152,7 +261,7 @@ describe('global tables and worker lifecycle', () => {
 				.toStream()
 				.to(output, { key: stringCodec, value: numberCodec })
 			await app.start()
-			await sleep(2_500) // several failed commits -> worker is in backoff
+			await sleep(2_500) // several failed commits -> the app is in its recovery backoff
 			const t0 = Date.now()
 			await app.close()
 			expect(Date.now() - t0).toBeLessThan(5_000)
@@ -263,7 +372,7 @@ describe('start() retry', () => {
 		expect(new Set([...first, ...second]).size).toBe(N)
 	})
 
-	it('at-least-once: partitions processed concurrently count every record', async () => {
+	it('at-least-once: the tasks of one instance process concurrently and count every record', async () => {
 		const P = 4
 		const input = uniqueTopicName('r2-conc-in')
 		const output = uniqueTopicName('r2-conc-out')
@@ -285,7 +394,6 @@ describe('start() retry', () => {
 			applicationId,
 			client: newClient('r2-conc-app'),
 			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 50 },
-			consumerRun: { partitionConcurrency: P },
 		})
 		app.stream(input, { key: stringCodec, value: stringCodec })
 			.groupByKey()
@@ -307,4 +415,42 @@ describe('start() retry', () => {
 			await app.close()
 		}
 	})
+
+	it('at-least-once: the records of one task (two topics, one store) are processed one at a time', async () => {
+		const left = uniqueTopicName('r2-conc-merge-a')
+		const right = uniqueTopicName('r2-conc-merge-b')
+		const output = uniqueTopicName('r2-conc-merge-out')
+		await createTopics(admin, [{ name: left }, { name: right }, { name: output }])
+		// Both topics have the same key in partition 0: one count, kept in state partition 0.
+		const PER_TOPIC = 300
+		for (const topic of [left, right]) {
+			await producer.send(
+				topic,
+				Array.from({ length: PER_TOPIC }, () => ({ key: 'k', value: Buffer.from('x') }))
+			)
+		}
+		const app = flow({
+			applicationId: uniqueTopicName('r2-conc-merge-app'),
+			client: newClient('r2-conc-merge-app'),
+			consumer: { autoOffsetReset: 'earliest', maxWaitMs: 50 },
+		})
+		app.stream(left, { key: stringCodec, value: stringCodec })
+			.merge(app.stream(right, { key: stringCodec, value: stringCodec }))
+			.groupByKey()
+			.count({ key: stringCodec, value: numberCodec })
+			.toStream()
+			.to(output, { key: stringCodec, value: numberCodec })
+		try {
+			await app.start()
+			let counts: number[] = []
+			for (const deadline = Date.now() + 20_000; counts.length < 2 * PER_TOPIC && Date.now() < deadline;) {
+				await sleep(300)
+				counts = (await readAllCommitted(admin, output, 800)).map(m => numberCodec.decode(m.value!))
+			}
+			// Every record adds one: no update is lost to a concurrent read of the old count.
+			expect(counts).toEqual(Array.from({ length: 2 * PER_TOPIC }, (_, i) => i + 1))
+		} finally {
+			await app.close()
+		}
+	}, 60_000)
 })

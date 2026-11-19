@@ -1,6 +1,13 @@
 /** Shared helpers for the integration tests (real broker, see kafka.global-setup.ts). */
 import { afterAll, beforeAll } from 'vitest'
-import { ErrorCode, KafkaClient, KafkaError, type Consumer, type Message } from '@kafkats/client'
+import {
+	ErrorCode,
+	KafkaClient,
+	KafkaError,
+	type Consumer,
+	type KafkaClientConfig,
+	type Message,
+} from '@kafkats/client'
 import type {
 	ChangelogCheckpointStore,
 	Codec,
@@ -31,14 +38,28 @@ export function requireKafkaBrokers(): string[] {
 	return raw.split(',').map(b => b.trim())
 }
 
+/**
+ * An event-time base near the wall clock, a multiple of `alignMs` (so of every window size dividing it). Records
+ * stamped far in the past are deleted by the broker's time-based retention (7 days by default, checked every 5 minutes,
+ * the active segment included) while a test still reads them back.
+ */
+export function eventTimeBase(alignMs = 3_600_000): number {
+	return Math.floor(Date.now() / alignMs) * alignMs
+}
+
 /** A name that is unique per test run and call; also used for group and application ids. */
 export function uniqueTopicName(prefix: string): string {
 	return `${prefix.replace(/[^a-zA-Z0-9._-]/g, '-')}-${RUN_ID}-${randomSuffix()}`
 }
 
-/** A new (not yet connected) client for the test broker. */
+/** The config of a client for the test broker; a flow app given it creates, connects and disconnects the client. */
+export function clientConfig(prefix: string): KafkaClientConfig {
+	return { clientId: `${prefix}-${Date.now()}-${randomSuffix()}`, brokers: requireKafkaBrokers() }
+}
+
+/** A new (not yet connected) client for the test broker; whoever creates it disconnects it. */
 export function newClient(prefix: string): KafkaClient {
-	return new KafkaClient({ clientId: `${prefix}-${Date.now()}-${randomSuffix()}`, brokers: requireKafkaBrokers() })
+	return new KafkaClient(clientConfig(prefix))
 }
 
 /** Rejects with `Timed out after <ms>ms: <label>` when `promise` does not settle in time. */
@@ -189,36 +210,77 @@ export async function readCommittedTable<V>(
 	return table
 }
 
+/**
+ * A group's committed offset (-1 without one) and its metadata for one partition; pending transactional offset
+ * commits are waited for.
+ */
+export async function fetchCommitted(
+	client: KafkaClient,
+	groupId: string,
+	topic: string,
+	partition = 0
+): Promise<{ offset: bigint; metadata: string | null }> {
+	const coordinator = await client.cluster.getCoordinator('GROUP', groupId)
+	const response = await coordinator.offsetFetch({
+		groupId,
+		topics: [{ name: topic, partitions: [{ partitionIndex: partition }] }],
+		requireStable: true,
+	})
+	const { committedOffset, metadata } = response.topics[0]!.partitions[0]!
+	return { offset: committedOffset, metadata }
+}
+
 // ============================================================================
 // Fault injection and state providers
 // ============================================================================
 
+const injectedFailure = () => new KafkaError('injected commit failure', ErrorCode.RequestTimedOut)
+
 /**
- * Make `client.producer()` return producers whose transaction commit (`sendOffsets`) throws
- * `error()` whenever `shouldFail()` returns true (a retriable Kafka error by default).
+ * Make `client.producer()` return producers whose transactions (`beginTransaction()`, which `transaction()` uses too)
+ * fail `sendOffsets` with `error()` whenever `shouldFail()` returns true (a retriable Kafka error by default): the
+ * fault point of an exactly-once commit after its outputs and changelog records were sent.
  */
 export function injectCommitFailures(
 	client: KafkaClient,
 	shouldFail: () => boolean,
-	error: () => Error = () => new KafkaError('injected commit failure', ErrorCode.RequestTimedOut)
-) {
+	error: () => Error = injectedFailure
+): void {
 	const original = client.producer.bind(client)
-	;(client as any).producer = (config: any) => {
+	client.producer = config => {
 		const producer = original(config)
-		const originalTransaction = producer.transaction.bind(producer)
-		;(producer as any).transaction = (fn: any, ...rest: any[]) =>
-			originalTransaction(
-				async (tx: any) => {
-					const sendOffsets = tx.sendOffsets.bind(tx)
-					tx.sendOffsets = async (...args: any[]) => {
-						if (shouldFail()) throw error()
-						return sendOffsets(...args)
-					}
-					return fn(tx)
-				},
-				...rest
-			)
+		const begin = producer.beginTransaction.bind(producer)
+		producer.beginTransaction = async options => {
+			const transaction = await begin(options)
+			const { sendOffsets } = transaction
+			transaction.sendOffsets = (async (...args: unknown[]) => {
+				if (shouldFail()) throw error()
+				return Reflect.apply(sendOffsets, transaction, args)
+			}) as typeof sendOffsets
+			return transaction
+		}
 		return producer
+	}
+}
+
+/**
+ * Make `client.consumer()` return consumers whose `commit()` (at-least-once offset commits outside handlers) fails
+ * with `error()` whenever `shouldFail()` returns true (a retriable Kafka error by default).
+ */
+export function injectConsumerCommitFailures(
+	client: KafkaClient,
+	shouldFail: () => boolean,
+	error: () => Error = injectedFailure
+): void {
+	const original = client.consumer.bind(client)
+	client.consumer = config => {
+		const consumer = original(config)
+		const commit = consumer.commit.bind(consumer)
+		consumer.commit = async (offsets, options) => {
+			if (shouldFail()) throw error()
+			return commit(offsets, options)
+		}
+		return consumer
 	}
 }
 

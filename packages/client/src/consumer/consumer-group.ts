@@ -10,12 +10,15 @@
 
 import { EventEmitter } from 'node:events'
 import type { Cluster } from '@/client/cluster.js'
+import type { ClusterMetadata } from '@/client/types.js'
+import type { JoinGroupMember } from '@/protocol/messages/responses/join-group.js'
 import type { Broker } from '@/client/broker.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import { KafkaProtocolError, CoordinatorNotAvailableError, isConnectionFailure } from '@/client/errors.js'
 import type {
 	TopicPartition,
 	ConsumerGroupEvents,
+	ConsumerGroupMetadata,
 	ConsumerConfig,
 	ResolvedConsumerConfig,
 	PartitionAssignmentStrategy,
@@ -68,6 +71,8 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 	private generationId: number = -1
 	private state: ConsumerGroupState = ConsumerGroupState.UNJOINED
 	private assignment: TopicPartition[] = []
+	/** The group metadata of the last completed join; cleared when the coordinator rejects the member or generation. */
+	private joined: ConsumerGroupMetadata | undefined
 	private heartbeatTimer: ReturnType<typeof setTimeout> | null = null
 	private abortController: AbortController | null = null
 
@@ -76,6 +81,13 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 	private pendingRevocation: TopicPartition[] = [] // Partitions pending revoke in phase 1
 	private rebalanceProtocol: RebalanceProtocol = 'eager' // Set from broker-selected protocol
 	private selectedProtocolName: string | null = null // Broker-selected protocol name from JoinGroup
+	/**
+	 * Leader only (Kafka's assignment snapshot): the partition count, per subscribed topic, of the metadata the last
+	 * assignment was computed from, 0 for a topic that metadata did not show. Null on a member that does not lead.
+	 */
+	private assignedPartitionCounts: Map<string, number> | null = null
+	/** The metadata check in flight, started after a heartbeat (never awaited by the heartbeat loop). */
+	private metadataCheck: Promise<void> | null = null
 
 	constructor(cluster: Cluster, config: ConsumerConfig, logger?: Logger, assignor?: PartitionAssignor) {
 		super()
@@ -188,6 +200,15 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 	}
 
 	/**
+	 * The group metadata of this member's last completed join (JoinGroup and SyncGroup): what offsets committed for
+	 * its assignment must carry. Undefined before the first join, and from the moment the coordinator rejects the
+	 * member or its generation (session lost, fenced, illegal generation) until the next join completes.
+	 */
+	get groupMetadata(): ConsumerGroupMetadata | undefined {
+		return this.joined
+	}
+
+	/**
 	 * Get current partition assignment
 	 */
 	get currentAssignment(): TopicPartition[] {
@@ -232,6 +253,12 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 
 			const result = this.syncGroupResult!
 			this.syncGroupResult = null
+			this.joined = {
+				groupId: this.config.groupId,
+				generationId: this.generationId,
+				memberId: this.memberId,
+				groupInstanceId: this.config.groupInstanceId ?? null,
+			}
 
 			// For cooperative protocol, check for NEWLY revoked partitions
 			// (partitions in result.revoked but not already in pendingRevocation)
@@ -377,8 +404,7 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 			this.emitError(error as Error)
 		} finally {
 			this.state = ConsumerGroupState.UNJOINED
-			this.memberId = ''
-			this.generationId = -1
+			this.resetMember()
 			this.assignment = []
 			this.ownedPartitions = []
 			this.pendingRevocation = []
@@ -576,13 +602,24 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 			this.rebalanceProtocol = 'eager'
 		}
 
-		// If we're the leader, we need to compute assignments
-		if (response.leader === this.memberId) {
+		if (response.leader !== this.memberId) {
+			// Only the leader watches the metadata of the subscribed topics.
+			this.assignedPartitionCounts = null
+		} else if (response.skipAssignment) {
+			// A static leader that rejoined a stable group (KIP-814, JoinGroup v9): the group keeps its assignment, and
+			// the leader goes on watching the metadata (Java's onLeaderElected with skipAssignment).
+			this.logger.debug('this member is leader of an unchanged group, skipping the assignment', {
+				memberCount: response.members.length,
+			})
+			const { subscribed } = subscriptionsOf(response.members)
+			this.leaderAssignments = null
+			this.assignedPartitionCounts = partitionCounts(subscribed, await this.cluster.refreshMetadata(subscribed))
+		} else {
 			this.logger.debug('this member is leader, computing assignments', {
 				memberCount: response.members.length,
 				protocolName: response.protocolName,
 			})
-			await this.computeAssignments(topics, response.members, response.protocolName)
+			await this.computeAssignments(response.members, response.protocolName)
 		}
 
 		this.state = ConsumerGroupState.AWAITING_SYNC
@@ -601,9 +638,7 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 
 			case ErrorCode.UnknownMemberId:
 			case ErrorCode.IllegalGeneration:
-				// Clear member ID and rejoin
-				this.memberId = ''
-				this.generationId = -1
+				this.resetMember()
 				await this.joinGroup(topics)
 				break
 
@@ -655,31 +690,22 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 	}
 
 	/**
-	 * Compute partition assignments (leader only)
+	 * Compute partition assignments (leader only), over the topics any member subscribes to: like Java's
+	 * onLeaderElected, the leader fetches and watches the metadata of the whole group's subscription, so that a topic
+	 * only other members subscribe to is assigned too.
 	 */
-	private async computeAssignments(
-		topics: string[],
-		members: Array<{ memberId: string; groupInstanceId: string | null; metadata: Buffer }>,
-		protocolName: string | null
-	): Promise<void> {
-		// Fetch metadata for all subscribed topics
-		const metadata = await this.cluster.refreshMetadata(topics)
+	private async computeAssignments(members: JoinGroupMember[], protocolName: string | null): Promise<void> {
+		const { subscriptions, subscribed } = subscriptionsOf(members)
+		const metadata = await this.cluster.refreshMetadata(subscribed)
 
 		// Build topic -> partitions map
 		const topicPartitions = new Map<string, number[]>()
-		for (const topic of topics) {
+		for (const topic of subscribed) {
 			const topicMeta = metadata.topics.get(topic)
 			if (topicMeta) {
 				topicPartitions.set(topic, Array.from(topicMeta.partitions.keys()))
 			}
 		}
-
-		// Build member subscriptions
-		const memberSubscriptions: MemberSubscription[] = members.map(m => ({
-			memberId: m.memberId,
-			groupInstanceId: m.groupInstanceId ?? undefined,
-			metadata: decodeSubscriptionMetadata(m.metadata),
-		}))
 
 		// Use the assignor matching the broker-selected protocol
 		const assignor = this.getAssignorForProtocol(protocolName)
@@ -687,11 +713,65 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 			assignor: assignor.name,
 			protocolName,
 			memberCount: members.length,
-			topicCount: topics.length,
+			topicCount: subscribed.length,
 		})
 
 		// Compute assignments using the selected assignor
-		this.leaderAssignments = assignor.assign(memberSubscriptions, topicPartitions)
+		this.leaderAssignments = assignor.assign(subscriptions, topicPartitions)
+		this.assignedPartitionCounts = partitionCounts(subscribed, metadata)
+	}
+
+	/**
+	 * Kafka's leader metadata watch (ConsumerCoordinator.rejoinNeededOrPending), started after each heartbeat: the
+	 * leader asks for a rebalance once the partition counts of the subscribed topics differ from those it assigned
+	 * with, so that a topic metadata did not show yet at the assignment (one created moments before), added partitions
+	 * and a deleted topic are assigned again. A topic missing at the assignment is looked up again at every heartbeat
+	 * until it shows up; other changes are seen once a metadata refresh brings them. One check at a time, and the
+	 * heartbeat loop never waits for it (a slow metadata request must not delay heartbeats into a session timeout).
+	 */
+	private checkAssignedMetadata(): void {
+		if (this.metadataCheck || !this.assignedPartitionCounts) {
+			return
+		}
+		this.metadataCheck = this.rejoinIfAssignedMetadataChanged()
+			.catch((error: Error) => this.logger.warn('metadata check failed', { error: error.message }))
+			.finally(() => {
+				this.metadataCheck = null
+			})
+	}
+
+	private async rejoinIfAssignedMetadataChanged(): Promise<void> {
+		const assigned = this.assignedPartitionCounts
+		if (!assigned) {
+			return
+		}
+		const missing = [...assigned].filter(([, count]) => count === 0).map(([topic]) => topic)
+		if (missing.length > 0) {
+			try {
+				await this.cluster.refreshMetadata(missing)
+			} catch (error) {
+				this.logger.debug('metadata refresh of unassigned topics failed', {
+					topics: missing,
+					error: (error as Error).message,
+				})
+				return
+			}
+		}
+		// A rejoin or a loss while the refresh was in flight replaced or invalidated the snapshot.
+		if (this.assignedPartitionCounts !== assigned || this.state !== ConsumerGroupState.STABLE) {
+			return
+		}
+		const topics = this.cluster.getMetadata()?.topics
+		const count = (topic: string) => topics?.get(topic)?.partitions.size ?? 0
+		const changed = [...assigned].filter(([topic, assignedCount]) => count(topic) !== assignedCount)
+		if (changed.length === 0) {
+			return
+		}
+		this.logger.info('partitions of subscribed topics changed since the assignment, rejoining', {
+			topics: changed.map(([topic, assignedCount]) => ({ topic, assigned: assignedCount, now: count(topic) })),
+		})
+		this.assignedPartitionCounts = null
+		this.emit('rebalance')
 	}
 
 	// Temporary storage for leader assignments (used in syncGroup)
@@ -798,9 +878,7 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 
 			case ErrorCode.UnknownMemberId:
 			case ErrorCode.IllegalGeneration:
-				// Clear member ID and rejoin
-				this.memberId = ''
-				this.generationId = -1
+				this.resetMember()
 				this.state = ConsumerGroupState.UNJOINED
 				await this.joinGroup(topics)
 				await this.syncGroup(topics)
@@ -869,7 +947,9 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 						// May flip state to non-STABLE (UnknownMemberId, FencedInstanceId);
 						// the finally guard skips the reschedule in that case.
 						await this.handleHeartbeatError(response.errorCode)
+						return
 					}
+					this.checkAssignedMetadata()
 				})
 				.catch(async error => {
 					this.logger.error('heartbeat failed', { error: (error as Error).message })
@@ -911,18 +991,9 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 				break
 
 			case ErrorCode.UnknownMemberId: {
-				// Fatal session loss - lost generation without ability to commit
-				// Emit sessionLost with the partitions we lost (can't commit them anymore)
 				this.logger.warn('session lost - unknown member id', { memberId: this.memberId })
-				const lostPartitions = [...this.ownedPartitions]
-				this.memberId = ''
-				this.generationId = -1
-				this.ownedPartitions = []
-				this.pendingRevocation = []
-				// Emit sessionLost first (Consumer translates to partitionsLost)
-				if (lostPartitions.length > 0) {
-					this.emit('sessionLost', lostPartitions)
-				}
+				this.resetMember()
+				this.loseAssignment()
 
 				// For static members, UNKNOWN_MEMBER_ID after being replaced is a fencing scenario.
 				// Surface this as FENCED_INSTANCE_ID and stop instead of trying to transparently rejoin.
@@ -941,6 +1012,7 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 				// Common during cooperative rebalances
 				this.logger.debug('illegal generation', { generationId: this.generationId })
 				this.generationId = -1
+				this.joined = undefined
 				this.emit('rebalance')
 				break
 
@@ -952,19 +1024,35 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 			case ErrorCode.FencedInstanceId: {
 				// Fatal error - another instance with same groupInstanceId is active
 				this.logger.warn('session lost - instance fenced', { groupInstanceId: this.config.groupInstanceId })
-				const fencedPartitions = [...this.ownedPartitions]
-				this.ownedPartitions = []
-				this.pendingRevocation = []
-				// Emit sessionLost first (Consumer translates to partitionsLost)
-				if (fencedPartitions.length > 0) {
-					this.emit('sessionLost', fencedPartitions)
-				}
+				this.joined = undefined
+				this.loseAssignment()
 				this.emitError(new KafkaProtocolError(errorCode, 'Static member instance is fenced'))
 				break
 			}
 
 			default:
 				this.emitError(new KafkaProtocolError(errorCode, 'Heartbeat failed'))
+		}
+	}
+
+	/** Forget the member id and generation the coordinator rejected: the member joins as a new one next. */
+	private resetMember(): void {
+		this.memberId = ''
+		this.generationId = -1
+		this.joined = undefined
+	}
+
+	/**
+	 * After the session was lost, every partition is lost rather than revoked: its offsets can no longer be
+	 * committed. The assignment goes too, so the next rebalance does not revoke the lost partitions again.
+	 */
+	private loseAssignment(): void {
+		const lost = this.ownedPartitions
+		this.ownedPartitions = []
+		this.pendingRevocation = []
+		this.assignment = []
+		if (lost.length > 0) {
+			this.emit('sessionLost', lost)
 		}
 	}
 
@@ -984,4 +1072,23 @@ export class ConsumerGroup extends EventEmitter<ConsumerGroupEvents> {
 		this.ownedPartitions = []
 		this.pendingRevocation = []
 	}
+}
+
+/** The members' decoded subscriptions, and every topic one of them subscribes to (the group's subscription). */
+function subscriptionsOf(members: readonly JoinGroupMember[]): {
+	subscriptions: MemberSubscription[]
+	subscribed: string[]
+} {
+	const subscriptions = members.map(member => ({
+		memberId: member.memberId,
+		groupInstanceId: member.groupInstanceId ?? undefined,
+		metadata: decodeSubscriptionMetadata(member.metadata),
+	}))
+	const subscribed = [...new Set(subscriptions.flatMap(subscription => subscription.metadata.topics))].sort()
+	return { subscriptions, subscribed }
+}
+
+/** The partition count metadata shows of each topic (0 for a topic it does not show): the leader's snapshot. */
+function partitionCounts(topics: readonly string[], metadata: ClusterMetadata): Map<string, number> {
+	return new Map(topics.map(topic => [topic, metadata.topics.get(topic)?.partitions.size ?? 0]))
 }

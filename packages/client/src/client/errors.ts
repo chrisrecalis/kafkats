@@ -51,12 +51,18 @@ export class KafkaProtocolError extends KafkaError {
 export class LeaderNotAvailableError extends KafkaError {
 	readonly topic: string
 	readonly partition: number
+	/** Why the leader could not be looked up, when the metadata refresh failed (e.g. no broker reachable). */
+	override readonly cause?: Error
 
-	constructor(topic: string, partition: number) {
-		super(`Leader not available for ${topic}-${partition}`, ErrorCode.LeaderNotAvailable)
+	constructor(topic: string, partition: number, cause?: Error) {
+		super(
+			`Leader not available for ${topic}-${partition}${cause ? `: ${cause.message}` : ''}`,
+			ErrorCode.LeaderNotAvailable
+		)
 		this.name = 'LeaderNotAvailableError'
 		this.topic = topic
 		this.partition = partition
+		this.cause = cause
 	}
 }
 
@@ -262,6 +268,59 @@ export class IllegalGenerationError extends GroupError {
 }
 
 /**
+ * Commit rejected because this member's generation is gone (IllegalGeneration, UnknownMemberId, FencedInstanceId).
+ *
+ * The member must rejoin the group; the offsets were not committed.
+ */
+export class CommitFailedError extends GroupError {
+	override readonly cause: KafkaProtocolError
+
+	constructor(groupId: string, cause: KafkaProtocolError) {
+		super(`Commit failed for group ${groupId}: ${cause.message}`, cause.errorCode, groupId)
+		this.name = 'CommitFailedError'
+		this.cause = cause
+	}
+}
+
+// ==================== Consumer Offset Errors ====================
+
+/**
+ * The fetch position of a partition is outside the range of offsets the broker holds
+ */
+export class OffsetOutOfRangeError extends KafkaError {
+	readonly topic: string
+	readonly partition: number
+	readonly offset: bigint
+
+	constructor(topic: string, partition: number, offset: bigint) {
+		super(`Offset ${offset} is out of range for ${topic}-${partition}`, ErrorCode.OffsetOutOfRange)
+		this.name = 'OffsetOutOfRangeError'
+		this.topic = topic
+		this.partition = partition
+		this.offset = offset
+	}
+}
+
+/**
+ * Reset policy 'none' and no committed offset (Java NoOffsetForPartitionException).
+ */
+export class NoOffsetForPartitionError extends KafkaError {
+	readonly topic: string
+	readonly partition: number
+
+	constructor(topic: string, partition: number) {
+		super(
+			`No committed offset for ${topic}-${partition} and the offset reset policy is 'none'`,
+			ErrorCode.None, // Not a Kafka protocol error
+			false
+		)
+		this.name = 'NoOffsetForPartitionError'
+		this.topic = topic
+		this.partition = partition
+	}
+}
+
+/**
  * Producer record is too large
  */
 export class RecordTooLargeError extends KafkaError {
@@ -355,16 +414,20 @@ export class InvalidTxnStateError extends KafkaError {
  */
 export class TransactionAbortedError extends KafkaError {
 	readonly transactionalId: string
+	/** 'aborted': the transaction did not commit. 'unknown': EndTxn(commit) may have reached the broker. */
+	readonly outcome: 'aborted' | 'unknown'
 	override readonly cause?: Error
 
-	constructor(transactionalId: string, cause?: Error) {
+	constructor(transactionalId: string, cause?: Error, outcome: TransactionAbortedError['outcome'] = 'aborted') {
+		const what = outcome === 'unknown' ? 'Transaction commit outcome unknown' : 'Transaction aborted'
 		super(
-			`Transaction aborted for ${transactionalId}${cause ? `: ${cause.message}` : ''}`,
+			`${what} for ${transactionalId}${cause ? `: ${cause.message}` : ''}`,
 			ErrorCode.None, // Not a Kafka protocol error
 			false
 		)
 		this.name = 'TransactionAbortedError'
 		this.transactionalId = transactionalId
+		this.outcome = outcome
 		this.cause = cause
 	}
 }

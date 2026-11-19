@@ -114,10 +114,10 @@ export function memoryParitySuite(engine: EngineUnderTest): void {
 					expect(show(expiredMemory!)).toEqual(show(expiredLmdb!))
 				}
 				if (i % 50 === 0) {
-					const earliestStart = Math.floor(next() * 400) - 150
-					const latestEnd = earliestStart + Math.floor(next() * 300)
+					const earliestSessionEnd = Math.floor(next() * 400) - 150
+					const latestSessionStart = earliestSessionEnd + Math.floor(next() * 300)
 					const [fromLmdb, fromMemory] = await Promise.all(
-						stores.map(s => collect(s.findSessions(key, earliestStart, latestEnd)))
+						stores.map(s => collect(s.findSessions(key, earliestSessionEnd, latestSessionStart)))
 					)
 					expect(fromMemory).toEqual(fromLmdb)
 				}

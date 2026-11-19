@@ -1,7 +1,8 @@
 /**
- * Round 3 / attack 7: stream time across a restart. Stream time (the late-record clock) is held in memory per source
- * partition and restarts from 0 after a restart / reassignment, so a record that the failure-free run drops as "past
- * retention" is processed (and re-emitted) by a run with a restart in the middle.
+ * Round 3 / attack 7: stream time across a restart. The window aggregation's clock (the late-record clock) is committed
+ * with the offsets and seeded from them (D5), so a record that the failure-free run drops as late (its window closed
+ * more than the grace period ago) is dropped by a run with a restart in the middle too. A clock that started from 0
+ * after a restart or reassignment would count it and re-emit its window.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { KafkaClient, Producer } from '@kafkats/client'
@@ -36,16 +37,16 @@ describe('hardening: stream time survives a restart', () => {
 		})
 		app.stream(input, { key: str, value: str })
 			.groupByKey()
-			.windowedBy(TimeWindows.of(1_000))
+			.windowedBy(TimeWindows.ofSizeAndGrace('1s', '23s'))
 			.count({ storeName: 'w', value: num })
 			.toStream()
-			.selectKey(
-				(_v, k) =>
-					`${(k as unknown as { key: string }).key}@${(k as unknown as { window: { start: number } }).window.start % 1_000_000}`
-			)
+			.selectKey(k => `${k!.key}@${k!.window.start % 1_000_000}`)
 			.to(output, { key: str, value: num })
 		return app
 	}
+
+	/** An output row: the count of the window starting at `windowStart`. */
+	const row = (windowStart: number, count: number) => `a@${windowStart % 1_000_000}=${count}`
 
 	async function run(restart: boolean, lateTs: (base: number) => number[], base: number): Promise<string[]> {
 		const input = uniqueTopicName('r3-st-in')
@@ -61,7 +62,7 @@ describe('hardening: stream time survives a restart', () => {
 				}
 				await sleep(1_500)
 			}
-			// W(base) gets 2 records, then stream time jumps 100s (retention is 24s), then the first window is long expired
+			// W(base) gets 2 records, then stream time jumps 100s: W(base) closed 76s ago (its end + 23s grace)
 			await send([base, base + 200, base + 100_000])
 			if (restart) {
 				await app.close()
@@ -77,18 +78,20 @@ describe('hardening: stream time survives a restart', () => {
 		}
 	}
 
-	it('late record beyond retention (window long expired): restart run == failure-free run', async () => {
-		const lateTs = (base: number) => [base + 300] // 99.7s behind stream time: dropped by the failure-free run
+	it('late record of a closed window: restart run == failure-free run, which drops it', async () => {
+		const lateTs = (base: number) => [base + 300] // 99.7s behind stream time: W(base) closed long ago
 		const base = Math.floor(Date.now() / 1000) * 1000
 		const free = await run(false, lateTs, base)
+		expect(free).toEqual([row(base, 1), row(base, 2), row(base + 100_000, 1)].sort())
 		const restarted = await run(true, lateTs, base)
 		expect(restarted).toEqual(free)
 	}, 80_000)
 
-	it('late record within retention: restart run == failure-free run (guard)', async () => {
-		const lateTs = (base: number) => [base + 100_000 - 5_000]
+	it('late record within the grace period: restart run == failure-free run, which counts it (guard)', async () => {
+		const lateTs = (base: number) => [base + 100_000 - 5_000] // W(base + 95s) is open until base + 119s
 		const base = Math.floor(Date.now() / 1000) * 1000
 		const free = await run(false, lateTs, base)
+		expect(free).toContain(row(base + 95_000, 1))
 		const restarted = await run(true, lateTs, base)
 		expect(restarted).toEqual(free)
 	}, 80_000)

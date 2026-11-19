@@ -2,7 +2,7 @@
 	"name": "@kafkats/opentelemetry",
 	"private": false,
 	"version": "0.13.0",
-	"description": "OpenTelemetry traces and metrics for @kafkats/client.",
+	"description": "OpenTelemetry traces and metrics for @kafkats/client and @kafkats/flow.",
 	"type": "module",
 	"main": "dist/index.cjs",
 	"module": "dist/index.js",
@@ -60,6 +60,7 @@
 	},
 	"devDependencies": {
 		"@kafkats/client": "workspace:^",
+		"@kafkats/flow": "workspace:^",
 		"@opentelemetry/api": "^1.9.0",
 		"@opentelemetry/context-async-hooks": "^2.0.0",
 		"@opentelemetry/core": "^2.0.0",

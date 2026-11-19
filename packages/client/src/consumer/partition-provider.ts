@@ -10,28 +10,43 @@ import type { Cluster } from '@/client/cluster.js'
 import type { Logger } from '@/logger.js'
 import type { ConsumerGroup, JoinResult } from './consumer-group.js'
 import type { OffsetManager } from './offset-manager.js'
-import type { TopicPartition, ManualAssignment, AutoOffsetReset } from './types.js'
+import type {
+	AssignedPartition,
+	CommittedOffset,
+	ManualAssignment,
+	OffsetResetEvent,
+	OffsetResetPolicy,
+	TopicPartition,
+} from './types.js'
 import { diagnostics, trace, type RebalanceDiagnostics } from '@/diagnostics.js'
 import { retry } from '@/utils/retry.js'
 import { sleep } from '@/utils/sleep.js'
-import { CoordinatorNotAvailableError, NotCoordinatorError, isConnectionFailure } from '@/client/errors.js'
+import { tpKey } from '@/utils/topic-partition.js'
+import {
+	CoordinatorNotAvailableError,
+	NotCoordinatorError,
+	TimeoutError,
+	isConnectionFailure,
+} from '@/client/errors.js'
 import { ReconnectionStrategy } from '@/utils/reconnection-strategy.js'
 
 /** Minimum spacing between 'error' events reported while waiting for an unreachable cluster. */
 const UNREACHABLE_REPORT_INTERVAL_MS = 5000
 
-/**
- * Partition with resolved offset (internal type)
- */
-export type TopicPartitionOffset = TopicPartition & { offset: bigint }
-
 export interface PartitionProviderCallbacks {
+	/** The group asked for a rebalance; a rebalance step follows once the handlers returned. */
+	onRebalancePending: () => void
 	// Awaited at the start of the rebalance protocol so transactional consumers can commit
 	// in-flight work before partitions are revoked.
 	onRebalance: () => Promise<void>
-	onPartitionsAssigned: (partitions: TopicPartitionOffset[]) => Promise<void>
+	onPartitionsAssigned: (partitions: AssignedPartition[]) => Promise<void>
 	onPartitionsRevoked: (partitions: TopicPartition[]) => Promise<void>
-	onPartitionsLost: (partitions: TopicPartition[]) => void
+	/** Called synchronously when the session is lost; the next rejoin waits for the returned promise. */
+	onPartitionsLost: (partitions: TopicPartition[]) => Promise<void>
+	/** A rebalance step finished, and no other rebalance was requested meanwhile. */
+	onRebalanceComplete: () => void
+	/** A partition without a committed offset starts where its reset policy put it. */
+	onOffsetReset: (reset: OffsetResetEvent) => void
 	onError: (error: Error) => void
 }
 
@@ -41,7 +56,10 @@ export interface PartitionProvider {
 	stop(budgetMs?: number): Promise<void>
 	/** Abandon requests parked at an unresponsive broker (shutdown deadline exceeded). */
 	interrupt?(): void
+	/** Whether a rebalance step is waiting to be run (see checkAndHandleRebalance). */
 	hasPendingRebalance(): boolean
+	/** Whether a rebalance was requested and the step serving it has not finished yet. */
+	isRebalancing(): boolean
 	/**
 	 * Check for and handle any pending rebalance synchronously.
 	 * Called by the poll loop before processing batches to ensure
@@ -50,12 +68,40 @@ export interface PartitionProvider {
 	checkAndHandleRebalance(): Promise<void>
 }
 
+/**
+ * Where each partition starts: its given offset, else its committed offset, else where its reset policy puts it
+ * (reported to `onReset`). A partition whose policy is 'none' and that has no committed offset fails it with
+ * NoOffsetForPartitionError.
+ */
+async function resolveAssignment(
+	offsetManager: OffsetManager,
+	partitions: readonly TopicPartition[],
+	committedOffsets: ReadonlyMap<string, CommittedOffset>,
+	resetPolicy: OffsetResetPolicy,
+	onReset: (reset: OffsetResetEvent) => void,
+	givenOffsets?: ReadonlyMap<string, bigint>
+): Promise<AssignedPartition[]> {
+	const assigned: AssignedPartition[] = []
+	for (const { topic, partition } of partitions) {
+		const key = tpKey(topic, partition)
+		const committed = committedOffsets.get(key) ?? null
+		let offset = givenOffsets?.get(key) ?? committed?.offset
+		if (offset === undefined) {
+			const policy = typeof resetPolicy === 'function' ? resetPolicy(topic, partition) : resetPolicy
+			offset = await offsetManager.resolveStartingOffset(topic, partition, policy, committedOffsets)
+			onReset({ topic, partition, from: null, to: offset, reason: 'no-commit' })
+		}
+		assigned.push({ topic, partition, offset, committed })
+	}
+	return assigned
+}
+
 export interface ManualPartitionProviderConfig {
 	assignment: ManualAssignment[]
 	cluster: Cluster
 	groupId: string
 	offsetManager: OffsetManager
-	autoOffsetReset: AutoOffsetReset
+	autoOffsetReset: OffsetResetPolicy
 	signal?: AbortSignal
 }
 
@@ -64,7 +110,7 @@ export class ManualPartitionProvider implements PartitionProvider {
 	private readonly cluster: Cluster
 	private readonly groupId: string
 	private readonly offsetManager: OffsetManager
-	private readonly autoOffsetReset: AutoOffsetReset
+	private readonly autoOffsetReset: OffsetResetPolicy
 	private readonly signal?: AbortSignal
 
 	constructor(config: ManualPartitionProviderConfig) {
@@ -84,8 +130,21 @@ export class ManualPartitionProvider implements PartitionProvider {
 			topic: tp.topic,
 			partition: tp.partition,
 		}))
-		const partitionsWithOffsets = await this.resolveOffsets(partitions)
-		await callbacks.onPartitionsAssigned(partitionsWithOffsets)
+		const givenOffsets = new Map<string, bigint>()
+		for (const tp of this.assignment) {
+			if (tp.offset !== undefined) givenOffsets.set(tpKey(tp.topic, tp.partition), tp.offset)
+		}
+		const committedOffsets = await this.offsetManager.fetchCommittedOffsets(partitions)
+		await callbacks.onPartitionsAssigned(
+			await resolveAssignment(
+				this.offsetManager,
+				partitions,
+				committedOffsets,
+				this.autoOffsetReset,
+				callbacks.onOffsetReset,
+				givenOffsets
+			)
+		)
 
 		return partitions
 	}
@@ -96,37 +155,12 @@ export class ManualPartitionProvider implements PartitionProvider {
 		return false
 	}
 
-	async checkAndHandleRebalance(): Promise<void> {
-		// Manual assignment doesn't do rebalancing
+	isRebalancing(): boolean {
+		return false
 	}
 
-	private async resolveOffsets(partitions: TopicPartition[]): Promise<TopicPartitionOffset[]> {
-		const manualOffsets = new Map<string, bigint>()
-		for (const tp of this.assignment) {
-			if (tp.offset !== undefined) {
-				manualOffsets.set(`${tp.topic}:${tp.partition}`, tp.offset)
-			}
-		}
-
-		const committedOffsets = await this.offsetManager.fetchCommittedOffsets(partitions)
-
-		const result: TopicPartitionOffset[] = []
-		for (const tp of partitions) {
-			const key = `${tp.topic}:${tp.partition}`
-			const manualOffset = manualOffsets.get(key)
-			const offset =
-				manualOffset !== undefined
-					? manualOffset
-					: await this.offsetManager.resolveStartingOffset(
-							tp.topic,
-							tp.partition,
-							this.autoOffsetReset,
-							committedOffsets
-						)
-			result.push({ ...tp, offset })
-		}
-
-		return result
+	async checkAndHandleRebalance(): Promise<void> {
+		// Manual assignment doesn't do rebalancing
 	}
 
 	private async getCoordinatorWithRetry(): Promise<Broker> {
@@ -152,7 +186,7 @@ export interface GroupPartitionProviderConfig {
 	consumerGroup: ConsumerGroup
 	cluster: Cluster
 	groupId: string
-	autoOffsetReset: AutoOffsetReset
+	autoOffsetReset: OffsetResetPolicy
 	offsetManager: OffsetManager
 	logger: Logger
 	signal?: AbortSignal
@@ -163,7 +197,7 @@ export class GroupPartitionProvider implements PartitionProvider {
 	private readonly consumerGroup: ConsumerGroup
 	private readonly cluster: Cluster
 	private readonly groupId: string
-	private readonly autoOffsetReset: AutoOffsetReset
+	private readonly autoOffsetReset: OffsetResetPolicy
 	private readonly offsetManager: OffsetManager
 	private readonly logger: Logger
 	private readonly signal?: AbortSignal
@@ -171,7 +205,12 @@ export class GroupPartitionProvider implements PartitionProvider {
 
 	private callbacks: PartitionProviderCallbacks | null = null
 	private topics: string[] = []
-	private rebalancePending = false
+	/** A rebalance was requested and the run loop has not started its step yet. */
+	private rebalanceRequested = false
+	/** From the first request of a rebalance until the step serving it finished. */
+	private rebalancing = false
+	/** The loss hooks invoked since the last rejoin: the next rejoin waits for them. */
+	private readonly losses: Promise<void>[] = []
 	private lastUnreachableReportAt = 0
 
 	constructor(config: GroupPartitionProviderConfig) {
@@ -190,14 +229,18 @@ export class GroupPartitionProvider implements PartitionProvider {
 		this.topics = topics
 
 		this.consumerGroup.on('rebalance', () => this.onRebalanceEvent())
-		this.consumerGroup.on('sessionLost', (partitions: TopicPartition[]) => callbacks.onPartitionsLost(partitions))
+		this.consumerGroup.on('sessionLost', (partitions: TopicPartition[]) => {
+			const handled = callbacks.onPartitionsLost(partitions)
+			// Awaited, and its failure raised, by the next rejoin.
+			handled.catch(() => {})
+			this.losses.push(handled)
+		})
 		this.consumerGroup.on('error', (error: Error) => callbacks.onError(error))
 
 		const joinResult = await this.consumerGroup.join(topics)
 		await this.updateGroupState()
 
-		const partitionsWithOffsets = await this.resolveOffsets(joinResult.assignment)
-		await callbacks.onPartitionsAssigned(partitionsWithOffsets)
+		await callbacks.onPartitionsAssigned(await this.resolveOffsets(joinResult.assignment))
 
 		return joinResult.assignment
 	}
@@ -214,15 +257,19 @@ export class GroupPartitionProvider implements PartitionProvider {
 	 * Run a step of the rebalance protocol, retrying with bounded exponential backoff while the
 	 * cluster is unreachable (e.g. the broker is restarting). Dying here would strand the consumer
 	 * outside the group; instead it keeps trying until the cluster is back or the consumer stops.
-	 * Protocol-level errors are not retried. Failures are surfaced as throttled 'error' events.
+	 * Protocol-level errors are not retried, nor others unless `alsoRetried` says so. Failures are surfaced as
+	 * throttled 'error' events.
 	 */
-	private async whileReachable<T>(step: () => Promise<T>): Promise<T> {
+	private async whileReachable<T>(
+		step: () => Promise<T>,
+		alsoRetried: (error: unknown) => boolean = () => false
+	): Promise<T> {
 		const backoff = new ReconnectionStrategy({ initialDelayMs: 100, maxDelayMs: 5000, jitter: 0.2 })
 		for (;;) {
 			try {
 				return await step()
 			} catch (error) {
-				if (!isConnectionFailure(error) || this.signal?.aborted || !this.isRunning()) {
+				if (!(isConnectionFailure(error) || alsoRetried(error)) || this.signal?.aborted || !this.isRunning()) {
 					throw error
 				}
 				const now = Date.now()
@@ -241,27 +288,50 @@ export class GroupPartitionProvider implements PartitionProvider {
 
 	private onRebalanceEvent(): void {
 		this.logger.debug('rebalance event received')
-		this.rebalancePending = true
+		this.rebalanceRequested = true
+		if (!this.rebalancing) {
+			this.rebalancing = true
+			this.callbacks?.onRebalancePending()
+		}
 	}
 
 	hasPendingRebalance(): boolean {
-		return this.rebalancePending
+		return this.rebalanceRequested
+	}
+
+	isRebalancing(): boolean {
+		return this.rebalancing
 	}
 
 	async checkAndHandleRebalance(): Promise<void> {
-		if (!this.rebalancePending || !this.isRunning() || !this.callbacks) {
+		const callbacks = this.callbacks
+		if (!this.rebalanceRequested || !this.isRunning() || !callbacks) {
 			return
 		}
 
-		this.rebalancePending = false
+		this.rebalanceRequested = false
 		await trace(
 			diagnostics.rebalance,
 			(): RebalanceDiagnostics => ({ clientId: this.cluster.clientId, groupId: this.groupId }),
 			async rebalance => {
-				await this.rebalance(this.callbacks!)
+				await this.rebalance(callbacks)
 				if (rebalance) rebalance.assignment = this.consumerGroup.currentAssignment
 			}
 		)
+		// A rebalance requested after this one's join is a new one: its own step completes it.
+		if (this.rebalanceRequested || !this.isRunning()) return
+		this.rebalancing = false
+		callbacks.onRebalanceComplete()
+	}
+
+	/** Rejoin the group, once the loss hooks invoked so far have resolved. */
+	private async rejoin(revokedPartitions?: TopicPartition[]): Promise<JoinResult> {
+		await Promise.all(this.losses.splice(0))
+		const result = await this.whileReachable(() => this.consumerGroup.rejoin(this.topics, revokedPartitions))
+		// What asked for a rebalance until the group answered (e.g. heartbeats while partitions were revoked) asked
+		// for the rebalance this join took part in.
+		this.rebalanceRequested = false
+		return result
 	}
 
 	/** Go through one rebalance: let the application finish, give up partitions, rejoin, take the new assignment. */
@@ -281,7 +351,7 @@ export class GroupPartitionProvider implements PartitionProvider {
 				await callbacks.onPartitionsRevoked(previousAssignment)
 			}
 
-			const rejoinResult = await this.whileReachable(() => this.consumerGroup.rejoin(this.topics))
+			const rejoinResult = await this.rejoin()
 			if (!this.isRunning()) return
 
 			await this.updateGroupState()
@@ -325,8 +395,7 @@ export class GroupPartitionProvider implements PartitionProvider {
 			await this.callbacks!.onPartitionsRevoked(previousAssignment)
 		}
 
-		const partitionsWithOffsets = await this.resolveOffsets(assignment)
-		await this.callbacks!.onPartitionsAssigned(partitionsWithOffsets)
+		await this.callbacks!.onPartitionsAssigned(await this.resolveOffsets(assignment))
 	}
 
 	/**
@@ -360,8 +429,7 @@ export class GroupPartitionProvider implements PartitionProvider {
 				await sleep(backoffMs, { signal: this.signal, resolveOnAbort: true })
 				if (!this.isRunning()) return
 
-				const revokedBefore = rejoinResult.revoked
-				rejoinResult = await this.whileReachable(() => this.consumerGroup.rejoin(this.topics, revokedBefore))
+				rejoinResult = await this.rejoin(rejoinResult.revoked)
 				await this.updateGroupState()
 
 				if (rejoinResult.needsRejoin && rejoinResult.revoked.length > 0) {
@@ -376,8 +444,7 @@ export class GroupPartitionProvider implements PartitionProvider {
 
 			const toAssign = assignFullAssignment ? rejoinResult.assignment : rejoinResult.added
 			if (toAssign.length > 0) {
-				const assignedWithOffsets = await this.resolveOffsets(toAssign)
-				await this.callbacks!.onPartitionsAssigned(assignedWithOffsets)
+				await this.callbacks!.onPartitionsAssigned(await this.resolveOffsets(toAssign))
 			}
 		}
 	}
@@ -391,20 +458,20 @@ export class GroupPartitionProvider implements PartitionProvider {
 		)
 	}
 
-	private async resolveOffsets(partitions: TopicPartition[]): Promise<TopicPartitionOffset[]> {
-		const committedOffsets = await this.whileReachable(() => this.offsetManager.fetchCommittedOffsets(partitions))
-
-		const result: TopicPartitionOffset[] = []
-		for (const tp of partitions) {
-			const offset = await this.offsetManager.resolveStartingOffset(
-				tp.topic,
-				tp.partition,
-				this.autoOffsetReset,
-				committedOffsets
-			)
-			result.push({ ...tp, offset })
-		}
-
-		return result
+	private async resolveOffsets(partitions: TopicPartition[]): Promise<AssignedPartition[]> {
+		// Each fetch is bounded by defaultApiTimeoutMs. One that ran out of time (a coordinator that does not answer,
+		// or answers it is loading) is tried again like one of an unreachable cluster, as Java's consumer does at its
+		// next poll: it does not fail the rebalance, which would leave the group.
+		const committedOffsets = await this.whileReachable(
+			() => this.offsetManager.fetchCommittedOffsets(partitions),
+			error => error instanceof TimeoutError
+		)
+		return resolveAssignment(
+			this.offsetManager,
+			partitions,
+			committedOffsets,
+			this.autoOffsetReset,
+			this.callbacks!.onOffsetReset
+		)
 	}
 }

@@ -31,7 +31,6 @@ describe('exactly_once: transaction aborted by the broker (transaction timeout)'
 		const app = flow({
 			applicationId: uniqueTopicName('flow-it-txn-timeout'),
 			client,
-			numStreamThreads: 1,
 			processingGuarantee: 'exactly_once',
 			commitIntervalMs: 100,
 			consumer: { maxWaitMs: 100 },
