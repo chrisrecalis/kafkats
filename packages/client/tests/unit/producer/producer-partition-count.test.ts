@@ -37,6 +37,24 @@ describe('Producer.partitionCount()', () => {
 		await expect(producer.partitionCount('missing-topic', { timeoutMs: 30 })).rejects.toThrow(TimeoutError)
 	})
 
+	it('looks up nothing more once timeoutMs passed', async () => {
+		vi.useFakeTimers()
+		try {
+			const cluster = createMockCluster()
+			const producer = new Producer(cluster)
+
+			const counted = expect(producer.partitionCount('missing-topic', { timeoutMs: 30 })).rejects.toThrow(
+				TimeoutError
+			)
+			await vi.advanceTimersByTimeAsync(30)
+			await counted
+			await vi.advanceTimersByTimeAsync(2_000)
+			expect(cluster.refreshMetadata).toHaveBeenCalledTimes(1)
+		} finally {
+			vi.useRealTimers()
+		}
+	})
+
 	it('rejects with the reason of an aborted signal', async () => {
 		const producer = new Producer(createMockCluster())
 		const controller = new AbortController()

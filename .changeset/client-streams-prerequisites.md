@@ -12,7 +12,7 @@
 **Consumer**
 
 - `consumer.commit(offsets, { timeoutMs, signal })` commits offsets of assigned partitions with optional metadata, from anywhere (also with `commitOffsets: false` and in `onPartitionsRevoked`). Coordinator moves and connection failures are retried within `timeoutMs`; it rejects with `RebalanceInProgressError`, `CommitFailedError` (the member's generation is gone, and the consumer rejoins) or `TimeoutError`. A commit still being retried when the consumer rejoined, or when a partition of it was revoked or lost, rejects with `CommitFailedError` instead of committing offsets meant for the old assignment.
-- `consumer.committed(partitions)` reads committed offsets back with their metadata and leader epoch.
+- `consumer.committed(partitions, { timeoutMs, signal })` reads committed offsets back with their metadata and leader epoch.
 - `consumer.groupMetadata()` returns the group metadata of the last completed join, for fenced transactional offset commits; `undefined` in manual mode, before the first join and after a lost session until the next join.
 - Rebalance hooks `onPartitionsRevoked`, `onPartitionsAssigned` and `onPartitionsLost`, awaited inside the rebalance. Assigned partitions are not fetched before `onPartitionsAssigned` returned, so `pause()` and `seek()` there apply before the first record; the lost hook is invoked synchronously with the loss and awaited before the rejoin; partitions lost while a hook runs are reported lost only, not revoked or assigned afterwards. A hook that throws fails the run.
 - `consumer.rebalancePending` and the `rebalancePending` / `rebalanceComplete` events. `partitionsAssigned` and `onPartitionsAssigned` receive `AssignedPartition`s, with the start offset and the committed offset of each partition.

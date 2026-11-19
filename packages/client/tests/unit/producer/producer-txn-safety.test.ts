@@ -179,8 +179,9 @@ describe('Producer transaction safety', () => {
 
 			await expect(
 				producer.transaction(async tx => {
-					// Fire-and-forget send that is still in flight when the abort starts.
+					// Fire-and-forget send whose produce request is still in flight when the abort starts.
 					void tx.send(TOPIC, { value: Buffer.from('slow') }).catch(() => {})
+					await vi.waitFor(() => expect(mockBroker.produce).toHaveBeenCalled())
 					throw new Error('user abort')
 				})
 			).rejects.toThrow(TransactionAbortedError)

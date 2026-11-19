@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { CommitFailedError, RebalanceInProgressError } from '@/client/errors.js'
+import { CommitFailedError, RebalanceInProgressError, TimeoutError } from '@/client/errors.js'
 import type { Consumer } from '@/consumer/consumer.js'
 import type { AssignedPartition } from '@/consumer/types.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
@@ -112,6 +112,23 @@ describe('Consumer.commit() and committed()', () => {
 		expect(broker.calls.filter(call => call === 'JoinGroup')).toHaveLength(2)
 		expect(consumer.rebalancePending).toBe(false)
 
+		consumer.stop()
+		await run
+	})
+
+	it('committed() rejects with a TimeoutError once timeoutMs passed while the coordinator does not answer', async () => {
+		const broker = fakeBroker()
+		const consumer = groupConsumer(broker)
+		const { run } = await running(consumer)
+		const answer = deferred()
+		broker.gates.offsetFetch = answer.promise
+
+		const startedAt = Date.now()
+		const error = await consumer.committed([tp(0)], { timeoutMs: 50 }).catch((e: unknown) => e)
+		expect(error).toBeInstanceOf(TimeoutError)
+		expect(Date.now() - startedAt).toBeLessThan(1_000)
+
+		answer.resolve()
 		consumer.stop()
 		await run
 	})

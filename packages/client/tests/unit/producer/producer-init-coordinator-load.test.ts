@@ -277,6 +277,70 @@ describe('Producer InitProducerId retries CoordinatorLoadInProgress', () => {
 			await producer.disconnect({ timeoutMs: 100 })
 		})
 
+		/** The next coordinator lookup waits until `release()`, then finds the coordinator. */
+		function holdLookup() {
+			let release!: () => void
+			mockCluster.getCoordinator.mockImplementationOnce(async () => {
+				await new Promise<void>(resolve => (release = resolve))
+				return txnCoordinator
+			})
+			return { release: () => release() }
+		}
+
+		it('a lookup answering after transaction() timed out sends no InitProducerId; the next begin looks up again', async () => {
+			txnCoordinator.initProducerId.mockResolvedValue(ok)
+			const lookup = holdLookup()
+			const producer = transactional({ maxBlockMs: 100 })
+
+			const { error } = await timed(producer.transaction(async () => {}))
+			expect(error).toBeInstanceOf(TimeoutError)
+			// An InitProducerId now would bump the epoch of the transactional id behind whatever replaced this producer.
+			lookup.release()
+			await new Promise(resolve => setTimeout(resolve, 20))
+			expect(txnCoordinator.initProducerId).not.toHaveBeenCalled()
+
+			const transaction = await producer.beginTransaction()
+			expect(mockCluster.getCoordinator).toHaveBeenCalledTimes(2)
+			expect(txnCoordinator.initProducerId).toHaveBeenCalledTimes(1)
+			await transaction.abort()
+			await producer.disconnect({ timeoutMs: 100 })
+		})
+
+		it('a lookup answering after disconnect() returned sends no InitProducerId', async () => {
+			txnCoordinator.initProducerId.mockResolvedValue(ok)
+			const lookup = holdLookup()
+			const producer = transactional({ maxBlockMs: 60_000 })
+			const begin = producer.beginTransaction()
+			begin.catch(() => {})
+			await vi.waitFor(() => expect(mockCluster.getCoordinator).toHaveBeenCalled())
+
+			await producer.disconnect({ timeoutMs: 100 })
+			await expect(begin).rejects.toThrow('Producer disconnected')
+			lookup.release()
+			await new Promise(resolve => setTimeout(resolve, 20))
+			expect(txnCoordinator.initProducerId).not.toHaveBeenCalled()
+		})
+
+		it('a lookup answering once maxBlockMs passed sends nothing, even before the deadline timer ran', async () => {
+			vi.useFakeTimers({ toFake: ['Date'] })
+			try {
+				txnCoordinator.initProducerId.mockResolvedValue(ok)
+				const lookup = holdLookup()
+				const producer = transactional({ maxBlockMs: 60_000 })
+				const begin = producer.beginTransaction().catch((error: unknown) => error)
+				await vi.waitFor(() => expect(mockCluster.getCoordinator).toHaveBeenCalled())
+
+				// The clock passes the deadline while the lookup's answer is on its way, ahead of the timer.
+				vi.setSystemTime(Date.now() + 60_001)
+				lookup.release()
+
+				expect(await begin).toBeInstanceOf(TimeoutError)
+				expect(txnCoordinator.initProducerId).not.toHaveBeenCalled()
+			} finally {
+				vi.useRealTimers()
+			}
+		})
+
 		it('a retry backoff longer than the time left', async () => {
 			txnCoordinator.initProducerId.mockResolvedValue({ ...ok, errorCode: ErrorCode.ConcurrentTransactions })
 			const producer = transactional({ maxBlockMs: 100, retryBackoffMs: 5000 })

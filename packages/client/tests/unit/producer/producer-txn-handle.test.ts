@@ -571,6 +571,26 @@ describe('Producer.beginTransaction()', () => {
 			await expect(producer.beginTransaction()).rejects.toThrow(InvalidTxnStateError)
 		})
 
+		it('the bump of an abort given up at its timeoutMs sends no InitProducerId once its lookup answers', async () => {
+			const producer = makeProducer()
+			const tx = await producer.beginTransaction()
+			answer(ErrorCode.OutOfOrderSequenceNumber)
+			await caught(tx.send(TOPIC, { value, partition: 0 }))
+			// EndTxn finds the coordinator; the bump's lookup waits.
+			const lookup = mocks.cluster.getCoordinator.getMockImplementation()!
+			let release!: () => void
+			mocks.cluster.getCoordinator.mockImplementationOnce(lookup).mockImplementationOnce(async (...args) => {
+				await new Promise<void>(resolve => (release = resolve))
+				return lookup(...args)
+			})
+
+			await expect(tx.abort({ timeoutMs: 50 })).rejects.toThrow(TimeoutError)
+			release()
+			await tick()
+			expect(coordinator.requests).toEqual(['InitProducerId()', 'AddPartitionsToTxn(0)', 'EndTxn(abort, 0)'])
+			expect(producer.transactionState).toBe('error')
+		})
+
 		it('a send preparing when the epoch failed is not appended, and the abort waits for it', async () => {
 			let outOfOrder!: () => void
 			mocks.leader.produce.mockImplementationOnce(
@@ -687,6 +707,146 @@ describe('Producer.beginTransaction()', () => {
 		it('offsets registered by a request retried after the epoch failed are not sent again', async () => {
 			await failedDuringRetry('addOffsetsToTxn', tx => tx.sendOffsets({ groupId: 'g1', offsets }))
 			expect(mocks.txnCoordinator.addOffsetsToTxn).toHaveBeenCalledTimes(1)
+		})
+	})
+
+	/** Registrations answered while their transaction ends, against the model of the 3.9 coordinator. */
+	describe('nothing of one transaction reaches another', () => {
+		let coordinator: ReturnType<typeof modelTransactions>
+
+		beforeEach(() => {
+			coordinator = modelTransactions(mocks)
+		})
+
+		const offsets = (offset: bigint) => ({ groupId: 'g1', offsets: [{ topic: TOPIC, partition: 0, offset }] })
+		const caught = (promise: Promise<unknown>): Promise<unknown> =>
+			promise.then(
+				() => undefined,
+				(error: unknown) => error
+			)
+		/** The offsets of every TxnOffsetCommit the group coordinator received. */
+		const committedOffsets = () =>
+			mocks.groupCoordinator.txnOffsetCommit.mock.calls.map(([request]) =>
+				request.topics.flatMap(t => t.partitions.map(p => p.committedOffset))
+			)
+
+		/** The next request of this kind is answered by the model only once `release()` was called. */
+		function hold(request: 'addOffsetsToTxn' | 'addPartitionsToTxn') {
+			const state = { held: false, release: () => {} }
+			const answer = mocks.txnCoordinator[request].getMockImplementation() as (r: unknown) => Promise<never>
+			mocks.txnCoordinator[request].mockImplementationOnce(async (r: unknown) => {
+				state.held = true
+				await new Promise<void>(resolve => (state.release = resolve))
+				return answer(r)
+			})
+			return state
+		}
+
+		it("an aborted transaction's offsets answered late are not committed by the next one", async () => {
+			const producer = makeProducer()
+			const first = await producer.beginTransaction()
+			const registration = hold('addOffsetsToTxn')
+			const registering = caught(first.sendOffsets(offsets(999n)))
+			await vi.waitFor(() => expect(registration.held).toBe(true))
+
+			const aborting = first.abort()
+			const beginning = producer.beginTransaction()
+			await tick()
+			// The abort waits for the answer: EndTxn must follow it, as the coordinator may begin the transaction.
+			expect(coordinator.requests).toEqual(['InitProducerId()'])
+			registration.release()
+
+			await aborting
+			const second = await beginning
+			await second.sendOffsets(offsets(5n))
+			await second.commit()
+
+			// Offset 999 is the aborted transaction's.
+			expect(committedOffsets()).toEqual([[5n]])
+			expect(await registering).toBeInstanceOf(TransactionAbortedError)
+			expect(coordinator.requests).toEqual([
+				'InitProducerId()',
+				'AddOffsetsToTxn(0)',
+				'EndTxn(abort, 0)',
+				'AddOffsetsToTxn(0): ConcurrentTransactions',
+				'AddOffsetsToTxn(0)',
+				'EndTxn(commit, 0)',
+			])
+		})
+
+		it('a transaction() whose callback timed out awaiting its offsets leaks none into the next transaction', async () => {
+			const producer = makeProducer()
+			const registration = hold('addOffsetsToTxn')
+			const failed = caught(producer.transaction(tx => tx.sendOffsets(offsets(999n)), { timeoutMs: 30 }))
+			await vi.waitFor(() => expect(registration.held).toBe(true))
+			await tick(60)
+
+			const beginning = producer.beginTransaction()
+			registration.release()
+			expect(await failed).toBeInstanceOf(TransactionAbortedError)
+			const next = await beginning
+			await next.sendOffsets(offsets(5n))
+			await next.commit()
+
+			expect(committedOffsets()).toEqual([[5n]])
+			expect(coordinator.requests.slice(0, 3)).toEqual([
+				'InitProducerId()',
+				'AddOffsetsToTxn(0)',
+				'EndTxn(abort, 0)',
+			])
+		})
+
+		it('a send whose partition is answered once the transaction aborts is rejected and produces nothing', async () => {
+			const producer = makeProducer()
+			const tx = await producer.beginTransaction()
+			const registration = hold('addPartitionsToTxn')
+			const sending = caught(tx.send(TOPIC, { value }))
+			await vi.waitFor(() => expect(registration.held).toBe(true))
+
+			const aborting = tx.abort()
+			registration.release()
+
+			expect(await sending).toBeInstanceOf(TransactionAbortedError)
+			await aborting
+			expect(mocks.leader.produce).not.toHaveBeenCalled()
+			expect(coordinator.requests).toEqual(['InitProducerId()', 'AddPartitionsToTxn(0)', 'EndTxn(abort, 0)'])
+		})
+
+		it('a commit waits for offsets still being registered, and commits them', async () => {
+			const producer = makeProducer()
+			const tx = await producer.beginTransaction()
+			const registration = hold('addOffsetsToTxn')
+			const registering = tx.sendOffsets(offsets(7n))
+			await vi.waitFor(() => expect(registration.held).toBe(true))
+
+			const committing = tx.commit()
+			await tick()
+			expect(coordinator.requests).toEqual(['InitProducerId()'])
+			registration.release()
+			await registering
+			await committing
+
+			expect(committedOffsets()).toEqual([[7n]])
+			expect(coordinator.requests).toEqual(['InitProducerId()', 'AddOffsetsToTxn(0)', 'EndTxn(commit, 0)'])
+		})
+
+		it('a commit aborts when offsets it waited for failed to register', async () => {
+			const producer = makeProducer()
+			const tx = await producer.beginTransaction()
+			mocks.txnCoordinator.addOffsetsToTxn.mockResolvedValueOnce({
+				throttleTimeMs: 0,
+				errorCode: ErrorCode.GroupAuthorizationFailed,
+			})
+			const registering = caught(tx.sendOffsets(offsets(7n)))
+
+			const error = await caught(tx.commit())
+			expect(error).toMatchObject({ outcome: 'aborted', cause: await registering })
+			expect(error).toBeInstanceOf(TransactionAbortedError)
+			expect(await registering).toMatchObject({ errorCode: ErrorCode.GroupAuthorizationFailed })
+			expect(mocks.groupCoordinator.txnOffsetCommit).not.toHaveBeenCalled()
+			// The coordinator never began the transaction: nothing to end.
+			expect(coordinator.requests).toEqual(['InitProducerId()'])
+			expect(producer.transactionState).toBe('idle')
 		})
 	})
 

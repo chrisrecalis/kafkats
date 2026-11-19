@@ -80,8 +80,8 @@ export function fakeBroker(
 	const joinErrors: ErrorCode[] = []
 	/** Answers of the next OffsetCommit requests (for every partition), then None. */
 	const commitErrors: ErrorCode[] = []
-	/** While set, SyncGroup (OffsetCommit) waits for it. */
-	const gates: { syncGroup?: Promise<void>; offsetCommit?: Promise<void> } = {}
+	/** While set, SyncGroup (OffsetCommit, OffsetFetch) waits for it. */
+	const gates: { syncGroup?: Promise<void>; offsetCommit?: Promise<void>; offsetFetch?: Promise<void> } = {}
 	let generationId = 0
 	let members = 0
 
@@ -170,6 +170,7 @@ export function fakeBroker(
 
 		async offsetFetch(request: OffsetFetchRequest) {
 			calls.push('OffsetFetch')
+			await gates.offsetFetch
 			return {
 				throttleTimeMs: 0,
 				errorCode: ErrorCode.None,

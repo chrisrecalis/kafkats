@@ -53,6 +53,22 @@ async function loseEndTxnAnswers(producer: Producer, transactionalId: string, co
 	}
 }
 
+/** The offset of `topicName` partition 0 that `groupId` committed, once no transaction holds it (-1 without one). */
+async function committedOffset(producer: Producer, groupId: string, topicName: string): Promise<bigint> {
+	const cluster = (producer as unknown as { cluster: Cluster }).cluster
+	const coordinator = await cluster.getCoordinator('GROUP', groupId)
+	for (;;) {
+		const response = await coordinator.offsetFetch({
+			groupId,
+			topics: [{ name: topicName, partitions: [{ partitionIndex: 0 }] }],
+			requireStable: true,
+		})
+		const partition = response.topics[0]!.partitions[0]!
+		if (partition.errorCode !== ErrorCode.UnstableOffsetCommit) return partition.committedOffset
+		await sleep(50)
+	}
+}
+
 describe.concurrent('EOS (integration) - transaction handles', () => {
 	it('shows committed handles to read_committed consumers and hides aborted ones', async () => {
 		const client = createClient('it-tx-handle')
@@ -192,6 +208,44 @@ describe.concurrent('EOS (integration) - transaction handles', () => {
 		expect(producer.transactionState).toBe('error')
 		// Why the outcome must not be reported as 'aborted': the broker did commit.
 		expect(await readCommitted(client, topicName, 1)).toEqual(['maybe'])
+
+		await producer.disconnect()
+		await client.disconnect()
+	})
+
+	it("an aborted transaction's offsets answered after its abort began are not committed by the next one", async () => {
+		const client = createClient('it-tx-offsets-late')
+		await client.connect()
+		const topicName = uniqueName('it-tx-offsets-late')
+		await client.createTopics([{ name: topicName, numPartitions: 1, replicationFactor: 1 }])
+		const transactionalId = uniqueName('tx')
+		const groupId = uniqueName('it-tx-offsets-group')
+		const producer = transactionalProducer(client, transactionalId)
+		const offsets = (offset: bigint) => ({ groupId, offsets: [{ topic: topicName, partition: 0, offset }] })
+
+		const aborted = await producer.beginTransaction()
+		// Abort once the AddOffsetsToTxn of the first transaction went out, its answer still on the way.
+		const cluster = (producer as unknown as { cluster: Cluster }).cluster
+		const coordinator = await cluster.getCoordinator('TRANSACTION', transactionalId)
+		const addOffsetsToTxn = coordinator.addOffsetsToTxn.bind(coordinator)
+		let sent!: () => void
+		const requested = new Promise<void>(resolve => (sent = resolve))
+		coordinator.addOffsetsToTxn = request => {
+			coordinator.addOffsetsToTxn = addOffsetsToTxn
+			const answer = addOffsetsToTxn(request)
+			sent()
+			return answer
+		}
+		const registering = aborted.sendOffsets(offsets(999n)).catch((e: unknown) => e)
+		await requested
+		await aborted.abort()
+
+		const next = await producer.beginTransaction()
+		await next.sendOffsets(offsets(5n))
+		await next.commit()
+
+		expect(await committedOffset(producer, groupId, topicName)).toBe(5n)
+		expect(await registering).toBeInstanceOf(TransactionAbortedError)
 
 		await producer.disconnect()
 		await client.disconnect()

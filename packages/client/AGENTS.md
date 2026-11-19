@@ -47,6 +47,7 @@ Flow's task runtime is built on these consumer and producer behaviours; a change
 - `consumer.commit(offsets, { signal })` commits with metadata outside handlers (also with `commitOffsets: false`),
   pinned to the generation it started in: a commit still retried after a rejoin, or after a partition of it was
   revoked or lost, rejects with `CommitFailedError`. `consumer.committed()` reads offsets back with their metadata.
+  Their `timeoutMs` bounds the whole call (requests in flight and coordinator lookups included), as does a signal.
 - `onPartitionsRevoked`, `onPartitionsAssigned` and `onPartitionsLost` are awaited inside the rebalance; assigned
   partitions are not fetched before `onPartitionsAssigned` returned; the lost hook runs synchronously with the loss.
   `rebalancePending` and its events tell flow to skip timer commits.
@@ -57,7 +58,11 @@ Flow's task runtime is built on these consumer and producer behaviours; a change
   `read_committed`.
 - `groupMetadata()` and `producer.beginTransaction()` (a `TransactionHandle` with `sendOffsets`, `commit`, `abort`)
   give fenced exactly-once commits; an unconfirmed `EndTxn` rejects with `TransactionAbortedError` and
-  `outcome: 'unknown'`. `producer.disconnect({ timeoutMs })` and `consumer.stop()` are bounded.
+  `outcome: 'unknown'`. `producer.disconnect({ timeoutMs })` and `consumer.stop()` are bounded. What a transaction
+  registers (partitions, offsets) is its own: `commit()` waits for `sendOffsets()` calls still in progress (a failed
+  one aborts it); once it aborts, sends and registrations in progress reject with `TransactionAbortedError` and
+  nothing of them reaches the next transaction. An initialization given up (`maxBlockMs`, `disconnect()`) sends no
+  InitProducerId after a coordinator lookup that answers late.
 - A fenced transactional producer (PRODUCER_FENCED on a produce, PRODUCER_FENCED or INVALID_PRODUCER_EPOCH from a
   coordinator) is fatal and never sends InitProducerId again: the handle's calls, `abort()` included, and every later
   begin reject with `ProducerFencedError`. Any other failure of the epoch (out-of-order sequence, an outcome the

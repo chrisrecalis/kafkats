@@ -450,8 +450,10 @@ export class Consumer extends EventEmitter<ConsumerEvents> {
 
 	/**
 	 * The committed offsets of partitions, with the metadata committed with them, keyed by `topic:partition`;
-	 * `null` for a partition without one. Offsets of an open transaction are waited for, up to `timeoutMs`
-	 * (default `defaultApiTimeoutMs`). Aborting `signal` rejects with its reason.
+	 * `null` for a partition without one. Offsets of an open transaction are waited for, and coordinator moves
+	 * retried, until `timeoutMs` (default `defaultApiTimeoutMs`) passed: it bounds the whole call, a request the
+	 * coordinator does not answer included, then it rejects with `TimeoutError` (cause: the last failure). Aborting
+	 * `signal` rejects with its reason.
 	 *
 	 * @throws If the consumer is not running
 	 */

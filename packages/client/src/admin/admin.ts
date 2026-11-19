@@ -52,7 +52,7 @@ import {
 } from '@/client/errors.js'
 import type { Logger } from '@/logger.js'
 import { noopLogger } from '@/logger.js'
-import { abortable } from '@/utils/abortable.js'
+import { abortable, deadlineSignal } from '@/utils/abortable.js'
 import { sleep } from '@/utils/sleep.js'
 import { tpKey } from '@/utils/topic-partition.js'
 import { DEFAULT_REQUEST_TIMEOUT_MS } from '@/network/types.js'
@@ -450,10 +450,7 @@ export class Admin {
 		this.logger.debug('deleting records', { partitions: pending.size, timeoutMs })
 
 		// Aborted at the deadline or by the caller's signal; the caller's is checked first when telling them apart.
-		const stop = new AbortController()
-		const timer = setTimeout(() => stop.abort(), timeoutMs)
-		const onAbort = () => stop.abort()
-		signal?.addEventListener('abort', onAbort, { once: true })
+		const stop = deadlineSignal(timeoutMs, signal)
 		try {
 			let relocate = new Set<string>()
 			let delayMs = DELETE_RECORDS_RETRY_INITIAL_DELAY_MS
@@ -488,8 +485,7 @@ export class Admin {
 			signal?.throwIfAborted()
 			if (!stop.signal.aborted) throw error
 		} finally {
-			clearTimeout(timer)
-			signal?.removeEventListener('abort', onAbort)
+			stop.clear()
 		}
 
 		for (const [key, { topic, partition }] of pending) {

@@ -504,7 +504,7 @@ describe('OffsetManager.fetchCommittedOffsets', () => {
 		})
 	})
 
-	it('retries unstable offsets for up to timeoutMs, then throws the last error', async () => {
+	it('retries unstable offsets for up to timeoutMs, then rejects with a TimeoutError carrying the last failure', async () => {
 		vi.useFakeTimers()
 		const coordinator = fakeCoordinator()
 		coordinator.offsetFetch.mockResolvedValue(
@@ -520,10 +520,53 @@ describe('OffsetManager.fetchCommittedOffsets', () => {
 			.catch(e => e)
 		await vi.advanceTimersByTimeAsync(1_000)
 		const error = await settled
+		const attempts = coordinator.offsetFetch.mock.calls.length
+		await vi.advanceTimersByTimeAsync(5_000)
 
-		expect(error).toBeInstanceOf(KafkaProtocolError)
-		expect(error.errorCode).toBe(ErrorCode.UnstableOffsetCommit)
-		expect(coordinator.offsetFetch.mock.calls.length).toBeGreaterThan(1)
+		expect(error).toBeInstanceOf(TimeoutError)
+		expect(error.timeoutMs).toBe(1_000)
+		expect(error.cause).toBeInstanceOf(KafkaProtocolError)
+		expect(error.cause.errorCode).toBe(ErrorCode.UnstableOffsetCommit)
+		expect(attempts).toBeGreaterThan(1)
+		expect(coordinator.offsetFetch).toHaveBeenCalledTimes(attempts)
+	})
+
+	it('bounds a fetch the coordinator does not answer by timeoutMs', async () => {
+		vi.useFakeTimers()
+		const coordinator = fakeCoordinator()
+		coordinator.offsetFetch.mockReturnValue(new Promise(() => {}))
+		const { manager } = makeManager(coordinator)
+
+		const settled = manager.fetchCommittedOffsets([{ topic: 't', partition: 0 }], { timeoutMs: 10 }).catch(e => e)
+		await vi.advanceTimersByTimeAsync(1_000)
+
+		const error = await Promise.race([settled, 'still pending'])
+		expect(error).toBeInstanceOf(TimeoutError)
+		expect(error.timeoutMs).toBe(10)
+		expect(error.cause).toBeUndefined()
+	})
+
+	it('bounds a coordinator rediscovery that does not answer by timeoutMs, and sends nothing after it', async () => {
+		vi.useFakeTimers()
+		const coordinator = fakeCoordinator()
+		coordinator.offsetFetch.mockResolvedValue({
+			throttleTimeMs: 0,
+			errorCode: ErrorCode.NotCoordinator,
+			topics: [],
+		})
+		const { manager, cluster } = makeManager(coordinator)
+		let lookedUp!: (found: FakeCoordinator) => void
+		cluster.getCoordinator.mockReturnValueOnce(new Promise(resolve => (lookedUp = resolve)))
+
+		const settled = manager.fetchCommittedOffsets([{ topic: 't', partition: 0 }], { timeoutMs: 500 }).catch(e => e)
+		await vi.advanceTimersByTimeAsync(1_000)
+		const error = await Promise.race([settled, 'still pending'])
+		lookedUp(coordinator)
+		await vi.advanceTimersByTimeAsync(5_000)
+
+		expect(error).toBeInstanceOf(TimeoutError)
+		expect(error.cause).toMatchObject({ errorCode: ErrorCode.NotCoordinator })
+		expect(coordinator.offsetFetch).toHaveBeenCalledTimes(1)
 	})
 
 	it('rejects with the reason of an aborted signal and stops retrying', async () => {

@@ -29,13 +29,16 @@ import type { AutoOffsetReset, CommitOffset, CommittedOffset, IsolationLevel, To
 import { diagnostics, trace, type CommitDiagnostics } from '@/diagnostics.js'
 import { noopLogger, type Logger } from '@/logger.js'
 import { parseKey, tpKey } from '@/utils/topic-partition.js'
-import { abortable } from '@/utils/abortable.js'
+import { abortable, deadlineSignal } from '@/utils/abortable.js'
 import { retry } from '@/utils/retry.js'
 import { sleep } from '@/utils/sleep.js'
 
 /** Bounds of a coordinator request made on the application's behalf. */
 export interface OffsetRequestOptions {
-	/** Time budget of the call, retries included (default: the consumer's `defaultApiTimeoutMs`). */
+	/**
+	 * Time budget of the call, its requests, coordinator lookups and retries included (default: the consumer's
+	 * `defaultApiTimeoutMs`).
+	 */
 	timeoutMs?: number
 	/** Aborting it rejects the call with the signal's reason. */
 	signal?: AbortSignal
@@ -379,10 +382,7 @@ export class OffsetManager {
 		signal: AbortSignal | undefined
 	): Promise<void> {
 		// Aborted by the deadline or by the caller's signal; the caller's is checked first when telling them apart.
-		const stop = new AbortController()
-		const timer = setTimeout(() => stop.abort(), timeoutMs)
-		const onAbort = () => stop.abort()
-		signal?.addEventListener('abort', onAbort, { once: true })
+		const stop = deadlineSignal(timeoutMs, signal)
 		let lastError: unknown
 		try {
 			let delayMs = COMMIT_RETRY_INITIAL_DELAY_MS
@@ -411,8 +411,7 @@ export class OffsetManager {
 			}
 			throw this.commitError(error)
 		} finally {
-			clearTimeout(timer)
-			signal?.removeEventListener('abort', onAbort)
+			stop.clear()
 		}
 	}
 
@@ -566,8 +565,9 @@ export class OffsetManager {
 	 * Fetch the committed offsets of partitions, keyed by `topic:partition`; partitions without one are absent.
 	 *
 	 * Only stable offsets are read: while a transaction holds pending offsets, the fetch is retried, like other
-	 * retriable errors and coordinator moves, with backoff until `timeoutMs` is spent; then the last error is thrown.
-	 * Aborting `signal` rejects with its reason.
+	 * retriable errors and coordinator moves, with backoff. `timeoutMs` (default `defaultApiTimeoutMs`) bounds the whole
+	 * call, a request in flight and a coordinator lookup included: then it rejects with a `TimeoutError` (cause: the last
+	 * failure) and sends nothing more. Aborting `signal` rejects with its reason.
 	 */
 	async fetchCommittedOffsets(
 		partitions: readonly TopicPartition[],
@@ -594,6 +594,10 @@ export class OffsetManager {
 			partitions: partitions.map(partitionIndex => ({ partitionIndex })),
 		}))
 
+		const timeoutMs = options.timeoutMs ?? this.apiTimeoutMs
+		// Aborted by the deadline or by the caller's signal; the caller's is checked first when telling them apart.
+		const stop = deadlineSignal(timeoutMs, options.signal)
+		let lastError: unknown
 		// Retriable top-level codes (coordinator loading/moved) must not fatally fail consumer
 		// start/rebalance — retry with backoff and re-discover the coordinator.
 		const fetching = retry(
@@ -626,26 +630,40 @@ export class OffsetManager {
 				return res
 			},
 			{
-				// Time-bounded by timeoutMs; maxAttempts is only a non-firing safety net.
+				// Time-bounded by the deadline; maxAttempts is only a non-firing safety net.
 				maxAttempts: 1_000,
-				maxElapsedMs: options.timeoutMs ?? this.apiTimeoutMs,
 				initialDelayMs: 100,
 				maxDelayMs: 1_000,
 				multiplier: 2,
 				jitter: 0,
-				signal: options.signal,
-				shouldRetry: error => isKafkaError(error) && error.retriable,
+				signal: stop.signal,
+				shouldRetry: error => !stop.signal.aborted && isKafkaError(error) && error.retriable,
 				onRetry: async ({ error }) => {
+					lastError = error
 					const errorCode = isKafkaError(error) ? error.errorCode : undefined
 					if (errorCode === ErrorCode.NotCoordinator || errorCode === ErrorCode.CoordinatorNotAvailable) {
 						this.cluster.invalidateCoordinator('GROUP', this.groupId)
-						const refreshed = await this.cluster.getCoordinator('GROUP', this.groupId).catch(() => null)
+						const refreshed = await abortable(
+							this.cluster.getCoordinator('GROUP', this.groupId),
+							stop.signal
+						).catch(() => null)
 						if (refreshed) this.coordinator = refreshed
 					}
 				},
 			}
 		)
-		const response = await abortable(fetching, options.signal)
+		let response: Awaited<typeof fetching>
+		try {
+			response = await abortable(fetching, stop.signal)
+		} catch (error) {
+			options.signal?.throwIfAborted()
+			if (!stop.signal.aborted) throw error
+			const timeout = new TimeoutError(`OffsetFetch for group ${this.groupId} did not succeed`, timeoutMs)
+			if (lastError !== undefined) timeout.cause = lastError
+			throw timeout
+		} finally {
+			stop.clear()
+		}
 
 		// Build result map (partition-level errors were rejected above)
 		const result = new Map<string, CommittedOffset>()

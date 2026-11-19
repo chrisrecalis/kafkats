@@ -125,6 +125,9 @@ export interface ProducerConfig {
 	 * retrying coordinator discovery and InitProducerId before failing with a `TimeoutError`
 	 * (default: 60000), requests in flight included. A timed-out initialization is tried again by
 	 * the next send or transaction, which first awaits an InitProducerId left unanswered (Java).
+	 * A coordinator lookup that answers once the initialization timed out (or the producer
+	 * disconnected) sends no InitProducerId: it would bump the epoch of the transactional id
+	 * behind a producer that replaced this one.
 	 */
 	maxBlockMs?: number
 }
@@ -381,13 +384,20 @@ export interface ProducerTransaction {
 	 * member's generation (KIP-447): metadata with a negative generation or an empty member id
 	 * is rejected with `CommitFailedError` before anything is sent. The `{ groupId }` form is
 	 * not fenced.
+	 *
+	 * The offsets belong to this transaction only: a commit waits for a registration still in
+	 * progress (AddOffsetsToTxn) and commits its offsets with the transaction. Like a failed send,
+	 * a registration that fails (also one not awaited) makes the commit abort. Once the transaction
+	 * aborts, a registration in progress sends nothing more and rejects with
+	 * `TransactionAbortedError`, also when its request is answered afterwards.
 	 */
 	sendOffsets(context: ConsumeContext): Promise<void>
 	sendOffsets(context: ConsumeContext, offsets: TransactionOffset[]): Promise<void>
 	sendOffsets(params: SendOffsetsParams): Promise<void>
 
 	/**
-	 * Signal that is aborted when the transaction times out or is aborted
+	 * Signal that is aborted when the transaction times out or is aborted, with a
+	 * `TransactionAbortedError` as its reason
 	 *
 	 * Use this to cancel long-running operations when the transaction fails:
 	 * - Aborted on timeout (after `transactionTimeoutMs`)
@@ -419,7 +429,8 @@ export interface ProducerTransaction {
  */
 export interface TransactionHandle extends ProducerTransaction {
 	/**
-	 * Commit: flush the transaction's sends, commit its offsets (TxnOffsetCommit), EndTxn(commit)
+	 * Commit: flush the transaction's sends, wait for its offset registrations, commit its offsets
+	 * (TxnOffsetCommit), EndTxn(commit)
 	 *
 	 * Rejects with `TransactionAbortedError` when the transaction did not commit:
 	 * - `outcome: 'aborted'`: it was aborted, as `abort()` does (also when a send failed, or the
@@ -435,6 +446,10 @@ export interface TransactionHandle extends ProducerTransaction {
 	commit(options?: ProducerCallOptions): Promise<void>
 	/**
 	 * Abort: reject the queued sends, wait for those in flight, EndTxn(abort)
+	 *
+	 * Sends and offset registrations still in progress start no request any more; one already
+	 * sent is awaited (so that EndTxn follows it), and what it is answered is not added: they
+	 * reject with `TransactionAbortedError`. Nothing of the transaction reaches the next one.
 	 *
 	 * When the producer's epoch failed during the transaction (an out-of-order sequence, a send
 	 * whose outcome its retries left unknown, InvalidProducerEpoch on a produce), its sends were
