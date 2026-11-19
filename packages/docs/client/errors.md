@@ -64,10 +64,11 @@ try {
 
 A send that fails rejects with a `KafkaError`. When the broker rejected the records for good, it is a
 `KafkaProtocolError` carrying the broker's `errorCode` (`retriable: false`). When the producer stopped retrying, it is a
-`KafkaError` with `retriable: true` whose `cause` is the last failure; the records may or may not have been written. An
-idempotent (or transactional) producer that had sent the records rejects with a `KafkaError` for the ambiguous outcome
-instead (also `retriable: true`), whose `cause` is that exhausted-retries `KafkaError`: the last failure is one level
-deeper, its `cause.cause`.
+`KafkaError` with `retriable: true` whose `cause` is the last failure; the records may or may not have been written.
+When the retries run out for records an idempotent (or transactional) producer had already sent, it fails its epoch
+instead: that send and every other send it had not settled yet reject with one `KafkaError` for the ambiguous outcome
+(also `retriable: true`), whose `cause` is the exhausted-retries `KafkaError` of the batch that had been sent; its last
+failure is `cause.cause`.
 
 ```typescript
 import { ErrorCode, KafkaError, KafkaProtocolError } from '@kafkats/client'
