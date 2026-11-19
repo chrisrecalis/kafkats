@@ -67,12 +67,12 @@ try {
 await tx.commit()
 ```
 
-- `beginTransaction()` waits its turn first in first out together with `transaction()` calls (one open transaction per transactional ID, see [Concurrent Transactions](#concurrent-transactions)). The first transaction of a producer initializes it, which fences older producers with the same transactional ID. An initialization that does not finish within `maxBlockMs` rejects with `TimeoutError` and the next begin tries again; once it gave up, or the producer disconnected, a coordinator lookup still running sends no InitProducerId, so a producer you replaced cannot fence its replacement afterwards.
+- `beginTransaction()` waits its turn first in first out together with `transaction()` calls (one open transaction per transactional ID, see [Concurrent Transactions](#concurrent-transactions)). The first transaction of a producer initializes it, which fences older producers with the same transactional ID. An initialization that does not finish within `maxBlockMs` rejects with `TimeoutError` and the next begin tries again. Once it gave up, or the producer disconnected, it sends no InitProducerId any more (a coordinator lookup still running sends none), but one already sent may still be applied by the broker, like in the Java client: then it fences a producer that replaced this one with the same transactional ID, or aborts the transaction the replacement has open, which then rejects with `ProducerFencedError` and has to be replaced in turn.
 - A handle has no client-side timeout: the broker aborts a transaction left open longer than `transactionTimeoutMs`. Pass `beginTransaction({ signal })` to bound it yourself: aborting the signal rejects a call still waiting for its turn, and aborts the transaction once it is open, until `commit()` or `abort()` is called. From then on it has no effect: those calls take their own `{ timeoutMs, signal }`, and without them a commit or abort can take as long as the producer's coordinator retries (up to `maxBlockMs` for each request, plus the flush).
 - `tx.commit({ timeoutMs, signal })` flushes the transaction's sends, commits its offsets and ends it. It rejects with `TransactionAbortedError` when the transaction did not commit, and with `ProducerFencedError` once the producer was fenced (see [Error Handling](#error-handling)).
-- `tx.abort({ timeoutMs, signal })` rejects the queued sends, waits for those in flight and ends the transaction, then bumps the producer's epoch if a send failed it (see [Producer Fenced](#producer-fenced)). If that does not finish in time, the producer enters the `'error'` state and the call rejects; on a fenced producer it sends nothing and rejects with `ProducerFencedError`.
-- Sends and offsets belong to their transaction. `tx.commit()` waits for `sendOffsets()` calls still registering their group (AddOffsetsToTxn) and commits their offsets; like a failed send, a failed `sendOffsets()` (also one not awaited) makes the commit abort. Once a transaction aborts (`abort()`, a commit that turned into an abort, a timed-out `transaction()` callback, `disconnect()`), its sends and offset registrations still in progress start no request any more, a request already sent is awaited before EndTxn, and they reject with `TransactionAbortedError`, also when that request succeeded: nothing of one transaction reaches the next.
-- `tx.signal` is aborted, with a `TransactionAbortedError` as its reason, once the transaction ends without committing. Calling `send()`, `sendOffsets()` or `commit()` on a transaction that ended rejects with `InvalidTxnStateError`.
+- `tx.abort({ timeoutMs, signal })` rejects the queued sends (also the records of a send that waited behind another one of its partition), waits for those in flight and ends the transaction (EndTxn, also when the answer to a partition or offset registration was lost, as the coordinator may have begun the transaction), then bumps the producer's epoch if a send failed it (see [Producer Fenced](#producer-fenced)). If that does not finish in time, the producer enters the `'error'` state and the call rejects; on a fenced producer it sends nothing and rejects with `ProducerFencedError`, also when the fence arrives while it waits for the sends.
+- Sends and offsets belong to their transaction. `tx.commit()` waits for `sendOffsets()` calls still registering their group (AddOffsetsToTxn) and commits their offsets; like a failed send, a failed `sendOffsets()` (also one not awaited, also for its arguments, such as group metadata of a member that has not joined) makes the commit abort. Once a transaction aborts (`abort()`, a commit that turned into an abort, a timed-out `transaction()` callback, `disconnect()`), its sends and offset registrations still in progress start no request any more, a request already sent is awaited before EndTxn, and they reject with `TransactionAbortedError`, also when that request succeeded: nothing of one transaction reaches the next.
+- `tx.signal` is aborted, with a `TransactionAbortedError` as its reason, once the transaction ends without committing. Calling `send()`, `sendOffsets()` or `commit()` on a transaction that ended rejects with `InvalidTxnStateError` (with `ProducerFencedError` once the producer was fenced).
 
 `producer.transactionState` tells where the producer stands: `'idle'`, `'in_transaction'`, `'committing'`, `'aborting'`, or `'error'` once it can run no transaction any more (a fence, an abort that did not finish, or a commit whose outcome is unknown). A producer in the `'error'` state refuses new transactions; replace it with a new one (`disconnect()` is still allowed).
 
@@ -219,7 +219,7 @@ How it works:
 - `flush()` and `disconnect()` cover all lanes; disconnect still refuses while a `transaction()` call is active or queued, and aborts the transactions that handles left open.
 
 ::: warning Fencing and transactional IDs
-Transactional-ID zombie fencing applies **per lane**. For consume-transform-produce, always pass `consumerGroupMetadata` to `sendOffsets()` (KIP-447) so a zombie's offset commits are fenced by consumer-group generation regardless of which lane they ran on. Also note that changing `transactionConcurrency` changes the set of transactional IDs in use: a transaction left open under an ID that is no longer used stays open until the broker's `transactional.id.expiration.ms` elapses.
+Transactional-ID zombie fencing applies **per lane**: a fence makes only its lane fatal (`transaction()` rejects with `ProducerFencedError`, so does every later transaction that takes that lane, and `transactionState` reads `'error'`), while transactions on the other lanes go on. For consume-transform-produce, always pass `consumerGroupMetadata` to `sendOffsets()` (KIP-447) so a zombie's offset commits are fenced by consumer-group generation regardless of which lane they ran on. Also note that changing `transactionConcurrency` changes the set of transactional IDs in use: a transaction left open under an ID that is no longer used stays open until the broker's `transactional.id.expiration.ms` elapses.
 :::
 
 ## Transaction API
@@ -357,24 +357,25 @@ raises `ProducerFencedError` instead, see [Producer Fenced](#producer-fenced)).
 
 ### Producer Fenced
 
-When another producer with the same `transactionalId` initializes, it aborts the transaction this producer has open
-and takes over the transactional ID under a newer epoch; the broker does the same to a transaction that outlives
+When another producer with the same `transactionalId` initializes, it aborts the transaction this producer has open and
+takes over the transactional ID under a newer epoch; the broker does the same to a transaction that outlives
 `transactionTimeoutMs`. The broker then answers this producer PRODUCER_FENCED (or INVALID_PRODUCER_EPOCH from a
 coordinator), and the producer is fenced for good, like in the Java client: it rejects the transaction's `send()`,
-`sendOffsets()`, `commit()` and `abort()` (which sends nothing: the transaction was aborted already) and every later
-`beginTransaction()` or `transaction()` with `ProducerFencedError`, `transactionState` is `'error'`, and it never
-initializes again: replace it (`disconnect()` still works). It never sends InitProducerId again because the coordinator
-checks only the producer id there, so a fenced producer's InitProducerId would abort its successor's transaction.
+`sendOffsets()`, `commit()` and `abort()` (which sends nothing: the transaction was aborted already), also once the
+transaction ended, and every later `beginTransaction()` or `transaction()` with `ProducerFencedError`,
+`transactionState` is `'error'`, and it never initializes again: replace it (`disconnect()` still works). It never sends
+InitProducerId again because the coordinator checks only the producer id there, so a fenced producer's InitProducerId
+would abort its successor's transaction.
 
-Other failures of the producer's epoch leave the open transaction abortable only: an out-of-order sequence, a send
-whose outcome its retries left unknown (the broker may have appended it), or INVALID_PRODUCER_EPOCH on a produce
-(KIP-588: a partition saw a newer epoch, which only the coordinator can tell apart from a fence). The failed send
-rejects with that error and every other send of the transaction with it or with `TransactionAbortedError` (whose `cause`
-is that error); nothing more goes out under the epoch, and `commit()` aborts. The abort sends EndTxn(abort) under the
-current epoch and, once it succeeded, InitProducerId to bump the epoch, after which the producer runs the next
-transaction under the new epoch. If the EndTxn is answered PRODUCER_FENCED, the producer is fenced as above and the
-abort rejects with `ProducerFencedError`; if the bump does not complete within `maxBlockMs`, the abort rejects and the
-producer is in the `'error'` state. A `disconnect()` aborting such a transaction skips the bump.
+Other failures of the producer's epoch leave the open transaction abortable only: an out-of-order sequence, a send whose
+outcome its retries left unknown (the broker may have appended it), or INVALID_PRODUCER_EPOCH on a produce (KIP-588: a
+partition saw a newer epoch, which only the coordinator can tell apart from a fence). The failed send rejects with that
+error and every other send of the transaction with it or with `TransactionAbortedError` (whose `cause` is that error);
+nothing more goes out under the epoch, and `commit()` aborts. The abort sends EndTxn(abort) under the current epoch and,
+once it succeeded, InitProducerId to bump the epoch, after which the producer runs the next transaction under the new
+epoch. If the EndTxn is answered PRODUCER_FENCED, the producer is fenced as above and the abort rejects with
+`ProducerFencedError`; if the bump does not complete within `maxBlockMs`, the abort rejects and the producer is in the
+`'error'` state. A `disconnect()` aborting such a transaction, or called during the bump, skips the bump.
 
 An idempotent producer without a transaction rejects the sends of a failed epoch (with `ProducerFencedError` for
 PRODUCER_FENCED) and initializes again under a new epoch at once.

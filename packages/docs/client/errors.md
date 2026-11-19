@@ -194,7 +194,7 @@ throws it from `poll()`.
 | Error                     | Raised when                                                                                                                                                                                                   |
 | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `TransactionAbortedError` | A transaction did not commit. `outcome: 'aborted'`: it did not; `'unknown'`: EndTxn(commit) was sent but not confirmed, the broker may have committed. `cause` is why.                                        |
-| `InvalidTxnStateError`    | A call does not fit the transaction's state: a handle used after it ended, or a transaction begun on a producer in the `'error'` state.                                                                       |
+| `InvalidTxnStateError`    | A call does not fit the transaction's state: a handle used after it ended, or a transaction begun on a producer in the `'error'` state (a fenced producer raises `ProducerFencedError`).                      |
 | `ProducerFencedError`     | A newer producer with the same transactional ID (or the transaction timeout) took the producer's epoch: it rejects every later call; replace it. Also an idempotent producer's send answered PRODUCER_FENCED. |
 
 See [Transactions: Error Handling](/client/transactions#error-handling).

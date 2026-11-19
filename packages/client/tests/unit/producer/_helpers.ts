@@ -105,12 +105,15 @@ type TransactionStatus = 'Empty' | 'Ongoing' | 'PrepareCommit' | 'PrepareAbort' 
  *
  * `successor()` is a new producer with the same transactional id initializing, `successorBegins()` its first
  * AddPartitionsToTxn, `successorEndTxn()` its EndTxn. `requests` lists what this producer sent, with the answers.
+ * `staleEpochError` is the coordinator's answer to a stale epoch: PRODUCER_FENCED, or INVALID_PRODUCER_EPOCH from a
+ * coordinator older than KIP-588.
  */
 export function modelTransactions({ txnCoordinator, leader }: Pick<TransactionalMocks, 'txnCoordinator' | 'leader'>) {
 	const model = {
 		epoch: -1,
 		lastEpoch: -1,
 		status: 'Empty' as TransactionStatus,
+		staleEpochError: ErrorCode.ProducerFenced as ErrorCode,
 		/** Epoch of the last transaction markers written. */
 		markerEpoch: -1,
 		/** Ongoing transactions aborted by an InitProducerId that fenced their epoch. */
@@ -152,7 +155,7 @@ export function modelTransactions({ txnCoordinator, leader }: Pick<Transactional
 		model.status = 'Empty'
 	}
 	const endTxn = (epoch: number, committed: boolean): ErrorCode => {
-		if (epoch !== model.epoch) return ErrorCode.ProducerFenced
+		if (epoch !== model.epoch) return model.staleEpochError
 		if (completeMarkers()) return ErrorCode.ConcurrentTransactions
 		if (model.status === 'Ongoing') {
 			model.status = committed ? 'PrepareCommit' : 'PrepareAbort'
@@ -164,7 +167,7 @@ export function modelTransactions({ txnCoordinator, leader }: Pick<Transactional
 	}
 	/** AddPartitionsToTxn and AddOffsetsToTxn. */
 	const add = (epoch: number): ErrorCode => {
-		if (epoch !== model.epoch) return ErrorCode.ProducerFenced
+		if (epoch !== model.epoch) return model.staleEpochError
 		if (completeMarkers()) return ErrorCode.ConcurrentTransactions
 		model.status = 'Ongoing'
 		return ErrorCode.None
@@ -190,7 +193,7 @@ export function modelTransactions({ txnCoordinator, leader }: Pick<Transactional
 		if (producerEpoch === undefined || model.epoch === -1 || producerEpoch === model.epoch) {
 			bump(producerEpoch)
 		} else if (producerEpoch !== model.lastEpoch) {
-			return answer(ErrorCode.ProducerFenced)
+			return answer(model.staleEpochError)
 		}
 		return answer(ErrorCode.None)
 	})

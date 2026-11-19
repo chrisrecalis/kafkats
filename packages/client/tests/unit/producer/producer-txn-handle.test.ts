@@ -3,7 +3,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Producer } from '@/producer/producer.js'
 import type { ProducerConfig, TransactionHandle } from '@/producer/types.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
-import { InvalidTxnStateError, ProducerFencedError, TimeoutError, TransactionAbortedError } from '@/client/errors.js'
+import {
+	CommitFailedError,
+	InvalidTxnStateError,
+	ProducerFencedError,
+	TimeoutError,
+	TransactionAbortedError,
+} from '@/client/errors.js'
 import { decodeRecordBatch } from '@/protocol/records/record-batch.js'
 import { ConnectionClosedError } from '@/network/errors.js'
 import { buildProduceResponse, createTransactionalMocks, modelTransactions } from './_helpers.js'
@@ -434,10 +440,42 @@ describe('Producer.beginTransaction()', () => {
 
 			it('disconnect() aborts with EndTxn, without the bump', async () => {
 				const { producer, tx } = await failedTransaction()
+				const errors: unknown[] = []
+				producer.on('error', error => errors.push(error))
 
 				await producer.disconnect()
 				expect(coordinator.requests).toEqual([...before, 'EndTxn(abort, 0)'])
-				await expect(tx.commit()).rejects.toThrow(InvalidTxnStateError)
+				// The transaction aborted: skipping the bump is no failure of the abort.
+				expect(producer.transactionState).toBe('idle')
+				expect(errors).toEqual([])
+				await expect(tx.commit()).rejects.toMatchObject({
+					name: 'InvalidTxnStateError',
+					currentState: 'aborted',
+				})
+			})
+
+			it('a disconnect() while the abort bumps the epoch skips the bump: the abort resolves', async () => {
+				const { producer, tx } = await failedTransaction()
+				const errors: unknown[] = []
+				producer.on('error', error => errors.push(error))
+				// EndTxn finds the coordinator; the bump's lookup waits.
+				const lookup = mocks.cluster.getCoordinator.getMockImplementation()!
+				let release!: () => void
+				mocks.cluster.getCoordinator.mockImplementationOnce(lookup).mockImplementationOnce(async (...args) => {
+					await new Promise<void>(resolve => (release = resolve))
+					return lookup(...args)
+				})
+
+				const aborting = caught(tx.abort())
+				await vi.waitFor(() => expect(release).toBeDefined())
+				await producer.disconnect()
+				release()
+				await tick()
+
+				expect(await aborting).toBeUndefined()
+				expect(coordinator.requests).toEqual([...before, 'EndTxn(abort, 0)'])
+				expect(producer.transactionState).toBe('idle')
+				expect(errors).toEqual([])
 			})
 		})
 
@@ -495,62 +533,116 @@ describe('Producer.beginTransaction()', () => {
 			}
 		)
 
-		it('transaction() rejects with the fence its callback met', async () => {
-			const producer = makeProducer()
-			answer(ErrorCode.ProducerFenced)
+		it.each([1, 2])(
+			'transaction() rejects with the fence its callback met (transactionConcurrency %i)',
+			async transactionConcurrency => {
+				// With 2, the transaction runs on a lane: the lane is fenced, not the pool.
+				const producer = makeProducer({ transactionConcurrency })
+				answer(ErrorCode.ProducerFenced)
 
-			const error = await caught(
-				producer.transaction(async tx => {
-					await tx.send(TOPIC, { value, partition: 0 })
-				})
-			)
-			expect(error).toBeInstanceOf(ProducerFencedError)
-			expect(coordinator.requests).toEqual(['InitProducerId()', 'AddPartitionsToTxn(0)'])
-		})
-
-		it.each([
-			{
-				request: 'AddPartitionsToTxn',
-				last: (tx: TransactionHandle) => tx.send(TOPIC, { value, partition: 1 }),
-			},
-			{ request: 'AddOffsetsToTxn', last: (tx: TransactionHandle) => tx.sendOffsets({ groupId: 'g1', offsets }) },
-			{
-				request: 'TxnOffsetCommit',
-				first: (tx: TransactionHandle) => tx.sendOffsets({ groupId: 'g1', offsets }),
-				last: (tx: TransactionHandle) => {
-					mocks.groupCoordinator.txnOffsetCommit.mockResolvedValueOnce({
-						throttleTimeMs: 0,
-						topics: [
-							{ name: TOPIC, partitions: [{ partitionIndex: 0, errorCode: ErrorCode.ProducerFenced }] },
-						],
+				const error = await caught(
+					producer.transaction(async tx => {
+						await tx.send(TOPIC, { value, partition: 0 })
 					})
-					return tx.commit()
+				)
+				expect(error).toBeInstanceOf(ProducerFencedError)
+				expect(producer.transactionState).toBe('error')
+				expect(coordinator.requests).toEqual(['InitProducerId()', 'AddPartitionsToTxn(0)'])
+			}
+		)
+
+		/** What a coordinator answers a stale epoch: INVALID_PRODUCER_EPOCH before KIP-588, both a fence (Java). */
+		const fences = [
+			{ code: 'PRODUCER_FENCED', errorCode: ErrorCode.ProducerFenced },
+			{ code: 'INVALID_PRODUCER_EPOCH', errorCode: ErrorCode.InvalidProducerEpoch },
+		]
+
+		describe.each(fences)('$code from a coordinator', ({ errorCode }) => {
+			beforeEach(() => {
+				coordinator.staleEpochError = errorCode
+			})
+
+			it.each([
+				{
+					request: 'AddPartitionsToTxn',
+					last: (tx: TransactionHandle) => tx.send(TOPIC, { value, partition: 1 }),
 				},
-			},
-			{ request: 'EndTxn', last: (tx: TransactionHandle) => tx.commit() },
-		])('PRODUCER_FENCED from $request is fatal at once', async ({ first, last }) => {
-			const producer = makeProducer()
-			const tx = await producer.beginTransaction()
-			await tx.send(TOPIC, { value, partition: 0 })
-			await first?.(tx)
-			coordinator.successor()
-			coordinator.successorBegins()
-			const sent = coordinator.requests.length
+				{
+					request: 'AddOffsetsToTxn',
+					last: (tx: TransactionHandle) => tx.sendOffsets({ groupId: 'g1', offsets }),
+				},
+				{
+					request: 'TxnOffsetCommit',
+					first: (tx: TransactionHandle) => tx.sendOffsets({ groupId: 'g1', offsets }),
+					last: (tx: TransactionHandle) => {
+						mocks.groupCoordinator.txnOffsetCommit.mockResolvedValueOnce({
+							throttleTimeMs: 0,
+							topics: [{ name: TOPIC, partitions: [{ partitionIndex: 0, errorCode }] }],
+						})
+						return tx.commit()
+					},
+				},
+				{ request: 'EndTxn', last: (tx: TransactionHandle) => tx.commit() },
+			])('to $request is fatal at once: every later call rejects with the fence', async ({ first, last }) => {
+				const producer = makeProducer()
+				const tx = await producer.beginTransaction()
+				await tx.send(TOPIC, { value, partition: 0 })
+				await first?.(tx)
+				coordinator.successor()
+				coordinator.successorBegins()
+				const sent = coordinator.requests.length
 
-			const fenced = await caught(last(tx))
-			expect(fenced).toBeInstanceOf(ProducerFencedError)
-			expect(fenced).toMatchObject({ errorCode: ErrorCode.ProducerFenced, producerId: 1n, producerEpoch: 0 })
-			expect(producer.transactionState).toBe('error')
-			await caught(tx.abort())
-			await expect(producer.beginTransaction()).rejects.toBe(fenced)
+				const fenced = await caught(last(tx))
+				expect(fenced).toBeInstanceOf(ProducerFencedError)
+				expect(fenced).toMatchObject({
+					errorCode: ErrorCode.ProducerFenced,
+					producerId: 1n,
+					producerEpoch: 0,
+					cause: expect.objectContaining({ errorCode }),
+				})
+				expect(producer.transactionState).toBe('error')
+				// Also once the handle ended (a fenced commit) and after an abort (Java: every call in FATAL_ERROR).
+				await expect(tx.abort()).rejects.toBe(fenced)
+				await expect(tx.abort()).rejects.toBe(fenced)
+				await expect(tx.send(TOPIC, { value, partition: 0 })).rejects.toBe(fenced)
+				await expect(tx.sendOffsets({ groupId: 'g1', offsets })).rejects.toBe(fenced)
+				await expect(tx.commit()).rejects.toBe(fenced)
+				await expect(producer.beginTransaction()).rejects.toBe(fenced)
 
-			// The fenced request was the last one: no EndTxn to abort, no InitProducerId.
-			expect(coordinator.requests.length - sent).toBeLessThanOrEqual(1)
-			expect(coordinator.requests.filter(request => request.startsWith('InitProducerId'))).toEqual([
-				'InitProducerId()',
-			])
-			expect(coordinator.fenceAborts).toBe(1)
-			expect(coordinator.successorEndTxn(true)).toBe(ErrorCode.None)
+				// The fenced request was the last one: no EndTxn to abort, no InitProducerId.
+				expect(coordinator.requests.length - sent).toBeLessThanOrEqual(1)
+				expect(coordinator.requests.filter(request => request.startsWith('InitProducerId'))).toEqual([
+					'InitProducerId()',
+				])
+				expect(coordinator.fenceAborts).toBe(1)
+				expect(coordinator.successorEndTxn(true)).toBe(ErrorCode.None)
+			})
+
+			it('to the bump is fatal: the abort and every later begin reject with the fence', async () => {
+				const producer = makeProducer()
+				const tx = await producer.beginTransaction()
+				answer(ErrorCode.OutOfOrderSequenceNumber)
+				await caught(tx.send(TOPIC, { value, partition: 0 }))
+				// A successor initializes between the abort's EndTxn and its bump.
+				const initProducerId = mocks.txnCoordinator.initProducerId.getMockImplementation()!
+				mocks.txnCoordinator.initProducerId.mockImplementationOnce(async request => {
+					coordinator.successor()
+					return initProducerId(request)
+				})
+
+				const fenced = await caught(tx.abort())
+				expect(fenced).toBeInstanceOf(ProducerFencedError)
+				expect(fenced).toMatchObject({ cause: expect.objectContaining({ errorCode }) })
+				expect(producer.transactionState).toBe('error')
+				await expect(tx.abort()).rejects.toBe(fenced)
+				await expect(producer.beginTransaction()).rejects.toBe(fenced)
+				expect(coordinator.requests).toEqual([
+					'InitProducerId()',
+					'AddPartitionsToTxn(0)',
+					'EndTxn(abort, 0)',
+					`InitProducerId(1, 0): ${ErrorCode[errorCode]}`,
+				])
+			})
 		})
 
 		it('a bump that does not finish within maxBlockMs leaves the producer in the error state', async () => {
@@ -715,6 +807,7 @@ describe('Producer.beginTransaction()', () => {
 		let coordinator: ReturnType<typeof modelTransactions>
 
 		beforeEach(() => {
+			mocks = createTransactionalMocks(TOPIC, { partitionCount: 2 })
 			coordinator = modelTransactions(mocks)
 		})
 
@@ -730,17 +823,86 @@ describe('Producer.beginTransaction()', () => {
 				request.topics.flatMap(t => t.partitions.map(p => p.committedOffset))
 			)
 
-		/** The next request of this kind is answered by the model only once `release()` was called. */
-		function hold(request: 'addOffsetsToTxn' | 'addPartitionsToTxn') {
+		/**
+		 * The next request of this kind is answered by the model only once `release()` was called; or its answer is lost
+		 * (the connection closes) after the model applied it, or before it reached the model.
+		 */
+		function hold(
+			request: 'addOffsetsToTxn' | 'addPartitionsToTxn',
+			outcome: 'answered' | 'applied' | 'lost' = 'answered'
+		) {
 			const state = { held: false, release: () => {} }
 			const answer = mocks.txnCoordinator[request].getMockImplementation() as (r: unknown) => Promise<never>
 			mocks.txnCoordinator[request].mockImplementationOnce(async (r: unknown) => {
 				state.held = true
 				await new Promise<void>(resolve => (state.release = resolve))
-				return answer(r)
+				if (outcome === 'answered') return answer(r)
+				if (outcome === 'applied') await answer(r)
+				throw new ConnectionClosedError('connection lost')
 			})
 			return state
 		}
+		/** The values of the records the leader received, in the order of its produce requests. */
+		async function producedValues(): Promise<string[]> {
+			const batches = await Promise.all(
+				mocks.leader.produce.mock.calls.flatMap(([request]) =>
+					request.topics.flatMap(t => t.partitions.map(p => decodeRecordBatch(p.records)))
+				)
+			)
+			return batches.flatMap(batch => batch.records.map(record => String(record.value)))
+		}
+
+		it("an aborted transaction's batch queued behind a busy partition is rejected, not produced into the next one", async () => {
+			let releaseA1!: () => void
+			mocks.leader.produce
+				.mockImplementationOnce(
+					() =>
+						new Promise(resolve => {
+							releaseA1 = () =>
+								resolve(
+									buildProduceResponse([
+										{ name: TOPIC, partitions: [{ partitionIndex: 0, errorCode: ErrorCode.None }] },
+									])
+								)
+						})
+				)
+				.mockResolvedValueOnce(
+					buildProduceResponse([
+						{ name: TOPIC, partitions: [{ partitionIndex: 1, errorCode: ErrorCode.MessageTooLarge }] },
+					])
+				)
+			const producer = makeProducer()
+			const a = await producer.beginTransaction()
+			const a1 = a.send(TOPIC, { value: Buffer.from('A1'), partition: 0 })
+			await vi.waitFor(() => expect(mocks.leader.produce).toHaveBeenCalledTimes(1))
+			// A2-p0 waits behind A1 for partition 0; A2-p1 is rejected, which rejects the whole send.
+			const a2 = await caught(
+				a.send(TOPIC, [
+					{ value: Buffer.from('A2-p0'), partition: 0 },
+					{ value: Buffer.from('A2-p1'), partition: 1 },
+				])
+			)
+			expect(a2).toMatchObject({ errorCode: ErrorCode.MessageTooLarge })
+
+			const aborting = a.abort()
+			releaseA1()
+			await a1
+			await aborting
+			const b = await producer.beginTransaction()
+			await b.send(TOPIC, { value: Buffer.from('B1'), partition: 0 })
+			await b.commit()
+
+			expect(await producedValues()).toEqual(['A1', 'A2-p1', 'B1'])
+			expect(coordinator.requests).toEqual([
+				'InitProducerId()',
+				'AddPartitionsToTxn(0)',
+				'AddPartitionsToTxn(0)',
+				'EndTxn(abort, 0)',
+				'AddPartitionsToTxn(0): ConcurrentTransactions',
+				'AddPartitionsToTxn(0)',
+				'EndTxn(commit, 0)',
+			])
+		})
 
 		it("an aborted transaction's offsets answered late are not committed by the next one", async () => {
 			const producer = makeProducer()
@@ -848,6 +1010,111 @@ describe('Producer.beginTransaction()', () => {
 			expect(coordinator.requests).toEqual(['InitProducerId()'])
 			expect(producer.transactionState).toBe('idle')
 		})
+
+		it.each([
+			{
+				invalid: 'an unjoined generation',
+				params: {
+					consumerGroupMetadata: { groupId: 'g1', generationId: -1, memberId: '', groupInstanceId: null },
+					offsets: offsets(7n).offsets,
+				},
+				error: CommitFailedError,
+			},
+			{ invalid: 'no group', params: { offsets: offsets(7n).offsets }, error: Error },
+		])('a sendOffsets() with $invalid, not awaited, makes the commit abort', async ({ params, error }) => {
+			const producer = makeProducer()
+			const tx = await producer.beginTransaction()
+			await tx.send(TOPIC, { value, partition: 0 })
+			const registering = caught(tx.sendOffsets(params))
+
+			const aborted = await caught(tx.commit())
+			expect(await registering).toBeInstanceOf(error)
+			expect(aborted).toBeInstanceOf(TransactionAbortedError)
+			expect(aborted).toMatchObject({ outcome: 'aborted', cause: await registering })
+			expect(mocks.groupCoordinator.txnOffsetCommit).not.toHaveBeenCalled()
+			expect(coordinator.requests).toEqual(['InitProducerId()', 'AddPartitionsToTxn(0)', 'EndTxn(abort, 0)'])
+		})
+
+		/**
+		 * A registration whose answer is lost while its transaction aborts: the coordinator may have begun the
+		 * transaction (Java retries it to an answer before EndTxn).
+		 */
+		describe.each([
+			{
+				request: 'addOffsetsToTxn' as const,
+				registered: 'AddOffsetsToTxn(0)',
+				register: (tx: TransactionHandle) => tx.sendOffsets(offsets(1n)),
+			},
+			{
+				request: 'addPartitionsToTxn' as const,
+				registered: 'AddPartitionsToTxn(0)',
+				register: (tx: TransactionHandle) => tx.send(TOPIC, { value, partition: 0 }),
+			},
+		])(
+			'$request answered with a lost connection while its transaction aborts',
+			({ request, registered, register }) => {
+				it.each([
+					{
+						outcome: 'applied' as const,
+						// The coordinator began the transaction: EndTxn aborts it.
+						requests: ['InitProducerId()', registered, 'EndTxn(abort, 0)'],
+					},
+					{
+						outcome: 'lost' as const,
+						// It never did: the coordinator has no transaction to abort.
+						requests: ['InitProducerId()', 'EndTxn(abort, 0): InvalidTxnState'],
+					},
+				])('the abort sends EndTxn; $outcome by the coordinator', async ({ outcome, requests }) => {
+					const producer = makeProducer()
+					const tx = await producer.beginTransaction()
+					const registration = hold(request, outcome)
+					const registering = caught(register(tx))
+					await vi.waitFor(() => expect(registration.held).toBe(true))
+
+					const aborting = tx.abort()
+					registration.release()
+					await aborting
+					expect(await registering).toBeInstanceOf(TransactionAbortedError)
+					expect(coordinator.requests).toEqual(requests)
+					expect(coordinator.status).not.toBe('Ongoing')
+					expect(producer.transactionState).toBe('idle')
+
+					const next = await producer.beginTransaction()
+					await next.send(TOPIC, { value, partition: 0 })
+					await next.commit()
+					expect(coordinator.requests.at(-1)).toBe('EndTxn(commit, 0)')
+				})
+			}
+		)
+
+		it.each([
+			{ sent: 'nothing', send: async () => {} },
+			{ sent: 'a record', send: (tx: TransactionHandle) => tx.send(TOPIC, { value, partition: 0 }) },
+		])(
+			'a fence met while the abort waits for a registration is fatal: no EndTxn ($sent sent before)',
+			async ({ send }) => {
+				const producer = makeProducer()
+				const errors: unknown[] = []
+				producer.on('error', error => errors.push(error))
+				const tx = await producer.beginTransaction()
+				await send(tx)
+				const registration = hold('addOffsetsToTxn')
+				const registering = caught(tx.sendOffsets(offsets(1n)))
+				await vi.waitFor(() => expect(registration.held).toBe(true))
+				// The model answers the held registration PRODUCER_FENCED.
+				coordinator.successor()
+
+				const aborting = caught(tx.abort())
+				registration.release()
+				const fenced = await registering
+				expect(fenced).toBeInstanceOf(ProducerFencedError)
+				expect(await aborting).toBe(fenced)
+				expect(producer.transactionState).toBe('error')
+				expect(errors).toEqual([fenced])
+				expect(coordinator.requests.filter(request => request.startsWith('EndTxn'))).toEqual([])
+				await expect(producer.beginTransaction()).rejects.toBe(fenced)
+			}
+		)
 	})
 
 	describe('disconnect', () => {

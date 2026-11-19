@@ -127,7 +127,8 @@ export interface ProducerConfig {
 	 * the next send or transaction, which first awaits an InitProducerId left unanswered (Java).
 	 * A coordinator lookup that answers once the initialization timed out (or the producer
 	 * disconnected) sends no InitProducerId: it would bump the epoch of the transactional id
-	 * behind a producer that replaced this one.
+	 * behind a producer that replaced this one. One already sent may still be applied, like in
+	 * the Java client.
 	 */
 	maxBlockMs?: number
 }
@@ -387,7 +388,8 @@ export interface ProducerTransaction {
 	 *
 	 * The offsets belong to this transaction only: a commit waits for a registration still in
 	 * progress (AddOffsetsToTxn) and commits its offsets with the transaction. Like a failed send,
-	 * a registration that fails (also one not awaited) makes the commit abort. Once the transaction
+	 * a call of an open transaction that fails (also one not awaited, also for its arguments)
+	 * makes the commit abort. Once the transaction
 	 * aborts, a registration in progress sends nothing more and rejects with
 	 * `TransactionAbortedError`, also when its request is answered afterwards.
 	 */
@@ -440,32 +442,36 @@ export interface TransactionHandle extends ProducerTransaction {
 	 * - `outcome: 'unknown'`: EndTxn(commit) was sent but not confirmed, so the broker may have
 	 *   committed. The producer enters the 'error' state.
 	 *
-	 * Rejects with `ProducerFencedError` once the producer is fenced (see `abort()`), and with
+	 * Rejects with `ProducerFencedError` once the producer is fenced (see `abort()`), else with
 	 * `InvalidTxnStateError` once the transaction is committing or ended.
 	 */
 	commit(options?: ProducerCallOptions): Promise<void>
 	/**
 	 * Abort: reject the queued sends, wait for those in flight, EndTxn(abort)
 	 *
-	 * Sends and offset registrations still in progress start no request any more; one already
-	 * sent is awaited (so that EndTxn follows it), and what it is answered is not added: they
-	 * reject with `TransactionAbortedError`. Nothing of the transaction reaches the next one.
+	 * Sends and offset registrations still in progress start no request any more; records not
+	 * sent yet are rejected; a request already sent is awaited (so that EndTxn follows it), and
+	 * what it is answered is not added: they reject with `TransactionAbortedError`. Nothing of the
+	 * transaction reaches the next one. EndTxn is sent once the coordinator may have begun the
+	 * transaction, also when the answer to a registration was lost (then a coordinator that never
+	 * began it answers INVALID_TXN_STATE, and the abort resolves).
 	 *
 	 * When the producer's epoch failed during the transaction (an out-of-order sequence, a send
 	 * whose outcome its retries left unknown, InvalidProducerEpoch on a produce), its sends were
 	 * rejected and nothing more went out; after EndTxn, InitProducerId bumps the epoch (Java
 	 * parity), and the producer runs the next transaction under the new one (`disconnect()` skips
-	 * the bump).
+	 * the bump, also one in progress).
 	 *
 	 * If that does not finish (EndTxn or the bump fails, `timeoutMs` passes or `signal` aborts),
 	 * the producer enters the 'error' state and this rejects. A fenced producer (another one with
 	 * the same transactional id took over, or the broker aborted the transaction after
 	 * `transactionTimeoutMs`: answers PRODUCER_FENCED, or INVALID_PRODUCER_EPOCH from a
 	 * coordinator) is in the 'error' state for good, never initialized again: this sends nothing
-	 * (the broker aborted the transaction) and rejects with the `ProducerFencedError`, like the
-	 * transaction's later sends, its commit and every later begin; replace the producer.
-	 * Resolves once that settled when the transaction already ended or is ending without a
-	 * commit. Rejects with `InvalidTxnStateError` while committing or once committed.
+	 * (the broker aborted the transaction) and rejects with the `ProducerFencedError`, also once
+	 * the transaction ended, like every later call of the handle and every later begin; replace
+	 * the producer. Otherwise it resolves once that settled when the transaction already ended or
+	 * is ending without a commit, and rejects with `InvalidTxnStateError` while committing or once
+	 * committed.
 	 */
 	abort(options?: ProducerCallOptions): Promise<void>
 }

@@ -72,13 +72,17 @@ describe('Producer transactional offsets', () => {
 			['an empty member id', member({ memberId: '' }), ErrorCode.UnknownMemberId],
 		])('rejects group metadata with %s before sending anything', async (_, consumerGroupMetadata, errorCode) => {
 			let error: unknown
-			await makeProducer().transaction(async tx => {
-				error = await tx
-					.sendOffsets({ consumerGroupMetadata, offsets: [{ topic: TOPIC, partition: 0, offset: 1n }] })
-					.catch((e: unknown) => e)
-			})
+			const aborted = await makeProducer()
+				.transaction(async tx => {
+					error = await tx
+						.sendOffsets({ consumerGroupMetadata, offsets: [{ topic: TOPIC, partition: 0, offset: 1n }] })
+						.catch((e: unknown) => e)
+				})
+				.catch((e: unknown) => e)
 
 			expect(error).toBeInstanceOf(CommitFailedError)
+			// Like a failed send, it makes the transaction abort, also when the callback caught it.
+			expect(aborted).toMatchObject({ outcome: 'aborted', cause: error })
 			expect(error).toMatchObject({
 				groupId: 'group-1',
 				errorCode,

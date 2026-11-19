@@ -22,7 +22,12 @@ import { diagnostics, trace, type RebalanceDiagnostics } from '@/diagnostics.js'
 import { retry } from '@/utils/retry.js'
 import { sleep } from '@/utils/sleep.js'
 import { tpKey } from '@/utils/topic-partition.js'
-import { CoordinatorNotAvailableError, NotCoordinatorError, isConnectionFailure } from '@/client/errors.js'
+import {
+	CoordinatorNotAvailableError,
+	NotCoordinatorError,
+	TimeoutError,
+	isConnectionFailure,
+} from '@/client/errors.js'
 import { ReconnectionStrategy } from '@/utils/reconnection-strategy.js'
 
 /** Minimum spacing between 'error' events reported while waiting for an unreachable cluster. */
@@ -252,15 +257,19 @@ export class GroupPartitionProvider implements PartitionProvider {
 	 * Run a step of the rebalance protocol, retrying with bounded exponential backoff while the
 	 * cluster is unreachable (e.g. the broker is restarting). Dying here would strand the consumer
 	 * outside the group; instead it keeps trying until the cluster is back or the consumer stops.
-	 * Protocol-level errors are not retried. Failures are surfaced as throttled 'error' events.
+	 * Protocol-level errors are not retried, nor others unless `alsoRetried` says so. Failures are surfaced as
+	 * throttled 'error' events.
 	 */
-	private async whileReachable<T>(step: () => Promise<T>): Promise<T> {
+	private async whileReachable<T>(
+		step: () => Promise<T>,
+		alsoRetried: (error: unknown) => boolean = () => false
+	): Promise<T> {
 		const backoff = new ReconnectionStrategy({ initialDelayMs: 100, maxDelayMs: 5000, jitter: 0.2 })
 		for (;;) {
 			try {
 				return await step()
 			} catch (error) {
-				if (!isConnectionFailure(error) || this.signal?.aborted || !this.isRunning()) {
+				if (!(isConnectionFailure(error) || alsoRetried(error)) || this.signal?.aborted || !this.isRunning()) {
 					throw error
 				}
 				const now = Date.now()
@@ -450,7 +459,13 @@ export class GroupPartitionProvider implements PartitionProvider {
 	}
 
 	private async resolveOffsets(partitions: TopicPartition[]): Promise<AssignedPartition[]> {
-		const committedOffsets = await this.whileReachable(() => this.offsetManager.fetchCommittedOffsets(partitions))
+		// Each fetch is bounded by defaultApiTimeoutMs. One that ran out of time (a coordinator that does not answer,
+		// or answers it is loading) is tried again like one of an unreachable cluster, as Java's consumer does at its
+		// next poll: it does not fail the rebalance, which would leave the group.
+		const committedOffsets = await this.whileReachable(
+			() => this.offsetManager.fetchCommittedOffsets(partitions),
+			error => error instanceof TimeoutError
+		)
 		return resolveAssignment(
 			this.offsetManager,
 			partitions,

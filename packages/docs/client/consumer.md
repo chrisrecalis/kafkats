@@ -270,7 +270,7 @@ const committed = await consumer.committed([{ topic: 'events', partition: 0 }])
 const entry = committed.get('events:0') // { offset, metadata, leaderEpoch? }, or null without a committed offset
 ```
 
-The map is keyed by `topic:partition`. Offsets of an open transaction are waited for, and a moved or loading coordinator retried, until `timeoutMs` (default `defaultApiTimeoutMs`) passed. It bounds the whole call, a coordinator that does not answer included: then it rejects with `TimeoutError`, whose `cause` is the last failure. Each assignment also carries the committed offsets of its partitions (see [Rebalance Hooks](#rebalance-hooks)).
+The map is keyed by `topic:partition`. Offsets of an open transaction are waited for, and a moved or loading coordinator retried, until `timeoutMs` (default `defaultApiTimeoutMs`) passed. It bounds the whole call, a coordinator that does not answer included: then it rejects with `TimeoutError`, whose `cause` is the last failure. Each assignment also carries the committed offsets of its partitions (see [Rebalance Hooks](#rebalance-hooks)); a rebalance whose fetch of them runs out of `defaultApiTimeoutMs` fetches them again, like while the cluster is unreachable (reporting an `error` event), instead of failing.
 
 ### Position, Next Offset and Lag
 

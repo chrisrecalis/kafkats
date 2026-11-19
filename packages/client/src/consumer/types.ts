@@ -361,7 +361,8 @@ export interface ConsumerConfig {
 	onPartitionsLost?: (partitions: TopicPartition[]) => Promise<void>
 	/**
 	 * Maximum time in ms to retry coordinator-related offset fetch and commit operations before
-	 * failing (default: 60000).
+	 * failing (default: 60000). The fetch of a rebalance's committed offsets is tried again after
+	 * that time, like while the cluster is unreachable, instead of failing the rebalance.
 	 */
 	defaultApiTimeoutMs?: number
 }

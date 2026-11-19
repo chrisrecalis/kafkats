@@ -47,7 +47,8 @@ Flow's task runtime is built on these consumer and producer behaviours; a change
 - `consumer.commit(offsets, { signal })` commits with metadata outside handlers (also with `commitOffsets: false`),
   pinned to the generation it started in: a commit still retried after a rejoin, or after a partition of it was
   revoked or lost, rejects with `CommitFailedError`. `consumer.committed()` reads offsets back with their metadata.
-  Their `timeoutMs` bounds the whole call (requests in flight and coordinator lookups included), as does a signal.
+  Their `timeoutMs` bounds the whole call (requests in flight and coordinator lookups included), as does a signal;
+  a rebalance fetches its committed offsets again after `defaultApiTimeoutMs`, like while the cluster is unreachable.
 - `onPartitionsRevoked`, `onPartitionsAssigned` and `onPartitionsLost` are awaited inside the rebalance; assigned
   partitions are not fetched before `onPartitionsAssigned` returned; the lost hook runs synchronously with the loss.
   `rebalancePending` and its events tell flow to skip timer commits.
@@ -60,21 +61,24 @@ Flow's task runtime is built on these consumer and producer behaviours; a change
   give fenced exactly-once commits; an unconfirmed `EndTxn` rejects with `TransactionAbortedError` and
   `outcome: 'unknown'`. `producer.disconnect({ timeoutMs })` and `consumer.stop()` are bounded. What a transaction
   registers (partitions, offsets) is its own: `commit()` waits for `sendOffsets()` calls still in progress (a failed
-  one aborts it); once it aborts, sends and registrations in progress reject with `TransactionAbortedError` and
-  nothing of them reaches the next transaction. An initialization given up (`maxBlockMs`, `disconnect()`) sends no
-  InitProducerId after a coordinator lookup that answers late.
+  one aborts it); once it aborts, sends and registrations in progress reject with `TransactionAbortedError`, records
+  not sent yet are dropped, EndTxn waits for every produce request of the transaction (and is sent when a
+  registration's answer was lost), and nothing of them reaches the next transaction. An initialization given up
+  (`maxBlockMs`, `disconnect()`) sends no InitProducerId after a coordinator lookup that answers late.
 - A fenced transactional producer (PRODUCER_FENCED on a produce, PRODUCER_FENCED or INVALID_PRODUCER_EPOCH from a
-  coordinator) is fatal and never sends InitProducerId again: the handle's calls, `abort()` included, and every later
-  begin reject with `ProducerFencedError`. Any other failure of the epoch (out-of-order sequence, an outcome the
-  retries left unknown, INVALID_PRODUCER_EPOCH on a produce) rejects the transaction's sends and leaves it abortable;
-  `abort()` sends EndTxn, then InitProducerId bumps the epoch (not during `disconnect()`). Flow migrates on all of
-  these and replaces the producer.
+  coordinator) is fatal and never sends InitProducerId again: the handle's calls, `abort()` included (also once the
+  handle ended, and when the fence arrives during the abort), every later begin and a `transaction()` run on a lane
+  of the pool reject with `ProducerFencedError`. Any other failure of the epoch (out-of-order sequence, an outcome
+  the retries left unknown, INVALID_PRODUCER_EPOCH on a produce) rejects the transaction's sends and leaves it
+  abortable; `abort()` sends EndTxn, then InitProducerId bumps the epoch (not during `disconnect()`, also one called
+  during the bump). Flow migrates on all of these and replaces the producer.
 - `admin.deleteRecords()` purges repartition topics; `murmur2` / `toPositive` and `producer.partitionCount()` give a
   key's partition like the Java client.
 
-Tests: `tests/unit/consumer/{consumer-commit,rebalance-hooks,group-metadata,fetch-pause-undelivered,session-lost}`,
-`tests/unit/producer/producer-txn-handle`, `tests/integration/consumer/{commit-api,rebalance-hooks,offset-reset}`,
-`tests/integration/eos/transaction-handle`. User documentation: `packages/docs/client/*.md`.
+Tests: `tests/unit/consumer/{consumer-commit,rebalance-hooks,rebalance-offset-fetch,group-metadata,session-lost}`,
+`tests/unit/consumer/fetch-pause-undelivered`, `tests/unit/producer/producer-txn-handle`,
+`tests/integration/consumer/{commit-api,rebalance-hooks,offset-reset}`, `tests/integration/eos/transaction-handle`.
+User documentation: `packages/docs/client/*.md`.
 
 ### Key Classes
 
