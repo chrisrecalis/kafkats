@@ -58,6 +58,12 @@ Flow's task runtime is built on these consumer and producer behaviours; a change
 - `groupMetadata()` and `producer.beginTransaction()` (a `TransactionHandle` with `sendOffsets`, `commit`, `abort`)
   give fenced exactly-once commits; an unconfirmed `EndTxn` rejects with `TransactionAbortedError` and
   `outcome: 'unknown'`. `producer.disconnect({ timeoutMs })` and `consumer.stop()` are bounded.
+- A fenced transactional producer (PRODUCER_FENCED on a produce, PRODUCER_FENCED or INVALID_PRODUCER_EPOCH from a
+  coordinator) is fatal and never sends InitProducerId again: the handle's calls, `abort()` included, and every later
+  begin reject with `ProducerFencedError`. Any other failure of the epoch (out-of-order sequence, an outcome the
+  retries left unknown, INVALID_PRODUCER_EPOCH on a produce) rejects the transaction's sends and leaves it abortable;
+  `abort()` sends EndTxn, then InitProducerId bumps the epoch (not during `disconnect()`). Flow migrates on all of
+  these and replaces the producer.
 - `admin.deleteRecords()` purges repartition topics; `murmur2` / `toPositive` and `producer.partitionCount()` give a
   key's partition like the Java client.
 

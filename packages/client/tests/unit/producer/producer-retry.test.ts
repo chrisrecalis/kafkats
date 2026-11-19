@@ -437,7 +437,7 @@ describe('Producer retry behavior', () => {
 			expect(initCount).toBe(2)
 		})
 
-		it('handles INVALID_PRODUCER_EPOCH as fencing', async () => {
+		it('fails the epoch on INVALID_PRODUCER_EPOCH and initializes again', async () => {
 			mockCluster.getAnyBroker.mockResolvedValue(mockBroker)
 			mockBroker.initProducerId.mockResolvedValue({
 				throttleTimeMs: 0,
@@ -476,8 +476,13 @@ describe('Producer retry behavior', () => {
 				])
 			)
 
-			await expect(producer.send('test-topic', { value: Buffer.from('test') })).rejects.toThrow(
-				ProducerFencedError
+			await expect(producer.send('test-topic', { value: Buffer.from('test') })).rejects.toMatchObject({
+				errorCode: ErrorCode.InvalidProducerEpoch,
+			})
+			// InitProducerId with its identity bumps the epoch.
+			await vi.waitFor(() => expect(mockBroker.initProducerId).toHaveBeenCalledTimes(2))
+			expect(mockBroker.initProducerId).toHaveBeenLastCalledWith(
+				expect.objectContaining({ producerId: 1001n, producerEpoch: 1 })
 			)
 		})
 	})

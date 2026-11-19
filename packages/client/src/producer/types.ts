@@ -422,22 +422,35 @@ export interface TransactionHandle extends ProducerTransaction {
 	 * Commit: flush the transaction's sends, commit its offsets (TxnOffsetCommit), EndTxn(commit)
 	 *
 	 * Rejects with `TransactionAbortedError` when the transaction did not commit:
-	 * - `outcome: 'aborted'`: it was aborted, as `abort()` does; or `timeoutMs` passed or `signal`
-	 *   aborted before EndTxn(commit) was sent, and then nothing more is sent: the broker's
-	 *   transaction timeout ends the transaction and the producer enters the 'error' state.
+	 * - `outcome: 'aborted'`: it was aborted, as `abort()` does (also when a send failed, or the
+	 *   producer's epoch did: then nothing can commit); or `timeoutMs` passed or `signal` aborted
+	 *   before EndTxn(commit) was sent, and then nothing more is sent: the broker's transaction
+	 *   timeout ends the transaction and the producer enters the 'error' state.
 	 * - `outcome: 'unknown'`: EndTxn(commit) was sent but not confirmed, so the broker may have
 	 *   committed. The producer enters the 'error' state.
 	 *
-	 * Rejects with `InvalidTxnStateError` once the transaction is committing or ended.
+	 * Rejects with `ProducerFencedError` once the producer is fenced (see `abort()`), and with
+	 * `InvalidTxnStateError` once the transaction is committing or ended.
 	 */
 	commit(options?: ProducerCallOptions): Promise<void>
 	/**
 	 * Abort: reject the queued sends, wait for those in flight, EndTxn(abort)
 	 *
-	 * If that does not finish (EndTxn fails, `timeoutMs` passes or `signal` aborts), the producer
-	 * enters the 'error' state and this rejects. Resolves once that settled when the transaction
-	 * already ended or is ending without a commit. Rejects with `InvalidTxnStateError` while
-	 * committing or once committed.
+	 * When the producer's epoch failed during the transaction (an out-of-order sequence, a send
+	 * whose outcome its retries left unknown, InvalidProducerEpoch on a produce), its sends were
+	 * rejected and nothing more went out; after EndTxn, InitProducerId bumps the epoch (Java
+	 * parity), and the producer runs the next transaction under the new one (`disconnect()` skips
+	 * the bump).
+	 *
+	 * If that does not finish (EndTxn or the bump fails, `timeoutMs` passes or `signal` aborts),
+	 * the producer enters the 'error' state and this rejects. A fenced producer (another one with
+	 * the same transactional id took over, or the broker aborted the transaction after
+	 * `transactionTimeoutMs`: answers PRODUCER_FENCED, or INVALID_PRODUCER_EPOCH from a
+	 * coordinator) is in the 'error' state for good, never initialized again: this sends nothing
+	 * (the broker aborted the transaction) and rejects with the `ProducerFencedError`, like the
+	 * transaction's later sends, its commit and every later begin; replace the producer.
+	 * Resolves once that settled when the transaction already ended or is ending without a
+	 * commit. Rejects with `InvalidTxnStateError` while committing or once committed.
 	 */
 	abort(options?: ProducerCallOptions): Promise<void>
 }

@@ -2,9 +2,10 @@ import { describe, expect, it } from 'vitest'
 
 import type { Cluster } from '@/client/cluster.js'
 import type { KafkaClient } from '@/client/index.js'
-import { TransactionAbortedError } from '@/client/errors.js'
+import { KafkaError, ProducerFencedError, TransactionAbortedError } from '@/client/errors.js'
 import { codec } from '@/codec.js'
 import { ConnectionClosedError } from '@/network/errors.js'
+import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import type { Producer } from '@/producer/producer.js'
 import { topic } from '@/topic.js'
 
@@ -100,13 +101,50 @@ describe.concurrent('EOS (integration) - transaction handles', () => {
 		const successor = transactionalProducer(client, transactionalId)
 		const successorTx = await successor.beginTransaction()
 
+		// EndTxn(commit) is answered PRODUCER_FENCED: the zombie can do nothing more (Java parity).
 		const error = await zombieTx.commit().catch((e: unknown) => e)
-		expect(error).toBeInstanceOf(TransactionAbortedError)
-		expect(error).toMatchObject({ outcome: 'aborted' })
+		expect(error).toBeInstanceOf(ProducerFencedError)
+		expect(zombie.transactionState).toBe('error')
 
 		await successorTx.send(testTopic, { value: 'successor' })
 		await successorTx.commit()
 
+		expect(await readCommitted(client, topicName, 1)).toEqual(['successor'])
+
+		await zombie.disconnect()
+		await successor.disconnect()
+		await client.disconnect()
+	})
+
+	it('a producer fenced by its successor never aborts the transaction the successor has open', async () => {
+		const client = createClient('it-tx-handle-zombie')
+		await client.connect()
+		const topicName = uniqueName('it-tx-handle-zombie')
+		const testTopic = topic<string>(topicName, { value: codec.string() })
+		await client.createTopics([{ name: topicName, numPartitions: 1, replicationFactor: 1 }])
+		const transactionalId = uniqueName('tx')
+
+		const zombie = transactionalProducer(client, transactionalId)
+		const zombieTx = await zombie.beginTransaction()
+		await zombieTx.send(testTopic, { value: 'zombie' })
+
+		// Initializing, the successor aborts the zombie's transaction under a newer epoch, then opens its own.
+		const successor = transactionalProducer(client, transactionalId)
+		const successorTx = await successor.beginTransaction()
+		await successorTx.send(testTopic, { value: 'successor' })
+
+		// The partition saw the newer epoch (KIP-588: INVALID_PRODUCER_EPOCH). An InitProducerId of the zombie now, with
+		// its producer id, would make the coordinator abort the successor's transaction.
+		const refused = await zombieTx.send(testTopic, { value: 'zombie-again' }).catch((e: unknown) => e)
+		expect(refused).toBeInstanceOf(KafkaError)
+		expect([ErrorCode.InvalidProducerEpoch, ErrorCode.ProducerFenced]).toContain((refused as KafkaError).errorCode)
+		// Its abort's EndTxn tells the fence: fatal, no epoch bump.
+		const fenced = await zombieTx.abort().catch((e: unknown) => e)
+		expect(fenced).toBeInstanceOf(ProducerFencedError)
+		expect(zombie.transactionState).toBe('error')
+		await expect(zombie.beginTransaction()).rejects.toBeInstanceOf(ProducerFencedError)
+
+		await successorTx.commit()
 		expect(await readCommitted(client, topicName, 1)).toEqual(['successor'])
 
 		await zombie.disconnect()

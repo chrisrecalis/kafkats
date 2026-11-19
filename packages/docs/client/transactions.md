@@ -69,11 +69,11 @@ await tx.commit()
 
 - `beginTransaction()` waits its turn first in first out together with `transaction()` calls (one open transaction per transactional ID, see [Concurrent Transactions](#concurrent-transactions)). The first transaction of a producer initializes it, which fences older producers with the same transactional ID.
 - A handle has no client-side timeout: the broker aborts a transaction left open longer than `transactionTimeoutMs`. Pass `beginTransaction({ signal })` to bound it yourself: aborting the signal rejects a call still waiting for its turn, and aborts the transaction once it is open, until `commit()` or `abort()` is called. From then on it has no effect: those calls take their own `{ timeoutMs, signal }`, and without them a commit or abort can take as long as the producer's coordinator retries (up to `maxBlockMs` for each request, plus the flush).
-- `tx.commit({ timeoutMs, signal })` flushes the transaction's sends, commits its offsets and ends it. It rejects with `TransactionAbortedError` when the transaction did not commit (see [Error Handling](#error-handling)).
-- `tx.abort({ timeoutMs, signal })` rejects the queued sends, waits for those in flight and ends the transaction. If that does not finish in time, the producer enters the `'error'` state and the call rejects.
+- `tx.commit({ timeoutMs, signal })` flushes the transaction's sends, commits its offsets and ends it. It rejects with `TransactionAbortedError` when the transaction did not commit, and with `ProducerFencedError` once the producer was fenced (see [Error Handling](#error-handling)).
+- `tx.abort({ timeoutMs, signal })` rejects the queued sends, waits for those in flight and ends the transaction, then bumps the producer's epoch if a send failed it (see [Producer Fenced](#producer-fenced)). If that does not finish in time, the producer enters the `'error'` state and the call rejects; on a fenced producer it sends nothing and rejects with `ProducerFencedError`.
 - `tx.signal` is aborted once the transaction ends without committing. Calling `send()`, `sendOffsets()` or `commit()` on a transaction that ended rejects with `InvalidTxnStateError`.
 
-`producer.transactionState` tells where the producer stands: `'idle'`, `'in_transaction'`, `'committing'`, `'aborting'`, or `'error'` once it can run no transaction any more (an abort that did not finish, or a commit whose outcome is unknown). A producer in the `'error'` state refuses new transactions; replace it with a new one (`disconnect()` is still allowed).
+`producer.transactionState` tells where the producer stands: `'idle'`, `'in_transaction'`, `'committing'`, `'aborting'`, or `'error'` once it can run no transaction any more (a fence, an abort that did not finish, or a commit whose outcome is unknown). A producer in the `'error'` state refuses new transactions; replace it with a new one (`disconnect()` is still allowed).
 
 ## Transaction Timeout
 
@@ -318,8 +318,9 @@ Idempotent mode:
 
 ### Transaction Aborted
 
-`transaction()` and `tx.commit()` reject with `TransactionAbortedError` when the transaction did not commit. Its `cause`
-is why (the error your callback threw, a failed send, the broker's answer), and its `outcome` says what is known:
+`transaction()` and `tx.commit()` reject with `TransactionAbortedError` when the transaction did not commit (with
+`ProducerFencedError` when the producer was fenced, see [Producer Fenced](#producer-fenced)). Its `cause` is why (the
+error your callback threw, a failed send, the broker's answer), and its `outcome` says what is known:
 
 - `'aborted'`: the transaction did not commit; read_committed consumers see none of it. Its work can be redone in a
   new transaction (on a new producer if `producer.transactionState` is `'error'`).
@@ -331,7 +332,7 @@ A commit cut short by its own `timeoutMs` or `signal` before EndTxn(commit) was 
 sent, the broker ends the transaction after `transactionTimeoutMs`, and the producer enters the `'error'` state.
 
 ```typescript
-import { TransactionAbortedError } from '@kafkats/client'
+import { ProducerFencedError, TransactionAbortedError } from '@kafkats/client'
 
 try {
 	await producer.transaction(async txn => {
@@ -342,35 +343,50 @@ try {
 	if (error instanceof TransactionAbortedError && error.outcome === 'unknown') {
 		// Maybe committed: replace the producer before going on
 	} else if (error instanceof TransactionAbortedError) {
-		// Not committed (timeout, failed send, fenced, ...): error.cause tells why
+		// Not committed (timeout, failed send, ...): error.cause tells why
+	} else if (error instanceof ProducerFencedError) {
+		// Not committed, and this producer can run no transaction any more: replace it
 	}
 }
 ```
 
 `InvalidTxnStateError` is raised by calls that do not fit the transaction's state: using a handle after it ended,
-committing one that is aborting, or beginning a transaction on a producer in the `'error'` state.
+committing one that is aborting, or beginning a transaction on a producer in the `'error'` state (a fenced producer
+raises `ProducerFencedError` instead, see [Producer Fenced](#producer-fenced)).
 
 ### Producer Fenced
 
-When another producer with the same `transactionalId` initializes, this producer's open transaction can no longer
-commit: it is aborted with `TransactionAbortedError`, whose `cause` is the broker's answer (a `KafkaProtocolError` with
-`errorCode` `ErrorCode.ProducerFenced` or `ErrorCode.InvalidProducerEpoch`). From the fence on, the transaction's
-`send()` and `sendOffsets()` reject with `TransactionAbortedError` (whose `cause` is what fenced it), also while the
-producer initializes again under a new epoch: nothing of the transaction goes out under that epoch, which no
-transaction of its own contains. An idempotent producer fenced while producing rejects its sends with
-`ProducerFencedError`.
+When another producer with the same `transactionalId` initializes, it aborts the transaction this producer has open
+and takes over the transactional ID under a newer epoch; the broker does the same to a transaction that outlives
+`transactionTimeoutMs`. The broker then answers this producer PRODUCER_FENCED (or INVALID_PRODUCER_EPOCH from a
+coordinator), and the producer is fenced for good, like in the Java client: it rejects the transaction's `send()`,
+`sendOffsets()`, `commit()` and `abort()` (which sends nothing: the transaction was aborted already) and every later
+`beginTransaction()` or `transaction()` with `ProducerFencedError`, `transactionState` is `'error'`, and it never
+initializes again: replace it (`disconnect()` still works). It never sends InitProducerId again because the coordinator
+checks only the producer id there, so a fenced producer's InitProducerId would abort its successor's transaction.
+
+Other failures of the producer's epoch leave the open transaction abortable only: an out-of-order sequence, a send
+whose outcome its retries left unknown (the broker may have appended it), or INVALID_PRODUCER_EPOCH on a produce
+(KIP-588: a partition saw a newer epoch, which only the coordinator can tell apart from a fence). The failed send
+rejects with that error and every other send of the transaction with it or with `TransactionAbortedError` (whose `cause`
+is that error); nothing more goes out under the epoch, and `commit()` aborts. The abort sends EndTxn(abort) under the
+current epoch and, once it succeeded, InitProducerId to bump the epoch, after which the producer runs the next
+transaction under the new epoch. If the EndTxn is answered PRODUCER_FENCED, the producer is fenced as above and the
+abort rejects with `ProducerFencedError`; if the bump does not complete within `maxBlockMs`, the abort rejects and the
+producer is in the `'error'` state. A `disconnect()` aborting such a transaction skips the bump.
+
+An idempotent producer without a transaction rejects the sends of a failed epoch (with `ProducerFencedError` for
+PRODUCER_FENCED) and initializes again under a new epoch at once.
 
 ```typescript
-import { ErrorCode, KafkaError, TransactionAbortedError } from '@kafkats/client'
+import { ProducerFencedError } from '@kafkats/client'
 
 try {
 	await producer.transaction(async txn => {
 		// ...
 	})
 } catch (error) {
-	const code =
-		error instanceof TransactionAbortedError && error.cause instanceof KafkaError ? error.cause.errorCode : null
-	if (code === ErrorCode.ProducerFenced || code === ErrorCode.InvalidProducerEpoch) {
+	if (error instanceof ProducerFencedError) {
 		// Another producer took over - shut down this instance
 		await producer.disconnect()
 		process.exit(1)
