@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 
+import { KafkaProtocolError } from '@/client/errors.js'
 import { Producer } from '@/producer/producer.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
 import { createTransactionalMocks } from './_helpers.js'
@@ -51,6 +52,26 @@ describe('Producer: AddPartitionsToTxn of a transactional send', () => {
 		expect(mocks.cluster.invalidateCoordinator).toHaveBeenCalledWith('TRANSACTION', 'tx-1')
 		expect(mocks.txnCoordinator.addPartitionsToTxn).toHaveBeenCalledTimes(2)
 		await tx.commit()
+	})
+
+	it('rejects the send with the coordinator error once every attempt was answered with it, producing nothing', async () => {
+		mocks.txnCoordinator.addPartitionsToTxn.mockResolvedValue({
+			throttleTimeMs: 0,
+			errorCode: ErrorCode.NotCoordinator,
+			results: [],
+		})
+		const tx = await makeProducer().beginTransaction()
+
+		const error = await tx.send(TOPIC, { value, partition: 0 }).catch((cause: unknown) => cause)
+
+		expect(error).toBeInstanceOf(KafkaProtocolError)
+		expect(error).toMatchObject({ errorCode: ErrorCode.NotCoordinator })
+		// retries: 2, so three attempts, each sent to a coordinator looked up again.
+		expect(mocks.txnCoordinator.addPartitionsToTxn).toHaveBeenCalledTimes(3)
+		expect(mocks.cluster.invalidateCoordinator).toHaveBeenCalledTimes(3)
+		expect(mocks.cluster.invalidateCoordinator).toHaveBeenCalledWith('TRANSACTION', 'tx-1')
+		expect(mocks.leader.produce).not.toHaveBeenCalled()
+		await tx.abort()
 	})
 
 	it('adds the partition once the request fully succeeded: later sends of it register nothing', async () => {

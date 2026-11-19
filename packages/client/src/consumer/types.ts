@@ -295,7 +295,8 @@ export interface ConsumerConfig {
 	 * - 'earliest': the earliest available offset;
 	 * - 'latest' (default): the end of the partition, the last stable offset under 'read_committed';
 	 * - 'none': without a committed offset the run fails with `NoOffsetForPartitionError`; out of range, the
-	 *   partition is paused and `offsetOutOfRange` is emitted: `seek()` it, then `resume()` it.
+	 *   partition is paused and `offsetOutOfRange` is emitted: `seek()` it, then `resume()` it. Without an
+	 *   `offsetOutOfRange` listener the run fails with `OffsetOutOfRangeError` instead.
 	 *
 	 * 'earliest' and 'latest' emit `offsetReset`.
 	 */
@@ -582,7 +583,8 @@ export interface ConsumerEvents {
 	fetchPosition: [position: TopicPartitionOffset, recordCount: number]
 	/**
 	 * Emitted when a partition's position is out of range and its reset policy is 'none': the partition is paused.
-	 * `seek()` it to where it goes on, then `resume()` it.
+	 * `seek()` it to where it goes on, then `resume()` it. With no listener for this event the run fails with
+	 * `OffsetOutOfRangeError` instead.
 	 */
 	offsetOutOfRange: [position: TopicPartitionOffset]
 	/** Emitted when a partition's position was set by its reset policy ('earliest' or 'latest'). */

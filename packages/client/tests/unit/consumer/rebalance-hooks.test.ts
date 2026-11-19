@@ -324,6 +324,21 @@ describe('Consumer rebalance hooks', () => {
 			await expect(consumer.runBatch(TOPIC, async () => {})).rejects.toBe(failure)
 		})
 
+		it('onBeforeRebalance: the member leaves the group instead of joining again', async () => {
+			const broker = fakeBroker()
+			broker.produce(0, 1)
+			const consumer = groupConsumer(broker, { onBeforeRebalance: () => Promise.reject(failure) })
+			consumer.on('error', () => {})
+			const { run } = await started(consumer, 1)
+			broker.calls.length = 0
+
+			broker.heartbeatErrors.push(ErrorCode.RebalanceInProgress)
+
+			await expect(run).rejects.toBe(failure)
+			expect(broker.calls).toContain('LeaveGroup')
+			expect(broker.calls).not.toContain('JoinGroup')
+		})
+
 		it('onPartitionsRevoked', async () => {
 			const broker = fakeBroker()
 			broker.produce(0, 1)

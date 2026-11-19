@@ -313,6 +313,8 @@ consumer.on('offsetOutOfRange', ({ topic, partition, offset }) => {
 | `'latest'` (default) | End of the partition; `offsetReset`            | End of the partition; `offsetReset`                                        |
 | `'none'`             | The run fails with `NoOffsetForPartitionError` | The partition is paused and `offsetOutOfRange` is emitted; the run goes on |
 
+Under `'none'`, a position out of range ends the run with `OffsetOutOfRangeError` when nothing listens for `offsetOutOfRange` (like the Java consumer's `poll()`, which throws it): register the listener before the run starts.
+
 Under `read_committed` (the default), the end of a partition is its last stable offset: `'latest'` does not skip records of transactions still open.
 
 ### Connections
@@ -387,7 +389,7 @@ consumer.on('error', error => {
 | `partitionsLost`     | `TopicPartition[]`                            | The session was lost with these partitions; their offsets can no longer be committed                |
 | `rebalanceComplete`  | -                                             | The rebalance finished (the member rejoined and took its partitions), unless another one is pending |
 | `offsetReset`        | `{ topic, partition, from, to, reason }`      | A partition's position was set by `'earliest'` or `'latest'` (see [Offset Reset](#offset-reset))    |
-| `offsetOutOfRange`   | `{ topic, partition, offset }`                | A partition's position is out of range under `'none'`: it is paused                                 |
+| `offsetOutOfRange`   | `{ topic, partition, offset }`                | A partition's position is out of range under `'none'`: it is paused (no listener: the run fails)    |
 | `fetchPosition`      | `{ topic, partition, offset }`, `recordCount` | Fetching advanced; `offset` is the next fetch position                                              |
 
 `consumer.rebalancePending` is `true` from `rebalancePending` until `rebalanceComplete`.

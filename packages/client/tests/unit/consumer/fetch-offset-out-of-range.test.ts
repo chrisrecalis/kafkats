@@ -21,9 +21,20 @@ describe('FetchManager OffsetOutOfRange handling', () => {
 		expect(error).toMatchObject({ topic: TOPIC, partition: 0, offset: 100n })
 	})
 
+	it("surfaces OffsetOutOfRangeError from poll() under 'none' when the callback reports nobody listens", async () => {
+		const onOffsetOutOfRange = vi.fn(() => false)
+		const { fm, fetch } = await fetchManagerHarness({ autoOffsetReset: 'none', config: { onOffsetOutOfRange } })
+		fm.addPartitions([{ ...tp(0), offset: 100n }])
+
+		await fetch(fetchResponse({ partition: 0, ...OUT_OF_RANGE }), 0)
+
+		expect(onOffsetOutOfRange).toHaveBeenCalledExactlyOnceWith({ topic: TOPIC, partition: 0, offset: 100n })
+		await expect(fm.poll()).rejects.toBeInstanceOf(OffsetOutOfRangeError)
+	})
+
 	it("pauses the partition and reports it under 'none', and the run goes on", async () => {
 		const pending: PartitionBatch[] = []
-		const onOffsetOutOfRange = vi.fn()
+		const onOffsetOutOfRange = vi.fn(() => true)
 		const { fm, fetch } = await fetchManagerHarness({
 			autoOffsetReset: 'none',
 			config: { onOffsetOutOfRange, undelivered: pending, maxBytesPerPartition: 150 },
@@ -93,7 +104,7 @@ describe('FetchManager OffsetOutOfRange handling', () => {
 		const policy = vi.fn((_topic: string, partition: number): AutoOffsetReset =>
 			partition === 0 ? 'earliest' : 'none'
 		)
-		const onOffsetOutOfRange = vi.fn()
+		const onOffsetOutOfRange = vi.fn(() => true)
 		const onOffsetReset = vi.fn()
 		const { fm, fetch } = await fetchManagerHarness({
 			autoOffsetReset: policy,

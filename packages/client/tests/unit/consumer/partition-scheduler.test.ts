@@ -34,10 +34,13 @@ describe('consumer partition scheduler', () => {
 		consumerInternal.abortController = new AbortController()
 		const polls = [[batch(0, 0n)], [batch(1, 0n)], [batch(1, 1n)]]
 		consumerInternal.fetchManager = {
-			// Like the FetchManager, it queues what it drains on the consumer's undelivered batches.
+			// Like the FetchManager, it queues what it drains on the consumer's undelivered batches. A poll past the
+			// scripted answers fails the run: answering at once forever would spin the loop instead of failing.
 			poll: vi.fn().mockImplementation(async (excluded: ReadonlyMap<string, unknown>) => {
 				pollExclusions.push([...excluded.keys()])
-				consumerInternal.undelivered.push(...(polls.shift() ?? []))
+				const answer = polls.shift()
+				if (!answer) throw new Error('poll() called after the scripted answers were used up')
+				consumerInternal.undelivered.push(...answer)
 			}),
 			isBatchAssigned: vi.fn().mockReturnValue(true),
 			wakePoll: vi.fn(),

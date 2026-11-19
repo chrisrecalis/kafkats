@@ -44,7 +44,7 @@ export interface KafkaClientConfig {
 	/** Logger instance (optional, defaults to no-op) */
 	logger?: Logger
 
-	/** Log level when using default logger (default: 'info') */
+	/** Level of the built-in console logger, used when no `logger` is given. Without either, nothing is logged. */
 	logLevel?: LogLevel
 }
 

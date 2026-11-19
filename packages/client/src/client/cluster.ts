@@ -11,6 +11,8 @@ import {
 	NotCoordinatorError,
 	BrokerNotAvailableError,
 	NoBrokersAvailableError,
+	TimeoutError,
+	isConnectionFailure,
 	shouldRefreshMetadata,
 	throwIfError,
 } from './errors.js'
@@ -332,13 +334,20 @@ export class Cluster extends EventEmitter<ClusterEvents> {
 	/**
 	 * The broker leading a partition. When the cached metadata names no leader (topic or partition not
 	 * known yet, or the partition is between leaders, leaderId -1), the topic's metadata is refreshed
-	 * once first. If there is still no leader, it throws `LeaderNotAvailableError` for the caller to retry.
+	 * once first. If there is still no leader, or no broker could be reached for the refresh, it throws
+	 * `LeaderNotAvailableError` (with the refresh's failure as `cause`) for the caller to retry.
 	 */
 	async getLeaderForPartition(topic: string, partition: number): Promise<Broker> {
 		let leaderId = this.cachedLeaderId(topic, partition)
 		if (leaderId < 0) {
 			this.logger.debug('leader unknown, refreshing metadata', { topic, partition })
-			await this.refreshMetadata([topic])
+			try {
+				await this.refreshMetadata([topic])
+			} catch (error) {
+				// A broker's definitive answer goes to the caller as it is; not reaching one leaves the leader unknown.
+				if (!isConnectionFailure(error) && !(error instanceof TimeoutError)) throw error
+				throw new LeaderNotAvailableError(topic, partition, error as Error)
+			}
 			leaderId = this.cachedLeaderId(topic, partition)
 		}
 

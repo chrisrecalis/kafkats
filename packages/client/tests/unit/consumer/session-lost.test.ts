@@ -35,8 +35,10 @@ describe('Consumer', () => {
 		const partitions = [{ topic: 't', partition: 0 }]
 		const partitionsWithOffsets = [{ topic: 't', partition: 0, offset: 0n, committed: null }]
 
-		await callbacks.onPartitionsLost(partitions)
+		// Set synchronously with the loss, before the hook's promise settles.
+		const lost = callbacks.onPartitionsLost(partitions)
 		expect(consumerAny.sessionLost).toBe(true)
+		await lost
 
 		await callbacks.onPartitionsAssigned(partitionsWithOffsets)
 		expect(consumerAny.sessionLost).toBe(false)

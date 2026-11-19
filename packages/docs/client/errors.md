@@ -64,7 +64,10 @@ try {
 
 A send that fails rejects with a `KafkaError`. When the broker rejected the records for good, it is a
 `KafkaProtocolError` carrying the broker's `errorCode` (`retriable: false`). When the producer stopped retrying, it is a
-`KafkaError` with `retriable: true` whose `cause` is the last failure; the records may or may not have been written.
+`KafkaError` with `retriable: true` whose `cause` is the last failure; the records may or may not have been written. An
+idempotent (or transactional) producer that had sent the records rejects with a `KafkaError` for the ambiguous outcome
+instead (also `retriable: true`), whose `cause` is that exhausted-retries `KafkaError`: the last failure is one level
+deeper, its `cause.cause`.
 
 ```typescript
 import { ErrorCode, KafkaError, KafkaProtocolError } from '@kafkats/client'
@@ -86,7 +89,8 @@ try {
 
 ### LeaderNotAvailableError
 
-Partition leader is unavailable:
+Partition leader is unavailable: the metadata names no leader for the partition, also after a refresh, or no broker
+could be reached to refresh it (`cause` is then the failure of the refresh). Retriable:
 
 ```typescript
 import { LeaderNotAvailableError } from '@kafkats/client'
@@ -184,10 +188,10 @@ try {
 
 ### OffsetOutOfRangeError
 
-A partition's fetch position is outside the offsets the broker holds (`topic`, `partition`, `offset`). The consumer
-does not throw it: under `'none'` it pauses the partition and emits `offsetOutOfRange` (see
-[Offset Reset](/client/consumer#offset-reset)). A `FetchManager` used directly without an `onOffsetOutOfRange` callback
-throws it from `poll()`.
+A partition's fetch position is outside the offsets the broker holds (`topic`, `partition`, `offset`), and its reset
+policy is `'none'`. With an `offsetOutOfRange` listener the consumer does not throw it: it pauses the partition and
+emits the event (see [Offset Reset](/client/consumer#offset-reset)). With no listener, the run (`runEach()`,
+`runBatch()`, `stream()`) rejects with it.
 
 ## Transaction Errors
 

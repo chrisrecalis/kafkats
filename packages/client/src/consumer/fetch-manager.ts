@@ -531,10 +531,11 @@ export interface FetchManagerConfig {
 	onError?: (error: Error) => void
 	/**
 	 * Called when the fetch position of a partition is out of range and its reset policy is 'none'. The
-	 * partition is paused first, as by pausePartitions; seek it before resuming it. Without this callback the
-	 * next poll() throws OffsetOutOfRangeError instead.
+	 * partition is paused first, as by pausePartitions; seek it before resuming it. Returns whether the
+	 * application handles it (an emit's result: whether anyone listens); when it does not, or without this
+	 * callback, the next poll() throws OffsetOutOfRangeError (Java's poll() throws it).
 	 */
-	onOffsetOutOfRange?: (position: TopicPartitionOffset) => void
+	onOffsetOutOfRange?: (position: TopicPartitionOffset) => boolean
 	/** Called after an out-of-range fetch position was reset by the partition's 'earliest' or 'latest' policy. */
 	onOffsetReset?: (reset: {
 		topic: string
@@ -968,7 +969,8 @@ export class FetchManager {
 	/**
 	 * The fetch position of a partition is out of range (retention deleted it, or the log was truncated below
 	 * it). The partition's reset policy decides: 'earliest' and 'latest' move the position there and report the
-	 * reset; 'none' pauses the partition and reports it, so the application decides where it goes on.
+	 * reset; 'none' pauses the partition and reports it, so the application decides where it goes on (nobody
+	 * listening: the run ends with OffsetOutOfRangeError).
 	 */
 	private async handleOffsetOutOfRange(state: PartitionState): Promise<void> {
 		const { topic, partition, offset } = state
@@ -987,8 +989,9 @@ export class FetchManager {
 
 		if (policy === 'none') {
 			this.pausePartitions([{ topic, partition }])
-			if (this.config.onOffsetOutOfRange) this.config.onOffsetOutOfRange({ topic, partition, offset })
-			else this.pendingError = new OffsetOutOfRangeError(topic, partition, offset)
+			if (!this.config.onOffsetOutOfRange?.({ topic, partition, offset })) {
+				this.pendingError = new OffsetOutOfRangeError(topic, partition, offset)
+			}
 			return
 		}
 

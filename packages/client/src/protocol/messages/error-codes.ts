@@ -244,7 +244,7 @@ export function getErrorMessage(code: ErrorCode): string {
 		[ErrorCode.InvalidShareSessionEpoch]: 'The share session epoch is invalid',
 		[ErrorCode.ShareSessionLimitReached]: 'The limit of share sessions has been reached',
 		[ErrorCode.InvalidProducerEpoch]:
-			'The producer attempted an operation with an old epoch; a newer producer with the same transactionalId has fenced it',
+			'The producer attempted an operation with an old epoch; its producer id has a newer epoch now',
 		[ErrorCode.ProducerFenced]: 'The producer has been fenced by a newer instance with the same transactionalId',
 		[ErrorCode.InvalidProducerIdMapping]:
 			'The producer attempted to use a producer id which is not currently assigned to its transactional id',

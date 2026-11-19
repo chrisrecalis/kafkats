@@ -2,9 +2,18 @@ import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 
 import { Cluster } from '@/client/cluster.js'
 import { Broker } from '@/client/broker.js'
-import { BrokerNotAvailableError, LeaderNotAvailableError, CoordinatorNotAvailableError } from '@/client/errors.js'
+import {
+	BrokerNotAvailableError,
+	ConnectionError,
+	CoordinatorNotAvailableError,
+	KafkaProtocolError,
+	LeaderNotAvailableError,
+	NoBrokersAvailableError,
+	TimeoutError,
+} from '@/client/errors.js'
 import { encodeSubscriptionMetadata } from '@/consumer/assignors/index.js'
 import { ConsumerGroup } from '@/consumer/consumer-group.js'
+import { OffsetManager } from '@/consumer/offset-manager.js'
 import { ConnectionClosedError } from '@/network/errors.js'
 import { ErrorCode } from '@/protocol/messages/error-codes.js'
 
@@ -307,6 +316,66 @@ describe('Cluster', () => {
 
 			await expect(cluster.getLeaderForPartition('t', 0)).resolves.toBe(mockBroker)
 			expect(mockBroker.metadata).toHaveBeenCalledTimes(1)
+		})
+
+		/** A cluster whose cached metadata names no leader for t-0, so that a lookup refreshes it. */
+		async function leaderlessCluster() {
+			const cluster = new Cluster({ clientId: 'c', brokers: ['bootstrap:9092'] })
+			const mockBroker = createMockBroker(1, { isConnected: true })
+			wireBroker(cluster, mockBroker)
+			mockBroker.metadata.mockResolvedValueOnce(
+				metadataResponse([partitionMeta(0, -1, 4, ErrorCode.LeaderNotAvailable)])
+			)
+			await cluster.refreshMetadata()
+			return { cluster, mockBroker }
+		}
+
+		it('throws the retriable LeaderNotAvailableError, caused by the failure, when the refresh reaches no broker', async () => {
+			const { cluster, mockBroker } = await leaderlessCluster()
+			// The broker went away: the refresh finds no broker to ask.
+			;(mockBroker as unknown as { isConnected: boolean }).isConnected = false
+			mockBroker.connect.mockRejectedValue(new ConnectionClosedError('Connection refused'))
+
+			const error = await cluster.getLeaderForPartition('t', 0).catch((cause: unknown) => cause)
+
+			expect(error).toBeInstanceOf(LeaderNotAvailableError)
+			expect(error).toMatchObject({ topic: 't', partition: 0, retriable: true })
+			expect((error as LeaderNotAvailableError).cause).toBeInstanceOf(NoBrokersAvailableError)
+		})
+
+		it.each([
+			['a connection failure', new ConnectionError('broker-1', 9092)],
+			['a timeout', new TimeoutError('Metadata request', 30_000)],
+		])('throws LeaderNotAvailableError when the refresh fails with %s', async (_, failure) => {
+			const { cluster, mockBroker } = await leaderlessCluster()
+			mockBroker.metadata.mockRejectedValueOnce(failure)
+
+			const error = await cluster.getLeaderForPartition('t', 0).catch((cause: unknown) => cause)
+
+			expect(error).toBeInstanceOf(LeaderNotAvailableError)
+			expect((error as LeaderNotAvailableError).cause).toBe(failure)
+		})
+
+		it("passes on a broker's definitive answer to the refresh", async () => {
+			const { cluster, mockBroker } = await leaderlessCluster()
+			const denied = new KafkaProtocolError(ErrorCode.TopicAuthorizationFailed, 'Metadata for t')
+			mockBroker.metadata.mockRejectedValueOnce(denied)
+
+			await expect(cluster.getLeaderForPartition('t', 0)).rejects.toBe(denied)
+		})
+
+		it('lets an offset lookup retry a leader lookup whose refresh reached no broker', async () => {
+			const { cluster, mockBroker } = await leaderlessCluster()
+			const listOffsets = vi.fn().mockResolvedValue({
+				topics: [{ name: 't', partitions: [{ partitionIndex: 0, errorCode: ErrorCode.None, offset: 42n }] }],
+			})
+			;(mockBroker as unknown as { listOffsets: typeof listOffsets }).listOffsets = listOffsets
+			// The first refresh reaches no broker; the next one finds broker 1 leading the partition.
+			vi.spyOn(cluster, 'getAnyBroker').mockRejectedValueOnce(new NoBrokersAvailableError())
+			mockBroker.metadata.mockResolvedValueOnce(metadataResponse([partitionMeta(0, 1, 5)]))
+
+			await expect(new OffsetManager(cluster, 'g').getEarliestOffset('t', 0)).resolves.toBe(42n)
+			expect(listOffsets).toHaveBeenCalledTimes(1)
 		})
 	})
 

@@ -51,12 +51,18 @@ export class KafkaProtocolError extends KafkaError {
 export class LeaderNotAvailableError extends KafkaError {
 	readonly topic: string
 	readonly partition: number
+	/** Why the leader could not be looked up, when the metadata refresh failed (e.g. no broker reachable). */
+	override readonly cause?: Error
 
-	constructor(topic: string, partition: number) {
-		super(`Leader not available for ${topic}-${partition}`, ErrorCode.LeaderNotAvailable)
+	constructor(topic: string, partition: number, cause?: Error) {
+		super(
+			`Leader not available for ${topic}-${partition}${cause ? `: ${cause.message}` : ''}`,
+			ErrorCode.LeaderNotAvailable
+		)
 		this.name = 'LeaderNotAvailableError'
 		this.topic = topic
 		this.partition = partition
+		this.cause = cause
 	}
 }
 

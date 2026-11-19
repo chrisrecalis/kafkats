@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { NoOffsetForPartitionError } from '@/client/errors.js'
+import { NoOffsetForPartitionError, OffsetOutOfRangeError } from '@/client/errors.js'
 import type { AssignedPartition, AutoOffsetReset, OffsetResetEvent, TopicPartitionOffset } from '@/consumer/types.js'
 import { fakeBroker, groupConsumer, TOPIC, tp, until } from './group-harness.js'
 
@@ -78,6 +78,25 @@ describe('Consumer offset reset policy', () => {
 
 		consumer.stop()
 		await run
+	})
+
+	it("fails the run with OffsetOutOfRangeError for an out-of-range position under 'none' when nothing listens for offsetOutOfRange", async () => {
+		const broker = fakeBroker()
+		broker.produce(0, 5)
+		broker.committed.set(0, { offset: 1n, metadata: null })
+		broker.committed.set(1, { offset: 0n, metadata: null })
+		broker.deleteBefore(0, 3n)
+		const consumer = groupConsumer(broker, { autoOffsetReset: 'none' })
+		const errors: unknown[] = []
+		consumer.on('error', error => errors.push(error))
+
+		const failure = await consumer
+			.runBatch(TOPIC, async () => {}, { commitOffsets: false })
+			.catch((error: unknown) => error)
+
+		expect(failure).toBeInstanceOf(OffsetOutOfRangeError)
+		expect(failure).toMatchObject({ topic: TOPIC, partition: 0, offset: 1n })
+		expect(errors).toContain(failure)
 	})
 
 	it("moves an out-of-range position under 'earliest' and reports the reset", async () => {

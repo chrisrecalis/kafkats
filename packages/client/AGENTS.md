@@ -55,7 +55,8 @@ Flow's task runtime is built on these consumer and producer behaviours; a change
 - `pause()` and `seek()` withhold records already fetched; `nextOffset()` and `currentLag()` are exact per partition
   (KIP-695 idling and KIP-1094 committed offsets depend on them).
 - `autoOffsetReset` as a function chooses the reset policy per partition; under `'none'` a position out of range pauses
-  the partition and emits `offsetOutOfRange` instead of ending the run; `'latest'` is the last stable offset under
+  the partition and emits `offsetOutOfRange` instead of ending the run (with no listener for it, the run ends with
+  `OffsetOutOfRangeError`: flow listens before each run starts); `'latest'` is the last stable offset under
   `read_committed`.
 - `groupMetadata()` and `producer.beginTransaction()` (a `TransactionHandle` with `sendOffsets`, `commit`, `abort`)
   give fenced exactly-once commits; an unconfirmed `EndTxn` rejects with `TransactionAbortedError` and

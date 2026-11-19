@@ -40,18 +40,18 @@ const client = new KafkaClient({
 
 ### Options Reference
 
-| Option                      | Type                                     | Default  | Description                                      |
-| --------------------------- | ---------------------------------------- | -------- | ------------------------------------------------ |
-| `clientId`                  | `string`                                 | -        | Required. Client identifier shown in broker logs |
-| `brokers`                   | `string[]`                               | -        | Required. Bootstrap broker addresses             |
-| `requestTimeoutMs`          | `number`                                 | `30000`  | Request timeout (ms)                             |
-| `connectionTimeoutMs`       | `number`                                 | `10000`  | Connection timeout (ms)                          |
-| `metadataRefreshIntervalMs` | `number`                                 | `300000` | How often to refresh cluster metadata (ms)       |
-| `maxInFlightRequests`       | `number`                                 | `5`      | Max in-flight requests per broker connection     |
-| `tls`                       | `TlsConfig`                              | -        | TLS configuration (omit for plaintext)           |
-| `sasl`                      | `SaslConfig`                             | -        | SASL authentication configuration                |
-| `logger`                    | `Logger`                                 | -        | Custom logger implementation                     |
-| `logLevel`                  | `'debug' \| 'info' \| 'warn' \| 'error'` | `'info'` | Log level for the built-in logger                |
+| Option                      | Type                                                 | Default  | Description                                                                                      |
+| --------------------------- | ---------------------------------------------------- | -------- | ------------------------------------------------------------------------------------------------ |
+| `clientId`                  | `string`                                             | -        | Required. Client identifier shown in broker logs                                                 |
+| `brokers`                   | `string[]`                                           | -        | Required. Bootstrap broker addresses                                                             |
+| `requestTimeoutMs`          | `number`                                             | `30000`  | Request timeout (ms)                                                                             |
+| `connectionTimeoutMs`       | `number`                                             | `10000`  | Connection timeout (ms)                                                                          |
+| `metadataRefreshIntervalMs` | `number`                                             | `300000` | How often to refresh cluster metadata (ms)                                                       |
+| `maxInFlightRequests`       | `number`                                             | `5`      | Max in-flight requests per broker connection                                                     |
+| `tls`                       | `TlsConfig`                                          | -        | TLS configuration (omit for plaintext)                                                           |
+| `sasl`                      | `SaslConfig`                                         | -        | SASL authentication configuration                                                                |
+| `logger`                    | `Logger`                                             | -        | Custom logger implementation                                                                     |
+| `logLevel`                  | `'debug' \| 'info' \| 'warn' \| 'error' \| 'silent'` | -        | Log level of the built-in console logger. Without `logger` or `logLevel` the client logs nothing |
 
 ### SASL Reauthentication
 
@@ -149,11 +149,11 @@ const consumer = client.consumer({
 The policy applies to partitions without a committed offset and to positions out of range (records deleted). Pass a
 function `(topic, partition) => policy` to choose per partition.
 
-| Value        | Behavior                                                                                                                                     |
-| ------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `'earliest'` | Start from beginning of topic                                                                                                                |
-| `'latest'`   | Start from end of topic (new messages only); the last stable offset under `read_committed`                                                   |
-| `'none'`     | No committed offset: the run fails with `NoOffsetForPartitionError`. Out of range: the partition is paused and `offsetOutOfRange` is emitted |
+| Value        | Behavior                                                                                                                                                                                                           |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `'earliest'` | Start from beginning of topic                                                                                                                                                                                      |
+| `'latest'`   | Start from end of topic (new messages only); the last stable offset under `read_committed`                                                                                                                         |
+| `'none'`     | No committed offset: the run fails with `NoOffsetForPartitionError`. Out of range: the partition is paused and `offsetOutOfRange` is emitted (with no listener for it, the run fails with `OffsetOutOfRangeError`) |
 
 See [Rebalance Hooks](/client/consumer#rebalance-hooks) and [Offset Reset](/client/consumer#offset-reset).
 
